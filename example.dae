@@ -124,6 +124,12 @@ global {
     # For IPv6 DNS servers, the format is "[ipv6]:port", such as "[2001:4860:4860::8888]:53". 
     # Fallback resolver will always be available, even if you do not specify it in the configuration file.
     # fallback_resolver: '8.8.8.8:53'
+
+    # "auto" means it will not be enabled when sniffing is available.
+    # In a dual-stack environment, if the node does not support IPv6, the program may still attempt to use an IPv6 connection first. 
+    # If the connection is directly blocked, some programs that do not support "Happy Eyeballs" may need to wait for a while before retrying with IPv4.
+    # When sniffing is enabled, it may allow programs attempting to use an IPv6 connection to actually dial to the target using IPv4.
+    not_blocking_even_node_not_alive: auto
 }
 
 # Subscriptions defined here will be resolved as nodes and merged as a part of the global node pool.

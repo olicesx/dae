@@ -7,13 +7,14 @@ package dialer
 
 import (
 	"fmt"
+	"math"
+	"math/rand"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
-	"github.com/daeuniverse/outbound/pkg/fastrand"
 	"github.com/sirupsen/logrus"
 )
 
@@ -24,6 +25,7 @@ const (
 
 type minLatency struct {
 	sortingLatency time.Duration
+	priority       int
 	dialer         *Dialer
 }
 
@@ -46,6 +48,8 @@ type AliveDialerSet struct {
 
 	selectionPolicy consts.DialerSelectionPolicy
 	minLatency      minLatency
+
+	dialerToPriority map[*Dialer]int
 }
 
 func NewAliveDialerSet(
@@ -74,6 +78,7 @@ func NewAliveDialerSet(
 		tolerance:               tolerance,
 		aliveChangeCallback:     aliveChangeCallback,
 		dialerToIndex:           make(map[*Dialer]int),
+		dialerToPriority:        make(map[*Dialer]int),
 		dialerToLatency:         make(map[*Dialer]time.Duration),
 		dialerToLatencyOffset:   dialerToLatencyOffset,
 		inorderedAliveDialerSet: make([]*Dialer, 0, len(dialers)),
@@ -85,6 +90,9 @@ func NewAliveDialerSet(
 	}
 	for _, d := range dialers {
 		a.dialerToIndex[d] = -Init
+	}
+	for i, d := range dialers {
+		a.dialerToPriority[d] = dialersAnnotations[i].Priority
 	}
 	for _, d := range dialers {
 		a.NotifyLatencyChange(d, setAlive)
@@ -98,17 +106,51 @@ func (a *AliveDialerSet) GetRand() *Dialer {
 	if len(a.inorderedAliveDialerSet) == 0 {
 		return nil
 	}
-	ind := fastrand.Intn(len(a.inorderedAliveDialerSet))
-	return a.inorderedAliveDialerSet[ind]
+
+	// Find the highest priority among alive dialers
+	highestPriority := math.MinInt
+	for _, d := range a.inorderedAliveDialerSet {
+		priority, _ := a.dialerToPriority[d]
+		if priority > highestPriority {
+			highestPriority = priority
+		}
+	}
+
+	// Collect all dialers with the highest priority
+	highPriorityDialers := make([]*Dialer, 0)
+	for _, d := range a.inorderedAliveDialerSet {
+		priority, _ := a.dialerToPriority[d]
+		if priority == highestPriority {
+			highPriorityDialers = append(highPriorityDialers, d)
+		}
+	}
+
+	// Pick a random dialer from the high priority ones
+	if len(highPriorityDialers) > 0 {
+		return highPriorityDialers[rand.Intn(len(highPriorityDialers))]
+	}
+
+	return nil
 }
 
 func (a *AliveDialerSet) SortingLatency(d *Dialer) time.Duration {
 	return a.dialerToLatency[d] + a.dialerToLatencyOffset[d]
 }
 
+func (a *AliveDialerSet) Priority(d *Dialer) int {
+	return a.dialerToPriority[d]
+}
+
 // GetMinLatency acquires correct selectionPolicy.
 func (a *AliveDialerSet) GetMinLatency() (d *Dialer, latency time.Duration) {
 	return a.minLatency.dialer, a.minLatency.sortingLatency
+}
+
+// GetMinLatency acquires correct selectionPolicy.
+func (a *AliveDialerSet) setMinLatency(d *Dialer, sortingLatency time.Duration, priority int) {
+	a.minLatency.sortingLatency = sortingLatency
+	a.minLatency.priority = priority
+	a.minLatency.dialer = d
 }
 
 func (a *AliveDialerSet) printLatencies() {
@@ -145,10 +187,9 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	var (
-		rawLatency     time.Duration
-		sortingLatency time.Duration
-		hasLatency     bool
-		minPolicy      bool
+		rawLatency time.Duration
+		hasLatency bool
+		minPolicy  bool
 	)
 
 	switch a.selectionPolicy {
@@ -212,14 +253,19 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 
 	if hasLatency {
 		bakOldBestDialer := a.minLatency.dialer
-		// Calc minLatency.
+		// Update latency and calc minLatency dialer.
+		// Update minLatency dialer to current dialer if it's better, or Recalculate it if dialer get worse.
 		a.dialerToLatency[dialer] = rawLatency
-		sortingLatency = a.SortingLatency(dialer)
-		if alive &&
+		sortingLatency := a.SortingLatency(dialer)
+		priority := a.Priority(dialer)
+		if alive && priority == a.minLatency.priority &&
 			sortingLatency <= a.minLatency.sortingLatency && // To avoid arithmetic overflow.
 			sortingLatency <= a.minLatency.sortingLatency-a.tolerance {
-			a.minLatency.sortingLatency = sortingLatency
-			a.minLatency.dialer = dialer
+			// Same priority and latency is smaller than minLatency.
+			a.setMinLatency(dialer, sortingLatency, priority)
+		} else if alive && priority > a.minLatency.priority {
+			// Higher priority.
+			a.setMinLatency(dialer, sortingLatency, priority)
 		} else if a.minLatency.dialer == dialer {
 			a.minLatency.sortingLatency = sortingLatency
 			if !alive || sortingLatency > a.minLatency.sortingLatency {
@@ -278,25 +324,27 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 
 func (a *AliveDialerSet) calcMinLatency() {
 	var minLatency = time.Hour
+	var highestPriority = math.MinInt
 	var minDialer *Dialer
 	for _, d := range a.inorderedAliveDialerSet {
-		_, ok := a.dialerToLatency[d]
-		if !ok {
-			continue
-		}
+		priority, _ := a.dialerToPriority[d]
+
 		sortingLatency := a.SortingLatency(d)
-		if sortingLatency < minLatency {
+		if sortingLatency < minLatency && priority >= highestPriority {
 			minLatency = sortingLatency
+			highestPriority = priority
 			minDialer = d
 		}
 	}
+
 	if a.minLatency.dialer == nil {
-		a.minLatency.sortingLatency = minLatency
-		a.minLatency.dialer = minDialer
+		a.setMinLatency(minDialer, minLatency, highestPriority)
 	} else if minDialer != nil &&
 		minLatency <= a.minLatency.sortingLatency && // To avoid arithmetic overflow.
 		minLatency <= a.minLatency.sortingLatency-a.tolerance {
-		a.minLatency.sortingLatency = minLatency
-		a.minLatency.dialer = minDialer
+		a.setMinLatency(minDialer, minLatency, highestPriority)
+	} else if minDialer != nil &&
+		highestPriority > a.minLatency.priority {
+		a.setMinLatency(minDialer, minLatency, highestPriority)
 	}
 }

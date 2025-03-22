@@ -50,6 +50,7 @@ type Global struct {
 	BandwidthMaxTx              string        `mapstructure:"bandwidth_max_tx" default:"0"`
 	BandwidthMaxRx              string        `mapstructure:"bandwidth_max_rx" default:"0"`
 	NotBlockingEvenNodeNotAlive string        `mapstructure:"not_blocking_even_node_not_alive" default:"auto"`
+	UDPHopInterval              time.Duration `mapstructure:"udphop_interval" default:"30s"`
 }
 
 type Utls struct {

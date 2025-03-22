@@ -10,12 +10,14 @@ import (
 	"net/netip"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/daeuniverse/dae/common/assets"
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 	"github.com/daeuniverse/dae/pkg/geodata"
 	"github.com/mohae/deepcopy"
+	"github.com/oschwald/maxminddb-golang/v2"
 	"github.com/sirupsen/logrus"
 )
 
@@ -154,9 +156,24 @@ func (o *DeduplicateParamsOptimizer) Optimize(rules []*config_parser.RoutingRule
 	return rules, nil
 }
 
+type mmdbCache struct {
+	fieldCache map[string]map[string][]string // fieldName -> fieldValue -> subnets
+}
+
+// DatReaderOptimizer 添加缓存字段
 type DatReaderOptimizer struct {
-	LocationFinder *assets.LocationFinder
-	Logger         *logrus.Logger
+	LocationFinder  *assets.LocationFinder
+	Logger          *logrus.Logger
+	mmdbCaches      map[string]mmdbCache // filename -> cache
+	mmdbCachesMutex sync.RWMutex
+}
+
+func NewDatReaderOptimizer(logger *logrus.Logger, locationFinder *assets.LocationFinder) *DatReaderOptimizer {
+	return &DatReaderOptimizer{
+		LocationFinder: locationFinder,
+		Logger:         logger,
+		mmdbCaches:     make(map[string]mmdbCache),
+	}
 }
 
 func (o *DatReaderOptimizer) loadGeoSite(filename string, code string) (params []*config_parser.Param, err error) {
@@ -233,9 +250,6 @@ func (o *DatReaderOptimizer) loadGeoIp(filename string, code string) (params []*
 	if err != nil {
 		return nil, err
 	}
-	if err != nil {
-		return nil, err
-	}
 	if geoIp.InverseMatch {
 		return nil, fmt.Errorf("not support inverse match yet")
 	}
@@ -252,6 +266,88 @@ func (o *DatReaderOptimizer) loadGeoIp(filename string, code string) (params []*
 	return params, nil
 }
 
+func (o *DatReaderOptimizer) loadMMDB(filename string, field string, value string) (params []*config_parser.Param, err error) {
+	if !strings.HasSuffix(filename, ".mmdb") {
+		filename += ".mmdb"
+	}
+
+	filePath, err := o.LocationFinder.GetLocationAsset(o.Logger, filename)
+	if err != nil {
+		o.Logger.Debugf("Failed to read mmdb \"%v:%v=%v\": %v", filename, field, value, err)
+		return nil, err
+	}
+	o.Logger.Debugf("Read mmdb \"%v:%v=%v\" from %v", filename, field, value, filePath)
+
+	// 检查缓存中是否已有结果
+	o.mmdbCachesMutex.RLock()
+	if cache, ok := o.mmdbCaches[filePath]; ok {
+		if fieldCache, ok := cache.fieldCache[field]; ok {
+			if subnets, ok := fieldCache[value]; ok {
+				for _, subnet := range subnets {
+					params = append(params, &config_parser.Param{
+						Key: "",
+						Val: subnet,
+					})
+				}
+				o.mmdbCachesMutex.RUnlock()
+				return params, nil
+			}
+		}
+	}
+	o.mmdbCachesMutex.RUnlock()
+
+	db, err := maxminddb.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	// 如果缓存中没有这个字段的记录，则构建该字段的完整缓存
+	o.mmdbCachesMutex.Lock()
+	defer o.mmdbCachesMutex.Unlock()
+
+	// 缓存结构初始化
+	if _, ok := o.mmdbCaches[filePath]; !ok {
+		o.mmdbCaches[filePath] = mmdbCache{
+			fieldCache: make(map[string]map[string][]string),
+		}
+	}
+	if _, ok := o.mmdbCaches[filePath].fieldCache[field]; !ok {
+		o.mmdbCaches[filePath].fieldCache[field] = make(map[string][]string)
+	}
+
+	// 构建该字段的完整缓存
+	for result := range db.Networks() {
+		var v string
+		err := result.DecodePath(&v, field)
+
+		if err != nil {
+			return nil, err
+		}
+
+		subnet := result.Prefix().String()
+		v = strings.ToLower(v)
+
+		if v == value {
+			params = append(params, &config_parser.Param{
+				Key: "",
+				Val: subnet,
+			})
+		}
+
+		if _, ok := o.mmdbCaches[filePath].fieldCache[field]; !ok {
+			o.mmdbCaches[filePath].fieldCache[field] = make(map[string][]string)
+		}
+		if _, ok := o.mmdbCaches[filePath].fieldCache[field][v]; !ok {
+			o.mmdbCaches[filePath].fieldCache[field][v] = []string{subnet}
+		} else {
+			o.mmdbCaches[filePath].fieldCache[field][v] = append(o.mmdbCaches[filePath].fieldCache[field][v], subnet)
+		}
+	}
+
+	return params, nil
+}
+
 func (o *DatReaderOptimizer) Optimize(rules []*config_parser.RoutingRule) ([]*config_parser.RoutingRule, error) {
 	var err error
 	for _, rule := range rules {
@@ -265,6 +361,9 @@ func (o *DatReaderOptimizer) Optimize(rules []*config_parser.RoutingRule) ([]*co
 					params, err = o.loadGeoSite("geosite", param.Val)
 				case "geoip":
 					params, err = o.loadGeoIp("geoip", param.Val)
+				case "mmdb":
+					fields := strings.SplitN(param.Val, "=", 2)
+					params, err = o.loadMMDB("geoip", strings.ToLower(fields[0]), strings.ToLower(fields[1]))
 				case "ext":
 					fields := strings.SplitN(param.Val, ":", 2)
 					switch f.Name {

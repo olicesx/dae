@@ -160,7 +160,7 @@ var (
 	BpfLoopFeatureVersion                     = internal.Version{5, 17, 0}
 )
 
-const (
+var (
 	TproxyMark       uint32 = 0x08000000
 	TproxyMarkString string = "0x08000000" // Should be aligned with nftables
 	Recognize        uint16 = 0x2017

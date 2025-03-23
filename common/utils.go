@@ -457,7 +457,7 @@ nextLink:
 				return nil, err
 			}
 			for _, route := range rs {
-				if route.Dst != nil {
+				if ones, _ := route.Dst.Mask.Size(); ones != 0 {
 					continue
 				}
 				// Have no dst, it is a default route.

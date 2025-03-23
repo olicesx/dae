@@ -74,7 +74,7 @@ func scopeToString(scope netlink.Scope) string {
 }
 
 // Translate protocol enum into semantic words
-func protocolToString(proto int) string {
+func protocolToString(proto netlink.RouteProtocol) string {
 	switch proto {
 	case unix.RTPROT_BABEL:
 		return "babel"

@@ -69,7 +69,7 @@ func (p *UdpTaskPool) EmitTask(key string, task UdpTask) {
 			p:         p,
 			ch:        ch,
 			timer:     nil,
-			agingTime: DefaultNatTimeout,
+			agingTime: DefaultNatTimeoutUDP,
 			ctx:       ctx,
 			closed:    make(chan struct{}),
 		}

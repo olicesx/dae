@@ -124,7 +124,7 @@ begin:
 			createOption = &UdpEndpointOptions{}
 		}
 		if createOption.NatTimeout == 0 {
-			createOption.NatTimeout = DefaultNatTimeout
+			createOption.NatTimeout = DefaultNatTimeoutUDP
 		}
 		if createOption.Handler == nil {
 			return nil, true, fmt.Errorf("createOption.Handler cannot be nil")

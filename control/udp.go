@@ -23,7 +23,9 @@ import (
 )
 
 var (
-	DefaultNatTimeout = 3 * time.Minute
+	// Values from OpenWRT default sysctl config
+	DefaultNatTimeoutTCP = 5 * time.Minute
+	DefaultNatTimeoutUDP = 90 * time.Second
 )
 
 const (
@@ -48,7 +50,7 @@ func ChooseNatTimeout(data []byte, sniffDns bool) (dmsg *dnsmessage.Msg, timeout
 			return &dnsmsg, DnsNatTimeout
 		}
 	}
-	return nil, DefaultNatTimeout
+	return nil, DefaultNatTimeoutUDP
 }
 
 // sendPkt uses bind first, and fallback to send hdr if addr is in use.

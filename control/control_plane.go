@@ -294,6 +294,14 @@ func NewControlPlane(
 		outbounds = append(outbounds, dialerGroup)
 	}
 
+	/// Node Connectivity Check.
+	for _, g := range outbounds {
+		for _, d := range g.Dialers {
+			// We only activate check of nodes that have a group.
+			d.ActivateCheck()
+		}
+	}
+
 	/// Routing.
 	// Generate outboundName2Id from outbounds.
 	if len(outbounds) > int(consts.OutboundUserDefinedMax) {
@@ -628,14 +636,6 @@ func (c *ControlPlane) dnsUpstreamReadyCallback(dnsUpstream *dns.Upstream) (err 
 	return nil
 }
 
-func (c *ControlPlane) ActivateCheck() {
-	for _, g := range c.outbounds {
-		for _, d := range g.Dialers {
-			// We only activate check of nodes that have a group.
-			d.ActivateCheck()
-		}
-	}
-}
 func (c *ControlPlane) ChooseDialTarget(outbound consts.OutboundIndex, dst netip.AddrPort, domain string) (dialTarget string, shouldReroute bool, dialIp bool) {
 	dialMode := consts.DialMode_Ip
 
@@ -846,7 +846,6 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			// }
 		}
 	}()
-	c.ActivateCheck()
 	<-c.ctx.Done()
 	return nil
 }

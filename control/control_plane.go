@@ -210,50 +210,6 @@ func NewControlPlane(
 		}
 	}()
 
-	/// Bind to links. Binding should be advance of dialerGroups to avoid un-routable old connection.
-	// Bind to LAN
-	if len(global.LanInterface) > 0 {
-		if global.AutoConfigKernelParameter {
-			_ = SetIpv4forward("1")
-			_ = setForwarding("all", consts.IpVersionStr_6, "1")
-		}
-		global.LanInterface = common.Deduplicate(global.LanInterface)
-		for _, ifname := range global.LanInterface {
-			core.bindLan(ifname, global.AutoConfigKernelParameter)
-		}
-	}
-	// Bind to WAN
-	if len(global.WanInterface) > 0 {
-		if err = core.setupSkPidMonitor(); err != nil {
-			log.WithError(err).Warnln("cgroup2 is not enabled; pname routing cannot be used")
-		}
-		if global.EnableLocalTcpFastRedirect {
-			if err = core.setupLocalTcpFastRedirect(); err != nil {
-				log.WithError(err).Warnln("failed to setup local tcp fast redirect")
-			}
-		}
-		for _, ifname := range global.WanInterface {
-			if len(global.LanInterface) > 0 {
-				// FIXME: Code is not elegant here.
-				// bindLan setting conf.ipv6.all.forwarding=1 suppresses accept_ra=1,
-				// thus we set it 2 as a workaround.
-				// See https://sysctl-explorer.net/net/ipv6/accept_ra/ for more information.
-				if global.AutoConfigKernelParameter {
-					acceptRa := sysctl.Keyf("net.ipv6.conf.%v.accept_ra", ifname)
-					val, _ := acceptRa.Get()
-					if val == "1" {
-						_ = acceptRa.Set("2", false)
-					}
-				}
-			}
-			core.bindWan(ifname, global.AutoConfigKernelParameter)
-		}
-	}
-	// Bind to dae0 and dae0peer
-	if err = core.bindDaens(); err != nil {
-		return nil, fmt.Errorf("bindDaens: %w", err)
-	}
-
 	/// DialerGroups (outbounds).
 	if global.AllowInsecure {
 		log.Warnln("AllowInsecure is enabled, but it is not recommended. Please make sure you have to turn it on.")
@@ -507,6 +463,50 @@ func NewControlPlane(
 		return nil, err
 	}
 	go dnsUpstream.InitUpstreams()
+
+	/// Bind to links. Binding should be advance of dialerGroups to avoid un-routable old connection.
+	// Bind to LAN
+	if len(global.LanInterface) > 0 {
+		if global.AutoConfigKernelParameter {
+			_ = SetIpv4forward("1")
+			_ = setForwarding("all", consts.IpVersionStr_6, "1")
+		}
+		global.LanInterface = common.Deduplicate(global.LanInterface)
+		for _, ifname := range global.LanInterface {
+			core.bindLan(ifname, global.AutoConfigKernelParameter)
+		}
+	}
+	// Bind to WAN
+	if len(global.WanInterface) > 0 {
+		if err = core.setupSkPidMonitor(); err != nil {
+			log.WithError(err).Warnln("cgroup2 is not enabled; pname routing cannot be used")
+		}
+		if global.EnableLocalTcpFastRedirect {
+			if err = core.setupLocalTcpFastRedirect(); err != nil {
+				log.WithError(err).Warnln("failed to setup local tcp fast redirect")
+			}
+		}
+		for _, ifname := range global.WanInterface {
+			if len(global.LanInterface) > 0 {
+				// FIXME: Code is not elegant here.
+				// bindLan setting conf.ipv6.all.forwarding=1 suppresses accept_ra=1,
+				// thus we set it 2 as a workaround.
+				// See https://sysctl-explorer.net/net/ipv6/accept_ra/ for more information.
+				if global.AutoConfigKernelParameter {
+					acceptRa := sysctl.Keyf("net.ipv6.conf.%v.accept_ra", ifname)
+					val, _ := acceptRa.Get()
+					if val == "1" {
+						_ = acceptRa.Set("2", false)
+					}
+				}
+			}
+			core.bindWan(ifname, global.AutoConfigKernelParameter)
+		}
+	}
+	// Bind to dae0 and dae0peer
+	if err = core.bindDaens(); err != nil {
+		return nil, fmt.Errorf("bindDaens: %w", err)
+	}
 
 	close(plane.ready)
 	return plane, nil

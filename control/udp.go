@@ -156,7 +156,7 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, r
 		routingResult.Mark = c.soMarkFromDae
 	}
 	if isDns {
-		return c.dnsController.Handle_(dnsMessage, &udpRequest{
+		return c.dnsController.Handle(dnsMessage, &udpRequest{
 			realSrc:       realSrc,
 			realDst:       realDst,
 			src:           src,

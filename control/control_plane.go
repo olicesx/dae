@@ -420,15 +420,8 @@ func NewControlPlane(
 			return cache, nil
 		},
 		BestDialerChooser: plane.chooseBestDnsDialer,
-		TimeoutExceedCallback: func(dialArgument *dialArgument, err error) {
-			dialArgument.bestDialer.ReportUnavailable(&dialer.NetworkType{
-				L4Proto:   dialArgument.l4proto,
-				IpVersion: dialArgument.ipversion,
-				IsDns:     true,
-			}, err)
-		},
-		IpVersionPrefer: dnsConfig.IpVersionPrefer,
-		FixedDomainTtl:  fixedDomainTtl,
+		IpVersionPrefer:   dnsConfig.IpVersionPrefer,
+		FixedDomainTtl:    fixedDomainTtl,
 	}); err != nil {
 		return nil, err
 	}

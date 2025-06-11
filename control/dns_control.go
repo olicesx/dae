@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
@@ -42,27 +41,24 @@ const (
 )
 
 var (
+	UnspecifiedAddressA        = netip.MustParseAddr("0.0.0.0")
+	UnspecifiedAddressAAAA     = netip.MustParseAddr("::")
 	ErrUnsupportedQuestionType = fmt.Errorf("unsupported question type")
 )
 
-var (
-	UnspecifiedAddressA    = netip.MustParseAddr("0.0.0.0")
-	UnspecifiedAddressAAAA = netip.MustParseAddr("::")
-)
-
 type DnsControllerOption struct {
-	Log                   *logrus.Logger
-	CacheAccessCallback   func(cache *DnsCache) (err error)
-	CacheRemoveCallback   func(cache *DnsCache) (err error)
-	NewCache              func(fqdn string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
-	BestDialerChooser     func(req *udpRequest, upstream *dns.Upstream) (*dialArgument, error)
-	TimeoutExceedCallback func(dialArgument *dialArgument, err error)
-	IpVersionPrefer       int
-	FixedDomainTtl        map[string]int
+	Log                 *logrus.Logger
+	CacheAccessCallback func(cache *DnsCache) (err error)
+	CacheRemoveCallback func(cache *DnsCache) (err error)
+	NewCache            func(fqdn string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
+	BestDialerChooser   func(req *udpRequest, upstream *dns.Upstream) (*dialArgument, error)
+	IpVersionPrefer     int
+	FixedDomainTtl      map[string]int
 }
 
 type DnsController struct {
-	handling sync.Map
+	createMuMap sync.Map
+	refMu       sync.RWMutex
 
 	routing     *dns.Dns
 	qtypePrefer uint16
@@ -72,8 +68,6 @@ type DnsController struct {
 	cacheRemoveCallback func(cache *DnsCache) (err error)
 	newCache            func(fqdn string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
 	bestDialerChooser   func(req *udpRequest, upstream *dns.Upstream) (*dialArgument, error)
-	// timeoutExceedCallback is used to report this dialer is broken for the NetworkType
-	timeoutExceedCallback func(dialArgument *dialArgument, err error)
 
 	fixedDomainTtl map[string]int
 	// mutex protects the dnsCache.
@@ -81,11 +75,6 @@ type DnsController struct {
 	dnsCache            map[string]*DnsCache
 	dnsForwarderCacheMu sync.Mutex
 	dnsForwarderCache   map[dnsForwarderKey]DnsForwarder
-}
-
-type handlingState struct {
-	mu  sync.Mutex
-	ref uint32
 }
 
 func parseIpVersionPreference(prefer int) (uint16, error) {
@@ -112,12 +101,11 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 		routing:     routing,
 		qtypePrefer: prefer,
 
-		log:                   option.Log,
-		cacheAccessCallback:   option.CacheAccessCallback,
-		cacheRemoveCallback:   option.CacheRemoveCallback,
-		newCache:              option.NewCache,
-		bestDialerChooser:     option.BestDialerChooser,
-		timeoutExceedCallback: option.TimeoutExceedCallback,
+		log:                 option.Log,
+		cacheAccessCallback: option.CacheAccessCallback,
+		cacheRemoveCallback: option.CacheRemoveCallback,
+		newCache:            option.NewCache,
+		bestDialerChooser:   option.BestDialerChooser,
 
 		fixedDomainTtl:      option.FixedDomainTtl,
 		dnsCacheMu:          sync.Mutex{},
@@ -357,7 +345,7 @@ type dnsForwarderKey struct {
 	dialArgument dialArgument
 }
 
-func (c *DnsController) Handle_(dnsMessage *dnsmessage.Msg, req *udpRequest) (err error) {
+func (c *DnsController) Handle(dnsMessage *dnsmessage.Msg, req *udpRequest) (err error) {
 	if c.log.IsLevelEnabled(logrus.TraceLevel) && len(dnsMessage.Question) > 0 {
 		q := dnsMessage.Question[0]
 		c.log.Tracef("Received UDP(DNS) %v <-> %v: %v %v",
@@ -381,10 +369,10 @@ func (c *DnsController) Handle_(dnsMessage *dnsmessage.Msg, req *udpRequest) (er
 	switch qtype {
 	case dnsmessage.TypeA, dnsmessage.TypeAAAA:
 		if c.qtypePrefer == 0 {
-			return c.handle_(dnsMessage, req, true)
+			return c.handleDNSRequest(dnsMessage, req, true)
 		}
 	default:
-		return c.handle_(dnsMessage, req, true)
+		return c.handleDNSRequest(dnsMessage, req, true)
 	}
 
 	// Try to make both A and AAAA lookups.
@@ -403,10 +391,10 @@ func (c *DnsController) Handle_(dnsMessage *dnsmessage.Msg, req *udpRequest) (er
 
 	done := make(chan struct{})
 	go func() {
-		_ = c.handle_(dnsMessage2, req, false)
+		_ = c.handleDNSRequest(dnsMessage2, req, false)
 		done <- struct{}{}
 	}()
-	err = c.handle_(dnsMessage, req, false)
+	err = c.handleDNSRequest(dnsMessage, req, false)
 	<-done
 	if err != nil {
 		return err
@@ -430,21 +418,15 @@ func (c *DnsController) Handle_(dnsMessage *dnsmessage.Msg, req *udpRequest) (er
 	}
 }
 
-func (c *DnsController) handle_(
+func (c *DnsController) handleDNSRequest(
 	dnsMessage *dnsmessage.Msg,
 	req *udpRequest,
 	needResp bool,
 ) (err error) {
-	// Prepare qname, qtype.
-	var qname string
-	var qtype uint16
-	if len(dnsMessage.Question) != 0 {
-		q := dnsMessage.Question[0]
-		qname = q.Name
-		qtype = q.Qtype
-	}
+	// 准备查询信息
+	qname, qtype := c.prepareQueryInfo(dnsMessage)
 
-	// Route request.
+	// 路由请求
 	upstreamIndex, upstream, err := c.routing.RequestSelect(qname, qtype)
 	if err != nil {
 		return err
@@ -459,34 +441,61 @@ func (c *DnsController) handle_(
 	}
 
 	// No parallel for the same lookup.
-	handlingState_, _ := c.handling.LoadOrStore(cacheKey, new(handlingState))
-	handlingState := handlingState_.(*handlingState)
-	atomic.AddUint32(&handlingState.ref, 1)
-	handlingState.mu.Lock()
+	c.refMu.RLock()
+	createMu_, _ := c.createMuMap.LoadOrStore(cacheKey, new(createMu))
+	createMu := createMu_.(*createMu)
+	createMu.ref += 1
+	c.refMu.RUnlock()
+	createMu.mu.Lock()
 	defer func() {
-		handlingState.mu.Unlock()
-		atomic.AddUint32(&handlingState.ref, ^uint32(0))
-		if atomic.LoadUint32(&handlingState.ref) == 0 {
-			c.handling.Delete(cacheKey)
+		createMu.mu.Unlock()
+		c.refMu.Lock()
+		createMu.ref -= 1
+		if createMu.ref == 0 {
+			c.createMuMap.Delete(cacheKey)
 		}
+		c.refMu.Unlock()
 	}()
 
 	if resp := c.LookupDnsRespCache_(dnsMessage, cacheKey, false); resp != nil {
-		// Send cache to client directly.
-		if needResp {
-			if err = sendPkt(c.log, resp, req.realDst, req.realSrc, req.src, req.lConn); err != nil {
-				return fmt.Errorf("failed to write cached DNS resp: %w", err)
-			}
-		}
-		if c.log.IsLevelEnabled(logrus.DebugLevel) && len(dnsMessage.Question) > 0 {
-			q := dnsMessage.Question[0]
-			c.log.Debugf("UDP(DNS) %v <-> Cache: %v %v",
-				RefineSourceToShow(req.realSrc, req.realDst.Addr()), strings.ToLower(q.Name), QtypeToString(q.Qtype),
-			)
-		}
-		return nil
+		return c.handleCachedResponse(dnsMessage, req, resp, needResp)
 	}
 
+	c.logDNSRequest(dnsMessage, upstreamIndex, upstream)
+
+	data, err := dnsMessage.Pack()
+	if err != nil {
+		return fmt.Errorf("pack DNS packet: %w", err)
+	}
+
+	return c.dialSend(0, req, data, dnsMessage.Id, upstream, needResp)
+}
+
+func (c *DnsController) prepareQueryInfo(dnsMessage *dnsmessage.Msg) (qname string, qtype uint16) {
+	if len(dnsMessage.Question) != 0 {
+		q := dnsMessage.Question[0]
+		qname = q.Name
+		qtype = q.Qtype
+	}
+	return
+}
+
+func (c *DnsController) handleCachedResponse(dnsMessage *dnsmessage.Msg, req *udpRequest, resp []byte, needResp bool) error {
+	if needResp {
+		if err := sendPkt(c.log, resp, req.realDst, req.realSrc, req.src, req.lConn); err != nil {
+			return fmt.Errorf("failed to write cached DNS resp: %w", err)
+		}
+	}
+	if c.log.IsLevelEnabled(logrus.DebugLevel) && len(dnsMessage.Question) > 0 {
+		q := dnsMessage.Question[0]
+		c.log.Debugf("UDP(DNS) %v <-> Cache: %v %v",
+			RefineSourceToShow(req.realSrc, req.realDst.Addr()), strings.ToLower(q.Name), QtypeToString(q.Qtype),
+		)
+	}
+	return nil
+}
+
+func (c *DnsController) logDNSRequest(dnsMessage *dnsmessage.Msg, upstreamIndex consts.DnsRequestOutboundIndex, upstream *dns.Upstream) {
 	if c.log.IsLevelEnabled(logrus.TraceLevel) {
 		upstreamName := upstreamIndex.String()
 		if upstream != nil {
@@ -497,13 +506,6 @@ func (c *DnsController) handle_(
 			"upstream": upstreamName,
 		}).Traceln("Request to DNS upstream")
 	}
-
-	// Re-pack DNS packet.
-	data, err := dnsMessage.Pack()
-	if err != nil {
-		return fmt.Errorf("pack DNS packet: %w", err)
-	}
-	return c.dialSend(0, req, data, dnsMessage.Id, upstream, needResp)
 }
 
 // sendReject_ send empty answer.
@@ -602,6 +604,9 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 
 	respMsg, err = forwarder.ForwardDNS(ctxDial, data)
 	if err != nil {
+		if netErr, ok := err.(net.Error); ok && !netErr.Temporary() {
+			dialArgument.bestDialer.ReportUnavailable(networkType, err)
+		}
 		return err
 	}
 

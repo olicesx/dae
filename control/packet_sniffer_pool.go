@@ -28,6 +28,7 @@ type PacketSniffer struct {
 type PacketSnifferPool struct {
 	pool        sync.Map
 	createMuMap sync.Map
+	refMu       sync.RWMutex
 }
 type PacketSnifferOptions struct {
 	Ttl time.Duration
@@ -65,10 +66,22 @@ func (p *PacketSnifferPool) GetOrCreate(key PacketSnifferKey, createOption *Pack
 	_qs, ok := p.pool.Load(key)
 begin:
 	if !ok {
-		createMu, _ := p.createMuMap.LoadOrStore(key, &sync.Mutex{})
-		createMu.(*sync.Mutex).Lock()
-		defer createMu.(*sync.Mutex).Unlock()
-		defer p.createMuMap.Delete(key)
+		p.refMu.RLock()
+		createMu_, _ := p.createMuMap.LoadOrStore(key, new(createMu))
+		createMu := createMu_.(*createMu)
+		createMu.ref += 1
+		p.refMu.RUnlock()
+		createMu.mu.Lock()
+		defer func() {
+			createMu.mu.Unlock()
+			p.refMu.Lock()
+			createMu.ref -= 1
+			if createMu.ref == 0 {
+				p.createMuMap.Delete(key)
+			}
+			p.refMu.Unlock()
+		}()
+
 		_qs, ok = p.pool.Load(key)
 		if ok {
 			goto begin

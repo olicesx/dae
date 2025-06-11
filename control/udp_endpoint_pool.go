@@ -74,12 +74,18 @@ func (ue *UdpEndpoint) Close() error {
 type UdpEndpointPool struct {
 	pool        sync.Map
 	createMuMap sync.Map
+	refMu       sync.RWMutex
 }
 type UdpEndpointOptions struct {
 	Handler    UdpHandler
 	NatTimeout time.Duration
 	// GetTarget is useful only if the underlay does not support Full-cone.
 	GetDialOption func() (option *DialOption, err error)
+}
+
+type createMu struct {
+	mu  sync.Mutex
+	ref uint32
 }
 
 var DefaultUdpEndpointPool = NewUdpEndpointPool()
@@ -111,10 +117,22 @@ func (p *UdpEndpointPool) GetOrCreate(lAddr netip.AddrPort, createOption *UdpEnd
 	_ue, ok := p.pool.Load(lAddr)
 begin:
 	if !ok {
-		createMu, _ := p.createMuMap.LoadOrStore(lAddr, &sync.Mutex{})
-		createMu.(*sync.Mutex).Lock()
-		defer createMu.(*sync.Mutex).Unlock()
-		defer p.createMuMap.Delete(lAddr)
+		p.refMu.RLock()
+		createMu_, _ := p.createMuMap.LoadOrStore(lAddr, new(createMu))
+		createMu := createMu_.(*createMu)
+		createMu.ref += 1
+		p.refMu.RUnlock()
+		createMu.mu.Lock()
+		defer func() {
+			createMu.mu.Unlock()
+			p.refMu.Lock()
+			createMu.ref -= 1
+			if createMu.ref == 0 {
+				p.createMuMap.Delete(lAddr)
+			}
+			p.refMu.Unlock()
+		}()
+
 		_ue, ok = p.pool.Load(lAddr)
 		if ok {
 			goto begin

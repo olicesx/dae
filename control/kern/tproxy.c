@@ -48,6 +48,8 @@
 #define MAX_COOKIE_PID_PNAME_MAPPING_NUM (65536)
 #define MAX_DOMAIN_ROUTING_NUM 65536
 #define MAX_ARG_LEN 128
+
+#define UTP_MAX_EXTENSIONS 4
 #define IPV6_MAX_EXTENSIONS 8
 
 #define ipv6_optlen(p) (((p)+1) << 3)
@@ -211,6 +213,7 @@ enum __attribute__((packed)) MatchType {
 	MatchType_L4Proto,
 	MatchType_IpVersion,
 	MatchType_Mac,
+	MatchType_L7Proto,
 	MatchType_ProcessName,
 	MatchType_IfIndex,
 	MatchType_Dscp,
@@ -227,6 +230,11 @@ enum IpVersionType {
 	IpVersionType_4 = 1,
 	IpVersionType_6,
 	IpVersionType_X,
+};
+
+enum L7ProtoType {
+	L7ProtoType_Bittorrent = 1,
+	L7ProtoType_X,
 };
 
 struct port_range {
@@ -251,6 +259,7 @@ struct match_set {
 		__u32 index;
 		struct port_range port_range;
 		enum L4ProtoType l4proto_type;
+		enum L7ProtoType l7proto_type;
 		enum IpVersionType ip_version;
 		__u32 pname[TASK_COMM_LEN / 4];
 		__u32 ifindex;
@@ -437,20 +446,19 @@ static __always_inline int
 parse_transport(const struct __sk_buff *skb, __u32 link_h_len,
 		struct ethhdr *ethh, struct iphdr *iph, struct ipv6hdr *ipv6h,
 		struct icmp6hdr *icmp6h, struct tcphdr *tcph,
-		struct udphdr *udph, __u8 *ihl, __u8 *l4proto)
+		struct udphdr *udph, __u8 *ihl, __u8 *l4proto, __u32 *offset)
 {
-	__u32 offset = 0;
 	int ret;
 
 	if (link_h_len == ETH_HLEN) {
-		ret = bpf_skb_load_bytes(skb, offset, ethh,
+		ret = bpf_skb_load_bytes(skb, *offset, ethh,
 					 sizeof(struct ethhdr));
 		if (ret) {
 			bpf_printk("not ethernet packet");
 			return 1;
 		}
 		// Skip ethhdr for next hdr.
-		offset += sizeof(struct ethhdr);
+		*offset += sizeof(struct ethhdr);
 	} else {
 		__builtin_memset(ethh, 0, sizeof(struct ethhdr));
 		ethh->h_proto = skb->protocol;
@@ -468,31 +476,33 @@ parse_transport(const struct __sk_buff *skb, __u32 link_h_len,
 	//						bpf_htons(ETH_P_IP),
 	// bpf_htons(ETH_P_IPV6));
 	if (ethh->h_proto == bpf_htons(ETH_P_IP)) {
-		ret = bpf_skb_load_bytes(skb, offset, iph,
+		ret = bpf_skb_load_bytes(skb, *offset, iph,
 					 sizeof(struct iphdr));
 		if (ret)
 			return -EFAULT;
 		// Skip ipv4hdr and options for next hdr.
-		offset += iph->ihl * 4;
+		*offset += iph->ihl * 4;
 
 		// We only process TCP and UDP traffic.
 		*l4proto = iph->protocol;
 		switch (iph->protocol) {
 		case IPPROTO_TCP:
-			ret = bpf_skb_load_bytes(skb, offset, tcph,
+			ret = bpf_skb_load_bytes(skb, *offset, tcph,
 						 sizeof(struct tcphdr));
 			if (ret) {
 				// Not a complete tcphdr.
 				return -EFAULT;
 			}
+			*offset += sizeof(struct tcphdr);
 			break;
 		case IPPROTO_UDP:
-			ret = bpf_skb_load_bytes(skb, offset, udph,
+			ret = bpf_skb_load_bytes(skb, *offset, udph,
 						 sizeof(struct udphdr));
 			if (ret) {
 				// Not a complete udphdr.
 				return -EFAULT;
 			}
+			*offset += sizeof(struct udphdr);
 			break;
 		default:
 			return 1;
@@ -500,21 +510,21 @@ parse_transport(const struct __sk_buff *skb, __u32 link_h_len,
 		*ihl = iph->ihl;
 		return 0;
 	} else if (ethh->h_proto == bpf_htons(ETH_P_IPV6)) {
-		ret = bpf_skb_load_bytes(skb, offset, ipv6h,
+		ret = bpf_skb_load_bytes(skb, *offset, ipv6h,
 					 sizeof(struct ipv6hdr));
 		if (ret) {
 			bpf_printk("not a valid IPv6 packet");
 			return -EFAULT;
 		}
 
-		offset += sizeof(struct ipv6hdr);
+		*offset += sizeof(struct ipv6hdr);
 		*ihl = sizeof(struct ipv6hdr) / 4;
 		__u8 nexthdr = ipv6h->nexthdr;
 
 		// Skip all extension headers.
 		struct ipv6_ext_ctx ext_ctx = {
 			.skb = skb,
-			.offset = &offset,
+			.offset = offset,
 			.nexthdr = &nexthdr,
 			.result = 0
 		};
@@ -534,23 +544,25 @@ parse_transport(const struct __sk_buff *skb, __u32 link_h_len,
 
 		switch (nexthdr) {
 		case IPPROTO_TCP:
-			ret = bpf_skb_load_bytes(skb, offset, tcph,
+			ret = bpf_skb_load_bytes(skb, *offset, tcph,
 						 sizeof(struct tcphdr));
 			if (ret) {
 				// Not a complete tcphdr.
 				return -EFAULT;
 			}
+			*offset += sizeof(struct tcphdr);
 			break;
 		case IPPROTO_UDP:
-			ret = bpf_skb_load_bytes(skb, offset, udph,
+			ret = bpf_skb_load_bytes(skb, *offset, udph,
 						 sizeof(struct udphdr));
 			if (ret) {
 				// Not a complete udphdr.
 				return -EFAULT;
 			}
+			*offset += sizeof(struct udphdr);
 			break;
 		case IPPROTO_ICMPV6:
-			ret = bpf_skb_load_bytes(skb, offset, icmp6h,
+			ret = bpf_skb_load_bytes(skb, *offset, icmp6h,
 						 sizeof(struct icmp6hdr));
 			if (ret) {
 				// Not a complete icmp6hdr.
@@ -569,8 +581,103 @@ parse_transport(const struct __sk_buff *skb, __u32 link_h_len,
 	return 1;
 }
 
+static __always_inline bool
+is_bittorrent(const struct __sk_buff *skb, __u32 offset)
+{
+    __u8 buf[20];
+    int ret = bpf_skb_load_bytes(skb, offset, buf, sizeof(buf));
+
+    if (ret) {
+	return false;
+    }
+
+    if (buf[0] != 0x13) {
+	return false;
+    }
+
+    const char *protocol = "BitTorrent protocol";
+
+    for (int i = 0; i < 19; i++) {
+	if (buf[i + 1] != protocol[i]) {
+	    return false;
+	}
+    }
+
+    return true;
+}
+
+static __always_inline bool
+is_utp(const struct __sk_buff *skb, __u8 l4proto, __u32 offset)
+{
+	const __u32 min_size = offset + 40;
+
+	if (l4proto != IPPROTO_UDP || skb->len < min_size) {
+		return false;
+	}
+
+	__u8 header[2];
+    int ret = bpf_skb_load_bytes(skb, offset, header, sizeof(header));
+	if (ret) {
+	return false;
+    }
+
+	__u8 version = header[0] & 0x0F;
+    __u8 typ = header[0] >> 4;
+	if (version != 1 || typ > 4) {
+	return false;
+    }
+
+	__u8 extension = header[1];
+
+	offset += 20;
+
+	for (int i = 0; i < UTP_MAX_EXTENSIONS; i++) {
+		if (extension == 0) {
+			return is_bittorrent(skb, offset);
+		}
+		if (extension > 0x04) {
+	    return false;
+	}
+
+		ret = bpf_skb_load_bytes(skb, offset, header, sizeof(header));
+		if (ret) {
+			return false;
+		}
+
+		extension = header[0];
+		offset += header[1] + sizeof(header);
+	}
+	return false;
+}
+
+static __always_inline bool
+is_udp_tracker(const struct __sk_buff *skb, __u8 l4proto, __u32 offset) {
+	const __u32 tracker_connect_min_size = 16;
+    const __u64 tracker_protocol_id = 0x41727101980;
+    const __u32 tracker_connect_action = 0;
+
+	if (l4proto != IPPROTO_UDP || skb->len < offset + tracker_connect_min_size) {
+		return false;
+	}
+
+	__u64 id;
+	__u32 action;
+	int ret = bpf_skb_load_bytes(skb, offset, &id, sizeof(id));
+
+	if (ret || id != tracker_protocol_id) {
+		return false;
+	}
+
+	ret = bpf_skb_load_bytes(skb, offset + sizeof(id), &action, sizeof(action));
+	if (ret || action != tracker_connect_action) {
+		return false;
+	}
+
+	return true;
+}
+
 struct route_params {
-	__u32 flag[8];
+	__u32 flag[16];
 	const void *l4hdr;
 	const __be32 *saddr;
 	const __be32 *daddr;
@@ -597,6 +704,7 @@ static int route_loop_cb(__u32 index, void *data)
 #define _is_wan ctx->params->flag[2]
 #define _dscp ctx->params->flag[6]
 #define _ifindex ctx->params->flag[7]
+#define _l7proto_type ctx->params->flag[8]
 
 	struct route_ctx *ctx = data;
 	struct match_set *match_set;
@@ -699,6 +807,15 @@ lookup_lpm:
 			match_set->type, match_set->not, match_set->outbound);
 #endif
 		if (_ipversion_type & match_set->ip_version)
+			ctx->goodsubrule = true;
+		break;
+	case MatchType_L7Proto:
+#ifdef __DEBUG_ROUTING
+		bpf_printk(
+			"CHECK: l7proto, match_set->type: %u, not: %d, outbound: %u",
+			match_set->type, match_set->not, match_set->outbound);
+#endif
+		if (_l7proto_type & match_set->l7proto_type)
 			ctx->goodsubrule = true;
 		break;
 	case MatchType_DomainSet:
@@ -839,6 +956,7 @@ before_next_loop:
 #undef _is_wan
 #undef _dscp
 #undef _ifindex
+#undef _l7proto_type
 }
 
 static __always_inline __s64 route(const struct route_params *params)
@@ -848,7 +966,8 @@ static __always_inline __s64 route(const struct route_params *params)
 #define _pname (&params->flag[2])
 #define _is_wan params->flag[2]
 #define _dscp params->flag[6]
-#define _ifindex params->flag[6]
+#define _ifindex params->flag[7]
+#define _l7proto_type params->flag[8]
 
 	int ret;
 	struct route_ctx ctx = {};
@@ -904,6 +1023,7 @@ static __always_inline __s64 route(const struct route_params *params)
 #undef _is_wan
 #undef _dscp
 #undef _ifindex
+#undef _l7proto_type
 }
 
 static __always_inline int assign_listener(struct __sk_buff *skb, __u8 l4proto)
@@ -1024,9 +1144,10 @@ static __always_inline int do_tproxy_lan_egress(struct __sk_buff *skb, u32 link_
 	struct udphdr udph;
 	__u8 ihl;
 	__u8 l4proto;
+	__u32 offset = 0;
 
 	int ret = parse_transport(skb, link_h_len, &ethh, &iph, &ipv6h, &icmp6h,
-				  &tcph, &udph, &ihl, &l4proto);
+				  &tcph, &udph, &ihl, &l4proto, &offset);
 	if (ret) {
 		bpf_printk("parse_transport: %d", ret);
 		return TC_ACT_OK;
@@ -1075,9 +1196,10 @@ static __always_inline int do_tproxy_lan_ingress(struct __sk_buff *skb, u32 link
 	struct udphdr udph;
 	__u8 ihl;
 	__u8 l4proto;
+	__u32 offset = 0;
 
 	int ret = parse_transport(skb, link_h_len, &ethh, &iph, &ipv6h, &icmp6h,
-				  &tcph, &udph, &ihl, &l4proto);
+				  &tcph, &udph, &ihl, &l4proto, &offset);
 	if (ret) {
 		bpf_printk("parse_transport: %d", ret);
 		return TC_ACT_OK;
@@ -1170,6 +1292,13 @@ new_connection:;
 		params.flag[1] = IpVersionType_6;
 	params.flag[6] = tuples.dscp;
 	params.flag[7] = skb->ifindex;
+
+	if (is_bittorrent(skb, offset) || is_utp(skb, l4proto, offset) || is_udp_tracker(skb, l4proto, offset)) {
+		params.flag[8] = L7ProtoType_Bittorrent;
+	} else {
+		params.flag[8] = L7ProtoType_X;
+	}
+
 	params.mac[2] = bpf_htonl((ethh.h_source[0] << 8) | (ethh.h_source[1]));
 	params.mac[3] =
 		bpf_htonl((ethh.h_source[2] << 24) | (ethh.h_source[3] << 16) |
@@ -1336,9 +1465,10 @@ static __always_inline int do_tproxy_wan_ingress(struct __sk_buff *skb, u32 link
 	struct udphdr udph;
 	__u8 ihl;
 	__u8 l4proto;
+	__u32 offset = 0;
 
 	int ret = parse_transport(skb, link_h_len, &ethh, &iph, &ipv6h, &icmp6h,
-				  &tcph, &udph, &ihl, &l4proto);
+				  &tcph, &udph, &ihl, &l4proto, &offset);
 	if (ret) {
 		bpf_printk("parse_transport: %d", ret);
 		return TC_ACT_OK;
@@ -1390,10 +1520,11 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 	struct udphdr udph;
 	__u8 ihl;
 	__u8 l4proto;
+	__u32 offset = 0;
 
 	bool tcp_state_syn;
 	int ret = parse_transport(skb, link_h_len, &ethh, &iph, &ipv6h, &icmp6h,
-				  &tcph, &udph, &ihl, &l4proto);
+				  &tcph, &udph, &ihl, &l4proto, &offset);
 	if (ret)
 		return TC_ACT_OK;
 	if (l4proto == IPPROTO_ICMPV6)
@@ -1416,6 +1547,11 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 		if (unlikely(tcp_state_syn)) {
 			// New TCP connection.
 			// bpf_printk("[%X]New Connection", bpf_ntohl(tcph.seq));
+			if (pid_is_control_plane(skb, &pid_pname)) {
+				// From control plane. Direct.
+				return TC_ACT_OK;
+			}
+
 			struct route_params params;
 
 			__builtin_memset(&params, 0, sizeof(params));
@@ -1427,16 +1563,20 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 				params.flag[1] = IpVersionType_6;
 			params.flag[6] = tuples.dscp;
 			params.flag[7] = skb->ifindex;
-			if (pid_is_control_plane(skb, &pid_pname)) {
-				// From control plane. Direct.
-				return TC_ACT_OK;
+
+			if (is_bittorrent(skb, offset)) {
+				params.flag[8] = L7ProtoType_Bittorrent;
+			} else {
+				params.flag[8] = L7ProtoType_X;
 			}
+
 			if (pid_pname) {
 				// 2, 3, 4, 5
 				__builtin_memcpy(&params.flag[2],
 						 pid_pname->pname,
 						 TASK_COMM_LEN);
 			}
+
 			params.mac[2] = bpf_htonl((ethh.h_source[0] << 8) |
 						  (ethh.h_source[1]));
 			params.mac[3] = bpf_htonl((ethh.h_source[2] << 24) |
@@ -1540,18 +1680,6 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 
 	} else if (l4proto == IPPROTO_UDP) {
 		// Routing. It decides if we redirect traffic to control plane.
-		struct route_params params;
-
-		__builtin_memset(&params, 0, sizeof(params));
-		params.l4hdr = &udph;
-		params.flag[0] = L4ProtoType_UDP;
-		if (skb->protocol == bpf_htons(ETH_P_IP))
-			params.flag[1] = IpVersionType_4;
-		else
-			params.flag[1] = IpVersionType_6;
-		params.flag[6] = tuples.dscp;
-		params.flag[7] = skb->ifindex;
-
 		struct pid_pname *pid_pname;
 
 		if (pid_is_control_plane(skb, &pid_pname)) {
@@ -1570,11 +1698,30 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 			return TC_ACT_OK;
 		}
 
+		struct route_params params;
+
+		__builtin_memset(&params, 0, sizeof(params));
+		params.l4hdr = &udph;
+		params.flag[0] = L4ProtoType_UDP;
+		if (skb->protocol == bpf_htons(ETH_P_IP))
+			params.flag[1] = IpVersionType_4;
+		else
+			params.flag[1] = IpVersionType_6;
+		params.flag[6] = tuples.dscp;
+		params.flag[7] = skb->ifindex;
+
+		if (is_bittorrent(skb, offset) || is_utp(skb, l4proto, offset) || is_udp_tracker(skb, l4proto, offset)) {
+			params.flag[8] = L7ProtoType_Bittorrent;
+		} else {
+			params.flag[8] = L7ProtoType_X;
+		}
+
 		if (pid_pname) {
 			// 2, 3, 4, 5
 			__builtin_memcpy(&params.flag[2], pid_pname->pname,
 					 TASK_COMM_LEN);
 		}
+
 		params.mac[2] =
 			bpf_htonl((ethh.h_source[0] << 8) | (ethh.h_source[1]));
 		params.mac[3] = bpf_htonl(

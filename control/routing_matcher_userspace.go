@@ -90,6 +90,8 @@ func (m *RoutingMatcher) Match(
 			if l4proto&consts.L4ProtoType(match.Value[0]) > 0 {
 				goodSubrule = true
 			}
+		case consts.MatchType_L7Proto:
+
 		case consts.MatchType_ProcessName:
 			if processName[0] != 0 && match.Value == processName {
 				goodSubrule = true

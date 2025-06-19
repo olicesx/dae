@@ -51,6 +51,7 @@ const (
 	MatchType_L4Proto
 	MatchType_IpVersion
 	MatchType_Mac
+	MatchType_L7Proto
 	MatchType_ProcessName
 	MatchType_IfIndex
 	MatchType_Dscp
@@ -133,6 +134,13 @@ const (
 	IpVersion_4 IpVersionType = 1
 	IpVersion_6 IpVersionType = 2
 	IpVersion_X IpVersionType = 3
+)
+
+type L7ProtoType uint8
+
+const (
+	L7ProtoType_Bittorrent L7ProtoType = iota + 1
+	L7ProtoType_X
 )
 
 func (v IpVersionType) ToIpVersionStr() IpVersionStr {

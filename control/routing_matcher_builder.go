@@ -45,6 +45,7 @@ func NewRoutingMatcherBuilder(log *logrus.Logger, rules []*config_parser.Routing
 	rulesBuilder.RegisterFunctionParser(consts.Function_Port, routing.PortRangeParserFactory(b.addPort))
 	rulesBuilder.RegisterFunctionParser(consts.Function_SourcePort, routing.PortRangeParserFactory(b.addSourcePort))
 	rulesBuilder.RegisterFunctionParser(consts.Function_L4Proto, routing.L4ProtoParserFactory(b.addL4Proto))
+	rulesBuilder.RegisterFunctionParser(consts.Function_L7Proto, routing.L7ProtoParserFactory(b.addL7Proto))
 	rulesBuilder.RegisterFunctionParser(consts.Function_Mac, routing.MacParserFactory(b.addSourceMac))
 	rulesBuilder.RegisterFunctionParser(consts.Function_ProcessName, routing.ProcessNameParserFactory(b.addProcessName))
 	rulesBuilder.RegisterFunctionParser(consts.Function_IfIndex, routing.UintParserFactory(b.addIfIndex))
@@ -252,6 +253,22 @@ func (b *RoutingMatcherBuilder) addIpVersion(f *config_parser.Function, values c
 	b.rules = append(b.rules, bpfMatchSet{
 		Value:    [16]byte{byte(values)},
 		Type:     uint8(consts.MatchType_IpVersion),
+		Not:      f.Not,
+		Outbound: outboundId,
+		Mark:     outbound.Mark,
+		Must:     outbound.Must,
+	})
+	return nil
+}
+
+func (b *RoutingMatcherBuilder) addL7Proto(f *config_parser.Function, values consts.L7ProtoType, outbound *routing.Outbound) (err error) {
+	outboundId, err := b.outboundToId(outbound.Name)
+	if err != nil {
+		return err
+	}
+	b.rules = append(b.rules, bpfMatchSet{
+		Value:    [16]byte{byte(values)},
+		Type:     uint8(consts.MatchType_L7Proto),
 		Not:      f.Not,
 		Outbound: outboundId,
 		Mark:     outbound.Mark,

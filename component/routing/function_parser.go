@@ -108,6 +108,19 @@ func IpVersionParserFactory(callback func(f *config_parser.Function, ipVersion c
 	}
 }
 
+func L7ProtoParserFactory(callback func(f *config_parser.Function, l7protoType consts.L7ProtoType, overrideOutbound *Outbound) (err error)) FunctionParser {
+	return func(log *logrus.Logger, f *config_parser.Function, key string, paramValueGroup []string, overrideOutbound *Outbound) (err error) {
+		var l7protoType consts.L7ProtoType
+		for _, v := range paramValueGroup {
+			switch v {
+			case "bittorrent":
+				l7protoType |= consts.L7ProtoType_Bittorrent
+			}
+		}
+		return callback(f, l7protoType, overrideOutbound)
+	}
+}
+
 func ProcessNameParserFactory(callback func(f *config_parser.Function, procNames [][consts.TaskCommLen]byte, overrideOutbound *Outbound) (err error)) FunctionParser {
 	return func(log *logrus.Logger, f *config_parser.Function, key string, paramValueGroup []string, overrideOutbound *Outbound) (err error) {
 		var procNames [][consts.TaskCommLen]byte

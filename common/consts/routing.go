@@ -20,6 +20,7 @@ const (
 	Function_SourcePort  = "sport"
 	Function_L4Proto     = "l4proto"
 	Function_IpVersion   = "ipversion"
+	Function_L7Proto     = "l7proto"
 	Function_Mac         = "mac"
 	Function_ProcessName = "pname"
 	Function_Dscp        = "dscp"

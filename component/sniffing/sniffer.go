@@ -169,11 +169,6 @@ func (s *Sniffer) SniffUdp() (d string, err error) {
 			s.sniffed = d
 		}
 	}()
-	defer func() {
-		if err == nil {
-			s.sniffed = d
-		}
-	}()
    // cancel context when sniffing completes to free resources
    defer s.cancel()
    s.readMu.Lock()

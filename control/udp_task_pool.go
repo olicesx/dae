@@ -102,12 +102,6 @@ func (p *UdpTaskPool) EmitTask(key string, task UdpTask) {
 		return
 	}
 
-	// 快速健康检查
-	if !DefaultUdpHealthMonitor.RegisterConnection() {
-		return
-	}
-	defer DefaultUdpHealthMonitor.UnregisterConnection()
-
 	// 尝试使用读锁快速查找现有队列
 	p.mu.RLock()
 	q, exists := p.m[key]
@@ -117,6 +111,13 @@ func (p *UdpTaskPool) EmitTask(key string, task UdpTask) {
 	if exists {
 		// 队列已存在，直接提交任务
 		p.submitTaskToQueue(q, task)
+		return
+	}
+
+	// 检查队列数量限制
+	if queueCount >= MaxUdpQueues {
+		// 达到队列数量限制，直接执行任务（降级处理）
+		go task()
 		return
 	}
 
@@ -132,7 +133,8 @@ func (p *UdpTaskPool) EmitTask(key string, task UdpTask) {
 
 	// 限制队列数量
 	if queueCount >= MaxUdpQueues {
-		DefaultUdpHealthMonitor.RecordTimeout()
+		// 队列数量超限，直接异步执行任务
+		go task()
 		return
 	}
 
@@ -160,38 +162,28 @@ func (p *UdpTaskPool) EmitTask(key string, task UdpTask) {
 	p.submitTaskToQueue(q, task)
 }
 
-// submitTaskToQueue 提交任务到指定队列（极简版本）
+// submitTaskToQueue 提交任务到指定队列（简化版本）
 func (p *UdpTaskPool) submitTaskToQueue(q *UdpTaskQueue, task UdpTask) {
-	// 包装任务以增加健康监控
+	// 简化的任务包装，只处理panic恢复
 	wrappedTask := func() {
 		defer func() {
-			DefaultUdpHealthMonitor.RecordPacketHandled()
 			if r := recover(); r != nil {
-				// 记录panic但继续
+				// 记录panic但继续执行
 			}
 		}()
 		task()
 	}
 
-	// 极速任务提交 - 非阻塞模式
+	// 非阻塞任务提交
 	select {
 	case q.ch <- wrappedTask:
 		// 任务成功排队
 	case <-q.ctx.Done():
-		// 上下文已取消
-		DefaultUdpHealthMonitor.RecordTimeout()
+		// 上下文已取消，直接执行
+		go wrappedTask()
 	default:
-		// 队列已满，异步重试一次
-		go func() {
-			select {
-			case q.ch <- wrappedTask:
-				// 重试成功
-			case <-q.ctx.Done():
-				DefaultUdpHealthMonitor.RecordTimeout()
-			case <-time.After(UdpTaskTimeout):
-				DefaultUdpHealthMonitor.RecordTimeout()
-			}
-		}()
+		// 队列已满，异步执行
+		go wrappedTask()
 	}
 }
 

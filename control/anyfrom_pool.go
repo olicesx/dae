@@ -172,39 +172,14 @@ func NewAnyfromPool() *AnyfromPool {
 }
 
 func (p *AnyfromPool) GetOrCreate(lAddr string, ttl time.Duration) (conn *Anyfrom, isNew bool, err error) {
+	// 简化版本：直接使用sync.Map的原子操作特性
 	if af, ok := p.pool.Load(lAddr); ok {
 		anyfrom := af.(*Anyfrom)
 		anyfrom.RefreshTtl()
 		return anyfrom, false, nil
 	}
 	
-	// 使用更精确的双重检查锁定模式避免重复创建
-	// 创建临时key用于创建锁
-	createKey := lAddr + "_creating"
-	if _, loaded := p.pool.LoadOrStore(createKey, struct{}{}); loaded {
-		// 有其他goroutine在创建，使用退避重试机制
-		for i := 0; i < 10; i++ {
-			time.Sleep(time.Millisecond * time.Duration(i+1)) // 递增退避
-			if af, ok := p.pool.Load(lAddr); ok {
-				anyfrom := af.(*Anyfrom)
-				anyfrom.RefreshTtl()
-				return anyfrom, false, nil
-			}
-		}
-		// 如果等待后仍未创建成功，返回错误而不是继续创建
-		return nil, false, fmt.Errorf("timeout waiting for connection creation on %s", lAddr)
-	}
-	
-	defer p.pool.Delete(createKey)
-	
-	// 再次检查是否已创建
-	if af, ok := p.pool.Load(lAddr); ok {
-		anyfrom := af.(*Anyfrom)
-		anyfrom.RefreshTtl()
-		return anyfrom, false, nil
-	}
-	
-	// 创建新的Anyfrom
+	// 创建新的Anyfrom连接
 	d := net.ListenConfig{
 		Control: func(network string, address string, c syscall.RawConn) error {
 			return dialer.TransparentControl(c)
@@ -217,7 +192,7 @@ func (p *AnyfromPool) GetOrCreate(lAddr string, ttl time.Duration) (conn *Anyfro
 		return nil
 	})
 	if err != nil {
-		return nil, true, err
+		return nil, true, fmt.Errorf("failed to create UDP connection for %s: %w", lAddr, err)
 	}
 	
 	uConn := pc.(*net.UDPConn)
@@ -237,6 +212,14 @@ func (p *AnyfromPool) GetOrCreate(lAddr string, ttl time.Duration) (conn *Anyfro
 		})
 	}
 	
-	p.pool.Store(lAddr, af)
+	// 使用LoadOrStore进行原子性创建，如果同时有其他goroutine创建了，使用它们的结果
+	if actual, loaded := p.pool.LoadOrStore(lAddr, af); loaded {
+		// 其他goroutine已经创建了连接，关闭我们的连接并使用现有的
+		af.Close()
+		anyfrom := actual.(*Anyfrom)
+		anyfrom.RefreshTtl()
+		return anyfrom, false, nil
+	}
+	
 	return af, true, nil
 }

@@ -152,6 +152,9 @@ func (s *Sniffer) SniffTcp() (d string, err error) {
 		   // reset dataReady channel and closeOnce for next retry
 		   s.dataReady = make(chan struct{})
 		   s.closeOnce = sync.Once{}
+		   s.dataErrMu.Lock()
+		   s.dataError = nil
+		   s.dataErrMu.Unlock()
 		   retries++
 		   continue
 	   }

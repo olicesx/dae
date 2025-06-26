@@ -24,6 +24,7 @@ type Sniffer struct {
 	r         io.Reader
    dataReady  chan struct{}
    dataError  error
+   dataErrMu  sync.Mutex
    closeOnce  sync.Once
 
 	// Common
@@ -104,17 +105,23 @@ func (s *Sniffer) SniffTcp() (d string, err error) {
 			err = fmt.Errorf("%w: %w", oerr, err)
 		}
 	}()
+	const maxRetries = 5
+	retries := 0
 	for {
+		if retries >= maxRetries {
+			return "", fmt.Errorf("%w: maximum sniff retries reached", ErrNotApplicable)
+		}
 		if s.stream {
-		   go func() {
-			   // Read once
-			   _, err := s.buf.ReadFromOnce(s.r)
-			   if err != nil {
-				   s.dataError = err
-			   }
-			   // only close once to avoid panic on repeated close
-			   s.closeOnce.Do(func() { close(s.dataReady) })
-		   }()
+			go func() {
+				_, err := s.buf.ReadFromOnce(s.r)
+				if err != nil {
+					s.dataErrMu.Lock()
+					s.dataError = err
+					s.dataErrMu.Unlock()
+				}
+				// only close once to avoid panic on repeated close
+				s.closeOnce.Do(func() { close(s.dataReady) })
+			}()
 
 			// Waiting 100ms for data.
 			select {
@@ -141,11 +148,11 @@ func (s *Sniffer) SniffTcp() (d string, err error) {
 		if errors.Is(err, ErrNeedMore) {
 			oerr = err
 			s.dataReady = make(chan struct{})
+			retries++
 			continue
 		}
 		return d, err
 	}
-}
 
 func (s *Sniffer) SniffUdp() (d string, err error) {
 	if s.sniffed != "" {
@@ -201,10 +208,12 @@ func (s *Sniffer) Read(p []byte) (n int, err error) {
 
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
-
+	s.dataErrMu.Lock()
+	defer s.dataErrMu.Unlock()
 	if s.dataError != nil {
 		n, _ = s.buf.Read(p)
 		return n, s.dataError
+	}
 	}
 
 	if s.buf.Len() > 0 {

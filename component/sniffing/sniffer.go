@@ -154,12 +154,25 @@ func (s *Sniffer) SniffTcp() (d string, err error) {
 		if errors.Is(err, ErrNeedMore) {
 			oerr = err
 			// reset dataReady channel and closeOnce for next retry
-			// Do not spawn another goroutine; just reset error state.
 			s.dataReady = make(chan struct{})
 			s.closeOnce = sync.Once{}
 			s.dataErrMu.Lock()
 			s.dataError = nil
 			s.dataErrMu.Unlock()
+			
+			// restart goroutine for continuous data reading
+			if s.stream {
+				go func() {
+					_, err := s.buf.ReadFromOnce(s.r)
+					if err != nil {
+						s.dataErrMu.Lock()
+						s.dataError = err
+						s.dataErrMu.Unlock()
+					}
+					s.closeOnce.Do(func() { close(s.dataReady) })
+				}()
+			}
+			
 			retries++
 			continue
 		}

@@ -22,8 +22,9 @@ type Sniffer struct {
 	// Stream
 	stream    bool
 	r         io.Reader
-	dataReady chan struct{}
-	dataError error
+   dataReady  chan struct{}
+   dataError  error
+   closeOnce  sync.Once
 
 	// Common
 	sniffed string
@@ -105,14 +106,15 @@ func (s *Sniffer) SniffTcp() (d string, err error) {
 	}()
 	for {
 		if s.stream {
-			go func() {
-				// Read once.
-				_, err := s.buf.ReadFromOnce(s.r)
-				if err != nil {
-					s.dataError = err
-				}
-				close(s.dataReady)
-			}()
+		   go func() {
+			   // Read once
+			   _, err := s.buf.ReadFromOnce(s.r)
+			   if err != nil {
+				   s.dataError = err
+			   }
+			   // only close once to avoid panic on repeated close
+			   s.closeOnce.Do(func() { close(s.dataReady) })
+		   }()
 
 			// Waiting 100ms for data.
 			select {
@@ -165,8 +167,9 @@ func (s *Sniffer) SniffUdp() (d string, err error) {
 	// Always ready.
 	select {
 	case <-s.dataReady:
-	default:
-		close(s.dataReady)
+	   default:
+		   // only close once to avoid panic on repeated close
+		   s.closeOnce.Do(func() { close(s.dataReady) })
 	}
 
 	if s.buf.Len() == 0 {

@@ -109,22 +109,28 @@ func (s *Sniffer) SniffTcp() (d string, err error) {
 	}()
 	const maxRetries = 5
 	retries := 0
+
+	// Start the goroutine for reading data only once if stream.
+	if s.stream {
+		go func() {
+			_, err := s.buf.ReadFromOnce(s.r)
+			if err != nil {
+				s.dataErrMu.Lock()
+				s.dataError = err
+				s.dataErrMu.Unlock()
+			}
+			// only close once to avoid panic on repeated close
+			s.closeOnce.Do(func() { close(s.dataReady) })
+		}()
+	} else {
+		close(s.dataReady)
+	}
+
 	for {
 		if retries >= maxRetries {
 			return "", fmt.Errorf("%w: maximum sniff retries reached", ErrNotApplicable)
 		}
 		if s.stream {
-			go func() {
-				_, err := s.buf.ReadFromOnce(s.r)
-				if err != nil {
-					s.dataErrMu.Lock()
-					s.dataError = err
-					s.dataErrMu.Unlock()
-				}
-				// only close once to avoid panic on repeated close
-				s.closeOnce.Do(func() { close(s.dataReady) })
-			}()
-
 			// Waiting 100ms for data.
 			select {
 			case <-s.dataReady:
@@ -134,8 +140,6 @@ func (s *Sniffer) SniffTcp() (d string, err error) {
 			case <-s.ctx.Done():
 				return "", fmt.Errorf("%w: %w", ErrNotApplicable, context.DeadlineExceeded)
 			}
-		} else {
-			close(s.dataReady)
 		}
 
 		if s.buf.Len() == 0 {
@@ -147,19 +151,20 @@ func (s *Sniffer) SniffTcp() (d string, err error) {
 			s.SniffTls,
 			s.SniffHttp,
 		)
-	   if errors.Is(err, ErrNeedMore) {
-		   oerr = err
-		   // reset dataReady channel and closeOnce for next retry
-		   s.dataReady = make(chan struct{})
-		   s.closeOnce = sync.Once{}
-		   s.dataErrMu.Lock()
-		   s.dataError = nil
-		   s.dataErrMu.Unlock()
-		   retries++
-		   continue
-	   }
-			return d, err
+		if errors.Is(err, ErrNeedMore) {
+			oerr = err
+			// reset dataReady channel and closeOnce for next retry
+			// Do not spawn another goroutine; just reset error state.
+			s.dataReady = make(chan struct{})
+			s.closeOnce = sync.Once{}
+			s.dataErrMu.Lock()
+			s.dataError = nil
+			s.dataErrMu.Unlock()
+			retries++
+			continue
 		}
+		return d, err
+	}
 	// end SniffTcp
 }
 

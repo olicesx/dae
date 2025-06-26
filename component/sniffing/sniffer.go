@@ -92,11 +92,13 @@ func (s *Sniffer) SniffTcp() (d string, err error) {
 	if s.sniffed != "" {
 		return s.sniffed, nil
 	}
-	defer func() {
+   defer func() {
 		if err == nil {
 			s.sniffed = d
 		}
 	}()
+   // cancel context when sniffing completes to free resources
+   defer s.cancel()
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 	var oerr error
@@ -145,20 +147,24 @@ func (s *Sniffer) SniffTcp() (d string, err error) {
 			s.SniffTls,
 			s.SniffHttp,
 		)
-		if errors.Is(err, ErrNeedMore) {
-			oerr = err
-			s.dataReady = make(chan struct{})
-			retries++
-			continue
+	   if errors.Is(err, ErrNeedMore) {
+		   oerr = err
+		   // reset dataReady channel and closeOnce for next retry
+		   s.dataReady = make(chan struct{})
+		   s.closeOnce = sync.Once{}
+		   retries++
+		   continue
+	   }
+			return d, err
 		}
-		return d, err
-	}
+	// end SniffTcp
+}
 
 func (s *Sniffer) SniffUdp() (d string, err error) {
 	if s.sniffed != "" {
 		return s.sniffed, nil
 	}
-	defer func() {
+   defer func() {
 		if err == nil {
 			s.sniffed = d
 		}
@@ -168,7 +174,9 @@ func (s *Sniffer) SniffUdp() (d string, err error) {
 			s.sniffed = d
 		}
 	}()
-	s.readMu.Lock()
+   // cancel context when sniffing completes to free resources
+   defer s.cancel()
+   s.readMu.Lock()
 	defer s.readMu.Unlock()
 
 	// Always ready.

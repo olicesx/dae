@@ -238,7 +238,6 @@ func (s *Sniffer) Read(p []byte) (n int, err error) {
 		n, _ = s.buf.Read(p)
 		return n, s.dataError
 	}
-	}
 
 	if s.buf.Len() > 0 {
 		// Read buf first.

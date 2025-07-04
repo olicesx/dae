@@ -6,48 +6,35 @@
 package control
 
 import (
-	"strconv"
-
 	"github.com/cilium/ebpf"
+	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/sys/unix"
 )
 
-func FormatL4Proto(l4proto uint8) string {
-	if l4proto == unix.IPPROTO_TCP {
-		return "tcp"
-	}
-	if l4proto == unix.IPPROTO_UDP {
-		return "udp"
-	}
-	return strconv.Itoa(int(l4proto))
-}
-
-func (c *controlPlaneCore) outboundAliveChangeCallback(outbound uint8, dryrun bool) func(alive bool, networkType *dialer.NetworkType, isInit bool) {
-	return func(alive bool, networkType *dialer.NetworkType, isInit bool) {
-		select {
-		case <-c.closed.Done():
-			return
-		default:
-		}
-		if !isInit && dryrun {
+func (c *controlPlaneCore) outboundAliveChangeCallback(outbound uint8, noConnectivityTrySniff bool, noConnectivityOutbound consts.OutboundIndex) func(alive bool, networkType *dialer.NetworkType) {
+	return func(alive bool, networkType *dialer.NetworkType) {
+		if c.closed.Err() != nil {
 			return
 		}
-		if !isInit || c.log.IsLevelEnabled(logrus.TraceLevel) {
-			strAlive := "NOT ALIVE"
-			if alive {
-				strAlive = "ALIVE"
-			}
-			c.log.WithFields(logrus.Fields{
-				"outboundId": outbound,
-			}).Tracef("Outbound <%v> %v -> %v, notify the kernel program.", c.outboundId2Name[outbound], networkType.StringWithoutDns(), strAlive)
-		}
-
-		value := uint32(0)
+		// if c.log.IsLevelEnabled(logrus.TraceLevel) {
+		strAlive := "NOT ALIVE"
 		if alive {
-			value = 1
+			strAlive = "ALIVE"
 		}
+		c.log.WithFields(logrus.Fields{
+			"outboundId": outbound,
+		}).Warnf("Outbound <%v> %v -> %v, notify the kernel program.", c.outboundId2Name[outbound], networkType.StringWithoutDns(), strAlive)
+		// }
+
+		// 0: go control plane
+		// 1: direct
+		// 2: block
+		value := uint32(0)
+		if !alive && !noConnectivityTrySniff {
+			value = uint32(noConnectivityOutbound) + 1
+		}
+
 		if err := c.bpf.OutboundConnectivityMap.Update(bpfOutboundConnectivityQuery{
 			Outbound:  outbound,
 			L4proto:   networkType.L4Proto.ToL4Proto(),

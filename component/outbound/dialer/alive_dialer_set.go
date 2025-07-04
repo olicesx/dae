@@ -35,21 +35,24 @@ type minLatency struct {
 type AliveDialerSet struct {
 	log             *logrus.Logger
 	dialerGroupName string
-	CheckTyp        *NetworkType
+	networkType     *NetworkType
 	tolerance       time.Duration
 
-	aliveChangeCallback func(alive bool)
+	aliveChangeCallback func(alive bool, networkType *NetworkType)
 
 	mu                      sync.Mutex
 	dialerToIndex           map[*Dialer]int // *Dialer -> index of inorderedAliveDialerSet
 	dialerToLatency         map[*Dialer]time.Duration
 	dialerToLatencyOffset   map[*Dialer]time.Duration
+	dialerToPriority        map[*Dialer]int
 	inorderedAliveDialerSet []*Dialer
 
-	selectionPolicy consts.DialerSelectionPolicy
+	selectionPolicy DialerSelectionPolicy
 	minLatency      minLatency
 
-	dialerToPriority map[*Dialer]int
+	fixedDialer *Dialer
+
+	alive bool
 }
 
 func NewAliveDialerSet(
@@ -57,96 +60,85 @@ func NewAliveDialerSet(
 	dialerGroupName string,
 	networkType *NetworkType,
 	tolerance time.Duration,
-	selectionPolicy consts.DialerSelectionPolicy,
+	selectionPolicy DialerSelectionPolicy,
 	dialers []*Dialer,
 	dialersAnnotations []*Annotation,
-	aliveChangeCallback func(alive bool),
-	setAlive bool,
+	aliveChangeCallback func(alive bool, networkType *NetworkType),
 ) *AliveDialerSet {
 	if len(dialers) != len(dialersAnnotations) {
 		panic(fmt.Sprintf("unmatched annotations length: %v dialers and %v annotations", len(dialers), len(dialersAnnotations)))
 	}
-	dialerToLatencyOffset := make(map[*Dialer]time.Duration)
-	for i := range dialers {
-		d, a := dialers[i], dialersAnnotations[i]
-		dialerToLatencyOffset[d] = a.AddLatency
-	}
 	a := &AliveDialerSet{
 		log:                     log,
 		dialerGroupName:         dialerGroupName,
-		CheckTyp:                networkType,
+		networkType:             networkType,
 		tolerance:               tolerance,
 		aliveChangeCallback:     aliveChangeCallback,
 		dialerToIndex:           make(map[*Dialer]int),
 		dialerToPriority:        make(map[*Dialer]int),
 		dialerToLatency:         make(map[*Dialer]time.Duration),
-		dialerToLatencyOffset:   dialerToLatencyOffset,
+		dialerToLatencyOffset:   make(map[*Dialer]time.Duration),
 		inorderedAliveDialerSet: make([]*Dialer, 0, len(dialers)),
 		selectionPolicy:         selectionPolicy,
 		minLatency: minLatency{
-			// Initiate the latency with a very big value.
 			sortingLatency: time.Hour,
 		},
 	}
-	for _, d := range dialers {
-		a.dialerToIndex[d] = -Init
-	}
 	for i, d := range dialers {
+		a.dialerToIndex[d] = -Init
 		a.dialerToPriority[d] = dialersAnnotations[i].Priority
+		a.dialerToLatencyOffset[d] = dialersAnnotations[i].AddLatency
 	}
-	for _, d := range dialers {
-		a.NotifyLatencyChange(d, setAlive)
+	if selectionPolicy.Policy == consts.DialerSelectionPolicy_Fixed {
+		a.fixedDialer = dialers[selectionPolicy.FixedIndex]
 	}
 	return a
+}
+
+func (a *AliveDialerSet) getHighestPriorityDialers() []*Dialer {
+	if len(a.inorderedAliveDialerSet) == 0 {
+		return nil
+	}
+
+	highestPriority := math.MinInt
+	for _, d := range a.inorderedAliveDialerSet {
+		if priority := a.GetPriority(d); priority > highestPriority {
+			highestPriority = priority
+		}
+	}
+
+	var highPriorityDialers []*Dialer
+	for _, d := range a.inorderedAliveDialerSet {
+		if a.GetPriority(d) == highestPriority {
+			highPriorityDialers = append(highPriorityDialers, d)
+		}
+	}
+	return highPriorityDialers
 }
 
 func (a *AliveDialerSet) GetRand() *Dialer {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if len(a.inorderedAliveDialerSet) == 0 {
+
+	highPriorityDialers := a.getHighestPriorityDialers()
+	if len(highPriorityDialers) == 0 {
 		return nil
 	}
-
-	// Find the highest priority among alive dialers
-	highestPriority := math.MinInt
-	for _, d := range a.inorderedAliveDialerSet {
-		priority, _ := a.dialerToPriority[d]
-		if priority > highestPriority {
-			highestPriority = priority
-		}
-	}
-
-	// Collect all dialers with the highest priority
-	highPriorityDialers := make([]*Dialer, 0)
-	for _, d := range a.inorderedAliveDialerSet {
-		priority, _ := a.dialerToPriority[d]
-		if priority == highestPriority {
-			highPriorityDialers = append(highPriorityDialers, d)
-		}
-	}
-
-	// Pick a random dialer from the high priority ones
-	if len(highPriorityDialers) > 0 {
-		return highPriorityDialers[rand.Intn(len(highPriorityDialers))]
-	}
-
-	return nil
+	return highPriorityDialers[rand.Intn(len(highPriorityDialers))]
 }
 
-func (a *AliveDialerSet) SortingLatency(d *Dialer) time.Duration {
+func (a *AliveDialerSet) GetSortingLatency(d *Dialer) time.Duration {
 	return a.dialerToLatency[d] + a.dialerToLatencyOffset[d]
 }
 
-func (a *AliveDialerSet) Priority(d *Dialer) int {
+func (a *AliveDialerSet) GetPriority(d *Dialer) int {
 	return a.dialerToPriority[d]
 }
 
-// GetMinLatency acquires correct selectionPolicy.
 func (a *AliveDialerSet) GetMinLatency() (d *Dialer, latency time.Duration) {
 	return a.minLatency.dialer, a.minLatency.sortingLatency
 }
 
-// GetMinLatency acquires correct selectionPolicy.
 func (a *AliveDialerSet) setMinLatency(d *Dialer, sortingLatency time.Duration, priority int) {
 	a.minLatency.sortingLatency = sortingLatency
 	a.minLatency.priority = priority
@@ -155,196 +147,297 @@ func (a *AliveDialerSet) setMinLatency(d *Dialer, sortingLatency time.Duration, 
 
 func (a *AliveDialerSet) printLatencies() {
 	var builder strings.Builder
-	builder.WriteString(fmt.Sprintf("Group '%v' [%v]:\n", a.dialerGroupName, a.CheckTyp.String()))
+	builder.WriteString(fmt.Sprintf("Group '%v' [%v]:\n", a.dialerGroupName, a.networkType.String()))
+	samePriority := true
+
 	var alive []*struct {
-		d *Dialer
-		l time.Duration
-		o time.Duration
+		dialer         *Dialer
+		latency        time.Duration
+		offset         time.Duration
+		sortingLatency time.Duration
+		priority       int
 	}
-	for _, d := range a.inorderedAliveDialerSet {
-		latency, ok := a.dialerToLatency[d]
+	for _, dialer := range a.inorderedAliveDialerSet {
+		latency, ok := a.dialerToLatency[dialer]
 		if !ok {
 			continue
 		}
-		offset := a.dialerToLatencyOffset[d]
+		offset := a.dialerToLatencyOffset[dialer]
+		priority := a.GetPriority(dialer)
+		if len(alive) > 0 {
+			samePriority = samePriority && priority == alive[len(alive)-1].priority
+		}
 		alive = append(alive, &struct {
-			d *Dialer
-			l time.Duration
-			o time.Duration
-		}{d, latency, offset})
+			dialer         *Dialer
+			latency        time.Duration
+			offset         time.Duration
+			sortingLatency time.Duration
+			priority       int
+		}{dialer, latency, offset, latency + offset, priority})
 	}
 	sort.SliceStable(alive, func(i, j int) bool {
-		return alive[i].l+alive[i].o < alive[j].l+alive[j].o
+		// First sort by priority (higher priority first)
+		if alive[i].priority != alive[j].priority {
+			return alive[i].priority > alive[j].priority
+		}
+		// Then sort by latency (lower latency first)
+		return alive[i].sortingLatency < alive[j].sortingLatency
 	})
-	for i, dl := range alive {
-		builder.WriteString(fmt.Sprintf("%4d. [%v] %v: %v\n", i+1, dl.d.property.SubscriptionTag, dl.d.property.Name, latencyString(dl.l, dl.o)))
+	for i, dialer := range alive {
+		priorityStr := ""
+		if !samePriority {
+			priorityStr = fmt.Sprintf(" (priority: %d)", dialer.priority)
+		}
+		tagStr := ""
+		if dialer.dialer.property.SubscriptionTag != "" {
+			tagStr = fmt.Sprintf(" [%v]", dialer.dialer.property.SubscriptionTag)
+		}
+		builder.WriteString(fmt.Sprintf("%4d.%v %v: %v%s\n", i+1, tagStr, dialer.dialer.property.Name, latencyString(dialer.latency, dialer.offset), priorityStr))
 	}
-	a.log.Infoln(strings.TrimSuffix(builder.String(), "\n"))
+	// TODO: Log level?
+	a.log.Warnln(strings.TrimSuffix(builder.String(), "\n"))
+}
+
+// latencyData 包含延迟相关的数据
+type latencyData struct {
+	rawLatency time.Duration
+	minPolicy  bool
+}
+
+// getLatencyData 根据选择策略获取延迟数据
+func (a *AliveDialerSet) getLatencyData(dialer *Dialer, networkType *NetworkType) (data latencyData, hasLatency bool) {
+	switch a.selectionPolicy.Policy {
+	case consts.DialerSelectionPolicy_MinLastLatency:
+		data.rawLatency, hasLatency = dialer.mustGetCollection(networkType).Latencies10.LastLatency()
+		data.minPolicy = true
+	case consts.DialerSelectionPolicy_MinAverage10Latencies:
+		data.rawLatency, hasLatency = dialer.mustGetCollection(networkType).Latencies10.AvgLatency()
+		data.minPolicy = true
+	case consts.DialerSelectionPolicy_MinMovingAverageLatencies:
+		data.rawLatency = dialer.mustGetCollection(networkType).MovingAverage
+		hasLatency = data.rawLatency > 0
+		data.minPolicy = true
+	}
+	return
+}
+
+func (a *AliveDialerSet) updateDialerAliveState(dialer *Dialer, alive bool) {
+	if alive {
+		a.addAliveDialer(dialer)
+	} else if !alive {
+		a.removeAliveDialer(dialer)
+	}
+}
+
+func (a *AliveDialerSet) addAliveDialer(dialer *Dialer) {
+	index := a.dialerToIndex[dialer]
+	if index >= 0 {
+		return
+	}
+
+	if index != -Init {
+		a.log.WithFields(logrus.Fields{
+			"dialer": dialer.property.Name,
+			"group":  a.dialerGroupName,
+		}).Warnf("[NOT ALIVE --%v-> ALIVE]", a.networkType.String())
+	}
+
+	a.dialerToIndex[dialer] = len(a.inorderedAliveDialerSet)
+	a.inorderedAliveDialerSet = append(a.inorderedAliveDialerSet, dialer)
+}
+
+func (a *AliveDialerSet) removeAliveDialer(dialer *Dialer) {
+	index := a.dialerToIndex[dialer]
+	if index < -Init {
+		return
+	}
+
+	if index == -Init {
+		a.log.WithFields(logrus.Fields{
+			"dialer": dialer.property.Name,
+			"group":  a.dialerGroupName,
+		}).Infof("[ALIVE --%v-> NOT ALIVE]", a.networkType.String())
+	} else {
+		a.log.WithFields(logrus.Fields{
+			"dialer": dialer.property.Name,
+			"group":  a.dialerGroupName,
+		}).Warnf("[ALIVE --%v-> NOT ALIVE]", a.networkType.String())
+
+		// TODO: Debug, for get which dialer still alive
+		a.printLatencies()
+	}
+
+	if index >= len(a.inorderedAliveDialerSet) {
+		a.log.Panicf("index:%v >= len(a.inorderedAliveDialerSet):%v", index, len(a.inorderedAliveDialerSet))
+	}
+
+	a.dialerToIndex[dialer] = -NotAlive
+
+	if index == -Init {
+		return
+	}
+
+	if index < len(a.inorderedAliveDialerSet)-1 {
+		// 将该元素与最后一个元素交换
+		lastDialer := a.inorderedAliveDialerSet[len(a.inorderedAliveDialerSet)-1]
+		if dialer == lastDialer {
+			a.log.Panicf("dialer[%p] == lastDialer[%p]", dialer, lastDialer)
+		}
+
+		a.dialerToIndex[lastDialer] = index
+		a.inorderedAliveDialerSet[index], a.inorderedAliveDialerSet[len(a.inorderedAliveDialerSet)-1] =
+			a.inorderedAliveDialerSet[len(a.inorderedAliveDialerSet)-1], a.inorderedAliveDialerSet[index]
+	}
+
+	// 弹出最后一个元素
+	a.inorderedAliveDialerSet = a.inorderedAliveDialerSet[:len(a.inorderedAliveDialerSet)-1]
+}
+
+func (a *AliveDialerSet) shouldUpdateMinLatency(dialer *Dialer, sortingLatency time.Duration, priority int) bool {
+	// no dialer is available
+	if a.minLatency.dialer == nil {
+		return true
+	}
+
+	// Higher priority
+	if priority > a.minLatency.priority {
+		return true
+	} else if priority < a.minLatency.priority {
+		return false
+	}
+
+	// Same priority and smaller latency
+	if sortingLatency <= a.minLatency.sortingLatency-a.tolerance {
+		return true
+	}
+
+	return false
+}
+
+// updateLatency should only called for alive dialer.
+func (a *AliveDialerSet) updateLatency(dialer *Dialer) {
+	sortingLatency := a.GetSortingLatency(dialer)
+	priority := a.GetPriority(dialer)
+
+	if a.shouldUpdateMinLatency(dialer, sortingLatency, priority) {
+		a.setMinLatency(dialer, sortingLatency, priority)
+	} else if a.minLatency.dialer == dialer {
+		latencyIncreased := sortingLatency > a.minLatency.sortingLatency
+		a.minLatency.sortingLatency = sortingLatency
+		// If the latency of the current dialer increases, recalculate the minimum latency dialer.
+		if latencyIncreased {
+			minDialer, minLatency, highestPriority := a.calcMinLatency()
+			if minLatency <= sortingLatency-a.tolerance {
+				a.setMinLatency(minDialer, minLatency, highestPriority)
+			}
+		}
+	}
+}
+
+func (a *AliveDialerSet) handleAliveStateChange(alive bool) {
+	if a.alive == alive {
+		return
+	}
+
+	if alive {
+		a.log.WithFields(logrus.Fields{
+			"group":   a.dialerGroupName,
+			"network": a.networkType.String(),
+		}).Infof("Group is alive")
+	} else {
+		a.log.WithFields(logrus.Fields{
+			"group":   a.dialerGroupName,
+			"network": a.networkType.String(),
+		}).Infof("Group has no dialer alive")
+	}
+	a.alive = alive
+	a.printLatencies()
+	a.aliveChangeCallback(alive, a.networkType)
+}
+
+// logDialerSelection 记录拨号器选择日志
+func (a *AliveDialerSet) logDialerSelection(oldBestDialer *Dialer, newBestDialer *Dialer) {
+	re := "re-"
+	var oldDialerName string
+
+	if oldBestDialer == nil {
+		re = ""
+		oldDialerName = "<nil>"
+	} else {
+		oldDialerName = oldBestDialer.property.Name
+	}
+
+	if oldBestDialer == nil {
+		a.log.WithFields(logrus.Fields{
+			string(a.selectionPolicy.Policy): latencyString(a.dialerToLatency[a.minLatency.dialer], a.dialerToLatencyOffset[a.minLatency.dialer]),
+			"_new_dialer":                    newBestDialer.property.Name,
+			"_old_dialer":                    oldDialerName,
+			"group":                          a.dialerGroupName,
+			"network":                        a.networkType.String(),
+		}).Warnf("Group %vselects dialer", re)
+	} else {
+		a.log.WithFields(logrus.Fields{
+			string(a.selectionPolicy.Policy): latencyString(a.dialerToLatency[a.minLatency.dialer], a.dialerToLatencyOffset[a.minLatency.dialer]),
+			"_new_dialer":                    newBestDialer.property.Name,
+			"_old_dialer":                    oldDialerName,
+			"group":                          a.dialerGroupName,
+			"network":                        a.networkType.String(),
+		}).Infof("Group %vselects dialer", re)
+	}
 }
 
 // NotifyLatencyChange should be invoked when dialer every time latency and alive state changes.
 func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	var (
-		rawLatency time.Duration
-		hasLatency bool
-		minPolicy  bool
-	)
 
-	switch a.selectionPolicy {
-	case consts.DialerSelectionPolicy_MinLastLatency:
-		rawLatency, hasLatency = dialer.mustGetCollection(a.CheckTyp).Latencies10.LastLatency()
-		minPolicy = true
-	case consts.DialerSelectionPolicy_MinAverage10Latencies:
-		rawLatency, hasLatency = dialer.mustGetCollection(a.CheckTyp).Latencies10.AvgLatency()
-		minPolicy = true
-	case consts.DialerSelectionPolicy_MinMovingAverageLatencies:
-		rawLatency = dialer.mustGetCollection(a.CheckTyp).MovingAverage
-		hasLatency = rawLatency > 0
-		minPolicy = true
-	}
+	a.updateDialerAliveState(dialer, alive)
 
-	if alive {
-		index := a.dialerToIndex[dialer]
-		if index >= 0 {
-			// This dialer is already alive.
-		} else {
-			// Dialer: not alive -> alive.
-			if index == -NotAlive {
-				a.log.WithFields(logrus.Fields{
-					"dialer": dialer.property.Name,
-					"group":  a.dialerGroupName,
-				}).Infof("[NOT ALIVE --%v-> ALIVE]", a.CheckTyp.String())
-			}
-			a.dialerToIndex[dialer] = len(a.inorderedAliveDialerSet)
-			a.inorderedAliveDialerSet = append(a.inorderedAliveDialerSet, dialer)
+	latencyData, hasLatency := a.getLatencyData(dialer, a.networkType)
+
+	if latencyData.minPolicy {
+		oldMinLatency := a.minLatency.dialer
+		if alive {
+			if hasLatency {
+				a.dialerToLatency[dialer] = latencyData.rawLatency // Update latency
+				a.updateLatency(dialer)                            // calculate min latency dialer
+			} // TODO: else?
+		} else if dialer == a.minLatency.dialer {
+			minDialer, minLatency, highestPriority := a.calcMinLatency()
+			a.setMinLatency(minDialer, minLatency, highestPriority)
 		}
-	} else {
-		index := a.dialerToIndex[dialer]
-		if index >= 0 {
-			// Dialer: alive -> not alive.
-			a.log.WithFields(logrus.Fields{
-				"dialer": dialer.property.Name,
-				"group":  a.dialerGroupName,
-			}).Infof("[ALIVE --%v-> NOT ALIVE]", a.CheckTyp.String())
-			// Remove the dialer from inorderedAliveDialerSet.
-			if index >= len(a.inorderedAliveDialerSet) {
-				a.log.Panicf("index:%v >= len(a.inorderedAliveDialerSet):%v", index, len(a.inorderedAliveDialerSet))
-			}
-			a.dialerToIndex[dialer] = -NotAlive
-			if index < len(a.inorderedAliveDialerSet)-1 {
-				// Swap this element with the last element.
-				dialerToSwap := a.inorderedAliveDialerSet[len(a.inorderedAliveDialerSet)-1]
-				if dialer == dialerToSwap {
-					a.log.Panicf("dialer[%p] == dialerToSwap[%p]", dialer, dialerToSwap)
-				}
-
-				a.dialerToIndex[dialerToSwap] = index
-				a.inorderedAliveDialerSet[index], a.inorderedAliveDialerSet[len(a.inorderedAliveDialerSet)-1] =
-					a.inorderedAliveDialerSet[len(a.inorderedAliveDialerSet)-1], a.inorderedAliveDialerSet[index]
-			}
-			// Pop the last element.
-			a.inorderedAliveDialerSet = a.inorderedAliveDialerSet[:len(a.inorderedAliveDialerSet)-1]
-		} else {
-			// This dialer is already not alive.
+		if a.minLatency.dialer != nil && a.minLatency.dialer != oldMinLatency {
+			a.logDialerSelection(oldMinLatency, a.minLatency.dialer)
 		}
 	}
 
-	if hasLatency {
-		bakOldBestDialer := a.minLatency.dialer
-		// Update latency and calc minLatency dialer.
-		// Update minLatency dialer to current dialer if it's better, or Recalculate it if dialer get worse.
-		a.dialerToLatency[dialer] = rawLatency
-		sortingLatency := a.SortingLatency(dialer)
-		priority := a.Priority(dialer)
-		if alive && priority == a.minLatency.priority &&
-			sortingLatency <= a.minLatency.sortingLatency && // To avoid arithmetic overflow.
-			sortingLatency <= a.minLatency.sortingLatency-a.tolerance {
-			// Same priority and latency is smaller than minLatency.
-			a.setMinLatency(dialer, sortingLatency, priority)
-		} else if alive && priority > a.minLatency.priority {
-			// Higher priority.
-			a.setMinLatency(dialer, sortingLatency, priority)
-		} else if a.minLatency.dialer == dialer {
-			a.minLatency.sortingLatency = sortingLatency
-			if !alive || sortingLatency > a.minLatency.sortingLatency {
-				// Latency increases.
-				if !alive {
-					a.minLatency.dialer = nil
-				}
-				a.calcMinLatency()
-				// Now `a.minLatency.dialer` will be nil if there is no alive dialer.
-			}
-		}
-		currentAlive := a.minLatency.dialer != nil
-		// If best dialer changed.
-		if a.minLatency.dialer != bakOldBestDialer {
-			if currentAlive {
-				re := "re-"
-				var oldDialerName string
-				if bakOldBestDialer == nil {
-					// Not alive -> alive
-					defer a.aliveChangeCallback(true)
-					re = ""
-					oldDialerName = "<nil>"
-				} else {
-					oldDialerName = bakOldBestDialer.property.Name
-				}
-				a.log.WithFields(logrus.Fields{
-					string(a.selectionPolicy): latencyString(a.dialerToLatency[a.minLatency.dialer], a.dialerToLatencyOffset[a.minLatency.dialer]),
-					"_new_dialer":             a.minLatency.dialer.property.Name,
-					"_old_dialer":             oldDialerName,
-					"group":                   a.dialerGroupName,
-					"network":                 a.CheckTyp.String(),
-				}).Infof("Group %vselects dialer", re)
-
-				a.printLatencies()
-			} else {
-				// Alive -> not alive
-				defer a.aliveChangeCallback(false)
-				a.log.WithFields(logrus.Fields{
-					"group":   a.dialerGroupName,
-					"network": a.CheckTyp.String(),
-				}).Infof("Group has no dialer alive")
-			}
+	if a.selectionPolicy.Policy == consts.DialerSelectionPolicy_Fixed {
+		if dialer == a.fixedDialer {
+			a.handleAliveStateChange(alive)
 		}
 	} else {
-		if alive && minPolicy && a.minLatency.dialer == nil {
-			// Use first dialer if no dialer has alive state (usually happen at the very beginning).
-			a.minLatency.dialer = dialer
-			a.log.WithFields(logrus.Fields{
-				"group":   a.dialerGroupName,
-				"network": a.CheckTyp.String(),
-				"dialer":  a.minLatency.dialer.property.Name,
-			}).Infof("Group selects dialer")
-		}
+		a.handleAliveStateChange(len(a.inorderedAliveDialerSet) > 0)
 	}
 }
 
-func (a *AliveDialerSet) calcMinLatency() {
+// calcMinLatency return the dialer with the minimum latency and highest priority
+func (a *AliveDialerSet) calcMinLatency() (dialer *Dialer, latency time.Duration, priority int) {
 	var minLatency = time.Hour
 	var highestPriority = math.MinInt
 	var minDialer *Dialer
-	for _, d := range a.inorderedAliveDialerSet {
-		priority, _ := a.dialerToPriority[d]
 
-		sortingLatency := a.SortingLatency(d)
-		if sortingLatency < minLatency && priority >= highestPriority {
+	for _, d := range a.inorderedAliveDialerSet {
+		priority := a.GetPriority(d)
+		sortingLatency := a.GetSortingLatency(d)
+
+		switch {
+		case priority > highestPriority:
+		case sortingLatency < minLatency && priority == highestPriority:
 			minLatency = sortingLatency
 			highestPriority = priority
 			minDialer = d
 		}
 	}
 
-	if a.minLatency.dialer == nil {
-		a.setMinLatency(minDialer, minLatency, highestPriority)
-	} else if minDialer != nil &&
-		minLatency <= a.minLatency.sortingLatency && // To avoid arithmetic overflow.
-		minLatency <= a.minLatency.sortingLatency-a.tolerance {
-		a.setMinLatency(minDialer, minLatency, highestPriority)
-	} else if minDialer != nil &&
-		highestPriority > a.minLatency.priority {
-		a.setMinLatency(minDialer, minLatency, highestPriority)
-	}
+	return minDialer, minLatency, highestPriority
 }

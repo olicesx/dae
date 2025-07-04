@@ -7,7 +7,6 @@ package control
 
 import (
 	"context"
-	"fmt"
 	"net/netip"
 	"os"
 	"regexp"
@@ -23,6 +22,7 @@ import (
 	dnsmessage "github.com/miekg/dns"
 	"github.com/mohae/deepcopy"
 	"github.com/safchain/ethtool"
+	"github.com/samber/oops"
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -103,7 +103,7 @@ func (c *controlPlaneCore) Close() (err error) {
 		if e := c.deferFuncs[i](); e != nil {
 			// Combine errors.
 			if err != nil {
-				err = fmt.Errorf("%w; %v", err, e)
+				err = oops.Errorf("%w; %v", err, e)
 			} else {
 				err = e
 			}
@@ -177,7 +177,7 @@ func (c *controlPlaneCore) addQdisc(ifname string) error {
 		QdiscType: "clsact",
 	}
 	if err := netlink.QdiscAdd(qdisc); err != nil {
-		return fmt.Errorf("cannot add clsact qdisc: %w", err)
+		return oops.Errorf("cannot add clsact qdisc: %w", err)
 	}
 	return nil
 }
@@ -197,7 +197,7 @@ func (c *controlPlaneCore) delQdisc(ifname string) error {
 	}
 	if err := netlink.QdiscDel(qdisc); err != nil {
 		if !os.IsExist(err) {
-			return fmt.Errorf("cannot add clsact qdisc: %w", err)
+			return oops.Errorf("cannot add clsact qdisc: %w", err)
 		}
 	}
 	return nil
@@ -302,11 +302,11 @@ func (c *controlPlaneCore) _bindLan(ifname string) error {
 		_ = netlink.FilterDel(filterIngressFlipped)
 	}
 	if err := netlink.FilterAdd(filterIngress); err != nil {
-		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
+		return oops.Errorf("cannot attach ebpf object to filter ingress: %w", err)
 	}
 	c.deferFuncs = append(c.deferFuncs, func() error {
 		if err := netlink.FilterDel(filterIngress); err != nil {
-			return fmt.Errorf("FilterDel(%v:%v): %w", ifname, filterIngress.Name, err)
+			return oops.Errorf("FilterDel(%v:%v): %w", ifname, filterIngress.Name, err)
 		}
 		return nil
 	})
@@ -339,11 +339,11 @@ func (c *controlPlaneCore) _bindLan(ifname string) error {
 		_ = netlink.FilterDel(filterEgressFlipped)
 	}
 	if err := netlink.FilterAdd(filterEgress); err != nil {
-		return fmt.Errorf("cannot attach ebpf object to filter egress: %w", err)
+		return oops.Errorf("cannot attach ebpf object to filter egress: %w", err)
 	}
 	c.deferFuncs = append(c.deferFuncs, func() error {
 		if err := netlink.FilterDel(filterEgress); err != nil {
-			return fmt.Errorf("FilterDel(%v:%v): %w", ifname, filterEgress.Name, err)
+			return oops.Errorf("FilterDel(%v:%v): %w", ifname, filterEgress.Name, err)
 		}
 		return nil
 	})
@@ -380,11 +380,11 @@ func (c *controlPlaneCore) setupSkPidMonitor() error {
 			Program: prog.Prog,
 		})
 		if err != nil {
-			return fmt.Errorf("AttachCgroup: %v: %w", prog.Prog.String(), err)
+			return oops.Errorf("AttachCgroup: %v: %w", prog.Prog.String(), err)
 		}
 		c.deferFuncs = append(c.deferFuncs, func() error {
 			if err := attached.Close(); err != nil {
-				return fmt.Errorf("inet6Bind.Close(): %w", err)
+				return oops.Errorf("inet6Bind.Close(): %w", err)
 			}
 			return nil
 		})
@@ -403,7 +403,7 @@ func (c *controlPlaneCore) setupLocalTcpFastRedirect() (err error) {
 		Attach:  ebpf.AttachCGroupSockOps,
 	})
 	if err != nil {
-		return fmt.Errorf("AttachCgroupSockOps: %w", err)
+		return oops.Errorf("AttachCgroupSockOps: %w", err)
 	}
 	c.deferFuncs = append(c.deferFuncs, cg.Close)
 
@@ -412,7 +412,7 @@ func (c *controlPlaneCore) setupLocalTcpFastRedirect() (err error) {
 		Program: c.bpf.SkMsgFastRedirect,
 		Attach:  ebpf.AttachSkMsgVerdict,
 	}); err != nil {
-		return fmt.Errorf("AttachSkMsgVerdict: %w", err)
+		return oops.Errorf("AttachSkMsgVerdict: %w", err)
 	}
 	return nil
 
@@ -463,7 +463,7 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 		return err
 	}
 	if link.Attrs().Index == consts.LoopbackIfIndex {
-		return fmt.Errorf("cannot bind to loopback interface")
+		return oops.Errorf("cannot bind to loopback interface")
 	}
 	_ = c.addQdisc(ifname)
 	linkHdrLen, err := c.linkHdrLen(ifname)
@@ -509,11 +509,11 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 		_ = netlink.FilterDel(filterEgressFlipped)
 	}
 	if err := netlink.FilterAdd(filterEgress); err != nil {
-		return fmt.Errorf("cannot attach ebpf object to filter egress: %w", err)
+		return oops.Errorf("cannot attach ebpf object to filter egress: %w", err)
 	}
 	c.deferFuncs = append(c.deferFuncs, func() error {
 		if err := netlink.FilterDel(filterEgress); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("FilterDel(%v:%v): %w", ifname, filterEgress.Name, err)
+			return oops.Errorf("FilterDel(%v:%v): %w", ifname, filterEgress.Name, err)
 		}
 		return nil
 	})
@@ -545,11 +545,11 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 		_ = netlink.FilterDel(filterIngressFlipped)
 	}
 	if err := netlink.FilterAdd(filterIngress); err != nil {
-		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
+		return oops.Errorf("cannot attach ebpf object to filter ingress: %w", err)
 	}
 	c.deferFuncs = append(c.deferFuncs, func() error {
 		if err := netlink.FilterDel(filterIngress); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("FilterDel(%v:%v): %w", ifname, filterIngress.Name, err)
+			return oops.Errorf("FilterDel(%v:%v): %w", ifname, filterIngress.Name, err)
 		}
 		return nil
 	})
@@ -591,7 +591,7 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 	if err = daens.With(func() error {
 		return netlink.FilterAdd(filterDae0peerIngress)
 	}); err != nil {
-		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
+		return oops.Errorf("cannot attach ebpf object to filter ingress: %w", err)
 	}
 	c.deferFuncs = append(c.deferFuncs, func() error {
 		daens.With(func() error {
@@ -623,11 +623,11 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 		_ = netlink.FilterDel(filterEgressFlipped)
 	}
 	if err := netlink.FilterAdd(filterDae0Ingress); err != nil {
-		return fmt.Errorf("cannot attach ebpf object to filter egress: %w", err)
+		return oops.Errorf("cannot attach ebpf object to filter egress: %w", err)
 	}
 	c.deferFuncs = append(c.deferFuncs, func() error {
 		if err := netlink.FilterDel(filterDae0Ingress); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("FilterDel(%v:%v): %w", daens.Dae0().Attrs().Name, filterDae0Ingress.Name, err)
+			return oops.Errorf("FilterDel(%v:%v): %w", daens.Dae0().Attrs().Name, filterDae0Ingress.Name, err)
 		}
 		return nil
 	})
@@ -635,7 +635,7 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 }
 
 // BatchNewDomain update bpf map domain_bump and domain_routing. This function should be invoked every new cache.
-func (c *controlPlaneCore) BatchNewDomain(cache *DnsCache) error {
+func (c *controlPlaneCore) BatchNewDomain(cache *LookupCache) error {
 	// Parse ips from DNS resp answers.
 	var ips []netip.Addr
 	for _, ans := range cache.Answer {
@@ -674,7 +674,7 @@ func (c *controlPlaneCore) BatchNewDomain(cache *DnsCache) error {
 		r := bpfDomainRouting{}
 
 		if consts.MaxMatchSetLen/32 != len(r.Bitmap) || len(cache.DomainBitmap) != len(r.Bitmap) {
-			return fmt.Errorf("domain bitmap length not sync with kern program")
+			return oops.Errorf("domain bitmap length not sync with kern program")
 		}
 
 		newBumpMap, exists := c.domainBumpMap[ip]
@@ -724,7 +724,7 @@ func (c *controlPlaneCore) BatchNewDomain(cache *DnsCache) error {
 }
 
 // BatchRemoveDomainBump update or remove bpf map domain_bump and domain_routing.
-func (c *controlPlaneCore) BatchRemoveDomain(cache *DnsCache) error {
+func (c *controlPlaneCore) BatchRemoveDomain(cache *LookupCache) error {
 	// Parse ips from DNS resp answers.
 	var ips []netip.Addr
 	for _, ans := range cache.Answer {

@@ -1150,7 +1150,7 @@ static __always_inline int do_tproxy_lan_egress(struct __sk_buff *skb, u32 link_
 				  &tcph, &udph, &ihl, &l4proto, &offset);
 	if (ret) {
 		bpf_printk("parse_transport: %d", ret);
-		return TC_ACT_OK;
+		return TC_ACT_PIPE;
 	}
 
 	if (skb->ingress_ifindex == NOWHERE_IFINDEX &&  // Only drop NDP_REDIRECT packets from localhost
@@ -1202,10 +1202,10 @@ static __always_inline int do_tproxy_lan_ingress(struct __sk_buff *skb, u32 link
 				  &tcph, &udph, &ihl, &l4proto, &offset);
 	if (ret) {
 		bpf_printk("parse_transport: %d", ret);
-		return TC_ACT_OK;
+		return TC_ACT_PIPE;
 	}
 	if (l4proto == IPPROTO_ICMPV6)
-		return TC_ACT_OK;
+		return TC_ACT_PIPE;
 
 	// Prepare five tuples.
 	struct tuples tuples;
@@ -1269,7 +1269,7 @@ new_connection:;
 		if (!(tcph.syn && !tcph.ack)) {
 			// Not a new TCP connection.
 			// Perhaps single-arm.
-			return TC_ACT_OK;
+			return TC_ACT_PIPE;
 		}
 		params.l4hdr = &tcph;
 		params.flag[0] = L4ProtoType_TCP;
@@ -1281,7 +1281,7 @@ new_connection:;
 		if (conn_state->is_wan_ingress_direction) {
 			// Replay (outbound) of an inbound flow
 			// => direct.
-			return TC_ACT_OK;
+			return TC_ACT_PIPE;
 		}
 		params.l4hdr = &udph;
 		params.flag[0] = L4ProtoType_UDP;
@@ -1365,18 +1365,28 @@ new_connection:;
 	}
 
 	// Check outbound connectivity in specific ipversion and l4proto.
-	struct outbound_connectivity_query q = { 0 };
+	if (!(l4proto == IPPROTO_UDP && tuples.five.dport == bpf_htons(53))) {
+		struct outbound_connectivity_query q = {
+			.outbound = routing_result.outbound,
+			.ipversion = skb->protocol == bpf_htons(ETH_P_IP) ? 4 : 6,
+			.l4proto = l4proto
+		};
 
-	q.outbound = routing_result.outbound;
-	q.ipversion = skb->protocol == bpf_htons(ETH_P_IP) ? 4 : 6;
-	q.l4proto = l4proto;
-	__u32 *alive;
+		__u32 *alive = bpf_map_lookup_elem(&outbound_connectivity_map, &q);
 
-	alive = bpf_map_lookup_elem(&outbound_connectivity_map, &q);
-	if (alive && *alive == 0 &&
-	    !(l4proto == IPPROTO_UDP && tuples.five.dport == bpf_htons(53))) {
-		// Outbound is not alive. Dns is an exception.
-		goto block;
+		if (!alive) {
+			// Outbound is not ready. direct
+			return TC_ACT_PIPE;
+		}
+
+		switch (*alive) {
+		case 1:
+			// Direct.
+			return TC_ACT_PIPE;
+		case 2:
+			// Block.
+			return TC_ACT_SHOT;
+		}
 	}
 
 	// Assign to control plane.
@@ -1386,7 +1396,7 @@ control_plane:
 	return bpf_redirect(PARAM.dae0_ifindex, 0);
 
 direct:
-	return TC_ACT_OK;
+	return TC_ACT_PIPE;
 
 block:
 	return TC_ACT_SHOT;
@@ -1471,7 +1481,7 @@ static __always_inline int do_tproxy_wan_ingress(struct __sk_buff *skb, u32 link
 				  &tcph, &udph, &ihl, &l4proto, &offset);
 	if (ret) {
 		bpf_printk("parse_transport: %d", ret);
-		return TC_ACT_OK;
+		return TC_ACT_PIPE;
 	}
 
 	// Update UDP Conntrack
@@ -1507,9 +1517,9 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 {
 	// Skip packets not from localhost.
 	if (skb->ingress_ifindex != NOWHERE_IFINDEX)
-		return TC_ACT_OK;
+		return TC_ACT_PIPE;
 	// if ((skb->mark & 0x80) == 0x80) {
-	//	 return TC_ACT_OK;
+	//	 return TC_ACT_PIPE;
 	// }
 
 	struct ethhdr ethh;
@@ -1526,9 +1536,9 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 	int ret = parse_transport(skb, link_h_len, &ethh, &iph, &ipv6h, &icmp6h,
 				  &tcph, &udph, &ihl, &l4proto, &offset);
 	if (ret)
-		return TC_ACT_OK;
+		return TC_ACT_PIPE;
 	if (l4proto == IPPROTO_ICMPV6)
-		return TC_ACT_OK;
+		return TC_ACT_PIPE;
 
 	// Backup for further use.
 	struct tuples tuples;
@@ -1549,7 +1559,7 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 			// bpf_printk("[%X]New Connection", bpf_ntohl(tcph.seq));
 			if (pid_is_control_plane(skb, &pid_pname)) {
 				// From control plane. Direct.
-				return TC_ACT_OK;
+				return TC_ACT_PIPE;
 			}
 
 			struct route_params params;
@@ -1617,7 +1627,7 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 
 			if (!routing_result) {
 				// Do not impact previous connections and server connections.
-				return TC_ACT_OK;
+				return TC_ACT_PIPE;
 			}
 			outbound = routing_result->outbound;
 			mark = routing_result->mark;
@@ -1633,7 +1643,7 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 #endif
 
 			skb->mark = mark;
-			return TC_ACT_OK;
+			return TC_ACT_PIPE;
 		} else if (unlikely(outbound == OUTBOUND_BLOCK)) {
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
 			bpf_printk("SHOT OUTBOUND_BLOCK");
@@ -1643,18 +1653,25 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 		// Rewrite to control plane.
 
 		// Check outbound connectivity in specific ipversion and l4proto.
-		struct outbound_connectivity_query q = { 0 };
+		struct outbound_connectivity_query q = {
+			.outbound = outbound,
+			.ipversion = skb->protocol == bpf_htons(ETH_P_IP) ? 4 : 6,
+			.l4proto = l4proto
+		};
 
-		q.outbound = outbound;
-		q.ipversion = skb->protocol == bpf_htons(ETH_P_IP) ? 4 : 6;
-		q.l4proto = l4proto;
-		__u32 *alive;
+		__u32 *alive = bpf_map_lookup_elem(&outbound_connectivity_map, &q);
 
-		alive = bpf_map_lookup_elem(&outbound_connectivity_map, &q);
-		if (alive && *alive == 0 &&
-		    !(l4proto == IPPROTO_UDP &&
-		      tuples.five.dport == bpf_htons(53))) {
-			// Outbound is not alive. Dns is an exception.
+		if (!alive) {
+			// Outbound is not ready. direct
+			return TC_ACT_PIPE;
+		}
+
+		switch (*alive) {
+		case 1:
+			// Direct.
+			return TC_ACT_PIPE;
+		case 2:
+			// Block.
 			return TC_ACT_SHOT;
 		}
 
@@ -1685,7 +1702,7 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 		if (pid_is_control_plane(skb, &pid_pname)) {
 			// from control plane
 			// => direct.
-			return TC_ACT_OK;
+			return TC_ACT_PIPE;
 		}
 
 		struct udp_conn_state *conn_state =
@@ -1695,7 +1712,7 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 		if (conn_state->is_wan_ingress_direction) {
 			// Replay (outbound) of an inbound flow
 			// => direct.
-			return TC_ACT_OK;
+			return TC_ACT_PIPE;
 		}
 
 		struct route_params params;
@@ -1770,7 +1787,7 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 		    // If mark is not zero, we should re-route it, so we send it to control
 		    // plane in WAN.
 		) {
-			return TC_ACT_OK;
+			return TC_ACT_PIPE;
 		} else if (unlikely(routing_result.outbound ==
 				    OUTBOUND_BLOCK)) {
 			return TC_ACT_SHOT;
@@ -1779,19 +1796,28 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 		// Rewrite to control plane.
 
 		// Check outbound connectivity in specific ipversion and l4proto.
-		struct outbound_connectivity_query q = { 0 };
+		if (tuples.five.dport != bpf_htons(53)) {
+			struct outbound_connectivity_query q = {
+				.outbound = routing_result.outbound,
+				.ipversion = skb->protocol == bpf_htons(ETH_P_IP) ? 4 : 6,
+				.l4proto = l4proto
+			};
 
-		q.outbound = routing_result.outbound;
-		q.ipversion = skb->protocol == bpf_htons(ETH_P_IP) ? 4 : 6;
-		q.l4proto = l4proto;
-		__u32 *alive;
+			__u32 *alive = bpf_map_lookup_elem(&outbound_connectivity_map, &q);
 
-		alive = bpf_map_lookup_elem(&outbound_connectivity_map, &q);
-		if (alive && *alive == 0 &&
-		    !(l4proto == IPPROTO_UDP &&
-		      tuples.five.dport == bpf_htons(53))) {
-			// Outbound is not alive. Dns is an exception.
-			return TC_ACT_SHOT;
+			if (!alive) {
+				// Outbound is not ready. direct
+				return TC_ACT_PIPE;
+			}
+
+			switch (*alive) {
+			case 1:
+				// Direct.
+				return TC_ACT_PIPE;
+			case 2:
+				// Block.
+				return TC_ACT_SHOT;
+			}
 		}
 	}
 

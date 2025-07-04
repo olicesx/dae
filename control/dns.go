@@ -1,7 +1,7 @@
 /*
 *  SPDX-License-Identifier: AGPL-3.0-only
 *  Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
-*/
+ */
 
 package control
 
@@ -35,7 +35,7 @@ type DnsForwarder interface {
 
 func newDnsForwarder(upstream *dns.Upstream, dialArgument dialArgument) (DnsForwarder, error) {
 	forwarder, err := func() (DnsForwarder, error) {
-		switch dialArgument.l4proto {
+		switch dialArgument.networkType.L4Proto {
 		case consts.L4ProtoStr_TCP:
 			switch upstream.Scheme {
 			case dns.UpstreamScheme_TCP, dns.UpstreamScheme_TCP_UDP:
@@ -59,7 +59,7 @@ func newDnsForwarder(upstream *dns.Upstream, dialArgument dialArgument) (DnsForw
 				return nil, fmt.Errorf("unexpected scheme: %v", upstream.Scheme)
 			}
 		default:
-			return nil, fmt.Errorf("unexpected l4proto: %v", dialArgument.l4proto)
+			return nil, fmt.Errorf("unexpected l4proto: %v", dialArgument.networkType.L4Proto)
 		}
 	}()
 	if err != nil {
@@ -115,7 +115,7 @@ func (d *DoH) getHttpRoundTripper() *http.Transport {
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			conn, err := d.dialArgument.bestDialer.DialContext(
 				ctx,
-				common.MagicNetwork("tcp", d.dialArgument.mark, d.dialArgument.mptcp),
+				common.MagicNetwork("tcp", d.dialArgument.mark),
 				d.dialArgument.bestTarget.String(),
 			)
 			if err != nil {
@@ -140,7 +140,7 @@ func (d *DoH) getHttp3RoundTripper() *http3.RoundTripper {
 			udpAddr := net.UDPAddrFromAddrPort(d.dialArgument.bestTarget)
 			conn, err := d.dialArgument.bestDialer.DialContext(
 				ctx,
-				common.MagicNetwork("udp", d.dialArgument.mark, d.dialArgument.mptcp),
+				common.MagicNetwork("udp", d.dialArgument.mark),
 				d.dialArgument.bestTarget.String(),
 			)
 			if err != nil {
@@ -207,7 +207,7 @@ func (d *DoQ) createConnection(ctx context.Context) (quic.EarlyConnection, error
 	udpAddr := net.UDPAddrFromAddrPort(d.dialArgument.bestTarget)
 	conn, err := d.dialArgument.bestDialer.DialContext(
 		ctx,
-		common.MagicNetwork("udp", d.dialArgument.mark, d.dialArgument.mptcp),
+		common.MagicNetwork("udp", d.dialArgument.mark),
 		d.dialArgument.bestTarget.String(),
 	)
 	if err != nil {
@@ -243,7 +243,7 @@ type DoTLS struct {
 func (d *DoTLS) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, error) {
 	conn, err := d.dialArgument.bestDialer.DialContext(
 		ctx,
-		common.MagicNetwork("tcp", d.dialArgument.mark, d.dialArgument.mptcp),
+		common.MagicNetwork("tcp", d.dialArgument.mark),
 		d.dialArgument.bestTarget.String(),
 	)
 	if err != nil {
@@ -279,7 +279,7 @@ type DoTCP struct {
 func (d *DoTCP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, error) {
 	conn, err := d.dialArgument.bestDialer.DialContext(
 		ctx,
-		common.MagicNetwork("tcp", d.dialArgument.mark, d.dialArgument.mptcp),
+		common.MagicNetwork("tcp", d.dialArgument.mark),
 		d.dialArgument.bestTarget.String(),
 	)
 	if err != nil {
@@ -307,7 +307,7 @@ type DoUDP struct {
 func (d *DoUDP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, error) {
 	conn, err := d.dialArgument.bestDialer.DialContext(
 		ctx,
-		common.MagicNetwork("udp", d.dialArgument.mark, d.dialArgument.mptcp),
+		common.MagicNetwork("udp", d.dialArgument.mark),
 		d.dialArgument.bestTarget.String(),
 	)
 	if err != nil {
@@ -316,34 +316,11 @@ func (d *DoUDP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 
 	timeout := 5 * time.Second
 	_ = conn.SetDeadline(time.Now().Add(timeout))
-	dnsReqCtx, cancelDnsReqCtx := context.WithTimeout(context.TODO(), timeout)
-	defer cancelDnsReqCtx()
 
-	go func() {
-		// Send DNS request every seconds.
-		for {
-			_, _ = conn.Write(data)
-			// if err != nil {
-			// 	if c.log.IsLevelEnabled(logrus.DebugLevel) {
-			// 		c.log.WithFields(logrus.Fields{
-			// 			"to":      dialArgument.bestTarget.String(),
-			// 			"pid":     req.routingResult.Pid,
-			// 			"pname":   ProcessName2String(req.routingResult.Pname[:]),
-			// 			"mac":     Mac2String(req.routingResult.Mac[:]),
-			// 			"from":    req.realSrc.String(),
-			// 			"network": networkType.String(),
-			// 			"err":     err.Error(),
-			// 		}).Debugln("Failed to write UDP(DNS) packet request.")
-			// 	}
-			// 	return
-			// }
-			select {
-			case <-dnsReqCtx.Done():
-				return
-			case <-time.After(1 * time.Second):
-			}
-		}
-	}()
+	_, err = conn.Write(data)
+	if err != nil {
+		return nil, err
+	}
 
 	// We can block here because we are in a coroutine.
 	respBuf := pool.GetFullCap(consts.EthernetMtu)

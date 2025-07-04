@@ -13,11 +13,14 @@ import (
 	"github.com/mohae/deepcopy"
 )
 
+type LookupCache struct {
+	DomainBitmap []uint32
+	DnsCache
+}
+
 type DnsCache struct {
-	DomainBitmap     []uint32
-	Answer           []dnsmessage.RR
-	Deadline         time.Time
-	OriginalDeadline time.Time // This field is not impacted by `fixed_domain_ttl`.
+	Answer   []dnsmessage.RR
+	Deadline time.Time
 }
 
 func (c *DnsCache) FillInto(req *dnsmessage.Msg) {

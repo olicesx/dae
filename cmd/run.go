@@ -24,6 +24,7 @@ import (
 
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol/direct"
+	"github.com/samber/oops"
 	"gopkg.in/natefinch/lumberjack.v2"
 
 	_ "net/http/pprof"
@@ -128,17 +129,17 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 	// Remove AbortFile at beginning.
 	_ = os.Remove(AbortFile)
 
-	// New ControlPlane.
-	c, err := newControlPlane(log, nil, nil, conf, externGeoDataDirs)
-	if err != nil {
-		return err
-	}
-
 	var pprofServer *http.Server
 	if conf.Global.PprofPort != 0 {
 		pprofAddr := fmt.Sprintf("localhost:%d", conf.Global.PprofPort)
 		pprofServer = &http.Server{Addr: pprofAddr, Handler: nil}
 		go pprofServer.ListenAndServe()
+	}
+
+	// New ControlPlane.
+	c, err := newControlPlane(log, nil, nil, conf, externGeoDataDirs)
+	if err != nil {
+		return err
 	}
 
 	// Serve tproxy TCP/UDP server util signals.
@@ -157,7 +158,7 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 		}()
 		control.GetDaeNetns().With(func() error {
 			if listener, err = c.ListenAndServe(readyChan, conf.Global.TproxyPort); err != nil {
-				log.Errorln("ListenAndServe:", err)
+				log.Errorf("%+v", oops.Wrapf(err, "ListenAndServe"))
 			}
 			return err
 		})
@@ -182,7 +183,7 @@ loop:
 				readyChan := make(chan bool, 1)
 				go func() {
 					if err := c.Serve(readyChan, listener); err != nil {
-						log.Errorln("ListenAndServe:", err)
+						log.Errorf("%+v", oops.Wrapf(err, "ListenAndServe"))
 					}
 					sigs <- nil
 				}()
@@ -235,9 +236,7 @@ loop:
 				var includes []string
 				newConf, includes, err = readConfig(cfgFile)
 				if err != nil {
-					log.WithFields(logrus.Fields{
-						"err": err,
-					}).Errorln("[Reload] Failed to reload")
+					log.Errorf("%+v", oops.Wrapf(err, "[Reload] Failed to reload"))
 					sdnotify.Ready()
 					_ = os.WriteFile(SignalProgressFilePath, append([]byte{consts.ReloadError}, []byte("\n"+err.Error())...), 0644)
 					continue
@@ -263,18 +262,14 @@ loop:
 			newC, err := newControlPlane(log, obj, dnsCache, newConf, externGeoDataDirs)
 			if err != nil {
 				reloadingErr = err
-				log.WithFields(logrus.Fields{
-					"err": err,
-				}).Errorln("[Reload] Failed to reload; try to roll back configuration")
+				log.Errorf("%+v", oops.Wrapf(err, "[Reload] Failed to reload; try to roll back configuration"))
 				// Load last config back.
 				newC, err = newControlPlane(log, obj, dnsCache, conf, externGeoDataDirs)
 				if err != nil {
 					sdnotify.Stopping()
 					obj.Close()
 					c.Close()
-					log.WithFields(logrus.Fields{
-						"err": err,
-					}).Fatalln("[Reload] Failed to roll back configuration")
+					log.Errorf("%+v", oops.Wrapf(err, "[Reload] Failed to roll back configuration"))
 				}
 				newConf = conf
 				log.Errorln("[Reload] Last reload failed; rolled back configuration")
@@ -317,7 +312,7 @@ loop:
 	defer os.Remove(PidFilePath)
 	defer control.GetDaeNetns().Close()
 	if e := c.Close(); e != nil {
-		return fmt.Errorf("close control plane: %w", e)
+		return oops.Errorf("close control plane: %w", e)
 	}
 	return nil
 }
@@ -335,7 +330,7 @@ func newControlPlane(log *logrus.Logger, bpf interface{}, dnsCache map[string]*c
 	}
 
 	/// Init Direct Dialers.
-	direct.InitDirectDialers(conf.Global.FallbackResolver)
+	direct.InitDirectDialers(conf.Global.FallbackResolver, conf.Global.Mptcp)
 	netutils.FallbackDns = netip.MustParseAddrPort(conf.Global.FallbackResolver)
 
 	// Resolve subscriptions to nodes.
@@ -345,7 +340,7 @@ func newControlPlane(log *logrus.Logger, bpf interface{}, dnsCache map[string]*c
 		client := http.Client{
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, network, addr string) (c net.Conn, err error) {
-					conn, err := direct.SymmetricDirect.DialContext(ctx, common.MagicNetwork("tcp", conf.Global.SoMarkFromDae, conf.Global.Mptcp), addr)
+					conn, err := direct.SymmetricDirect.DialContext(ctx, common.MagicNetwork("tcp", conf.Global.SoMarkFromDae), addr)
 					if err != nil {
 						return nil, err
 					}
@@ -362,7 +357,7 @@ func newControlPlane(log *logrus.Logger, bpf interface{}, dnsCache map[string]*c
 		for i := 0; ; i++ {
 			resp, err := client.Get(CheckNetworkLinks[i%len(CheckNetworkLinks)])
 			if err != nil {
-				log.Debugln("CheckNetwork:", err)
+				log.Debugln("%+v", oops.Wrapf(err, "CheckNetwork"))
 				var neterr net.Error
 				if errors.As(err, &neterr) && neterr.Timeout() {
 					// Do not sleep.
@@ -386,7 +381,7 @@ func newControlPlane(log *logrus.Logger, bpf interface{}, dnsCache map[string]*c
 	client := http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (c net.Conn, err error) {
-				conn, err := direct.SymmetricDirect.DialContext(ctx, common.MagicNetwork("tcp", conf.Global.SoMarkFromDae, conf.Global.Mptcp), addr)
+				conn, err := direct.SymmetricDirect.DialContext(ctx, common.MagicNetwork("tcp", conf.Global.SoMarkFromDae), addr)
 				if err != nil {
 					return nil, err
 				}
@@ -468,7 +463,7 @@ func preprocessWanInterfaceAuto(params *config.Config) error {
 		if ifname == "auto" {
 			defaultIfs, err := common.GetDefaultIfnames()
 			if err != nil {
-				return fmt.Errorf("failed to convert 'auto': %w", err)
+				return oops.Errorf("failed to convert 'auto': %w", err)
 			}
 			ifs = append(ifs, defaultIfs...)
 		} else {

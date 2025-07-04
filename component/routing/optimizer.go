@@ -160,20 +160,11 @@ type mmdbCache struct {
 	fieldCache map[string]map[string][]string // fieldName -> fieldValue -> subnets
 }
 
-// DatReaderOptimizer 添加缓存字段
 type DatReaderOptimizer struct {
 	LocationFinder  *assets.LocationFinder
 	Logger          *logrus.Logger
 	mmdbCaches      map[string]mmdbCache // filename -> cache
 	mmdbCachesMutex sync.RWMutex
-}
-
-func NewDatReaderOptimizer(logger *logrus.Logger, locationFinder *assets.LocationFinder) *DatReaderOptimizer {
-	return &DatReaderOptimizer{
-		LocationFinder: locationFinder,
-		Logger:         logger,
-		mmdbCaches:     make(map[string]mmdbCache),
-	}
 }
 
 func (o *DatReaderOptimizer) loadGeoSite(filename string, code string) (params []*config_parser.Param, err error) {
@@ -277,6 +268,10 @@ func (o *DatReaderOptimizer) loadMMDB(filename string, field string, value strin
 		return nil, err
 	}
 	o.Logger.Debugf("Read mmdb \"%v:%v=%v\" from %v", filename, field, value, filePath)
+
+	if o.mmdbCaches == nil {
+		o.mmdbCaches = make(map[string]mmdbCache)
+	}
 
 	// 检查缓存中是否已有结果
 	o.mmdbCachesMutex.RLock()

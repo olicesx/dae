@@ -244,7 +244,7 @@ func resolve(ctx context.Context, d netproxy.Dialer, dns netip.AddrPort, host st
 				case <-ctx.Done():
 					return
 				default:
-					time.Sleep(3 * time.Second)
+					time.Sleep(3 * time.Second) // TODO: Stuck Here, may from ResolveIp46 in ChooseDialTarget
 				}
 				_, err := c.Write(b)
 				if err != nil {

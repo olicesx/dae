@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
-	"structs"
 	"syscall"
 
 	"github.com/daeuniverse/dae/common"
@@ -38,7 +37,7 @@ func (c *ControlPlane) Route(src, dst netip.AddrPort, domain string, l4proto con
 		l4proto,
 		domain,
 		routingResult.Pname,
-		routingResult.Ifindex,
+		0, // ifindex not available in current bpfRoutingResult
 		routingResult.Dscp,
 		append([]uint8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, routingResult.Mac[:]...),
 	); err != nil {
@@ -53,15 +52,9 @@ func (c *controlPlaneCore) RetrieveRoutingResult(src, dst netip.AddrPort, l4prot
 	dstIp6 := dst.Addr().As16()
 
 	tuples := &bpfTuplesKey{
-		Sip: struct {
-			_       structs.HostLayout
-			U6Addr8 [16]uint8
-		}{U6Addr8: srcIp6},
-		Sport: common.Htons(src.Port()),
-		Dip: struct {
-			_       structs.HostLayout
-			U6Addr8 [16]uint8
-		}{U6Addr8: dstIp6},
+		Sip:     struct{ U6Addr8 [16]uint8 }{U6Addr8: srcIp6},
+		Sport:   common.Htons(src.Port()),
+		Dip:     struct{ U6Addr8 [16]uint8 }{U6Addr8: dstIp6},
 		Dport:   common.Htons(dst.Port()),
 		L4proto: l4proto,
 	}

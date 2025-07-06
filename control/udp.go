@@ -197,7 +197,6 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, r
 				"sniffed":  domain,
 				"ip":       RefineAddrPortToShow(realDst),
 				"pid":      routingResult.Pid,
-				"ifindex":  routingResult.Ifindex,
 				"dscp":     routingResult.Dscp,
 				"pname":    ProcessName2String(routingResult.Pname[:]),
 				"mac":      Mac2String(routingResult.Mac[:]),

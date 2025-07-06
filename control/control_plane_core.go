@@ -710,11 +710,12 @@ func (c *controlPlaneCore) BatchNewDomain(cache *LookupCache) error {
 		copy(r.Bitmap[:], c.domainRoutingMap[ip])
 		vals_routing = append(vals_routing, r)
 	}
-	if _, err := BpfMapBatchUpdate(c.bpf.DomainBumpMap, keys, vals_bump, &ebpf.BatchOptions{
-		ElemFlags: uint64(ebpf.UpdateAny),
-	}); err != nil {
-		return err
-	}
+	// TODO: DomainBumpMap is not available in current eBPF objects
+	// if _, err := BpfMapBatchUpdate(c.bpf.DomainBumpMap, keys, vals_bump, &ebpf.BatchOptions{
+	// 	ElemFlags: uint64(ebpf.UpdateAny),
+	// }); err != nil {
+	// 	return err
+	// }
 	if _, err := BpfMapBatchUpdate(c.bpf.DomainRoutingMap, keys, vals_routing, &ebpf.BatchOptions{
 		ElemFlags: uint64(ebpf.UpdateAny),
 	}); err != nil {
@@ -789,17 +790,19 @@ func (c *controlPlaneCore) BatchRemoveDomain(cache *LookupCache) error {
 			vals_modify_routing = append(vals_modify_routing, routingMap)
 		}
 	}
-	if _, err := BpfMapBatchDelete(c.bpf.DomainBumpMap, keys_del); err != nil {
-		return err
-	}
+	// TODO: DomainBumpMap is not available in current eBPF objects
+	// if _, err := BpfMapBatchDelete(c.bpf.DomainBumpMap, keys_del); err != nil {
+	// 	return err
+	// }
 	if _, err := BpfMapBatchDelete(c.bpf.DomainRoutingMap, keys_del); err != nil {
 		return err
 	}
-	if _, err := BpfMapBatchUpdate(c.bpf.DomainBumpMap, keys_modify, vals_modify_bump, &ebpf.BatchOptions{
-		ElemFlags: uint64(ebpf.UpdateAny),
-	}); err != nil {
-		return err
-	}
+	// TODO: DomainBumpMap is not available in current eBPF objects
+	// if _, err := BpfMapBatchUpdate(c.bpf.DomainBumpMap, keys_modify, vals_modify_bump, &ebpf.BatchOptions{
+	// 	ElemFlags: uint64(ebpf.UpdateAny),
+	// }); err != nil {
+	// 	return err
+	// }
 	if _, err := BpfMapBatchUpdate(c.bpf.DomainRoutingMap, keys_modify, vals_modify_routing, &ebpf.BatchOptions{
 		ElemFlags: uint64(ebpf.UpdateAny),
 	}); err != nil {

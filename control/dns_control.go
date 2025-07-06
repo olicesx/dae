@@ -360,7 +360,7 @@ func (c *DnsController) handleDNSRequest(
 	cacheKey := c.cacheKey(qname, qtype)
 
 	// Route Requset
-	RequestIndex, err := c.routing.RequestSelect(qname, qtype)
+	RequestIndex, upstream, err := c.routing.RequestSelect(qname, qtype)
 	if err != nil {
 		return err
 	}
@@ -370,7 +370,6 @@ func (c *DnsController) handleDNSRequest(
 		return nil
 	}
 
-	var upstream *dns.Upstream
 	if RequestIndex == consts.DnsRequestOutboundIndex_AsIs {
 		// As-is should not be valid in response routing, thus using connection realDest is reasonable.
 		var ip46 netutils.Ip46
@@ -386,11 +385,7 @@ func (c *DnsController) handleDNSRequest(
 			Ip46:     &ip46,
 		}
 	} else {
-		// Get corresponding upstream.
-		upstream, err = c.routing.GetUpstream(RequestIndex)
-		if err != nil {
-			return err
-		}
+		// upstream already retrieved from RequestSelect
 
 		// Lookup Cache
 		// Not Lookup Cache if AsIs

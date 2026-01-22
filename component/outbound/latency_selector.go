@@ -116,7 +116,7 @@ func (s *LatencyBasedSelector) printLatencies(aliveDialers []*dialer.Dialer, net
 			}
 			latencyStr := common.LatencyString(s.dialerToLatency[dialer], s.dialerGroup.dialerToAnnotation[dialer].AddLatency)
 			if !dialer.NeedAliveState() {
-				latencyStr = fmt.Sprint("Always Alive (%v)", latencyStr)
+				latencyStr = fmt.Sprintf("Always Alive (%v)", latencyStr)
 			}
 			builder.WriteString(fmt.Sprintf("%4d.%v %v: %v%s\n", i+1, tagStr, dialer.Name, latencyStr, fmt.Sprintf(" (priority: %d)", s.dialerGroup.GetPriority(dialer, s.getSortingLatency(dialer)))))
 		}

@@ -26,7 +26,8 @@ type RandomSelector struct {
 func NewRandomSelector(dialerGroup *DialerGroup, aliveChangeCallback func(alive bool, networkType *common.NetworkType)) Selector {
 	return &RandomSelector{
 		BaseSelector: BaseSelector{
-			dialerGroup: dialerGroup,
+			dialerGroup:         dialerGroup,
+			aliveChangeCallback: aliveChangeCallback,
 		},
 		dialerToAlive:   make(map[*dialer.Dialer]bool),
 		dialerToLatency: make(map[*dialer.Dialer]time.Duration),
@@ -38,7 +39,11 @@ func (s *RandomSelector) Select(networkType *common.NetworkType) (dialer *dialer
 	defer s.mu.RUnlock()
 
 	index := common.NetworkTypeToIndex(networkType)
-	return s.networkIndexToDialers[index][fastrand.Intn(len(s.networkIndexToDialers[index]))]
+	dialers := s.networkIndexToDialers[index]
+	if len(dialers) == 0 {
+		return nil
+	}
+	return dialers[fastrand.Intn(len(dialers))]
 }
 
 func (s *RandomSelector) updateDialerAliveState(dialer *dialer.Dialer, alive bool) {

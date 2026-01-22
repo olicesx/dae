@@ -36,5 +36,7 @@ func (s *BaseSelector) handleAliveStateChange(alive bool, networkType *common.Ne
 		}).Infof("Group has no dialer alive")
 	}
 	s.networkIndexToAlive[index] = &alive
-	s.aliveChangeCallback(alive, networkType)
+	if s.aliveChangeCallback != nil {
+		s.aliveChangeCallback(alive, networkType)
+	}
 }

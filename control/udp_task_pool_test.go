@@ -6,6 +6,7 @@
 package control
 
 import (
+	"net/netip"
 	"testing"
 	"time"
 
@@ -20,31 +21,29 @@ func TestUdpTaskPool(t *testing.T) {
 	t.Log(c)
 	DefaultNatTimeoutUDP = 1000 * time.Millisecond
 
+	key1 := netip.MustParseAddrPort("1.1.1.1:1")
+	key2 := netip.MustParseAddrPort("1.1.1.1:2")
+	key3 := netip.MustParseAddrPort("1.1.1.1:3")
+
 	// Test task execution
 	for i := 0; i <= UdpTaskQueueLength; i++ {
-		err = DefaultUdpTaskPool.EmitTask("testkey", func() { time.Sleep(500 * time.Millisecond) }, 5*time.Second)
-		require.NoError(t, err)
+		DefaultUdpTaskPool.EmitTask(key1, func() { time.Sleep(500 * time.Millisecond) })
 	} // Fill the queue to full
 	time.Sleep(400 * time.Millisecond) // Task should be executed
-	err = DefaultUdpTaskPool.EmitTask("testkey", func() {}, 5*time.Second)
-	require.NoError(t, err)
+	DefaultUdpTaskPool.EmitTask(key1, func() {})
 
 	// Test task timeout
 	for i := 0; i <= UdpTaskQueueLength; i++ {
-		err = DefaultUdpTaskPool.EmitTask("testkey2", func() { time.Sleep(500 * time.Millisecond) }, 100*time.Millisecond)
-		require.NoError(t, err)
+		DefaultUdpTaskPool.EmitTask(key2, func() { time.Sleep(500 * time.Millisecond) })
 	} // Fill the queue to full
 	time.Sleep(200 * time.Millisecond) // Task should be executed
-	err = DefaultUdpTaskPool.EmitTask("testkey2", func() {}, 5*time.Second)
-	require.NoError(t, err)
+	DefaultUdpTaskPool.EmitTask(key2, func() {})
 
 	// Test task gc with pending emit
 	for i := 0; i <= UdpTaskQueueLength; i++ {
-		err = DefaultUdpTaskPool.EmitTask("testkey3", func() { time.Sleep(100 * time.Second) }, 5*time.Second)
-		require.NoError(t, err)
+		DefaultUdpTaskPool.EmitTask(key3, func() { time.Sleep(100 * time.Second) })
 	} // Fill the queue
-	err = DefaultUdpTaskPool.EmitTask("testkey3", func() {}, 5*time.Second)
-	require.Error(t, err) // expect TaskPool is closed
+	DefaultUdpTaskPool.EmitTask(key3, func() {})
 
 	c, err = cpu.Times(false)
 	require.NoError(t, err)

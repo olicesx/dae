@@ -203,7 +203,7 @@ func NewControlPlane(
 		}); err != nil {
 			err = oops.Wrapf(err, "load eBPF objects")
 			if log.IsLevelEnabled(log.PanicLevel) {
-				log.Panicln("%+v", err)
+				log.Panicf("%+v", err)
 			}
 			return nil, err
 		}
@@ -922,7 +922,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				rss, err := getVmRSS()
 				common.VmRssKb.Set(float64(rss))
 				if err != nil {
-					log.Warnf("%+v", err, "getVmRSS")
+					log.Warnf("getVmRSS error: %+v", err)
 				}
 			case <-tickerResetTraffic.C:
 				common.TrafficBytes.Reset()

@@ -248,6 +248,90 @@ func (ss *Trie) HasPrefix(word string) bool {
 	return getBit(ss.leaves, nodeId) != 0
 }
 
+// HasSuffix iterates word backwards and checks if any suffix matches the Trie.
+// The Trie must have been built with reversed strings (via ToSuffixTrieString).
+func (ss *Trie) HasSuffix(word string) bool {
+	// Determine label bit size.
+	// We cannot access ss.labels.unitBitSize directly as it is private, but it is derived from chars.Size().
+	unitBitSize := bits.Len(uint(ss.chars.Size()))
+	
+	nodeId, bmIdx := 0, 0
+	labelsRaw := ss.labels.Raw()
+
+	// Fast path for domain trie (6-bit labels) without branching inside loop
+	if unitBitSize == 6 {
+		for i := len(word) - 1; i >= 0; i-- {
+			if (ss.leaves[nodeId>>6] & (1 << uint(nodeId&63))) != 0 {
+				return true
+			}
+
+			c := word[i]
+			charIndex := ss.chars.table[c]
+			if charIndex == 0 && c != ss.chars.zeroChar {
+				return false
+			}
+
+			for ; ; bmIdx++ {
+				if (ss.labelBitmap[bmIdx>>6] & (1 << uint(bmIdx&63))) != 0 {
+					return false
+				}
+
+				offset := bmIdx - nodeId
+				bitPos := offset * 6
+				wordIdx := bitPos >> 4
+				bitShift := bitPos & 15
+				
+				v := labelsRaw[wordIdx] >> bitShift
+				if bitShift > 10 {
+					v |= labelsRaw[wordIdx+1] << (16 - bitShift)
+				}
+				
+				if byte(v&0x3F) == charIndex {
+					break
+				}
+			}
+
+			rankIdx := bmIdx + 1
+			rankVal := int(ss.ranksBL.Get(rankIdx >> 6))
+			bitCnt := bits.OnesCount64(ss.labelBitmap[rankIdx>>6] & ((1 << uint(rankIdx&63)) - 1))
+			nodeId = rankIdx - rankVal - bitCnt
+			bmIdx = selectIthOne(ss.labelBitmap, ss.ranksBL, ss.selectsBL, nodeId-1) + 1
+		}
+		return (ss.leaves[nodeId>>6] & (1 << uint(nodeId&63))) != 0
+	}
+
+	// Generic Path
+	for i := len(word) - 1; i >= 0; i-- {
+		if (ss.leaves[nodeId>>6] & (1 << uint(nodeId&63))) != 0 {
+			return true
+		}
+
+		c := word[i]
+		charIndex := ss.chars.table[c]
+		if charIndex == 0 && c != ss.chars.zeroChar {
+			return false
+		}
+
+		for ; ; bmIdx++ {
+			if (ss.labelBitmap[bmIdx>>6] & (1 << uint(bmIdx&63))) != 0 {
+				return false
+			}
+
+			if byte(ss.labels.Get(bmIdx-nodeId)) == charIndex {
+				break
+			}
+		}
+
+		rankIdx := bmIdx + 1
+		rankVal := int(ss.ranksBL.Get(rankIdx >> 6))
+		bitCnt := bits.OnesCount64(ss.labelBitmap[rankIdx>>6] & ((1 << uint(rankIdx&63)) - 1))
+		nodeId = rankIdx - rankVal - bitCnt
+		bmIdx = selectIthOne(ss.labelBitmap, ss.ranksBL, ss.selectsBL, nodeId-1) + 1
+	}
+
+	return (ss.leaves[nodeId>>6] & (1 << uint(nodeId&63))) != 0
+}
+
 func setBit(bm *[]uint64, i int, v int) {
 	for i>>6 >= len(*bm) {
 		*bm = append(*bm, 0)

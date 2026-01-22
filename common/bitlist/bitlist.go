@@ -74,6 +74,11 @@ func (m *CompactBitList) Get(iUnit int) (v uint64) {
 	i := iUnit * m.unitBitSize / 16
 	j := iUnit * m.unitBitSize % 16
 
+	// Fast path: value fits in single uint16.
+	if j+m.unitBitSize <= 16 {
+		return uint64((b[i] >> j) & (1<<m.unitBitSize - 1))
+	}
+
 	var val uint16
 	byteSpace := 16 - j
 	// 11111111
@@ -135,4 +140,8 @@ func (m *CompactBitList) Tighten() {
 	a := make([]uint16, m.b.Len())
 	copy(a, m.b.Slice())
 	m.b = anybuffer.NewBufferFrom(a)
+}
+
+func (m *CompactBitList) Raw() []uint16 {
+	return m.b.Slice()
 }

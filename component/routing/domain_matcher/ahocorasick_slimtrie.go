@@ -118,14 +118,13 @@ func (n *AhocorasickSlimtrie) MatchDomainBitmap(domain string) (bitmap []uint32)
 	// 		return bitmap
 	// 	}
 	// }
-	// Suffix matching.
-	suffixTrieDomain := ToSuffixTrieString("^" + domain)
+	// Suffix matching via backward iteration (avoids string reversal allocation).
+	checkDomain := "^" + domain
 	for _, i := range n.validTrieIndexes {
 		if bitmap[i/32]&(1<<(i%32)) > 0 {
-			// Already matched.
 			continue
 		}
-		if n.trie[i].HasPrefix(suffixTrieDomain) {
+		if n.trie[i].HasSuffix(checkDomain) {
 			bitmap[i/32] |= 1 << (i % 32)
 		}
 	}

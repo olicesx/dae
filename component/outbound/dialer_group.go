@@ -65,6 +65,7 @@ func NewDialerGroup(
 
 	for _, d := range dialers {
 		d.RegisterDialerGroup(g)
+		g.NotifyStatusChange(d)
 	}
 
 	return g

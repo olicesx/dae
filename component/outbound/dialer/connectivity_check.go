@@ -447,6 +447,8 @@ func (d *Dialer) ReportUnavailable() {
 }
 
 func (d *Dialer) Update(ok bool, latency time.Duration, networkType *common.NetworkType, err error) {
+	oldAlive := d.alive
+	d.alive = ok
 	for g := range d.registeredDialerGroups {
 		if !ok {
 			latency = g.GetTimeoutPenalty()
@@ -469,7 +471,7 @@ func (d *Dialer) Update(ok bool, latency time.Duration, networkType *common.Netw
 			if networkType != nil {
 				fields["network"] = networkType.String()
 			}
-			if !d.alive {
+			if !oldAlive {
 				log.WithFields(fields).Infoln("Connectivity Check")
 			} else {
 				log.WithFields(fields).Debugln("Connectivity Check")
@@ -481,14 +483,15 @@ func (d *Dialer) Update(ok bool, latency time.Duration, networkType *common.Netw
 			if networkType != nil {
 				fields["network"] = networkType.String()
 			}
-			if d.alive {
+			if oldAlive {
 				log.WithFields(fields).Warnln(oops.Wrapf(err, "Connectivity Check Failed"))
 			} else {
 				log.WithFields(fields).Infoln(oops.Wrapf(err, "Connectivity Check Failed"))
 			}
 		}
 	}
-	d.alive = ok
+	// Notify all registered groups once after all statistics are updated
+	d.NotifyStatusChange()
 }
 
 func (d *Dialer) Check(opts *CheckOption) (ok bool, latency time.Duration, err error) {

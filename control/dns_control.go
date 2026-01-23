@@ -6,6 +6,7 @@
 package control
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"math"
@@ -17,6 +18,7 @@ import (
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/dns"
@@ -81,6 +83,12 @@ type DnsController struct {
 	mu              sync.Mutex
 	deadlineTimers  map[string]map[netip.Addr]*time.Timer
 	sniffVerifyMode consts.SniffVerifyMode
+	// sfGroup deduplicates concurrent DNS queries for the same domain
+	sfGroup singleflight.Group
+	// workerPool processes DNS requests using fixed worker pool
+	workerPool *DnsWorkerPool
+	// responseWg tracks response goroutines for graceful shutdown
+	responseWg sync.WaitGroup
 }
 
 func parseIpVersionPreference(prefer int) (uint16, error) {
@@ -103,6 +111,12 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 		return nil, err
 	}
 
+	// Normalize fixedDomainTtl keys to lowercase for consistent matching
+	normalizedFixedDomainTtl := make(map[string]int, len(option.FixedDomainTtl))
+	for domain, ttl := range option.FixedDomainTtl {
+		normalizedFixedDomainTtl[dnsmessage.CanonicalName(domain)] = ttl
+	}
+
 	return &DnsController{
 		routing:     routing,
 		qtypePrefer: prefer,
@@ -112,13 +126,14 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 		lookupCacheTimeout: option.LookupCacheTimeout,
 		bestDialerChooser:  option.BestDialerChooser,
 
-		fixedDomainTtl:    option.FixedDomainTtl,
+		fixedDomainTtl:    normalizedFixedDomainTtl,
 		minSniffingTtl:    option.MinSniffingTtl,
 		enableCache:       option.EnableCache,
 		sniffVerifyMode:   option.SniffVerifyMode,
 		dnsForwarderCache: sync.Map{},
 		dnsCache:          newCommonDnsCache[dnsCacheKey](),
 		deadlineTimers:    make(map[string]map[netip.Addr]*time.Timer),
+		workerPool:        NewDnsWorkerPool(8, 1000), // 8 workers, 1000 queue size
 	}, nil
 }
 
@@ -143,6 +158,7 @@ type dnsRequest struct {
 	dst           netip.AddrPort
 	routingResult *bpfRoutingResult
 	isTcp         bool
+	controller    *DnsController // Reference to controller for worker pool
 }
 
 type dialArgument struct {
@@ -195,65 +211,184 @@ func (c *DnsController) Handle(dnsMessage *dnsmessage.Msg, req *dnsRequest) {
 	// Avoids duplicated id from clients, so make the id unique.
 	dnsMessage.Id = uint16(fastrand.Intn(math.MaxUint16))
 
-	go func() {
-		var err error
-		// Check ip version preference and qtype.
-		switch queryInfo.qtype {
-		case dnsmessage.TypeA, dnsmessage.TypeAAAA:
-			if c.qtypePrefer == 0 {
-				err = c.handleDNSRequest(dnsMessage, req, queryInfo)
+	// Set controller reference in request for worker pool
+	req.controller = c
+
+	// Fast path: Check cache before submitting to worker pool
+	// This avoids worker queue latency for cache hits (90%+ of traffic)
+	if c.enableCache {
+		// Perform routing selection to determine outbound
+		requestIndex, err := c.routing.RequestSelect(queryInfo.qname, queryInfo.qtype)
+		if err == nil && requestIndex != consts.DnsRequestOutboundIndex_Reject {
+			// Get outbound for cache key
+			var outbound *outbound.DialerGroup
+			if requestIndex == consts.DnsRequestOutboundIndex_AsIs {
+				// AsIs mode - use nil as outbound (cache key won't include outbound)
+				outbound = nil
 			} else {
-				// Try to make both A and AAAA lookups.
-				dnsMessage2 := dnsMessage.Copy()
-				dnsMessage2.Id = uint16(fastrand.Intn(math.MaxUint16))
-				switch queryInfo.qtype {
-				case dnsmessage.TypeA:
-					dnsMessage2.Question[0].Qtype = dnsmessage.TypeAAAA
-				case dnsmessage.TypeAAAA:
-					dnsMessage2.Question[0].Qtype = dnsmessage.TypeA
+				var upstream *dns.Upstream
+				upstream, err = c.routing.GetUpstream(requestIndex)
+				if err == nil {
+					// Create a temporary dialArgument to get outbound
+					// This is a bit inefficient but necessary for correct cache key
+					dialArg, err := c.bestDialerChooser(req, upstream)
+					if err == nil {
+						outbound = dialArg.Outbound
+					}
+				}
+			}
+
+			// Try to get cached response
+			cacheKey := &dnsCacheKey{queryInfo: queryInfo, outbound: outbound}
+			if cache := c.dnsCache.Get(*cacheKey); cache != nil && !AllTimeout(cache) {
+				// Cache hit - process synchronously for minimal latency
+				FillInto(dnsMessage, cache)
+
+				if log.IsLevelEnabled(log.DebugLevel) && len(dnsMessage.Question) > 0 {
+					log.WithFields(log.Fields{
+						"answer": dnsMessage.Answer,
+					}).Debugf("UDP(DNS) <-> Cache (fast path): %v %v", queryInfo.qname, queryInfo.qtype)
 				}
 
-				// TODO: ignoreFixedTTL?
-				errCh := make(chan error, 1)
-				go func() {
-					err = c.handleDNSRequest(dnsMessage2, req, queryInfo)
-					errCh <- err
-				}()
-				err = oops.Join(c.handleDNSRequest(dnsMessage, req, queryInfo), <-errCh)
-				if err != nil {
-					break
+				// Update metrics
+				labels := prometheus.Labels{
+					"outbound": func() string {
+						if outbound != nil {
+							return outbound.Name
+						}
+						return "asis"
+					}(),
+					"qtype": QtypeToString(queryInfo.qtype),
 				}
-				if c.qtypePrefer != queryInfo.qtype && dnsMessage2 != nil && IncludeAnyIpInMsg(dnsMessage2) {
-					c.reject(dnsMessage)
+				common.DnsCacheHit.With(labels).Inc()
+
+				// Send response immediately
+				dnsMessage.Id = id
+				dnsMessage.Compress = true
+				buf := pool.GetBuffer(512)
+				defer pool.PutBuffer(buf)
+				if data, err := dnsMessage.PackBuffer(buf); err != nil {
+					log.Errorf("%+v", oops.Wrapf(err, "failed to pack dns message"))
+				} else if err = sendPkt(data, req.dst, req.src); err != nil {
+					log.Warningf("%+v", oops.Wrapf(err, "failed to send dns message back"))
 				}
+				return
 			}
-		default:
+		}
+	}
+
+	// Slow path: Cache miss - submit to worker pool
+	task := &DnsTask{
+		msg:       dnsMessage,
+		req:       req,
+		queryInfo: queryInfo,
+		ctx:       context.Background(),
+		done:      make(chan struct{}),
+	}
+
+	// Submit to worker pool and process asynchronously
+	if !c.workerPool.Submit(task) {
+		// Worker pool queue is full, fall back to goroutine
+		log.Warnf("DNS worker pool queue full, falling back to goroutine")
+		c.responseWg.Add(1)
+		go func() {
+			defer c.responseWg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Errorf("DNS response goroutine panic: %v", r)
+				}
+			}()
+			c.processDnsRequest(dnsMessage, req, queryInfo, id)
+			// Send response
+			dnsMessage.Id = id
+			dnsMessage.Compress = true
+			buf := pool.GetBuffer(512)
+			defer pool.PutBuffer(buf)
+			if data, err := dnsMessage.PackBuffer(buf); err != nil {
+				log.Errorf("%+v", oops.Wrapf(err, "failed to pack dns message"))
+			} else if err = sendPkt(data, req.dst, req.src); err != nil {
+				log.Warningf("%+v", oops.Wrapf(err, "failed to send dns message back"))
+			}
+		}()
+	} else {
+		// Process in worker pool - wait for worker to finish before sending response
+		c.responseWg.Add(1)
+		go func() {
+			defer c.responseWg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Errorf("DNS response goroutine panic: %v", r)
+				}
+			}()
+			// Wait for worker to finish processing
+			<-task.done
+			// The worker has called processDnsRequest which modified dnsMessage
+			// Now we can safely send the response back
+
+			// Keep the id the same with request.
+			dnsMessage.Id = id
+			dnsMessage.Compress = true
+			buf := pool.GetBuffer(512)
+			defer pool.PutBuffer(buf)
+			if data, err := dnsMessage.PackBuffer(buf); err != nil {
+				log.Errorf("%+v", oops.Wrapf(err, "failed to pack dns message"))
+			} else if err = sendPkt(data, req.dst, req.src); err != nil {
+				log.Warningf("%+v", oops.Wrapf(err, "failed to send dns message back"))
+			}
+		}()
+	}
+}
+
+// processDnsRequest contains the DNS request processing logic
+// This is called by the worker pool or fallback goroutine
+func (c *DnsController) processDnsRequest(dnsMessage *dnsmessage.Msg, req *dnsRequest, queryInfo queryInfo, id uint16) {
+	var err error
+	// Check ip version preference and qtype.
+	switch queryInfo.qtype {
+	case dnsmessage.TypeA, dnsmessage.TypeAAAA:
+		if c.qtypePrefer == 0 {
 			err = c.handleDNSRequest(dnsMessage, req, queryInfo)
-		}
-		if err != nil {
-			netErr, ok := IsNetError(err)
-			err = oops.
-				With("Is NetError", ok).
-				With("Is Temporary", ok && netErr.Temporary()).
-				With("Is Timeout", ok && netErr.Timeout()).
-				Wrapf(err, "failed to make dns request")
-			if !ok || !netErr.Temporary() {
-				log.Warningf("%+v", err)
+		} else {
+			// Try to make both A and AAAA lookups.
+			dnsMessage2 := dnsMessage.Copy()
+			dnsMessage2.Id = uint16(fastrand.Intn(math.MaxUint16))
+			switch queryInfo.qtype {
+			case dnsmessage.TypeA:
+				dnsMessage2.Question[0].Qtype = dnsmessage.TypeAAAA
+			case dnsmessage.TypeAAAA:
+				dnsMessage2.Question[0].Qtype = dnsmessage.TypeA
 			}
-			dnsMessage.Rcode = dnsmessage.RcodeServerFailure
-			dnsMessage.Response = true
+
+			// TODO: ignoreFixedTTL?
+			errCh := make(chan error, 1)
+			go func() {
+				err = c.handleDNSRequest(dnsMessage2, req, queryInfo)
+				errCh <- err
+			}()
+			err = oops.Join(c.handleDNSRequest(dnsMessage, req, queryInfo), <-errCh)
+			if err != nil {
+				break
+			}
+			if c.qtypePrefer != queryInfo.qtype && dnsMessage2 != nil && IncludeAnyIpInMsg(dnsMessage2) {
+				c.reject(dnsMessage)
+			}
 		}
-		// Keep the id the same with request.
-		dnsMessage.Id = id
-		dnsMessage.Compress = true
-		buf := pool.GetBuffer(512)
-		defer pool.PutBuffer(buf)
-		if data, err := dnsMessage.PackBuffer(buf); err != nil {
-			log.Errorf("%+v", oops.Wrapf(err, "failed to pack dns message"))
-		} else if err = sendPkt(data, req.dst, req.src); err != nil {
-			log.Warningf("%+v", oops.Wrapf(err, "failed to send dns message back"))
+	default:
+		err = c.handleDNSRequest(dnsMessage, req, queryInfo)
+	}
+	if err != nil {
+		netErr, ok := IsNetError(err)
+		err = oops.
+			With("Is NetError", ok).
+			With("Is Temporary", ok && netErr.Temporary()).
+			With("Is Timeout", ok && netErr.Timeout()).
+			Wrapf(err, "failed to make dns request")
+		if !ok || !netErr.Temporary() {
+			log.Warningf("%+v", err)
 		}
-	}()
+		dnsMessage.Rcode = dnsmessage.RcodeServerFailure
+		dnsMessage.Response = true
+	}
 }
 
 // TODO: 除了dialSend, 不应该有可预期的 err
@@ -264,7 +399,7 @@ func (c *DnsController) handleDNSRequest(
 	req *dnsRequest,
 	queryInfo queryInfo,
 ) error {
-	// Route Requset
+	// Route Request
 	RequestIndex, err := c.routing.RequestSelect(queryInfo.qname, queryInfo.qtype)
 	if err != nil {
 		return err
@@ -561,9 +696,45 @@ func (c *DnsController) dialSend(msg *dnsmessage.Msg, upstream *dns.Upstream, di
 		forwarder = actualValue.(DnsForwarder)
 	}
 
-	err := forwarder.ForwardDNS(msg)
+	// Use singleflight to deduplicate concurrent queries for the same domain
+	// Key format: "qname:qtype:upstream" to ensure uniqueness
+	sfKey := fmt.Sprintf("%s:%d:%s", queryInfo.qname, queryInfo.qtype, upstream.String())
+	result, err, shared := c.sfGroup.Do(sfKey, func() (interface{}, error) {
+		// ForwardDNS performs the actual DNS query
+		forwardErr := forwarder.ForwardDNS(msg)
+		if forwardErr != nil {
+			return nil, forwardErr
+		}
+		// Return a copy of the message to avoid data races
+		return msg.Copy(), nil
+	})
+
 	if err != nil {
 		return err
+	}
+
+	// If the result was shared (another goroutine performed the query),
+	// copy the result back to the original message
+	if shared {
+		// Use comma-ok pattern for type assertion to prevent panic
+		resultMsg, ok := result.(*dnsmessage.Msg)
+		if !ok {
+			return oops.Errorf("singleflight result type assertion failed: expected *dnsmessage.Msg, got %T", result)
+		}
+		// Copy the response back to the original message
+		msg.Id = resultMsg.Id
+		msg.Response = resultMsg.Response
+		msg.Rcode = resultMsg.Rcode
+		msg.Answer = append([]dnsmessage.RR{}, resultMsg.Answer...)
+		msg.Ns = append([]dnsmessage.RR{}, resultMsg.Ns...)
+		msg.Extra = append([]dnsmessage.RR{}, resultMsg.Extra...)
+	}
+
+	if log.IsLevelEnabled(log.DebugLevel) && shared {
+		log.WithFields(log.Fields{
+			"qname": queryInfo.qname,
+			"qtype": queryInfo.qtype,
+		}).Debugf("DNS query result was shared (singleflight deduplication)")
 	}
 
 	log.WithFields(log.Fields{
@@ -610,6 +781,14 @@ func (c *DnsController) dialSend(msg *dnsmessage.Msg, upstream *dns.Upstream, di
 func (c *DnsController) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Stop worker pool
+	if c.workerPool != nil {
+		c.workerPool.Stop()
+	}
+
+	// Wait for all response goroutines to finish
+	c.responseWg.Wait()
 
 	// Clean up all deadline timers to prevent goroutine leaks
 	for _, ipTimers := range c.deadlineTimers {

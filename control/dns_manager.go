@@ -125,7 +125,9 @@ func (m *DnsManager) read(buf []byte) (data []byte, err error) {
 }
 
 func (m *DnsManager) feed(data []byte) {
-	var msg dnsmessage.Msg
+	// Create new DNS message directly (no pool for simplicity and safety)
+	msg := &dnsmessage.Msg{}
+
 	err := msg.Unpack(data)
 	if err != nil {
 		log.Warnf("Failed to unpack dns resp, stream: %v, err: %v, data: %v", m.stream, err, data)
@@ -134,16 +136,16 @@ func (m *DnsManager) feed(data []byte) {
 	conn, ok := m.recvMap.Load(msg.Id)
 	if !ok {
 		log.Debugf("Unknown dns resp msg, stream: %v, id: %v", m.stream, msg.Id)
-		// Ignore message from unknown session
 		return
 	}
 
 	select {
-	case conn.(chan *dnsmessage.Msg) <- &msg:
-		// OK
+	case conn.(chan *dnsmessage.Msg) <- msg:
+		// OK - message is now owned by the receiver
+		return
 	default:
 		log.Debugf("Drop dns resp msg, stream: %v, id: %v", m.stream, msg.Id)
-		// Channel full, drop the message
+		return
 	}
 }
 
@@ -197,6 +199,7 @@ func (m *DnsManager) Resolve(ctx context.Context, msg *dnsmessage.Msg) error {
 		case <-ctx.Done():
 			return context.Canceled
 		case recvMsg := <-recvCh:
+			// Copy received message to the output message
 			*msg = *recvMsg
 			return nil
 		case <-timer.C:

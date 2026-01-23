@@ -76,7 +76,7 @@ func (c *commonDnsCache[K]) Get(cacheKey K) []*DnsCache {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if caches, ok := c.cache[cacheKey]; ok {
-		return caches
+		return append([]*DnsCache{}, caches...)
 	}
 	return nil
 }

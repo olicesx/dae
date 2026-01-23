@@ -63,7 +63,7 @@ func IncludeAnyIpInMsg(msg *dnsmessage.Msg) bool {
 
 type commonDnsCache[K comparable] struct {
 	cache map[K][]*DnsCache
-	mu    sync.Mutex
+	mu    sync.RWMutex
 }
 
 func newCommonDnsCache[K comparable]() *commonDnsCache[K] {
@@ -73,8 +73,8 @@ func newCommonDnsCache[K comparable]() *commonDnsCache[K] {
 }
 
 func (c *commonDnsCache[K]) Get(cacheKey K) []*DnsCache {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if caches, ok := c.cache[cacheKey]; ok {
 		return caches
 	}

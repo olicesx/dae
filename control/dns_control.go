@@ -278,8 +278,9 @@ func (c *DnsController) Handle(dnsMessage *dnsmessage.Msg, req *dnsRequest) {
 	}
 
 	// Slow path: Cache miss - submit to worker pool
+	// Create a copy of the message for the worker to avoid data races
 	task := &DnsTask{
-		msg:       dnsMessage,
+		msg:       dnsMessage.Copy(),
 		req:       req,
 		queryInfo: queryInfo,
 		ctx:       context.Background(),
@@ -298,7 +299,10 @@ func (c *DnsController) Handle(dnsMessage *dnsmessage.Msg, req *dnsRequest) {
 					log.Errorf("DNS response goroutine panic: %v", r)
 				}
 			}()
-			c.processDnsRequest(dnsMessage, req, queryInfo, id)
+			// Process the copy and copy result back
+			c.processDnsRequest(task.msg, req, queryInfo, id)
+			*dnsMessage = *task.msg
+
 			// Send response
 			dnsMessage.Id = id
 			dnsMessage.Compress = true
@@ -322,8 +326,9 @@ func (c *DnsController) Handle(dnsMessage *dnsmessage.Msg, req *dnsRequest) {
 			}()
 			// Wait for worker to finish processing
 			<-task.done
-			// The worker has called processDnsRequest which modified dnsMessage
-			// Now we can safely send the response back
+			// The worker has processed the task (which was a copy of dnsMessage)
+			// Now we need to copy the result back to the original dnsMessage
+			*dnsMessage = *task.msg
 
 			// Keep the id the same with request.
 			dnsMessage.Id = id

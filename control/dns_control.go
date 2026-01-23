@@ -52,8 +52,8 @@ var (
 
 type DnsControllerOption struct {
 	MatchBitmap        func(fqdn string) []uint32
-	NewLookupCache     func(ip netip.Addr, domainBitmap []uint32) error
-	LookupCacheTimeout func(ip netip.Addr, domainBitmap []uint32) error
+	NewLookupCache     func(ip netip.Addr, domainBitmap [32]uint32) error
+	LookupCacheTimeout func(ip netip.Addr, domainBitmap [32]uint32) error
 	BestDialerChooser  func(req *dnsRequest, upstream *dns.Upstream) (*dialArgument, error)
 	IpVersionPrefer    int
 	FixedDomainTtl     map[string]int
@@ -67,8 +67,8 @@ type DnsController struct {
 	qtypePrefer uint16
 
 	matchBitmap        func(fqdn string) []uint32
-	newLookupCache     func(ip netip.Addr, domainBitmap []uint32) error
-	lookupCacheTimeout func(ip netip.Addr, domainBitmap []uint32) error
+	newLookupCache     func(ip netip.Addr, domainBitmap [32]uint32) error
+	lookupCacheTimeout func(ip netip.Addr, domainBitmap [32]uint32) error
 	bestDialerChooser  func(req *dnsRequest, upstream *dns.Upstream) (*dialArgument, error)
 
 	fixedDomainTtl    map[string]int
@@ -438,8 +438,9 @@ func (c *DnsController) logDnsResponse(req *dnsRequest, dialArgument *dialArgume
 	}
 }
 
-func (c *DnsController) checkDomainBitmap(qname string) (domainBitmap []uint32, allZero bool, shouldUpdateLookupCache bool) {
-	domainBitmap = c.matchBitmap(qname)
+func (c *DnsController) checkDomainBitmap(qname string) (domainBitmap [32]uint32, allZero bool, shouldUpdateLookupCache bool) {
+	bitmapSlice := c.matchBitmap(qname)
+	copy(domainBitmap[:], bitmapSlice)
 	allZero = true
 	for _, v := range domainBitmap {
 		if v != 0 {
@@ -454,7 +455,7 @@ func (c *DnsController) checkDomainBitmap(qname string) (domainBitmap []uint32, 
 	return
 }
 
-func (c *DnsController) updateLookupCache(qname string, domainBitmap []uint32, allZero bool, ips []netip.Addr, ttl time.Duration) error {
+func (c *DnsController) updateLookupCache(qname string, domainBitmap [32]uint32, allZero bool, ips []netip.Addr, ttl time.Duration) error {
 	if len(ips) == 0 {
 		return nil
 	}

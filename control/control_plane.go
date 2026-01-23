@@ -442,7 +442,7 @@ func NewControlPlane(
 		MatchBitmap: func(fqdn string) []uint32 {
 			return plane.routingMatcher.domainMatcher.MatchDomainBitmap(fqdn)
 		},
-		NewLookupCache: func(ip netip.Addr, domainBitmap []uint32) error {
+		NewLookupCache: func(ip netip.Addr, domainBitmap [32]uint32) error {
 			// Write mappings into eBPF map:
 			// IP record (from dns lookup) -> domain routing
 			if err := core.BatchNewDomain(ip, domainBitmap); err != nil {
@@ -450,7 +450,7 @@ func NewControlPlane(
 			}
 			return nil
 		},
-		LookupCacheTimeout: func(ip netip.Addr, domainBitmap []uint32) error {
+		LookupCacheTimeout: func(ip netip.Addr, domainBitmap [32]uint32) error {
 			if err := core.BatchRemoveDomain(ip, domainBitmap); err != nil {
 				return oops.Wrapf(err, "BatchRemoveDomain")
 			}

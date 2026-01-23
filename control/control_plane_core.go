@@ -10,7 +10,6 @@ import (
 	"net/netip"
 	"os"
 	"regexp"
-	"slices"
 	"sync"
 
 	"github.com/cilium/ebpf"
@@ -52,7 +51,7 @@ type controlPlaneCore struct {
 	// IP -> rule index -> is all matched (Bitmap)
 	// one means all domains mapped by the current IP address are matched.
 	// TODO: 现在的算法中, 这个值可能不准确
-	domainRoutingMap map[netip.Addr][]uint32
+	domainRoutingMap map[netip.Addr][32]uint32
 	bumpMapMu        sync.Mutex
 
 	closed context.Context
@@ -85,7 +84,7 @@ func newControlPlaneCore(
 		ifmgr:              ifmgr,
 		domainBumpMap:      make(map[netip.Addr][]uint32),
 		domainUnmatchedMap: make(map[netip.Addr][]uint32),
-		domainRoutingMap:   make(map[netip.Addr][]uint32),
+		domainRoutingMap:   make(map[netip.Addr][32]uint32),
 		closed:             closed,
 		close:              toClose,
 	}
@@ -654,7 +653,16 @@ func getBit(bitmap []uint32, index int) uint32 {
 	return bitmap[index/32] >> (index % 32) & 1
 }
 
+
+func getBitArray(bitmap *[32]uint32, index int) uint32 {
+	return bitmap[index/32] >> (index % 32) & 1
+}
+
 func setBit(bitmap []uint32, index int) {
+	bitmap[index/32] |= 1 << (index % 32)
+}
+
+func setBitArray(bitmap *[32]uint32, index int) {
 	bitmap[index/32] |= 1 << (index % 32)
 }
 
@@ -662,10 +670,14 @@ func clearBit(bitmap []uint32, index int) {
 	bitmap[index/32] &^= 1 << (index % 32)
 }
 
+func clearBitArray(bitmap *[32]uint32, index int) {
+	bitmap[index/32] &^= 1 << (index % 32)
+}
+
 // BatchNewDomain update bpf map domain_bump and domain_routing. This function should be invoked every new cache.
 // TODO: 处理域名 IP 变更的情况
 // 这需要对新增的 answers 单独调用 BatchNewDomain, 同时针对每个 answer 单独处理过期时的 BatchRemoveDomain
-func (c *controlPlaneCore) BatchNewDomain(ip netip.Addr, domainBitmap []uint32) error {
+func (c *controlPlaneCore) BatchNewDomain(ip netip.Addr, domainBitmap [32]uint32) error {
 	// Update bpf map.
 	// Construct keys and vals, and BpfMapBatchUpdate.
 	c.bumpMapMu.Lock()
@@ -682,7 +694,7 @@ func (c *controlPlaneCore) BatchNewDomain(ip netip.Addr, domainBitmap []uint32) 
 		c.domainUnmatchedMap[ip] = make([]uint32, consts.MaxMatchSetLen)
 	}
 	for index := 0; index < consts.MaxMatchSetLen; index++ {
-		current := getBit(domainBitmap, index)
+		current := getBitArray(&domainBitmap, index)
 		c.domainBumpMap[ip][index] += current
 		if current == 0 {
 			c.domainUnmatchedMap[ip][index]++
@@ -691,23 +703,25 @@ func (c *controlPlaneCore) BatchNewDomain(ip netip.Addr, domainBitmap []uint32) 
 
 	for index, val := range c.domainBumpMap[ip] {
 		if val > 0 {
-			setBit(bumpMap.Bitmap[:], index)
+			setBitArray(&bumpMap.Bitmap, index)
 		}
 	}
 
 	if !exists {
 		// New IP, init routingMap
-		c.domainRoutingMap[ip] = slices.Clone(domainBitmap)
+		c.domainRoutingMap[ip] = domainBitmap
 	} else {
 		// Old IP, Update routingMap
+		routingMap := c.domainRoutingMap[ip]
 		for index := 0; index < consts.MaxMatchSetLen; index++ {
 			// If this domain matches the current rule, all previous domains also match the current rule, then it still matches, so no need to update
 			// If previous domains not match the current rule, then it still not match, so no need to update
 			// If previous domains match the current rule, but current domain not match, then it does not match, so need to update
-			if getBit(c.domainRoutingMap[ip], index) == 1 && getBit(domainBitmap, index) != 1 {
-				clearBit(c.domainRoutingMap[ip], index)
+			if getBitArray(&routingMap, index) == 1 && getBitArray(&domainBitmap, index) != 1 {
+				clearBitArray(&routingMap, index)
 			}
 		}
+		c.domainRoutingMap[ip] = routingMap
 	}
 
 	ip6 := ip.As16()
@@ -723,7 +737,7 @@ func (c *controlPlaneCore) BatchNewDomain(ip netip.Addr, domainBitmap []uint32) 
 
 // TODO: 如果不 GC 有什么代价呢? 随着时间增加准确性下降?
 // BatchRemoveDomainBump update or remove bpf map domain_bump and domain_routing.
-func (c *controlPlaneCore) BatchRemoveDomain(ip netip.Addr, domainBitmap []uint32) error {
+func (c *controlPlaneCore) BatchRemoveDomain(ip netip.Addr, domainBitmap [32]uint32) error {
 	// Update bpf map.
 	// Update and determine whether to delete
 
@@ -731,7 +745,7 @@ func (c *controlPlaneCore) BatchRemoveDomain(ip netip.Addr, domainBitmap []uint3
 	defer c.bumpMapMu.Unlock()
 
 	for index := 0; index < consts.MaxMatchSetLen; index++ {
-		current := getBit(domainBitmap, index)
+		current := getBitArray(&domainBitmap, index)
 		c.domainBumpMap[ip][index] -= current
 		if current == 0 {
 			c.domainUnmatchedMap[ip][index]--
@@ -745,13 +759,17 @@ func (c *controlPlaneCore) BatchRemoveDomain(ip netip.Addr, domainBitmap []uint3
 		if val > 0 {
 			// This IP still refers to some domain name that matches the domain_set, so there is no need to delete
 			del = false
-			setBit(bumpMap.Bitmap[:], index)
+			setBitArray(&bumpMap.Bitmap, index)
 			if c.domainUnmatchedMap[ip][index] == 0 {
-				setBit(c.domainRoutingMap[ip], index)
+				routingMap := c.domainRoutingMap[ip]
+				setBitArray(&routingMap, index)
+				c.domainRoutingMap[ip] = routingMap
 			}
 		} else {
 			// This IP no longer refers to any domain name that matches the domain_set
-			clearBit(c.domainRoutingMap[ip], index)
+			routingMap := c.domainRoutingMap[ip]
+			clearBitArray(&routingMap, index)
+			c.domainRoutingMap[ip] = routingMap
 		}
 	}
 

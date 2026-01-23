@@ -349,7 +349,6 @@ func (d *Dialer) runCheckLoop(checkOpt *CheckOption) {
 				}
 				ok, latency, err := d.Check(checkOpt)
 				d.Update(ok, latency, checkOpt.networkType, err)
-				d.NotifyStatusChange()
 				if ok {
 					break
 				}
@@ -426,9 +425,9 @@ func (d *Dialer) UnregisterDialerGroup(g DialerGroup) {
 }
 
 func (d *Dialer) NotifyStatusChange() {
-	if !d.needAliveState {
-		return
-	}
+	// if !d.needAliveState {
+	// 	return
+	// }
 	// Inform DialerGroups to update state.
 	// We use lock because AliveDialerSetSet is a reference of that in collection.
 	d.mu.Lock()

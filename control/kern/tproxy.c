@@ -1629,6 +1629,12 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 				// Do not impact previous connections and server connections.
 				return TC_ACT_PIPE;
 			}
+			// Skip routing result from different interface to avoid conflicts
+			// between LAN and WAN traffic.
+			if (routing_result->ifindex != skb->ifindex) {
+				// Interface changed, treat as new connection to get fresh routing.
+				goto new_connection;
+			}
 			outbound = routing_result->outbound;
 			mark = routing_result->mark;
 			must = routing_result->must;

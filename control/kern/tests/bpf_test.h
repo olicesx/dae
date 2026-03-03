@@ -111,6 +111,38 @@ check_status_and_mark(struct __sk_buff *skb,
 }
 
 static __always_inline int
+check_redirect_non_syn_tcp(struct __sk_buff *skb)
+{
+	__u32 *status_code;
+
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+
+	if (data + sizeof(*status_code) > data_end) {
+		bpf_printk("data + sizeof(*status_code) > data_end\n");
+		return TC_ACT_SHOT;
+	}
+
+	status_code = data;
+	if (*status_code != TC_ACT_REDIRECT) {
+		bpf_printk("status_code(%d) != TC_ACT_REDIRECT\n", *status_code);
+		return TC_ACT_SHOT;
+	}
+
+	if (skb->cb[0] != TPROXY_MARK) {
+		bpf_printk("skb->cb[0] != TPROXY_MARK\n");
+		return TC_ACT_SHOT;
+	}
+
+	if (skb->cb[1] != 0) {
+		bpf_printk("skb->cb[1] != 0 for non-syn tcp\n");
+		return TC_ACT_SHOT;
+	}
+
+	return TC_ACT_OK;
+}
+
+static __always_inline int
 check_routing_ipv4_tcp(struct __sk_buff *skb,
 		    __u32 expected_status_code,
 		    __u32 saddr, __u32 daddr,

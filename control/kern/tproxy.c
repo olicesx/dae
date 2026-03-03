@@ -1510,8 +1510,7 @@ new_connection:;
 			 */
 			struct routing_result *routing_result;
 
-			routing_result = bpf_map_lookup_elem(&routing_tuples_map,
-						      &pkt.tuples.five);
+			routing_result = bpf_map_lookup_elem(&routing_tuples_map, &pkt.tuples.five);
 			if (routing_result)
 				skb->mark = routing_result->mark;
 

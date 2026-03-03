@@ -1503,8 +1503,21 @@ new_connection:;
 	__builtin_memset(&params, 0, sizeof(params));
 	if (pkt.l4proto == IPPROTO_TCP) {
 		if (!is_new_tcp_connection(&pkt.tcph)) {
-			// Not a new TCP connection.
-			// Perhaps single-arm.
+			/*
+			 * Compatibility restore for 030902f behavior: non-SYN packets
+			 * should inherit previously-decided routing mark when a tuple cache
+			 * entry exists.
+			 */
+			struct routing_result *routing_result;
+
+			routing_result = bpf_map_lookup_elem(&routing_tuples_map,
+						      &pkt.tuples.five);
+			if (routing_result)
+				skb->mark = routing_result->mark;
+
+			/* No cache: keep historical direct-pass semantics (e.g.
+			 * single-arm / reply-path traffic).
+			 */
 			return TC_ACT_OK;
 		}
 		params.l4hdr = &pkt.tcph;

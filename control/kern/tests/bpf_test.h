@@ -16,9 +16,10 @@ static const __u32 three_key = 3;
 static const __u32 four_key = 4;
 
 static __always_inline int
-set_ipv4_tcp(struct __sk_buff *skb,
-	     __u32 saddr, __u32 daddr,
-	     __u16 sport, __u16 dport)
+set_ipv4_tcp_with_flags(struct __sk_buff *skb,
+			__u32 saddr, __u32 daddr,
+			__u16 sport, __u16 dport,
+			bool syn, bool ack, bool psh)
 {
 	bpf_skb_change_tail(skb, ETH_HLEN + IP4_HLEN + TCP_HLEN, 0);
 
@@ -63,7 +64,48 @@ set_ipv4_tcp(struct __sk_buff *skb,
 	}
 	tcp->source = bpf_htons(sport);
 	tcp->dest = bpf_htons(dport);
-	tcp->syn = 1;
+	tcp->syn = syn;
+	tcp->ack = ack;
+	tcp->psh = psh;
+
+	return TC_ACT_OK;
+}
+
+static __always_inline int
+set_ipv4_tcp(struct __sk_buff *skb,
+	     __u32 saddr, __u32 daddr,
+	     __u16 sport, __u16 dport)
+{
+	return set_ipv4_tcp_with_flags(skb, saddr, daddr, sport, dport,
+				       true, false, false);
+}
+
+static __always_inline int
+check_status_and_mark(struct __sk_buff *skb,
+		      __u32 expected_status_code,
+		      __u32 expected_mark)
+{
+	__u32 *status_code;
+
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+
+	if (data + sizeof(*status_code) > data_end) {
+		bpf_printk("data + sizeof(*status_code) > data_end\n");
+		return TC_ACT_SHOT;
+	}
+
+	status_code = data;
+	if (*status_code != expected_status_code) {
+		bpf_printk("status_code(%d) != %d\n", *status_code,
+			   expected_status_code);
+		return TC_ACT_SHOT;
+	}
+
+	if (skb->mark != expected_mark) {
+		bpf_printk("skb->mark(%d) != %d\n", skb->mark, expected_mark);
+		return TC_ACT_SHOT;
+	}
 
 	return TC_ACT_OK;
 }

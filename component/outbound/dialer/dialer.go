@@ -584,6 +584,10 @@ func (d *Dialer) markUnavailableFromProxyFailure() {
 		}
 	}
 
+	// Notify sticky IP dialer about the proxy failure to clear its IP cache.
+	// We only need to trigger this once as it invalidates the proxy address cache.
+	d.NotifyHealthCheckResult(false)
+
 
 	// Reset backoff level (start fresh for next recovery)
 	d.resetBackoffLevel()

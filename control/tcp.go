@@ -7,23 +7,23 @@ package control
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"net"
 	"net/netip"
-	"strings"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/consts"
+	daerrors "github.com/daeuniverse/dae/common/errors"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/daeuniverse/dae/component/sniffing"
 	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/pkg/zeroalloc/io"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/sys/unix"
 )
 
-func (c *ControlPlane) handleConn(lConn net.Conn) (err error) {
+func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn) (err error) {
 	defer lConn.Close()
 
 	// Sniff target domain.
@@ -36,17 +36,31 @@ func (c *ControlPlane) handleConn(lConn net.Conn) (err error) {
 	}
 
 	// Get tuples and outbound.
-	src := lConn.RemoteAddr().(*net.TCPAddr).AddrPort()
-	dst := lConn.LocalAddr().(*net.TCPAddr).AddrPort()
-	routingResult, err := c.core.RetrieveRoutingResult(src, dst, unix.IPPROTO_TCP)
+	// Converge IPv4-mapped IPv6 addresses before looking up eBPF routing tuples.
+	src := common.ConvergeAddrPort(lConn.RemoteAddr().(*net.TCPAddr).AddrPort())
+	dst := common.ConvergeAddrPort(lConn.LocalAddr().(*net.TCPAddr).AddrPort())
+	routingResult, err := c.core.RetrieveRoutingResult(src, dst, consts.IPPROTO_TCP)
 	if err != nil {
-		return fmt.Errorf("failed to retrieve target info %v: %v", dst.String(), err)
+		if stderrors.Is(err, ebpf.ErrKeyNotExist) {
+			// Graceful fallback: routing tuple might be unavailable due to race/window
+			// during connection handoff. Continue with userspace routing instead of
+			// aborting the TCP connection.
+			routingResult = &bpfRoutingResult{
+				Outbound: uint8(consts.OutboundControlPlaneRouting),
+			}
+			if c.log.IsLevelEnabled(logrus.DebugLevel) {
+				c.log.WithFields(logrus.Fields{
+					"src": src.String(),
+					"dst": dst.String(),
+				}).WithError(err).Debug("Routing tuple missing; fallback to userspace routing")
+			}
+		} else {
+			return fmt.Errorf("failed to retrieve target info %v: %v", dst.String(), err)
+		}
 	}
-	src = common.ConvergeAddrPort(src)
-	dst = common.ConvergeAddrPort(dst)
 
 	// Dial and relay.
-	rConn, err := c.RouteDialTcp(&RouteDialParam{
+	rConn, err := c.RouteDialTcp(ctx, &RouteDialParam{
 		Outbound:    consts.OutboundIndex(routingResult.Outbound),
 		Domain:      domain,
 		Mac:         routingResult.Mac,
@@ -62,17 +76,10 @@ func (c *ControlPlane) handleConn(lConn net.Conn) (err error) {
 	defer rConn.Close()
 
 	if err = RelayTCP(sniffer, rConn); err != nil {
-		switch {
-		case strings.HasSuffix(err.Error(), "write: broken pipe"),
-			strings.HasSuffix(err.Error(), "i/o timeout"),
-			strings.HasPrefix(err.Error(), "EOF"),
-			strings.HasSuffix(err.Error(), "connection reset by peer"),
-			strings.HasSuffix(err.Error(), "canceled by local with error code 0"),
-			strings.HasSuffix(err.Error(), "canceled by remote with error code 0"):
-			return nil // ignore
-		default:
-			return fmt.Errorf("handleTCP relay error: %w", err)
+		if daerrors.IsIgnorableTCPRelayError(err) {
+			return nil // ignore normal connection closure errors
 		}
+		return fmt.Errorf("handleTCP relay error: %w", err)
 	}
 	return nil
 }
@@ -88,20 +95,12 @@ type RouteDialParam struct {
 	Mark        uint32
 }
 
-func (c *ControlPlane) RouteDialTcp(p *RouteDialParam) (conn netproxy.Conn, err error) {
-	routingResult := &bpfRoutingResult{
-		Mark:     p.Mark,
-		Must:     0,
-		Mac:      p.Mac,
-		Outbound: uint8(p.Outbound),
-		Pname:    p.ProcessName,
-		Pid:      0,
-		Dscp:     p.Dscp,
-	}
-	outboundIndex := consts.OutboundIndex(routingResult.Outbound)
+func (c *ControlPlane) RouteDialTcp(ctx context.Context, p *RouteDialParam) (conn netproxy.Conn, err error) {
+	outboundIndex := p.Outbound
 	domain := p.Domain
 	src := p.Src
 	dst := p.Dest
+	mark := p.Mark
 
 	dialTarget, shouldReroute, dialIp := c.ChooseDialTarget(outboundIndex, dst, domain)
 	if shouldReroute {
@@ -111,10 +110,18 @@ func (c *ControlPlane) RouteDialTcp(p *RouteDialParam) (conn netproxy.Conn, err 
 	switch outboundIndex {
 	case consts.OutboundDirect:
 	case consts.OutboundControlPlaneRouting:
-		if outboundIndex, routingResult.Mark, _, err = c.Route(src, dst, domain, consts.L4ProtoType_TCP, routingResult); err != nil {
+		routingResult := &bpfRoutingResult{
+			Mark:     mark,
+			Mac:      p.Mac,
+			Outbound: uint8(p.Outbound),
+			Pname:    p.ProcessName,
+			Dscp:     p.Dscp,
+		}
+		var newMark uint32
+		if outboundIndex, newMark, _, err = c.Route(src, dst, domain, consts.L4ProtoType_TCP, routingResult); err != nil {
 			return nil, err
 		}
-		routingResult.Outbound = uint8(outboundIndex)
+		mark = newMark
 
 		if c.log.IsLevelEnabled(logrus.TraceLevel) {
 			c.log.Tracef("outbound: %v => %v",
@@ -126,8 +133,8 @@ func (c *ControlPlane) RouteDialTcp(p *RouteDialParam) (conn netproxy.Conn, err 
 		dialTarget, _, dialIp = c.ChooseDialTarget(outboundIndex, dst, domain)
 	default:
 	}
-	if routingResult.Mark == 0 {
-		routingResult.Mark = c.soMarkFromDae
+	if mark == 0 {
+		mark = c.soMarkFromDae
 	}
 	// TODO: Set-up ip to domain mapping and show domain if possible.
 	if int(outboundIndex) >= len(c.outbounds) {
@@ -156,37 +163,71 @@ func (c *ControlPlane) RouteDialTcp(p *RouteDialParam) (conn netproxy.Conn, err 
 			"dialer":   d.Property().Name,
 			"sniffed":  domain,
 			"ip":       RefineAddrPortToShow(dst),
-			"pid":      routingResult.Pid,
-			"dscp":     routingResult.Dscp,
-			"pname":    ProcessName2String(routingResult.Pname[:]),
-			"mac":      Mac2String(routingResult.Mac[:]),
+			"dscp":     p.Dscp,
+			"pname":    ProcessName2String(p.ProcessName[:]),
+			"mac":      Mac2String(p.Mac[:]),
 		}).Infof("%v <-> %v", RefineSourceToShow(src, dst.Addr()), dialTarget)
 	}
-	ctx, cancel := context.WithTimeout(context.TODO(), consts.DefaultDialTimeout)
+	// Use the provided context with timeout for dial operation.
+	// The context is expected to be a per-connection context with its own lifetime,
+	// not the ControlPlane's lifecycle context (c.ctx).
+	dialCtx, cancel := context.WithTimeout(ctx, consts.DefaultDialTimeout)
 	defer cancel()
-	return d.DialContext(ctx, common.MagicNetwork("tcp", routingResult.Mark, c.mptcp), dialTarget)
+	return d.DialContext(dialCtx, common.MagicNetwork("tcp", mark, c.mptcp), dialTarget)
 }
 
 type WriteCloser interface {
 	CloseWrite() error
 }
 
+// copyWait copies from src to dst until either EOF is reached on src,
+// an error occurs, or the context is done.
+// Uses zero-copy splice optimization when available.
+func copyWait(ctx context.Context, dst netproxy.Conn, src netproxy.Conn) (int64, error) {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			// Context canceled, force Read to fail.
+			_ = src.SetReadDeadline(time.Unix(1, 0))
+		case <-done:
+			// Copy finished, stop monitoring.
+		}
+	}()
+	defer close(done)
+
+	// Try zero-copy splice optimization first (Linux only)
+	// This will automatically fallback to standard copy if splice is not available
+	return netproxy.ReadFrom(dst, src)
+}
+
+// RelayTCP copies data bidirectionally between two connections.
+// It uses a context to control the lifecycle of the relay. If one side exits with an error
+// (causing the function to return and the context to be canceled), the copy operation
+// on the other side will be interrupted immediately.
+//
+// The 10-second read deadline set after CloseWrite ensures the connection doesn't
+// hang indefinitely waiting for the other end to close during graceful shutdown.
 func RelayTCP(lConn, rConn netproxy.Conn) (err error) {
 	eCh := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	go func() {
-		_, e := io.Copy(rConn, lConn)
+		_, e := copyWait(ctx, rConn, lConn)
 		if rConn, ok := rConn.(WriteCloser); ok {
 			rConn.CloseWrite()
 		}
 		rConn.SetReadDeadline(time.Now().Add(10 * time.Second))
 		eCh <- e
 	}()
-	_, e := io.Copy(lConn, rConn)
+	_, e := copyWait(ctx, lConn, rConn)
 	if lConn, ok := lConn.(WriteCloser); ok {
 		lConn.CloseWrite()
 	}
 	lConn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	if e != nil {
+		cancel()
 		e2 := <-eCh
 		if e2 != nil {
 			return fmt.Errorf("%w: %v", e, e2)

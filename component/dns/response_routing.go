@@ -8,6 +8,7 @@ package dns
 import (
 	"fmt"
 	"net/netip"
+	"slices"
 	"strconv"
 
 	"github.com/daeuniverse/dae/common/consts"
@@ -23,6 +24,7 @@ type ResponseMatcherBuilder struct {
 	log                *logrus.Logger
 	upstreamName2Id    map[string]uint8
 	simulatedDomainSet []routing.DomainSet
+	interfaceSet       [][]routing.InterfaceMatcher
 	ipSet              []*trie.Trie
 	fallback           *routing.Outbound
 	rules              []responseMatchSet
@@ -35,6 +37,7 @@ func NewResponseMatcherBuilder(log *logrus.Logger, rules []*config_parser.Routin
 	rulesBuilder.RegisterFunctionParser(consts.Function_QType, TypeParserFactory(b.addQType))
 	rulesBuilder.RegisterFunctionParser(consts.Function_Ip, routing.IpParserFactory(b.addIp))
 	rulesBuilder.RegisterFunctionParser(consts.Function_Upstream, routing.EmptyKeyPlainParserFactory(b.addUpstream))
+	rulesBuilder.RegisterFunctionParser(consts.Function_Interface, routing.InterfaceParserFactory(b.addInterface))
 	if err = rulesBuilder.Apply(rules); err != nil {
 		return nil, err
 	}
@@ -156,6 +159,21 @@ func (b *ResponseMatcherBuilder) addQType(f *config_parser.Function, values []ui
 	return nil
 }
 
+func (b *ResponseMatcherBuilder) addInterface(f *config_parser.Function, values []routing.InterfaceMatcher, upstream *routing.Outbound) (err error) {
+	upstreamId, err := b.upstreamToId(upstream.Name)
+	if err != nil {
+		return err
+	}
+	b.interfaceSet = append(b.interfaceSet, values)
+	b.rules = append(b.rules, responseMatchSet{
+		Type:     consts.MatchType_Interface,
+		Value:    uint16(len(b.interfaceSet) - 1),
+		Not:      f.Not,
+		Upstream: uint8(upstreamId),
+	})
+	return nil
+}
+
 func (b *ResponseMatcherBuilder) addFallback(fallbackOutbound config.FunctionOrString) (err error) {
 	upstream, err := routing.ParseOutbound(config.FunctionOrStringToFunction(fallbackOutbound))
 	if err != nil {
@@ -190,6 +208,7 @@ func (b *ResponseMatcherBuilder) Build() (matcher *ResponseMatcher, err error) {
 	}
 	// IpSet.
 	m.ipSet = b.ipSet
+	m.interfaceSet = b.interfaceSet
 
 	// Write routings.
 	// Fallback rule MUST be the last.
@@ -204,6 +223,7 @@ func (b *ResponseMatcherBuilder) Build() (matcher *ResponseMatcher, err error) {
 type ResponseMatcher struct {
 	domainMatcher routing.DomainMatcher // All domain matchSets use one DomainMatcher.
 	ipSet         []*trie.Trie
+	interfaceSet  [][]routing.InterfaceMatcher
 
 	matches []responseMatchSet
 }
@@ -220,6 +240,17 @@ func (m *ResponseMatcher) Match(
 	qType uint16,
 	ips []netip.Addr,
 	upstream consts.DnsRequestOutboundIndex,
+) (upstreamIndex consts.DnsResponseOutboundIndex, err error) {
+	return m.MatchWithInterface(qName, qType, ips, upstream, routing.InterfaceDirectionOut, "")
+}
+
+func (m *ResponseMatcher) MatchWithInterface(
+	qName string,
+	qType uint16,
+	ips []netip.Addr,
+	upstream consts.DnsRequestOutboundIndex,
+	direction routing.InterfaceDirection,
+	ifname string,
 ) (upstreamIndex consts.DnsResponseOutboundIndex, err error) {
 	if qName == "" {
 		return 0, fmt.Errorf("qName cannot be empty")
@@ -242,12 +273,8 @@ func (m *ResponseMatcher) Match(
 				goodSubrule = true
 			}
 		case consts.MatchType_IpSet:
-			for _, bin128 := range bin128 {
-				// Check if any of IP hit the rule.
-				if m.ipSet[match.Value].HasPrefix(bin128) {
-					goodSubrule = true
-					break
-				}
+			if slices.ContainsFunc(bin128, m.ipSet[match.Value].HasPrefix) {
+				goodSubrule = true
 			}
 		case consts.MatchType_QType:
 			if qType == uint16(match.Value) {
@@ -256,6 +283,13 @@ func (m *ResponseMatcher) Match(
 		case consts.MatchType_Upstream:
 			if upstream == consts.DnsRequestOutboundIndex(match.Value) {
 				goodSubrule = true
+			}
+		case consts.MatchType_Interface:
+			for _, iface := range m.interfaceSet[match.Value] {
+				if routing.MatchInterface(iface, direction, ifname) {
+					goodSubrule = true
+					break
+				}
 			}
 		case consts.MatchType_Fallback:
 			goodSubrule = true

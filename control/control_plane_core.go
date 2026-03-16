@@ -7,11 +7,13 @@ package control
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
 	"regexp"
 	"sync"
+	"sync/atomic"
 
 	"github.com/cilium/ebpf"
 	ciliumLink "github.com/cilium/ebpf/link"
@@ -27,8 +29,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// coreFlip should be 0 or 1
-var coreFlip = 0
+// coreFlip should be 0 or 1; accessed atomically.
+var coreFlip int32
 
 type controlPlaneCore struct {
 	mu sync.Mutex
@@ -55,8 +57,12 @@ func newControlPlaneCore(log *logrus.Logger,
 	kernelVersion *internal.Version,
 	isReload bool,
 ) *controlPlaneCore {
+	var flip int
 	if isReload {
-		coreFlip = coreFlip&1 ^ 1
+		flip = int(atomic.LoadInt32(&coreFlip)&1 ^ 1)
+		atomic.StoreInt32(&coreFlip, int32(flip))
+	} else {
+		flip = int(atomic.LoadInt32(&coreFlip))
 	}
 	var deferFuncs []func() error
 	if !isReload {
@@ -71,7 +77,7 @@ func newControlPlaneCore(log *logrus.Logger,
 		bpf:             bpf,
 		outboundId2Name: outboundId2Name,
 		kernelVersion:   kernelVersion,
-		flip:            coreFlip,
+		flip:            flip,
 		isReload:        isReload,
 		bpfEjected:      false,
 		ifmgr:           ifmgr,
@@ -81,7 +87,14 @@ func newControlPlaneCore(log *logrus.Logger,
 }
 
 func (c *controlPlaneCore) Flip() {
-	coreFlip = coreFlip&1 ^ 1
+	// Use CAS loop to avoid race condition between Load and Store.
+	for {
+		old := atomic.LoadInt32(&coreFlip)
+		newVal := old&1 ^ 1
+		if atomic.CompareAndSwapInt32(&coreFlip, old, newVal) {
+			break
+		}
+	}
 }
 func (c *controlPlaneCore) Close() (err error) {
 	c.mu.Lock()
@@ -91,19 +104,20 @@ func (c *controlPlaneCore) Close() (err error) {
 		return nil
 	default:
 	}
-	// Invoke defer funcs in reverse order.
+	// Invoke defer funcs in reverse order and collect errors.
+	// Use errors.Join (Go 1.20+) for clean multi-error handling.
+	var errs []error
 	for i := len(c.deferFuncs) - 1; i >= 0; i-- {
 		if e := c.deferFuncs[i](); e != nil {
-			// Combine errors.
-			if err != nil {
-				err = fmt.Errorf("%w; %v", err, e)
-			} else {
-				err = e
-			}
+			errs = append(errs, e)
 		}
 	}
 	c.close()
-	return err
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
 }
 
 func getIfParamsFromLink(link netlink.Link) (ifParams bpfIfParams, err error) {
@@ -156,10 +170,13 @@ func (c *controlPlaneCore) linkHdrLen(ifname string) (uint32, error) {
 	return linkHdrLen, nil
 }
 
-func (c *controlPlaneCore) addQdisc(ifname string) error {
+// buildClsactQdisc constructs the clsact GenericQdisc descriptor for ifname.
+// Shared by addQdisc and delQdisc to avoid duplicating the netlink.LinkByName
+// + GenericQdisc construction.
+func buildClsactQdisc(ifname string) (netlink.Link, *netlink.GenericQdisc, error) {
 	link, err := netlink.LinkByName(ifname)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	qdisc := &netlink.GenericQdisc{
 		QdiscAttrs: netlink.QdiscAttrs{
@@ -168,6 +185,14 @@ func (c *controlPlaneCore) addQdisc(ifname string) error {
 			Parent:    netlink.HANDLE_CLSACT,
 		},
 		QdiscType: "clsact",
+	}
+	return link, qdisc, nil
+}
+
+func (c *controlPlaneCore) addQdisc(ifname string) error {
+	_, qdisc, err := buildClsactQdisc(ifname)
+	if err != nil {
+		return err
 	}
 	if err := netlink.QdiscAdd(qdisc); err != nil {
 		return fmt.Errorf("cannot add clsact qdisc: %w", err)
@@ -176,17 +201,9 @@ func (c *controlPlaneCore) addQdisc(ifname string) error {
 }
 
 func (c *controlPlaneCore) delQdisc(ifname string) error {
-	link, err := netlink.LinkByName(ifname)
+	_, qdisc, err := buildClsactQdisc(ifname)
 	if err != nil {
 		return err
-	}
-	qdisc := &netlink.GenericQdisc{
-		QdiscAttrs: netlink.QdiscAttrs{
-			LinkIndex: link.Attrs().Index,
-			Handle:    netlink.MakeHandle(0xffff, 0),
-			Parent:    netlink.HANDLE_CLSACT,
-		},
-		QdiscType: "clsact",
 	}
 	if err := netlink.QdiscDel(qdisc); err != nil {
 		if !os.IsExist(err) {
@@ -252,6 +269,7 @@ func (c *controlPlaneCore) _bindLan(ifname string) error {
 	if err = CheckSendRedirects(ifname); err != nil {
 		return err
 	}
+	// Best effort to add qdisc; it may already exist.
 	_ = c.addQdisc(ifname)
 	linkHdrLen, err := c.linkHdrLen(ifname)
 	if err != nil {
@@ -287,12 +305,10 @@ func (c *controlPlaneCore) _bindLan(ifname string) error {
 		filterIngress.Name = filterIngress.Name + "_l3"
 	}
 	// Remove and add.
+	// Best effort to remove old filter; it may not exist.
 	_ = netlink.FilterDel(filterIngress)
 	if !c.isReload {
-		// Clean up thoroughly.
-		filterIngressFlipped := deepcopy.Copy(filterIngress).(*netlink.BpfFilter)
-		filterIngressFlipped.FilterAttrs.Handle ^= 1
-		_ = netlink.FilterDel(filterIngressFlipped)
+		tryDeleteFlippedFilter(filterIngress)
 	}
 	if err := netlink.FilterAdd(filterIngress); err != nil {
 		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
@@ -324,12 +340,10 @@ func (c *controlPlaneCore) _bindLan(ifname string) error {
 		filterEgress.Name = filterEgress.Name + "_l3"
 	}
 	// Remove and add.
+	// Best effort to remove old filter; it may not exist.
 	_ = netlink.FilterDel(filterEgress)
 	if !c.isReload {
-		// Clean up thoroughly.
-		filterEgressFlipped := deepcopy.Copy(filterEgress).(*netlink.BpfFilter)
-		filterEgressFlipped.FilterAttrs.Handle ^= 1
-		_ = netlink.FilterDel(filterEgressFlipped)
+		tryDeleteFlippedFilter(filterEgress)
 	}
 	if err := netlink.FilterAdd(filterEgress); err != nil {
 		return fmt.Errorf("cannot attach ebpf object to filter egress: %w", err)
@@ -432,6 +446,7 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 	if link.Attrs().Index == consts.LoopbackIfIndex {
 		return fmt.Errorf("cannot bind to loopback interface")
 	}
+	// Best effort to add qdisc; it may already exist.
 	_ = c.addQdisc(ifname)
 	linkHdrLen, err := c.linkHdrLen(ifname)
 	if err != nil {
@@ -467,13 +482,10 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 		filterEgress.Fd = c.bpf.bpfPrograms.TproxyWanEgressL3.FD()
 		filterEgress.Name = filterEgress.Name + "_l3"
 	}
+	// Best effort to remove old filter; it may not exist.
 	_ = netlink.FilterDel(filterEgress)
-	// Remove and add.
 	if !c.isReload {
-		// Clean up thoroughly.
-		filterEgressFlipped := deepcopy.Copy(filterEgress).(*netlink.BpfFilter)
-		filterEgressFlipped.FilterAttrs.Handle ^= 1
-		_ = netlink.FilterDel(filterEgressFlipped)
+		tryDeleteFlippedFilter(filterEgress)
 	}
 	if err := netlink.FilterAdd(filterEgress); err != nil {
 		return fmt.Errorf("cannot attach ebpf object to filter egress: %w", err)
@@ -503,13 +515,10 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 		filterIngress.Fd = c.bpf.bpfPrograms.TproxyWanIngressL3.FD()
 		filterIngress.Name = filterIngress.Name + "_l3"
 	}
+	// Best effort to remove old filter; it may not exist.
 	_ = netlink.FilterDel(filterIngress)
-	// Remove and add.
 	if !c.isReload {
-		// Clean up thoroughly.
-		filterIngressFlipped := deepcopy.Copy(filterIngress).(*netlink.BpfFilter)
-		filterIngressFlipped.FilterAttrs.Handle ^= 1
-		_ = netlink.FilterDel(filterIngressFlipped)
+		tryDeleteFlippedFilter(filterIngress)
 	}
 	if err := netlink.FilterAdd(filterIngress); err != nil {
 		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
@@ -529,7 +538,11 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 
 	// tproxy_dae0peer_ingress@eth0 at dae netns
 	daens.With(func() error {
-		return c.addQdisc(daens.Dae0Peer().Attrs().Name)
+		err := netlink.LinkSetTxQLen(daens.Dae0Peer(), DaeVethTxQLen)
+		if err == nil {
+			err = c.addQdisc(daens.Dae0Peer().Attrs().Name)
+		}
+		return err
 	})
 	filterDae0peerIngress := &netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
@@ -548,11 +561,11 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 	})
 	// Remove and add.
 	if !c.isReload {
-		// Clean up thoroughly.
+		// Clean up thoroughly: delete the filter with the flipped handle.
 		filterIngressFlipped := deepcopy.Copy(filterDae0peerIngress).(*netlink.BpfFilter)
 		filterIngressFlipped.FilterAttrs.Handle ^= 1
 		daens.With(func() error {
-			return netlink.FilterDel(filterDae0peerIngress)
+			return netlink.FilterDel(filterIngressFlipped) // R-07 fixed: was filterDae0peerIngress
 		})
 	}
 	if err = daens.With(func() error {
@@ -568,6 +581,7 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 	})
 
 	// tproxy_dae0_ingress@dae0 at host netns
+	// Best effort to add qdisc; it may already exist.
 	c.addQdisc(daens.Dae0().Attrs().Name)
 	filterDae0Ingress := &netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
@@ -581,13 +595,11 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 		Name:         consts.AppName + "_dae0_ingress",
 		DirectAction: true,
 	}
+	// Best effort to remove old filter; it may not exist.
 	_ = netlink.FilterDel(filterDae0Ingress)
 	// Remove and add.
 	if !c.isReload {
-		// Clean up thoroughly.
-		filterEgressFlipped := deepcopy.Copy(filterDae0Ingress).(*netlink.BpfFilter)
-		filterEgressFlipped.FilterAttrs.Handle ^= 1
-		_ = netlink.FilterDel(filterEgressFlipped)
+		tryDeleteFlippedFilter(filterDae0Ingress)
 	}
 	if err := netlink.FilterAdd(filterDae0Ingress); err != nil {
 		return fmt.Errorf("cannot attach ebpf object to filter egress: %w", err)
@@ -601,10 +613,18 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 	return
 }
 
-// BatchUpdateDomainRouting update bpf map domain_routing. Since one IP may have multiple domains, this function should
-// be invoked every A/AAAA-record lookup.
-func (c *controlPlaneCore) BatchUpdateDomainRouting(cache *DnsCache) error {
-	// Parse ips from DNS resp answers.
+// tryDeleteFlippedFilter deletes the TC filter obtained by flipping the
+// low bit of the handle. Used during non-reload startup to remove any
+// stale filter from a previous run that used the opposite flip value.
+func tryDeleteFlippedFilter(f *netlink.BpfFilter) {
+	flipped := deepcopy.Copy(f).(*netlink.BpfFilter)
+	flipped.FilterAttrs.Handle ^= 1
+	_ = netlink.FilterDel(flipped)
+}
+
+// extractIpsFromDnsCache returns the unique, valid non-unspecified IP addresses
+// contained in the A/AAAA records of a DNS cache entry.
+func extractIpsFromDnsCache(cache *DnsCache) []netip.Addr {
 	var ips []netip.Addr
 	for _, ans := range cache.Answer {
 		var (
@@ -622,24 +642,37 @@ func (c *controlPlaneCore) BatchUpdateDomainRouting(cache *DnsCache) error {
 		}
 		ips = append(ips, ip)
 	}
+	return ips
+}
+
+// BatchUpdateDomainRouting update bpf map domain_routing. Since one IP may have multiple domains, this function should
+// be invoked every A/AAAA-record lookup.
+func (c *controlPlaneCore) BatchUpdateDomainRouting(cache *DnsCache) error {
+	ips := extractIpsFromDnsCache(cache)
 	if len(ips) == 0 {
 		return nil
 	}
 
 	// Update bpf map.
 	// Construct keys and vals, and BpfMapBatchUpdate.
-	var keys [][4]uint32
-	var vals []bpfDomainRouting
+	// OPTIMIZATION: Pre-allocate capacity to avoid multiple allocations.
+	numIps := len(ips)
+	keys := make([][4]uint32, 0, numIps)
+	vals := make([]bpfDomainRouting, 0, numIps)
+
+	// Pre-check bitmap length compatibility once
+	if len(cache.DomainBitmap) != len(bpfDomainRouting{}.Bitmap) {
+		return fmt.Errorf("domain bitmap length not sync with kern program")
+	}
+
 	for _, ip := range ips {
 		ip6 := ip.As16()
 		keys = append(keys, common.Ipv6ByteSliceToUint32Array(ip6[:]))
 		r := bpfDomainRouting{}
-		if len(cache.DomainBitmap) != len(r.Bitmap) {
-			return fmt.Errorf("domain bitmap length not sync with kern program")
-		}
 		copy(r.Bitmap[:], cache.DomainBitmap)
 		vals = append(vals, r)
 	}
+
 	if _, err := BpfMapBatchUpdate(c.bpf.DomainRoutingMap, keys, vals, &ebpf.BatchOptions{
 		ElemFlags: uint64(ebpf.UpdateAny),
 	}); err != nil {
@@ -650,30 +683,13 @@ func (c *controlPlaneCore) BatchUpdateDomainRouting(cache *DnsCache) error {
 
 // BatchRemoveDomainRouting remove bpf map domain_routing.
 func (c *controlPlaneCore) BatchRemoveDomainRouting(cache *DnsCache) error {
-	// Parse ips from DNS resp answers.
-	var ips []netip.Addr
-	for _, ans := range cache.Answer {
-		var (
-			ip netip.Addr
-			ok bool
-		)
-		switch body := ans.(type) {
-		case *dnsmessage.A:
-			ip, ok = netip.AddrFromSlice(body.A)
-		case *dnsmessage.AAAA:
-			ip, ok = netip.AddrFromSlice(body.AAAA)
-		}
-		if !ok || ip.IsUnspecified() {
-			continue
-		}
-		ips = append(ips, ip)
-	}
+	ips := extractIpsFromDnsCache(cache)
 	if len(ips) == 0 {
 		return nil
 	}
 
 	// Update bpf map.
-	// Construct keys and vals, and BpfMapBatchUpdate.
+	// Construct keys and BpfMapBatchDelete.
 	var keys [][4]uint32
 	for _, ip := range ips {
 		ip6 := ip.As16()

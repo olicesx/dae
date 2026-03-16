@@ -23,12 +23,11 @@ import (
 var ErrBadUpstreamFormat = fmt.Errorf("bad upstream format")
 
 type Dns struct {
-	log              *logrus.Logger
-	upstream         []*UpstreamResolver
-	upstream2IndexMu sync.Mutex
-	upstream2Index   map[*Upstream]int
-	reqMatcher       *RequestMatcher
-	respMatcher      *ResponseMatcher
+	log            *logrus.Logger
+	upstream       []*UpstreamResolver
+	upstream2Index sync.Map
+	reqMatcher     *RequestMatcher
+	respMatcher    *ResponseMatcher
 }
 
 type NewOption struct {
@@ -41,10 +40,8 @@ type NewOption struct {
 func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 	s = &Dns{
 		log: opt.Logger,
-		upstream2Index: map[*Upstream]int{
-			nil: int(consts.DnsRequestOutboundIndex_AsIs),
-		},
 	}
+	s.upstream2Index.Store((*Upstream)(nil), int(consts.DnsRequestOutboundIndex_AsIs))
 	// Parse upstream.
 	upstreamName2Id := map[string]uint8{}
 	for i, upstreamRaw := range dns.Upstream {
@@ -73,36 +70,34 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 						}
 					}
 
-					s.upstream2IndexMu.Lock()
-					s.upstream2Index[upstream] = i
-					s.upstream2IndexMu.Unlock()
+					s.upstream2Index.Store(upstream, i)
 					return nil
 				}
 			}(i),
-			mu:       sync.Mutex{},
-			upstream: nil,
-			init:     false,
 		}
 		upstreamName2Id[tag] = uint8(len(s.upstream))
 		s.upstream = append(s.upstream, r)
 	}
 	// Optimize routings.
-	if dns.Routing.Request.Rules, err = routing.ApplyRulesOptimizers(dns.Routing.Request.Rules,
+	requestRules, err := routing.ApplyRulesOptimizers(dns.Routing.Request.Rules,
 		&routing.DatReaderOptimizer{Logger: opt.Logger, LocationFinder: opt.LocationFinder},
 		&routing.MergeAndSortRulesOptimizer{},
 		&routing.DeduplicateParamsOptimizer{},
-	); err != nil {
+	)
+	if err != nil {
 		return nil, err
 	}
-	if dns.Routing.Response.Rules, err = routing.ApplyRulesOptimizers(dns.Routing.Response.Rules,
+
+	responseRules, err := routing.ApplyRulesOptimizers(dns.Routing.Response.Rules,
 		&routing.DatReaderOptimizer{Logger: opt.Logger, LocationFinder: opt.LocationFinder},
 		&routing.MergeAndSortRulesOptimizer{},
 		&routing.DeduplicateParamsOptimizer{},
-	); err != nil {
+	)
+	if err != nil {
 		return nil, err
 	}
 	// Parse request routing.
-	reqMatcherBuilder, err := NewRequestMatcherBuilder(opt.Logger, dns.Routing.Request.Rules, upstreamName2Id, dns.Routing.Request.Fallback)
+	reqMatcherBuilder, err := NewRequestMatcherBuilder(opt.Logger, requestRules, upstreamName2Id, dns.Routing.Request.Fallback)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build DNS request routing: %w", err)
 	}
@@ -111,7 +106,7 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 		return nil, fmt.Errorf("failed to build DNS request routing: %w", err)
 	}
 	// Parse response routing.
-	respMatcherBuilder, err := NewResponseMatcherBuilder(opt.Logger, dns.Routing.Response.Rules, upstreamName2Id, dns.Routing.Response.Fallback)
+	respMatcherBuilder, err := NewResponseMatcherBuilder(opt.Logger, responseRules, upstreamName2Id, dns.Routing.Response.Fallback)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build DNS response routing: %w", err)
 	}
@@ -152,8 +147,12 @@ func (s *Dns) InitUpstreams() {
 }
 
 func (s *Dns) RequestSelect(qname string, qtype uint16) (upstreamIndex consts.DnsRequestOutboundIndex, upstream *Upstream, err error) {
+	return s.RequestSelectWithInterface(qname, qtype, routing.InterfaceDirectionOut, "")
+}
+
+func (s *Dns) RequestSelectWithInterface(qname string, qtype uint16, direction routing.InterfaceDirection, ifname string) (upstreamIndex consts.DnsRequestOutboundIndex, upstream *Upstream, err error) {
 	// Route.
-	upstreamIndex, err = s.reqMatcher.Match(qname, qtype)
+	upstreamIndex, err = s.reqMatcher.MatchWithInterface(qname, qtype, direction, ifname)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -174,6 +173,10 @@ func (s *Dns) RequestSelect(qname string, qtype uint16) (upstreamIndex consts.Dn
 }
 
 func (s *Dns) ResponseSelect(msg *dnsmessage.Msg, fromUpstream *Upstream) (upstreamIndex consts.DnsResponseOutboundIndex, upstream *Upstream, err error) {
+	return s.ResponseSelectWithInterface(msg, fromUpstream, routing.InterfaceDirectionOut, "")
+}
+
+func (s *Dns) ResponseSelectWithInterface(msg *dnsmessage.Msg, fromUpstream *Upstream, direction routing.InterfaceDirection, ifname string) (upstreamIndex consts.DnsResponseOutboundIndex, upstream *Upstream, err error) {
 	if !msg.Response {
 		return 0, nil, fmt.Errorf("DNS response expected but DNS request received")
 	}
@@ -207,11 +210,13 @@ func (s *Dns) ResponseSelect(msg *dnsmessage.Msg, fromUpstream *Upstream) (upstr
 		}
 	}
 
-	s.upstream2IndexMu.Lock()
-	from := s.upstream2Index[fromUpstream]
-	s.upstream2IndexMu.Unlock()
+	fromValue, ok := s.upstream2Index.Load(fromUpstream)
+	if !ok {
+		fromValue = int(consts.DnsRequestOutboundIndex_AsIs)
+	}
+	from := fromValue.(int)
 	// Route.
-	upstreamIndex, err = s.respMatcher.Match(qname, qtype, ips, consts.DnsRequestOutboundIndex(from))
+	upstreamIndex, err = s.respMatcher.MatchWithInterface(qname, qtype, ips, consts.DnsRequestOutboundIndex(from), direction, ifname)
 	if err != nil {
 		return 0, nil, err
 	}

@@ -37,6 +37,7 @@ type Sniffer struct {
 	needMore     bool
 	quicNextRead int
 	quicCryptos  []*quicutils.CryptoFrameOffset
+	quicPlaintexts []pool.PB
 }
 
 func NewStreamSniffer(r io.Reader, timeout time.Duration) *Sniffer {
@@ -154,11 +155,6 @@ func (s *Sniffer) SniffUdp() (d string, err error) {
 			s.sniffed = d
 		}
 	}()
-	defer func() {
-		if err == nil {
-			s.sniffed = d
-		}
-	}()
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 
@@ -171,6 +167,13 @@ func (s *Sniffer) SniffUdp() (d string, err error) {
 
 	if s.buf.Len() == 0 {
 		return "", ErrNotApplicable
+	}
+
+	if len(s.quicCryptos) == 0 {
+		nextBlock := s.buf.Bytes()[s.quicNextRead:]
+		if !IsLikelyQuicInitialPacket(nextBlock) {
+			return "", ErrNotApplicable
+		}
 	}
 
 	return sniffGroup(
@@ -219,9 +222,14 @@ func (s *Sniffer) Close() (err error) {
 	case <-s.ctx.Done():
 	default:
 		s.cancel()
-		if s.buf.Len() == 0 {
+		if s.buf != nil {
 			pool.PutBuffer(s.buf)
+			s.buf = nil
 		}
+		for _, p := range s.quicPlaintexts {
+			p.Put()
+		}
+		s.quicPlaintexts = nil
 	}
 	return nil
 }

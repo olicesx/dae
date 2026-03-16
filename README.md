@@ -35,6 +35,7 @@ Please refer to [Quick Start Guide](./docs/en/README.md) to start using `dae` ri
 
 1. If you setup dae and also a shadowsocks server (or any UDP servers) on the same machine in public network, such as a VPS, don't forget to add `l4proto(udp) && sport(your server ports) -> must_direct` rule for your UDP server port. Because states of UDP are hard to maintain, all outgoing UDP packets will potentially be proxied (depends on your routing), including traffic to your client. This behaviour is not what we want to see. `must_direct` makes all traffic from this port including DNS traffic direct.
 1. If users in mainland China find that the first screen time is very long when they visit some domestic websites for the first time, please check whether you use foreign DNS to handle some domestic domain in DNS routing. Sometimes this is hard to spot. For example, `ocsp.digicert.cn` is included in `geosite:geolocation-!cn` unexpectedly, which will cause some tls handshakes to take a long time. Be careful to use such domain sets in DNS routing.
+1. Interface matcher is available in routing and DNS rules: `interface(wan:0eth)` or `interface(lan:3eth,4eth)`. `wan` only supports out semantic, and `lan` only supports in semantic.
 
 ## How it works
 

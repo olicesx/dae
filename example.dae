@@ -181,6 +181,26 @@ dns {
     #    test.example.org: 3600
     #}
 
+    # Enable optimistic cache (RFC 8767) to improve cache hit rate and reduce latency.
+    # When enabled, expired cache entries within stale window are still returned while 
+    # background refresh updates the cache.
+    # This significantly improves user experience by serving stale data instead of waiting.
+    # Default: true
+    #optimistic_cache: true
+
+    # Stale window duration in seconds for optimistic cache (RFC 8767).
+    # Expired cache entries within this window will be returned while background refresh happens.
+    # Set to 0 to never expire (rely on LRU eviction when cache is full).
+    # Default: 60
+    #optimistic_cache_ttl: 60
+
+    # Maximum number of DNS cache entries.
+    # When cache size exceeds this limit, least recently used entries will be evicted.
+    # Set to 0 for unlimited cache size (default, original behavior).
+    # Recommended to set a limit when using optimistic_cache_ttl=0 to prevent memory leaks.
+    # Default: 0
+    #max_cache_size: 0
+
     # Bind to local address to listen for DNS queries
     # bind: '127.0.0.1:5353'
     # bind: 'tcp://127.0.0.1:5353'
@@ -218,6 +238,9 @@ dns {
         request {
             # Lookup China mainland domains using alidns, otherwise googledns.
             qname(geosite:cn) -> alidns
+            # Interface matcher examples:
+            # interface(wan:0eth) -> googledns   # wan only supports out semantic
+            # interface(lan:3eth,4eth) -> alidns # lan only supports in semantic
             # fallback is also called default.
             fallback: googledns
         }
@@ -300,6 +323,9 @@ group {
 # See https://github.com/daeuniverse/dae/blob/main/docs/en/configuration/routing.md for full examples.
 routing {
     ### Preset rules.
+    # Interface matcher examples:
+    # interface(wan:0eth) -> direct
+    # interface(lan:3eth,4eth) -> my_group
 
     # Network managers in localhost should be direct to avoid false negative network connectivity check when binding to
     # WAN.

@@ -6,9 +6,12 @@
 package control
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
+	"sync"
 
 	"time"
 
@@ -23,14 +26,89 @@ import (
 )
 
 var (
-	DefaultNatTimeout = 3 * time.Minute
+	// DefaultNatTimeout is the default NAT timeout for UDP connections.
+	// Reduced from 3 minutes to 30 seconds for faster resource cleanup.
+	// Most DNS queries complete within seconds, and long-lived connections
+	// (like QUIC) can use longer timeouts via QuicNatTimeout.
+	DefaultNatTimeout = 30 * time.Second
+	// QuicNatTimeout is 2 minutes for QUIC long-lived connections.
+	QuicNatTimeout = 2 * time.Minute
+
+	udpNoAliveDialerLogLimiter sync.Map // map[udpNoAliveDialerLogKey]int64(unix nano)
 )
 
 const (
 	DnsNatTimeout  = 17 * time.Second // RFC 5452
 	AnyfromTimeout = 5 * time.Second  // Do not cache too long.
 	MaxRetry       = 2
+
+	noAliveDialerLogInterval = 10 * time.Second
 )
+
+type udpNoAliveDialerLogKey struct {
+	outbound             string
+	origNetworkType      string
+	selectionNetworkType string
+	strictIpVersion      bool
+}
+
+func allowNoAliveDialerLog(key udpNoAliveDialerLogKey, now time.Time) bool {
+	nowNano := now.UnixNano()
+	for {
+		prev, ok := udpNoAliveDialerLogLimiter.Load(key)
+		if !ok {
+			if _, loaded := udpNoAliveDialerLogLimiter.LoadOrStore(key, nowNano); !loaded {
+				return true
+			}
+			continue
+		}
+
+		last, ok := prev.(int64)
+		if !ok {
+			udpNoAliveDialerLogLimiter.Store(key, nowNano)
+			return true
+		}
+		if nowNano-last < int64(noAliveDialerLogInterval) {
+			return false
+		}
+		if udpNoAliveDialerLogLimiter.CompareAndSwap(key, last, nowNano) {
+			return true
+		}
+	}
+}
+
+func (c *ControlPlane) logNoAliveDialerLimited(
+	outbound string,
+	policy consts.DialerSelectionPolicy,
+	origNetworkType string,
+	selectionNetworkType string,
+	src netip.AddrPort,
+	dst netip.AddrPort,
+	domain string,
+	strictIpVersion bool,
+) {
+	key := udpNoAliveDialerLogKey{
+		outbound:             outbound,
+		origNetworkType:      origNetworkType,
+		selectionNetworkType: selectionNetworkType,
+		strictIpVersion:      strictIpVersion,
+	}
+	if !allowNoAliveDialerLog(key, time.Now()) {
+		return
+	}
+
+	c.log.WithFields(logrus.Fields{
+		"outbound":               outbound,
+		"policy":                 policy,
+		"orig_network_type":      origNetworkType,
+		"selection_network_type": selectionNetworkType,
+		"strict_ip_version":      strictIpVersion,
+		"from":                   src.String(),
+		"to":                     dst.String(),
+		"sniffed":                domain,
+		"interval":               noAliveDialerLogInterval.String(),
+	}).Warn("no alive dialer for UDP selection (rate-limited)")
+}
 
 type DialOption struct {
 	Target        string
@@ -51,60 +129,156 @@ func ChooseNatTimeout(data []byte, sniffDns bool) (dmsg *dnsmessage.Msg, timeout
 	return nil, DefaultNatTimeout
 }
 
+func normalizeSendPktAddrFamily(from, realTo netip.AddrPort) (bindAddr, writeAddr netip.AddrPort) {
+	bindAddr = from
+	writeAddr = realTo
+
+	// Case 1: IPv6 socket writing to IPv4 target.
+	if realTo.Addr().Is4() && from.Addr().Is6() {
+		writeAddr = netip.AddrPortFrom(
+			netip.AddrFrom16(realTo.Addr().As16()),
+			realTo.Port(),
+		)
+	}
+
+	// Case 2: IPv4 source with IPv6 destination (including IPv4-mapped IPv6)
+	// should use an IPv6 bind address so socket family matches write target.
+	if from.Addr().Is4() && realTo.Addr().Is6() {
+		bindAddr = netip.AddrPortFrom(
+			netip.AddrFrom16(from.Addr().As16()),
+			from.Port(),
+		)
+	}
+
+	return bindAddr, writeAddr
+}
+
 // sendPkt uses bind first, and fallback to send hdr if addr is in use.
+// The from parameter is the remote server's address (used as local bind for responses).
+// The realTo parameter is the client's address (destination for the response).
 func sendPkt(log *logrus.Logger, data []byte, from netip.AddrPort, realTo, to netip.AddrPort, lConn *net.UDPConn) (err error) {
-	uConn, _, err := DefaultAnyfromPool.GetOrCreate(from.String(), AnyfromTimeout)
+	// Proxy chain support: Use original 'from' address as bindAddr to ensure
+	// each server response gets its own UDP socket. This prevents response mixing
+	// when multiple IPv6 servers would otherwise share [::]:port (wildcard binding).
+	//
+	// Cross-family handling ensures socket type matches write address family:
+	// - IPv6->IPv4: Convert writeAddr to IPv4-mapped IPv6 for dual-stack socket
+	// - IPv4->IPv6: Convert bindAddr to IPv4-mapped IPv6 to create IPv6 socket
+	bindAddr, writeAddr := normalizeSendPktAddrFamily(from, realTo)
+
+	uConn, _, err := DefaultAnyfromPool.GetOrCreate(bindAddr, AnyfromTimeout)
 	if err != nil {
 		return
 	}
-	_, err = uConn.WriteToUDPAddrPort(data, realTo)
+	_, err = uConn.WriteToUDPAddrPort(data, writeAddr)
 	return err
 }
 
 func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, realDst netip.AddrPort, routingResult *bpfRoutingResult, skipSniffing bool) (err error) {
 	var realSrc netip.AddrPort
 	var domain string
+	var ueKey UdpEndpointKey
 	realSrc = src
-	ue, ueExists := DefaultUdpEndpointPool.Get(realSrc)
-	if ueExists && ue.SniffedDomain != "" {
-		// It is quic ...
-		// Fast path.
-		domain := ue.SniffedDomain
-		dialTarget := realDst.String()
 
-		if c.log.IsLevelEnabled(logrus.TraceLevel) {
-			fields := logrus.Fields{
-				"network":  "udp(fp)",
-				"outbound": ue.Outbound.Name,
-				"policy":   ue.Outbound.GetSelectionPolicy(),
-				"dialer":   ue.Dialer.Property().Name,
-				"sniffed":  domain,
-				"ip":       RefineAddrPortToShow(realDst),
-				"pid":      routingResult.Pid,
-				"dscp":     routingResult.Dscp,
-				"pname":    ProcessName2String(routingResult.Pname[:]),
-				"mac":      Mac2String(routingResult.Mac[:]),
+	// DNS Fast Path: Skip UdpEndpoint lookup for DNS traffic (port 53).
+	// DNS is a stateless protocol and doesn't need the connection tracking
+	// features that UdpEndpoint provides (designed for QUIC and other long-lived UDP).
+	// This optimization eliminates a sync.Map.Load() operation for every DNS query.
+	if realDst.Port() == 53 {
+		// Potential DNS query - verify with DNS message parsing
+		dnsMessage, _ := ChooseNatTimeout(data, true)
+		if dnsMessage != nil {
+			// Confirmed DNS request - take fast path
+			if routingResult.Mark == 0 {
+				routingResult.Mark = c.soMarkFromDae
 			}
-			c.log.WithFields(fields).Tracef("%v <-> %v", RefineSourceToShow(realSrc, realDst.Addr()), dialTarget)
+			req := &udpRequest{
+				realSrc:       realSrc,
+				realDst:       realDst,
+				src:           src,
+				lConn:         lConn,
+				routingResult: routingResult,
+			}
+			if err := c.dnsController.Handle_(c.ctx, dnsMessage, req); err != nil {
+				if errors.Is(err, ErrDNSQueryConcurrencyLimitExceeded) {
+					return nil
+				}
+				// For DNS fast path, never leave client waiting on internal errors.
+				// Respond with SERVFAIL so resolver can retry/fallback promptly.
+				if sendErr := c.dnsController.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeServerFailure, "ServeFail (dns fast path)", req, nil); sendErr != nil {
+					return errors.Join(err, sendErr)
+				}
+				if c.log.IsLevelEnabled(logrus.DebugLevel) {
+					c.log.WithError(err).Debug("DNS fast path failed; SERVFAIL sent")
+				}
+				return nil
+			}
+			return nil
 		}
+		// Not a valid DNS packet (port 53 but not DNS format) - fall through to normal UDP path
+	}
 
-		_, err = ue.WriteTo(data, dialTarget)
-		if err != nil {
-			return err
+	// Non-DNS traffic: QUIC uses Symmetric NAT (key includes Dst).
+	ueKey = UdpEndpointKey{Src: realSrc}
+	ue, ueExists := DefaultUdpEndpointPool.Get(ueKey)
+	if !ueExists {
+		ueKey.Dst = realDst
+		ue, ueExists = DefaultUdpEndpointPool.Get(ueKey)
+	}
+	if ueExists {
+		if ue.SniffedDomain == "" && sniffing.IsLikelyQuicInitialPacket(data) {
+			// Chrome reuses UDP sockets; remove domain-less endpoint for new QUIC Initial.
+			if c.log.IsLevelEnabled(logrus.DebugLevel) {
+				c.log.WithField("src", realSrc).Debug("Removed trapped domain-less UdpEndpoint for new QUIC Initial packet")
+			}
+			_ = DefaultUdpEndpointPool.Remove(ueKey, ue)
+			ueExists = false
+		} else if ue.SniffedDomain != "" {
+			// It is quic ...
+			// Fast path.
+			domain := ue.SniffedDomain
+			dialTarget := realDst.String()
+
+			if c.log.IsLevelEnabled(logrus.TraceLevel) {
+				fields := logrus.Fields{
+					"network":  "udp(fp)",
+					"outbound": ue.Outbound.Name,
+					"policy":   ue.Outbound.GetSelectionPolicy(),
+					"dialer":   ue.Dialer.Property().Name,
+					"sniffed":  domain,
+					"ip":       RefineAddrPortToShow(realDst),
+					"pid":      routingResult.Pid,
+					"dscp":     routingResult.Dscp,
+					"pname":    ProcessName2String(routingResult.Pname[:]),
+					"mac":      Mac2String(routingResult.Mac[:]),
+				}
+				c.log.WithFields(fields).Tracef("%v <-> %v", RefineSourceToShow(realSrc, realDst.Addr()), dialTarget)
+			}
+
+			_, err = ue.WriteTo(data, dialTarget)
+			if err != nil {
+				return err
+			}
+			return nil
 		}
-		return nil
 	}
 
 	// To keep consistency with kernel program, we only sniff DNS request sent to 53.
-	dnsMessage, natTimeout := ChooseNatTimeout(data, realDst.Port() == 53)
-	// We should cache DNS records and set record TTL to 0, in order to monitor the dns req and resp in real time.
-	isDns := dnsMessage != nil
-	if !isDns && !skipSniffing && !ueExists {
-		// Sniff Quic, ...
+	// Note: valid DNS packets on port 53 are already handled and returned in the
+	// fast path above (L114-138).
+	natTimeout := DefaultNatTimeout
+	if !skipSniffing && !ueExists {
 		key := PacketSnifferKey{
 			LAddr: realSrc,
 			RAddr: realDst,
 		}
+
+		// Fast reject for obvious non-QUIC UDP packets when no existing sniff session.
+		if DefaultPacketSnifferSessionMgr.Get(key) == nil && !sniffing.IsLikelyQuicInitialPacket(data) {
+			goto afterSniffing
+		}
+
+		// Sniff Quic, ...
 		_sniffer, _ := DefaultPacketSnifferSessionMgr.GetOrCreate(key, nil)
 		_sniffer.Mu.Lock()
 		// Re-get sniffer from pool to confirm the transaction is not done.
@@ -121,10 +295,12 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, r
 				return nil
 			}
 			if err != nil {
-				logrus.WithError(err).
-					WithField("from", realSrc).
-					WithField("to", realDst).
-					Trace("sniffUdp")
+				if logrus.IsLevelEnabled(logrus.TraceLevel) {
+					logrus.WithError(err).
+						WithField("from", realSrc).
+						WithField("to", realDst).
+						Trace("sniffUdp")
+				}
 			}
 			defer DefaultPacketSnifferSessionMgr.Remove(key, sniffer)
 			// Re-handlePkt after self func.
@@ -136,7 +312,10 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, r
 						for _, d := range toRehandle {
 							dCopy := pool.Get(len(d))
 							copy(dCopy, d)
-							go c.handlePkt(lConn, dCopy, src, pktDst, realDst, routingResult, true)
+							go func(data pool.PB) {
+								defer data.Put()
+								c.handlePkt(lConn, data, src, pktDst, realDst, routingResult, true)
+							}(dCopy)
 						}
 					}
 				}()
@@ -146,20 +325,10 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, r
 			// sniffer may be nil.
 		}
 	}
-	if routingResult.Must > 0 {
-		isDns = false // Regard as plain traffic.
-	}
+
+afterSniffing:
 	if routingResult.Mark == 0 {
 		routingResult.Mark = c.soMarkFromDae
-	}
-	if isDns {
-		return c.dnsController.Handle_(dnsMessage, &udpRequest{
-			realSrc:       realSrc,
-			realDst:       realDst,
-			src:           src,
-			lConn:         lConn,
-			routingResult: routingResult,
-		})
 	}
 
 	// Dial and send.
@@ -198,14 +367,26 @@ getNew:
 		}).Warnln("Touch max retry limit.")
 		return fmt.Errorf("touch max retry limit")
 	}
-	ue, isNew, err := DefaultUdpEndpointPool.GetOrCreate(realSrc, &UdpEndpointOptions{
+
+	if domain != "" {
+		natTimeout = QuicNatTimeout
+	}
+
+	// QUIC (domain != "") uses Symmetric NAT.
+	ueKey = UdpEndpointKey{Src: realSrc}
+	if domain != "" {
+		ueKey.Dst = realDst
+	}
+
+	ue, isNew, err := DefaultUdpEndpointPool.GetOrCreate(ueKey, &UdpEndpointOptions{
 		// Handler handles response packets and send it to the client.
 		Handler: func(data []byte, from netip.AddrPort) (err error) {
 			// Do not return conn-unrelated err in this func.
 			return sendPkt(c.log, data, from, realSrc, src, lConn)
 		},
 		NatTimeout: natTimeout,
-		GetDialOption: func() (option *DialOption, err error) {
+		Log:        c.log,
+		GetDialOption: func(ctx context.Context) (option *DialOption, err error) {
 			if shouldReroute {
 				outboundIndex = consts.OutboundControlPlaneRouting
 			}
@@ -213,12 +394,7 @@ getNew:
 			switch outboundIndex {
 			case consts.OutboundDirect:
 			case consts.OutboundControlPlaneRouting:
-				if isDns {
-					// Routing of DNS packets are managed by DNS controller.
-					break
-				}
-
-				if outboundIndex, routingResult.Mark, _, err = c.Route(realSrc, realDst, domain, consts.L4ProtoType_TCP, routingResult); err != nil {
+				if outboundIndex, routingResult.Mark, _, err = c.Route(realSrc, realDst, domain, consts.L4ProtoType_UDP, routingResult); err != nil {
 					return nil, err
 				}
 				routingResult.Outbound = uint8(outboundIndex)
@@ -244,10 +420,43 @@ getNew:
 			outbound := c.outbounds[outboundIndex]
 
 			// Select dialer from outbound (dialer group).
+			// Ensure dialer's address family matches client's to prevent
+			// "non-IPv4/IPv6 address" errors when writing responses.
+			// Example: IPv6 client accessing IPv4 target should use IPv6 dialer.
+			selectionNetworkType := networkType
+			if clientIpVersion := consts.IpVersionFromAddr(realSrc.Addr()); clientIpVersion != networkType.IpVersion {
+				selectionNetworkType = &dialer.NetworkType{
+					L4Proto:   networkType.L4Proto,
+					IpVersion: clientIpVersion,
+					IsDns:     networkType.IsDns,
+				}
+			}
 			strictIpVersion := dialIp
-			dialerForNew, _, err := outbound.Select(networkType, strictIpVersion)
+			dialerForNew, _, err := outbound.Select(selectionNetworkType, strictIpVersion)
 			if err != nil {
-				return nil, fmt.Errorf("failed to select dialer from group %v (%v, dns?:%v,from: %v): %w", outbound.Name, networkType.StringWithoutDns(), isDns, realSrc.String(), err)
+				origType := networkType.StringWithoutDns()
+				selectedType := selectionNetworkType.StringWithoutDns()
+				if errors.Is(err, ob.ErrNoAliveDialer) {
+					c.logNoAliveDialerLimited(
+						outbound.Name,
+						outbound.GetSelectionPolicy(),
+						origType,
+						selectedType,
+						realSrc,
+						realDst,
+						domain,
+						strictIpVersion,
+					)
+					return nil, err
+				}
+				return nil, fmt.Errorf(
+					"failed to select dialer from group %v (orig:%v, selected:%v, from:%v): %w",
+					outbound.Name,
+					origType,
+					selectedType,
+					realSrc.String(),
+					err,
+				)
 			}
 			return &DialOption{
 				Target:        dialTarget,
@@ -259,6 +468,10 @@ getNew:
 		},
 	})
 	if err != nil {
+		if errors.Is(err, ob.ErrNoAliveDialer) {
+			// Already emitted a rate-limited diagnostic log above.
+			return nil
+		}
 		return fmt.Errorf("failed to GetOrCreate: %w", err)
 	}
 
@@ -273,7 +486,7 @@ getNew:
 				"retry":   retry,
 			}).Debugln("Old udp endpoint was not alive and removed.")
 		}
-		_ = DefaultUdpEndpointPool.Remove(realSrc, ue)
+		_ = DefaultUdpEndpointPool.Remove(ueKey, ue)
 		retry++
 		goto getNew
 	}
@@ -298,7 +511,7 @@ getNew:
 				"retry":   retry,
 			}).Debugln("Failed to write UDP packet request. Try to remove old UDP endpoint and retry.")
 		}
-		_ = DefaultUdpEndpointPool.Remove(realSrc, ue)
+		_ = DefaultUdpEndpointPool.Remove(ueKey, ue)
 		retry++
 		goto getNew
 	}
@@ -306,7 +519,7 @@ getNew:
 	// Print log.
 	// Only print routing for new connection to avoid the log exploded (Quic and BT).
 	if (isNew && c.log.IsLevelEnabled(logrus.InfoLevel)) || c.log.IsLevelEnabled(logrus.DebugLevel) {
-		fields := logrus.Fields{
+		entry := c.log.WithFields(logrus.Fields{
 			"network":  networkType.StringWithoutDns(),
 			"outbound": ue.Outbound.Name,
 			"policy":   ue.Outbound.GetSelectionPolicy(),
@@ -317,10 +530,11 @@ getNew:
 			"dscp":     routingResult.Dscp,
 			"pname":    ProcessName2String(routingResult.Pname[:]),
 			"mac":      Mac2String(routingResult.Mac[:]),
-		}
-		logger := c.log.WithFields(fields).Infof
+		})
+		// Build entry once; select level without a second WithFields allocation.
+		logger := entry.Infof
 		if !isNew && c.log.IsLevelEnabled(logrus.DebugLevel) {
-			logger = c.log.WithFields(fields).Debugf
+			logger = entry.Debugf
 		}
 		logger("%v <-> %v", RefineSourceToShow(realSrc, realDst.Addr()), dialTarget)
 	}

@@ -1,7 +1,7 @@
 /*
 *  SPDX-License-Identifier: AGPL-3.0-only
 *  Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
-*/
+ */
 
 package control
 
@@ -22,10 +22,17 @@ import (
 )
 
 const (
-	NsName       = "daens"
-	HostVethName = "dae0"
-	NsVethName   = "dae0peer"
+	NsName        = "daens"
+	HostVethName  = "dae0"
+	NsVethName    = "dae0peer"
+	DaeVethTxQLen = 1000
 )
+
+// ptrToUint32 returns a pointer to the given uint32 value.
+// Used for netlink Rule.Mask field which requires *uint32.
+func ptrToUint32(v uint32) *uint32 {
+	return &v
+}
 
 var (
 	daeNetns *DaeNetns
@@ -103,6 +110,30 @@ func (ns *DaeNetns) With(f func() error) (err error) {
 
 	if err = f(); err != nil {
 		return fmt.Errorf("failed to run func in dae netns: %v", err)
+	}
+	return
+}
+
+func (ns *DaeNetns) WithHost(f func() error) (err error) {
+	if err = daeNetns.Setup(); err != nil {
+		return fmt.Errorf("failed to setup dae netns: %v", err)
+	}
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	origNs, err := netns.Get()
+	if err != nil {
+		return fmt.Errorf("failed to get current netns: %v", err)
+	}
+	defer origNs.Close()
+
+	if err = netns.Set(ns.hostNs); err != nil {
+		return fmt.Errorf("failed to switch to host netns: %v", err)
+	}
+	defer netns.Set(origNs)
+
+	if err = f(); err != nil {
+		return fmt.Errorf("failed to run func in host netns: %v", err)
 	}
 	return
 }
@@ -194,8 +225,8 @@ func (ns *DaeNetns) setupRoutingPolicy() (err error) {
 		Flow:              -1,
 		Family:            unix.AF_INET,
 		Table:             table,
-		Mark:              int(consts.TproxyMark),
-		Mask:              int(consts.TproxyMark),
+		Mark:              uint32(consts.TproxyMark),
+		Mask:              ptrToUint32(uint32(consts.TproxyMark)),
 	}, {
 		SuppressIfgroup:   -1,
 		SuppressPrefixlen: -1,
@@ -204,8 +235,8 @@ func (ns *DaeNetns) setupRoutingPolicy() (err error) {
 		Flow:              -1,
 		Family:            unix.AF_INET6,
 		Table:             table,
-		Mark:              int(consts.TproxyMark),
-		Mask:              int(consts.TproxyMark),
+		Mark:              uint32(consts.TproxyMark),
+		Mask:              ptrToUint32(uint32(consts.TproxyMark)),
 	}}
 
 	for _, rule := range rules {
@@ -226,9 +257,10 @@ func (ns *DaeNetns) setupVeth() (err error) {
 	if err = netlink.LinkAdd(&netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{
 			Name:   HostVethName,
-			TxQLen: 1000,
+			TxQLen: DaeVethTxQLen,
 		},
-		PeerName: NsVethName,
+		PeerName:   NsVethName,
+		PeerTxQLen: DaeVethTxQLen,
 	}); err != nil {
 		return fmt.Errorf("failed to add veth pair: %v", err)
 	}

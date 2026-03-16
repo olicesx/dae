@@ -21,6 +21,7 @@ type RequestMatcherBuilder struct {
 	log                *logrus.Logger
 	upstreamName2Id    map[string]uint8
 	simulatedDomainSet []routing.DomainSet
+	interfaceSet       [][]routing.InterfaceMatcher
 	fallback           *routing.Outbound
 	rules              []requestMatchSet
 }
@@ -30,6 +31,7 @@ func NewRequestMatcherBuilder(log *logrus.Logger, rules []*config_parser.Routing
 	rulesBuilder := routing.NewRulesBuilder(log)
 	rulesBuilder.RegisterFunctionParser(consts.Function_QName, routing.PlainParserFactory(b.addQName))
 	rulesBuilder.RegisterFunctionParser(consts.Function_QType, TypeParserFactory(b.addQType))
+	rulesBuilder.RegisterFunctionParser(consts.Function_Interface, routing.InterfaceParserFactory(b.addInterface))
 	if err = rulesBuilder.Apply(rules); err != nil {
 		return nil, err
 	}
@@ -107,6 +109,21 @@ func (b *RequestMatcherBuilder) addQType(f *config_parser.Function, values []uin
 	return nil
 }
 
+func (b *RequestMatcherBuilder) addInterface(f *config_parser.Function, values []routing.InterfaceMatcher, upstream *routing.Outbound) (err error) {
+	upstreamId, err := b.upstreamToId(upstream.Name)
+	if err != nil {
+		return err
+	}
+	b.interfaceSet = append(b.interfaceSet, values)
+	b.rules = append(b.rules, requestMatchSet{
+		Type:     consts.MatchType_Interface,
+		Value:    uint16(len(b.interfaceSet) - 1),
+		Not:      f.Not,
+		Upstream: uint8(upstreamId),
+	})
+	return nil
+}
+
 func (b *RequestMatcherBuilder) addFallback(fallbackOutbound config.FunctionOrString) (err error) {
 	upstream, err := routing.ParseOutbound(config.FunctionOrStringToFunction(fallbackOutbound))
 	if err != nil {
@@ -145,6 +162,7 @@ func (b *RequestMatcherBuilder) Build() (matcher *RequestMatcher, err error) {
 	if b.rules[len(b.rules)-1].Type != consts.MatchType_Fallback {
 		return nil, fmt.Errorf("fallback rule MUST be the last")
 	}
+	m.interfaceSet = b.interfaceSet
 	m.matches = b.rules
 
 	return &m, nil
@@ -152,6 +170,7 @@ func (b *RequestMatcherBuilder) Build() (matcher *RequestMatcher, err error) {
 
 type RequestMatcher struct {
 	domainMatcher routing.DomainMatcher // All domain matchSets use one DomainMatcher.
+	interfaceSet  [][]routing.InterfaceMatcher
 
 	matches []requestMatchSet
 }
@@ -166,6 +185,15 @@ type requestMatchSet struct {
 func (m *RequestMatcher) Match(
 	qName string,
 	qType uint16,
+) (upstreamIndex consts.DnsRequestOutboundIndex, err error) {
+	return m.MatchWithInterface(qName, qType, routing.InterfaceDirectionOut, "")
+}
+
+func (m *RequestMatcher) MatchWithInterface(
+	qName string,
+	qType uint16,
+	direction routing.InterfaceDirection,
+	ifname string,
 ) (upstreamIndex consts.DnsRequestOutboundIndex, err error) {
 	var domainMatchBitmap []uint32
 	if qName != "" {
@@ -186,6 +214,13 @@ func (m *RequestMatcher) Match(
 		case consts.MatchType_QType:
 			if qType == match.Value {
 				goodSubrule = true
+			}
+		case consts.MatchType_Interface:
+			for _, iface := range m.interfaceSet[match.Value] {
+				if routing.MatchInterface(iface, direction, ifname) {
+					goodSubrule = true
+					break
+				}
 			}
 		case consts.MatchType_Fallback:
 			goodSubrule = true

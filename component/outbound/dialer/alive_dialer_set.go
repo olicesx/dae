@@ -38,7 +38,7 @@ type AliveDialerSet struct {
 
 	aliveChangeCallback func(alive bool)
 
-	mu                      sync.Mutex
+	mu                      sync.RWMutex
 	dialerToIndex           map[*Dialer]int // *Dialer -> index of inorderedAliveDialerSet
 	dialerToLatency         map[*Dialer]time.Duration
 	dialerToLatencyOffset   map[*Dialer]time.Duration
@@ -93,8 +93,8 @@ func NewAliveDialerSet(
 }
 
 func (a *AliveDialerSet) GetRand() *Dialer {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	if len(a.inorderedAliveDialerSet) == 0 {
 		return nil
 	}
@@ -108,6 +108,8 @@ func (a *AliveDialerSet) SortingLatency(d *Dialer) time.Duration {
 
 // GetMinLatency acquires correct selectionPolicy.
 func (a *AliveDialerSet) GetMinLatency() (d *Dialer, latency time.Duration) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	return a.minLatency.dialer, a.minLatency.sortingLatency
 }
 
@@ -171,10 +173,12 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 		} else {
 			// Dialer: not alive -> alive.
 			if index == -NotAlive {
-				a.log.WithFields(logrus.Fields{
-					"dialer": dialer.property.Name,
-					"group":  a.dialerGroupName,
-				}).Infof("[NOT ALIVE --%v-> ALIVE]", a.CheckTyp.String())
+				if a.log.IsLevelEnabled(logrus.InfoLevel) {
+					a.log.WithFields(logrus.Fields{
+						"dialer": dialer.property.Name,
+						"group":  a.dialerGroupName,
+					}).Infof("[NOT ALIVE --%v-> ALIVE]", a.CheckTyp.String())
+				}
 			}
 			a.dialerToIndex[dialer] = len(a.inorderedAliveDialerSet)
 			a.inorderedAliveDialerSet = append(a.inorderedAliveDialerSet, dialer)
@@ -183,10 +187,12 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 		index := a.dialerToIndex[dialer]
 		if index >= 0 {
 			// Dialer: alive -> not alive.
-			a.log.WithFields(logrus.Fields{
-				"dialer": dialer.property.Name,
-				"group":  a.dialerGroupName,
-			}).Infof("[ALIVE --%v-> NOT ALIVE]", a.CheckTyp.String())
+			if a.log.IsLevelEnabled(logrus.InfoLevel) {
+				a.log.WithFields(logrus.Fields{
+					"dialer": dialer.property.Name,
+					"group":  a.dialerGroupName,
+				}).Infof("[ALIVE --%v-> NOT ALIVE]", a.CheckTyp.String())
+			}
 			// Remove the dialer from inorderedAliveDialerSet.
 			if index >= len(a.inorderedAliveDialerSet) {
 				a.log.Panicf("index:%v >= len(a.inorderedAliveDialerSet):%v", index, len(a.inorderedAliveDialerSet))
@@ -212,6 +218,7 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 
 	if hasLatency {
 		bakOldBestDialer := a.minLatency.dialer
+		bakOldMinSortingLatency := a.minLatency.sortingLatency
 		// Calc minLatency.
 		a.dialerToLatency[dialer] = rawLatency
 		sortingLatency = a.SortingLatency(dialer)
@@ -222,7 +229,7 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 			a.minLatency.dialer = dialer
 		} else if a.minLatency.dialer == dialer {
 			a.minLatency.sortingLatency = sortingLatency
-			if !alive || sortingLatency > a.minLatency.sortingLatency {
+			if !alive || sortingLatency > bakOldMinSortingLatency {
 				// Latency increases.
 				if !alive {
 					a.minLatency.dialer = nil
@@ -239,39 +246,49 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 				var oldDialerName string
 				if bakOldBestDialer == nil {
 					// Not alive -> alive
-					defer a.aliveChangeCallback(true)
+					a.mu.Unlock()
+					a.aliveChangeCallback(true)
+					a.mu.Lock()
 					re = ""
 					oldDialerName = "<nil>"
 				} else {
 					oldDialerName = bakOldBestDialer.property.Name
 				}
-				a.log.WithFields(logrus.Fields{
-					string(a.selectionPolicy): latencyString(a.dialerToLatency[a.minLatency.dialer], a.dialerToLatencyOffset[a.minLatency.dialer]),
-					"_new_dialer":             a.minLatency.dialer.property.Name,
-					"_old_dialer":             oldDialerName,
-					"group":                   a.dialerGroupName,
-					"network":                 a.CheckTyp.String(),
-				}).Infof("Group %vselects dialer", re)
+				if a.log.IsLevelEnabled(logrus.InfoLevel) {
+					a.log.WithFields(logrus.Fields{
+						string(a.selectionPolicy): latencyString(a.dialerToLatency[a.minLatency.dialer], a.dialerToLatencyOffset[a.minLatency.dialer]),
+						"_new_dialer":             a.minLatency.dialer.property.Name,
+						"_old_dialer":             oldDialerName,
+						"group":                   a.dialerGroupName,
+						"network":                 a.CheckTyp.String(),
+					}).Infof("Group %vselects dialer", re)
+				}
 
 				a.printLatencies()
 			} else {
 				// Alive -> not alive
-				defer a.aliveChangeCallback(false)
-				a.log.WithFields(logrus.Fields{
-					"group":   a.dialerGroupName,
-					"network": a.CheckTyp.String(),
-				}).Infof("Group has no dialer alive")
+				a.mu.Unlock()
+				a.aliveChangeCallback(false)
+				a.mu.Lock()
+				if a.log.IsLevelEnabled(logrus.InfoLevel) {
+					a.log.WithFields(logrus.Fields{
+						"group":   a.dialerGroupName,
+						"network": a.CheckTyp.String(),
+					}).Infof("Group has no dialer alive")
+				}
 			}
 		}
 	} else {
 		if alive && minPolicy && a.minLatency.dialer == nil {
 			// Use first dialer if no dialer has alive state (usually happen at the very beginning).
 			a.minLatency.dialer = dialer
-			a.log.WithFields(logrus.Fields{
-				"group":   a.dialerGroupName,
-				"network": a.CheckTyp.String(),
-				"dialer":  a.minLatency.dialer.property.Name,
-			}).Infof("Group selects dialer")
+			if a.log.IsLevelEnabled(logrus.InfoLevel) {
+				a.log.WithFields(logrus.Fields{
+					"group":   a.dialerGroupName,
+					"network": a.CheckTyp.String(),
+					"dialer":  a.minLatency.dialer.property.Name,
+				}).Infof("Group selects dialer")
+			}
 		}
 	}
 }

@@ -8,8 +8,10 @@ package control
 import (
 	"encoding/binary"
 	"fmt"
+	"net"
 	"net/netip"
 	"strconv"
+	"strings"
 
 	"github.com/daeuniverse/dae/pkg/trie"
 
@@ -30,6 +32,7 @@ type RoutingMatcherBuilder struct {
 	rules              []bpfMatchSet
 	simulatedLpmTries  [][]netip.Prefix
 	simulatedDomainSet []routing.DomainSet
+	interfaceSet       [][]routing.InterfaceMatcher
 	fallback           *routing.Outbound
 }
 
@@ -46,6 +49,7 @@ func NewRoutingMatcherBuilder(log *logrus.Logger, rules []*config_parser.Routing
 	rulesBuilder.RegisterFunctionParser(consts.Function_ProcessName, routing.ProcessNameParserFactory(b.addProcessName))
 	rulesBuilder.RegisterFunctionParser(consts.Function_Dscp, routing.UintParserFactory(b.addDscp))
 	rulesBuilder.RegisterFunctionParser(consts.Function_IpVersion, routing.IpVersionParserFactory(b.addIpVersion))
+	rulesBuilder.RegisterFunctionParser(consts.Function_Interface, routing.InterfaceParserFactory(b.addInterface))
 	if err = rulesBuilder.Apply(rules); err != nil {
 		return nil, err
 	}
@@ -163,7 +167,7 @@ func (b *RoutingMatcherBuilder) addPort(f *config_parser.Function, values [][2]u
 		}
 		b.rules = append(b.rules, bpfMatchSet{
 			Type: uint8(consts.MatchType_Port),
-			Value: _bpfPortRange{
+			Value: bpfPortRange{
 				PortStart: value[0],
 				PortEnd:   value[1],
 			}.Encode(),
@@ -208,7 +212,7 @@ func (b *RoutingMatcherBuilder) addSourcePort(f *config_parser.Function, values 
 		}
 		b.rules = append(b.rules, bpfMatchSet{
 			Type: uint8(consts.MatchType_SourcePort),
-			Value: _bpfPortRange{
+			Value: bpfPortRange{
 				PortStart: value[0],
 				PortEnd:   value[1],
 			}.Encode(),
@@ -299,6 +303,71 @@ func (b *RoutingMatcherBuilder) addDscp(f *config_parser.Function, values []uint
 	return nil
 }
 
+func isZoneMatchedInterfaceName(zone routing.InterfaceZone, ifname string) bool {
+	switch zone {
+	case routing.InterfaceZoneWan:
+		return strings.HasPrefix(ifname, "wan")
+	case routing.InterfaceZoneLan:
+		return strings.HasPrefix(ifname, "lan")
+	default:
+		return false
+	}
+}
+
+func resolveInterfaceIfindex(zone routing.InterfaceZone, name string) (uint32, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return 0, err
+	}
+	for _, iface := range ifaces {
+		if iface.Name == name {
+			return uint32(iface.Index), nil
+		}
+	}
+	for _, iface := range ifaces {
+		if !isZoneMatchedInterfaceName(zone, iface.Name) {
+			continue
+		}
+		if idx := strings.IndexByte(iface.Name, '.'); idx > 0 && iface.Name[idx+1:] == name {
+			return uint32(iface.Index), nil
+		}
+	}
+	return 0, nil
+}
+
+func (b *RoutingMatcherBuilder) addInterface(f *config_parser.Function, values []routing.InterfaceMatcher, outbound *routing.Outbound) (err error) {
+	for i, value := range values {
+		outboundName := consts.OutboundLogicalOr.String()
+		if i == len(values)-1 {
+			outboundName = outbound.Name
+		}
+		outboundId, err := b.outboundToId(outboundName)
+		if err != nil {
+			return err
+		}
+		b.interfaceSet = append(b.interfaceSet, []routing.InterfaceMatcher{value})
+		ifindex, err := resolveInterfaceIfindex(value.Zone, value.Name)
+		if err != nil {
+			return err
+		}
+		if ifindex == 0 {
+			b.log.Warnf("interface(%v:%v): interface cannot be resolved now; kernel matcher will skip until next reload", value.Zone, value.Name)
+		}
+		matchSet := bpfMatchSet{
+			Type:     uint8(consts.MatchType_Interface),
+			Not:      f.Not,
+			Outbound: outboundId,
+			Mark:     outbound.Mark,
+			Must:     outbound.Must,
+		}
+		binary.LittleEndian.PutUint16(matchSet.Value[:2], uint16(len(b.interfaceSet)-1))
+		matchSet.Value[2] = byte(value.Zone)
+		binary.LittleEndian.PutUint32(matchSet.Value[4:8], ifindex)
+		b.rules = append(b.rules, matchSet)
+	}
+	return nil
+}
+
 func (b *RoutingMatcherBuilder) addFallback(fallbackOutbound config.FunctionOrString) (err error) {
 	outbound, err := routing.ParseOutbound(config.FunctionOrStringToFunction(fallbackOutbound))
 	if err != nil {
@@ -318,6 +387,14 @@ func (b *RoutingMatcherBuilder) addFallback(fallbackOutbound config.FunctionOrSt
 }
 
 func (b *RoutingMatcherBuilder) BuildKernspace(log *logrus.Logger) (err error) {
+	// Rule reload safety: clear LPM cache to avoid stale cache hits across
+	// different rule generations (e.g. index reuse after config changes).
+	{
+		if err = BpfMapDeleteAll[bpfLpmCacheKey, uint8](b.bpf.LpmCacheMap); err != nil {
+			return fmt.Errorf("clear lpm_cache_map: %w", err)
+		}
+	}
+
 	// Update lpm_array_map.
 	for i, cidrs := range b.simulatedLpmTries {
 		var keys []_bpfLpmKey
@@ -348,6 +425,9 @@ func (b *RoutingMatcherBuilder) BuildKernspace(log *logrus.Logger) (err error) {
 		ElemFlags: uint64(ebpf.UpdateAny),
 	}); err != nil {
 		return fmt.Errorf("BpfMapBatchUpdate: %w", err)
+	}
+	if err = b.bpf.RoutingMetaMap.Update(uint32(0), routingsLen, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("update routing_meta_map: %w", err)
 	}
 	log.Infof("Routing match set len: %v/%v", len(b.rules), consts.MaxMatchSetLen)
 
@@ -382,6 +462,7 @@ func (b *RoutingMatcherBuilder) BuildUserspace() (matcher *RoutingMatcher, err e
 	return &RoutingMatcher{
 		lpmMatcher:    lpmMatcher,
 		domainMatcher: domainMatcher,
+		interfaceSet:  b.interfaceSet,
 		matches:       b.rules,
 	}, nil
 }

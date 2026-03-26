@@ -2276,6 +2276,13 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, u32 link_h_len,
 		if (pid_is_control_plane(skb, &pid_pname))
 			return TC_ACT_OK;
 
+		struct bpf_sock *sk = skb->sk;
+		if (sk && PARAM.dae_socket_mark != 0) {
+			struct bpf_sock *full_sk = bpf_sk_fullsock(sk);
+			if (full_sk && full_sk->mark == PARAM.dae_socket_mark)
+				return TC_ACT_OK;
+		}
+
 		if (pid_pname)
 			__builtin_memcpy(&pkt->flag[2], pid_pname->pname,
 					 TASK_COMM_LEN);
@@ -2427,6 +2434,13 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, u32 link_h_len,
 
 	if (pid_is_control_plane(skb, &pid_pname))
 		return TC_ACT_OK;
+
+	struct bpf_sock *sk = skb->sk;
+	if (sk && PARAM.dae_socket_mark != 0) {
+		struct bpf_sock *full_sk = bpf_sk_fullsock(sk);
+		if (full_sk && full_sk->mark == PARAM.dae_socket_mark)
+			return TC_ACT_OK;
+	}
 
 	if (!is_short_lived_udp_traffic(&tuples->five)) {
 		udp_conn_state = mark_udp_seen(&tuples->five, false,

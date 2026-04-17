@@ -3669,6 +3669,14 @@ func (c *ControlPlane) releaseRetainedState() {
 	c.core = nil
 }
 
+func (c *ControlPlane) ActiveTCPConnections() (n int) {
+	c.inConnections.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	return n
+}
+
 func (c *ControlPlane) Close() (err error) {
 	if c == nil {
 		return nil

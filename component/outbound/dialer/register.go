@@ -44,6 +44,7 @@ func NewFromLinkWithProxyCacheContext(ctx context.Context, gOption *GlobalOption
 	p := Property{
 		Property:        *_p,
 		SubscriptionTag: subscriptionTag,
+		Link:            link,
 	}
 	proxyHost := controlPlaneAddressHost(p.Address)
 

@@ -186,6 +186,7 @@ type InstanceOption struct {
 type Property struct {
 	D.Property
 	SubscriptionTag string
+	Link            string
 }
 
 const (

@@ -47,6 +47,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+type NodeLatencySnapshot struct {
+	Link      string
+	LatencyMs *int32
+	Alive     bool
+	Message   string
+	CheckedAt time.Time
+}
+
 type ControlPlane struct {
 	log *logrus.Logger
 
@@ -3677,6 +3685,37 @@ func (c *ControlPlane) ActiveTCPConnections() (n int) {
 	return n
 }
 
+func (c *ControlPlane) TriggerLatencyChecks() {
+	for _, group := range c.outbounds {
+		for _, d := range group.Dialers {
+			d.NotifyCheck()
+		}
+	}
+}
+
+func (c *ControlPlane) SnapshotNodeLatencies() []NodeLatencySnapshot {
+	latenciesByLink := make(map[string]NodeLatencySnapshot)
+	for _, group := range c.outbounds {
+		for _, d := range group.Dialers {
+			link := d.Property().Link
+			if link == "" {
+				continue
+			}
+
+			snapshot := bestNodeLatencySnapshotForDialer(d)
+			if existing, ok := latenciesByLink[link]; !ok || preferNodeLatencySnapshot(snapshot, existing) {
+				latenciesByLink[link] = snapshot
+			}
+		}
+	}
+
+	results := make([]NodeLatencySnapshot, 0, len(latenciesByLink))
+	for _, snapshot := range latenciesByLink {
+		results = append(results, snapshot)
+	}
+	return results
+}
+
 func (c *ControlPlane) Close() (err error) {
 	if c == nil {
 		return nil
@@ -3720,6 +3759,62 @@ func (c *ControlPlane) Close() (err error) {
 	})
 
 	return c.closeErr
+}
+
+func bestNodeLatencySnapshotForDialer(d *dialer.Dialer) NodeLatencySnapshot {
+	snapshot := NodeLatencySnapshot{
+		Link:      d.Property().Link,
+		Alive:     false,
+		Message:   "no latency result",
+		CheckedAt: time.Time{},
+	}
+
+	checkTypes := []*dialer.NetworkType{
+		{
+			L4Proto:   consts.L4ProtoStr_TCP,
+			IpVersion: consts.IpVersionStr_4,
+			IsDns:     false,
+		},
+		{
+			L4Proto:   consts.L4ProtoStr_TCP,
+			IpVersion: consts.IpVersionStr_6,
+			IsDns:     false,
+		},
+	}
+
+	var bestLatency time.Duration
+	for _, networkType := range checkTypes {
+		latency, ok := d.MustGetLatencies10(networkType).LastLatency()
+		if !ok {
+			continue
+		}
+		if !snapshot.Alive || latency < bestLatency {
+			latencyMs := int32(latency.Milliseconds())
+			bestLatency = latency
+			snapshot.LatencyMs = &latencyMs
+			snapshot.Alive = d.MustGetAlive(networkType)
+			snapshot.Message = dialer.FormatLatencyMessage(&dialer.LatencyProbeResult{
+				Alive:   snapshot.Alive,
+				Latency: latency,
+			})
+			snapshot.CheckedAt = time.Now()
+		}
+	}
+
+	return snapshot
+}
+
+func preferNodeLatencySnapshot(next NodeLatencySnapshot, current NodeLatencySnapshot) bool {
+	if next.LatencyMs != nil && current.LatencyMs == nil {
+		return true
+	}
+	if next.LatencyMs == nil {
+		return false
+	}
+	if current.LatencyMs == nil {
+		return true
+	}
+	return *next.LatencyMs < *current.LatencyMs
 }
 
 // StopDNSListener stops the DNS listener if it's running

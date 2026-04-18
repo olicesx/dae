@@ -88,7 +88,7 @@ func (d *Dialer) latencyProbeCheckOptions() []*CheckOption {
 					tcpSomark = network.Mark
 					mptcp = network.Mptcp
 				}
-				return d.HttpCheck(ctx, opt.Url, opt.Ip4, opt.Method, tcpSomark, mptcp)
+				return d.HttpCheck(ctx, IdxTcp4, opt.Url, opt.Ip4, opt.Method, tcpSomark, mptcp)
 			},
 		},
 		{
@@ -111,7 +111,7 @@ func (d *Dialer) latencyProbeCheckOptions() []*CheckOption {
 					tcpSomark = network.Mark
 					mptcp = network.Mptcp
 				}
-				return d.HttpCheck(ctx, opt.Url, opt.Ip6, opt.Method, tcpSomark, mptcp)
+				return d.HttpCheck(ctx, IdxTcp6, opt.Url, opt.Ip6, opt.Method, tcpSomark, mptcp)
 			},
 		},
 	}

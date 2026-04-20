@@ -126,3 +126,210 @@ func TestDnsCache_FillIntoWithTTL_DoesNotMutateRequestOnPackError(t *testing.T) 
 	require.Nil(t, req.Answer, "request answer should remain untouched when fallback packing fails")
 	require.False(t, req.RecursionAvailable)
 }
+
+func TestDnsCache_PrepackResponse_Correctness(t *testing.T) {
+	answers := []dnsmessage.RR{
+		&dnsmessage.A{
+			Hdr: dnsmessage.RR_Header{
+				Name:   "test.example.com.",
+				Rrtype: dnsmessage.TypeA,
+				Class:  dnsmessage.ClassINET,
+				Ttl:    300,
+			},
+			A: []byte{93, 184, 216, 34},
+		},
+		&dnsmessage.AAAA{
+			Hdr: dnsmessage.RR_Header{
+				Name:   "test.example.com.",
+				Rrtype: dnsmessage.TypeAAAA,
+				Class:  dnsmessage.ClassINET,
+				Ttl:    300,
+			},
+			AAAA: []byte{0x26, 0x07, 0xf8, 0xb0, 0x40, 0x0, 0x8, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x20, 0x22},
+		},
+	}
+
+	cache := &DnsCache{
+		DomainBitmap:     []uint32{1, 2, 3},
+		Answer:           answers,
+		Deadline:         time.Now().Add(5 * time.Minute),
+		OriginalDeadline: time.Now().Add(5 * time.Minute),
+	}
+
+	require.NoError(t, cache.PrepackResponse("test.example.com.", dnsmessage.TypeA))
+
+	packed := cache.GetPackedResponse()
+	require.NotNil(t, packed)
+
+	var msg dnsmessage.Msg
+	require.NoError(t, msg.Unpack(packed))
+	require.Equal(t, dnsmessage.RcodeSuccess, msg.Rcode)
+	require.True(t, msg.Response)
+	require.True(t, msg.RecursionAvailable)
+	require.Len(t, msg.Question, 1)
+	require.Equal(t, "test.example.com.", msg.Question[0].Name)
+}
+
+func TestDnsCache_PrepackResponseBeforeStore_RestoresRRTTL(t *testing.T) {
+	answer := &dnsmessage.A{
+		Hdr: dnsmessage.RR_Header{
+			Name:   "test.example.com.",
+			Rrtype: dnsmessage.TypeA,
+			Class:  dnsmessage.ClassINET,
+			Ttl:    60,
+		},
+		A: []byte{93, 184, 216, 34},
+	}
+	ns := &dnsmessage.NS{
+		Hdr: dnsmessage.RR_Header{
+			Name:   "test.example.com.",
+			Rrtype: dnsmessage.TypeNS,
+			Class:  dnsmessage.ClassINET,
+			Ttl:    120,
+		},
+		Ns: "ns1.example.com.",
+	}
+	extra := &dnsmessage.A{
+		Hdr: dnsmessage.RR_Header{
+			Name:   "ns1.example.com.",
+			Rrtype: dnsmessage.TypeA,
+			Class:  dnsmessage.ClassINET,
+			Ttl:    180,
+		},
+		A: []byte{93, 184, 216, 35},
+	}
+	cache := &DnsCache{
+		Answer:           []dnsmessage.RR{answer},
+		NS:               []dnsmessage.RR{ns},
+		Extra:            []dnsmessage.RR{extra},
+		Deadline:         time.Now().Add(5 * time.Minute),
+		OriginalDeadline: time.Now().Add(5 * time.Minute),
+	}
+
+	require.NoError(t, cache.prepackResponseBeforeStore("test.example.com.", dnsmessage.TypeA, 42, time.Now()))
+	require.EqualValues(t, 60, answer.Header().Ttl)
+	require.EqualValues(t, 120, ns.Header().Ttl)
+	require.EqualValues(t, 180, extra.Header().Ttl)
+
+	packed := cache.GetPackedResponse()
+	require.NotNil(t, packed)
+
+	var msg dnsmessage.Msg
+	require.NoError(t, msg.Unpack(packed))
+	require.EqualValues(t, 42, msg.Answer[0].Header().Ttl)
+	require.EqualValues(t, 42, msg.Ns[0].Header().Ttl)
+	require.EqualValues(t, 42, msg.Extra[0].Header().Ttl)
+}
+
+func TestDnsCache_FillIntoWithTTL_Correctness(t *testing.T) {
+	deadline := time.Now().Add(300 * time.Second)
+	cache := &DnsCache{
+		DomainBitmap: []uint32{1, 2, 3},
+		Answer: []dnsmessage.RR{
+			&dnsmessage.A{
+				Hdr: dnsmessage.RR_Header{
+					Name:   "test.example.com.",
+					Rrtype: dnsmessage.TypeA,
+					Class:  dnsmessage.ClassINET,
+					Ttl:    0,
+				},
+				A: []byte{93, 184, 216, 34},
+			},
+		},
+		Deadline:         deadline,
+		OriginalDeadline: deadline,
+	}
+
+	resp := cache.FillIntoWithTTL(new(dnsmessage.Msg), time.Now())
+	require.NotNil(t, resp)
+
+	var msg dnsmessage.Msg
+	require.NoError(t, msg.Unpack(resp))
+	require.Len(t, msg.Answer, 1)
+	require.GreaterOrEqual(t, msg.Answer[0].Header().Ttl, uint32(299))
+	require.LessOrEqual(t, msg.Answer[0].Header().Ttl, uint32(300))
+
+	resp = cache.FillIntoWithTTL(new(dnsmessage.Msg), time.Now().Add(100*time.Second))
+	require.NotNil(t, resp)
+	require.NoError(t, msg.Unpack(resp))
+	require.GreaterOrEqual(t, msg.Answer[0].Header().Ttl, uint32(199))
+	require.LessOrEqual(t, msg.Answer[0].Header().Ttl, uint32(201))
+
+	resp = cache.FillIntoWithTTL(new(dnsmessage.Msg), deadline.Add(-500*time.Millisecond))
+	require.NotNil(t, resp)
+	require.NoError(t, msg.Unpack(resp))
+	require.EqualValues(t, 1, msg.Answer[0].Header().Ttl)
+}
+
+func TestDnsCache_GetPackedResponseWithApproximateTTL(t *testing.T) {
+	deadline := time.Now().Add(300 * time.Second)
+	cache := &DnsCache{
+		DomainBitmap: []uint32{1, 2, 3},
+		Answer: []dnsmessage.RR{
+			&dnsmessage.A{
+				Hdr: dnsmessage.RR_Header{
+					Name:   "test.example.com.",
+					Rrtype: dnsmessage.TypeA,
+					Class:  dnsmessage.ClassINET,
+					Ttl:    0,
+				},
+				A: []byte{93, 184, 216, 34},
+			},
+		},
+		Deadline:         deadline,
+		OriginalDeadline: deadline,
+	}
+
+	require.NoError(t, cache.PrepackResponse("test.example.com.", dnsmessage.TypeA))
+
+	resp := cache.GetPackedResponseWithApproximateTTL("test.example.com.", dnsmessage.TypeA, time.Now())
+	require.NotNil(t, resp)
+
+	var msg dnsmessage.Msg
+	require.NoError(t, msg.Unpack(resp))
+	require.GreaterOrEqual(t, msg.Answer[0].Header().Ttl, uint32(299))
+	require.LessOrEqual(t, msg.Answer[0].Header().Ttl, uint32(300))
+
+	resp = cache.GetPackedResponseWithApproximateTTL("test.example.com.", dnsmessage.TypeA, time.Now().Add(20*time.Second))
+	require.NotNil(t, resp)
+	require.NoError(t, msg.Unpack(resp))
+	require.GreaterOrEqual(t, msg.Answer[0].Header().Ttl, uint32(278))
+	require.LessOrEqual(t, msg.Answer[0].Header().Ttl, uint32(282))
+
+	resp = cache.GetPackedResponseWithApproximateTTL("test.example.com.", dnsmessage.TypeA, deadline.Add(-500*time.Millisecond))
+	require.NotNil(t, resp)
+	require.NoError(t, msg.Unpack(resp))
+	require.EqualValues(t, 1, msg.Answer[0].Header().Ttl)
+
+	require.Nil(t, cache.GetPackedResponseWithApproximateTTL("test.example.com.", dnsmessage.TypeA, deadline.Add(time.Second)))
+}
+
+func TestDnsCache_FallbackWhenPrepackNotAvailable(t *testing.T) {
+	deadline := time.Now().Add(300 * time.Second)
+	cache := &DnsCache{
+		DomainBitmap: []uint32{1, 2, 3},
+		Answer: []dnsmessage.RR{
+			&dnsmessage.A{
+				Hdr: dnsmessage.RR_Header{
+					Name:   "test.example.com.",
+					Rrtype: dnsmessage.TypeA,
+					Class:  dnsmessage.ClassINET,
+					Ttl:    0,
+				},
+				A: []byte{93, 184, 216, 34},
+			},
+		},
+		Deadline:         deadline,
+		OriginalDeadline: deadline,
+	}
+
+	require.Nil(t, cache.GetPackedResponseWithApproximateTTL("test.example.com.", dnsmessage.TypeA, time.Now()))
+
+	resp := cache.FillIntoWithTTL(new(dnsmessage.Msg), time.Now())
+	require.NotNil(t, resp)
+
+	var msg dnsmessage.Msg
+	require.NoError(t, msg.Unpack(resp))
+	require.GreaterOrEqual(t, msg.Answer[0].Header().Ttl, uint32(299))
+	require.LessOrEqual(t, msg.Answer[0].Header().Ttl, uint32(300))
+}

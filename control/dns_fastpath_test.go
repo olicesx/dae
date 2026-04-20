@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -119,120 +118,6 @@ func TestUdpTaskPool_NonDNSPreserveOrder(t *testing.T) {
 	for i := range n {
 		require.Equal(t, i, got[i], "non-DNS traffic should preserve order")
 	}
-}
-
-// TestDNSFastPath_MemoryProfile compares memory usage between direct execution and UdpTaskPool.
-func TestDNSFastPath_MemoryProfile(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping memory profile test in short mode")
-	}
-
-	pool := NewUdpTaskPool()
-
-	// Simulate 1000 different DNS source ports (random port scenario)
-	ports := make([]UdpFlowKey, 1000)
-	for i := range ports {
-		ports[i] = NewUdpSrcOnlyFlowKey(netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", 20000+i)))
-	}
-
-	var m1, m2, m3 runtime.MemStats
-
-	// Baseline
-	runtime.GC()
-	runtime.ReadMemStats(&m1)
-
-	// Without UdpTaskPool (DNS fast path simulation)
-	var done1 atomic.Int32
-	for i := 0; i < 1000; i++ {
-		go func() { done1.Add(1) }()
-	}
-	for done1.Load() < 1000 {
-		runtime.Gosched()
-	}
-
-	runtime.GC()
-	runtime.ReadMemStats(&m2)
-
-	// With UdpTaskPool (non-DNS path simulation)
-	var done2 atomic.Int32
-	for _, port := range ports {
-		pool.EmitTask(port, func() {
-			done2.Add(1)
-		})
-	}
-
-	require.Eventually(t, func() bool { return done2.Load() == 1000 }, 5*time.Second, 100*time.Millisecond)
-
-	runtime.GC()
-	runtime.ReadMemStats(&m3)
-
-	fastPathAlloc := m2.TotalAlloc - m1.TotalAlloc
-	taskPoolAlloc := m3.TotalAlloc - m2.TotalAlloc
-
-	t.Logf("Fast path allocated: %d bytes", fastPathAlloc)
-	t.Logf("UdpTaskPool allocated: %d bytes", taskPoolAlloc)
-	t.Logf("UdpTaskPool overhead: %d bytes (%.2fx)", taskPoolAlloc-fastPathAlloc,
-		float64(taskPoolAlloc)/float64(fastPathAlloc))
-
-	// UdpTaskPool should use more memory due to queue structures
-	require.Greater(t, taskPoolAlloc, fastPathAlloc,
-		"UdpTaskPool should use more memory than direct execution")
-}
-
-// BenchmarkDNSFastPath_DirectExecution benchmarks direct goroutine execution (DNS fast path).
-func BenchmarkDNSFastPath_DirectExecution(b *testing.B) {
-	var done atomic.Int64
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		go func() { done.Add(1) }()
-	}
-	for done.Load() < int64(b.N) {
-		runtime.Gosched()
-	}
-}
-
-// BenchmarkDNSFastPath_WithTaskPool benchmarks UdpTaskPool execution (non-DNS path).
-func BenchmarkDNSFastPath_WithTaskPool(b *testing.B) {
-	pool := NewUdpTaskPool()
-	key := NewUdpSrcOnlyFlowKey(netip.MustParseAddrPort("127.0.0.1:8080"))
-
-	var done atomic.Int64
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		pool.EmitTask(key, func() { done.Add(1) })
-	}
-	for done.Load() < int64(b.N) {
-		runtime.Gosched()
-	}
-}
-
-// BenchmarkDNSFastPath_ManySourcePorts benchmarks with many different source ports (realistic DNS scenario).
-func BenchmarkDNSFastPath_ManySourcePorts(b *testing.B) {
-	pool := NewUdpTaskPool()
-	var done atomic.Int64
-
-	b.Run("DirectExecution", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			port := uint16(20000 + (i % 1000))
-			_ = netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", port))
-			go func() { done.Add(1) }()
-		}
-		for done.Load() < int64(b.N) {
-			runtime.Gosched()
-		}
-	})
-
-	b.Run("UdpTaskPool", func(b *testing.B) {
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			port := uint16(20000 + (i % 1000))
-			key := NewUdpSrcOnlyFlowKey(netip.MustParseAddrPort(fmt.Sprintf("127.0.0.1:%d", port)))
-			pool.EmitTask(key, func() { done.Add(1) })
-		}
-		for done.Load() < int64(b.N) {
-			runtime.Gosched()
-		}
-	})
 }
 
 // TestDNSFastPath_RandomPorts simulates DNS queries with random source ports.

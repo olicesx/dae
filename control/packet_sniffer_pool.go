@@ -513,11 +513,6 @@ type packetSnifferFlowFamilyRef struct {
 
 const packetSnifferFlowFamilyRefDraining = int32(-1)
 
-type packetSnifferFlowFamilyEntry struct {
-	key     PacketSnifferKey
-	sniffer *PacketSniffer
-}
-
 func newPacketSnifferFlowFamilyRef() *packetSnifferFlowFamilyRef {
 	ref := &packetSnifferFlowFamilyRef{
 		members: make(map[PacketSnifferKey]*PacketSniffer),
@@ -547,23 +542,6 @@ func (ref *packetSnifferFlowFamilyRef) deleteMember(key PacketSnifferKey, sniffe
 		delete(ref.members, key)
 	}
 	ref.mu.Unlock()
-}
-
-func (ref *packetSnifferFlowFamilyRef) snapshotMembers() []packetSnifferFlowFamilyEntry {
-	if ref == nil {
-		return nil
-	}
-	ref.mu.RLock()
-	defer ref.mu.RUnlock()
-
-	entries := make([]packetSnifferFlowFamilyEntry, 0, len(ref.members))
-	for key, sniffer := range ref.members {
-		entries = append(entries, packetSnifferFlowFamilyEntry{
-			key:     key,
-			sniffer: sniffer,
-		})
-	}
-	return entries
 }
 
 func (ref *packetSnifferFlowFamilyRef) rangeMembers(fn func(PacketSnifferKey, *PacketSniffer) bool) {
@@ -951,10 +929,6 @@ func (p *PacketSnifferPool) deleteFlowFamilyMember(key PacketSnifferKey, sniffer
 	if family := p.loadFlowFamily(key); family != nil {
 		family.deleteMember(key, sniffer)
 	}
-}
-
-func (p *PacketSnifferPool) retainFlowFamily(key PacketSnifferKey) {
-	_ = p.retainFlowFamilyRef(key)
 }
 
 func (p *PacketSnifferPool) retainFlowFamilyRef(key PacketSnifferKey) *packetSnifferFlowFamilyRef {

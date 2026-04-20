@@ -28,10 +28,6 @@ type udpUnorderedTaskRunner struct {
 	overflow chan UdpTask
 }
 
-func newUdpUnorderedTaskRunner(ctx context.Context, workers, queueSizePerWorker int) *udpUnorderedTaskRunner {
-	return newUdpUnorderedTaskRunnerWithOverflow(ctx, workers, queueSizePerWorker, 0, 0)
-}
-
 func newDefaultUdpUnorderedTaskRunner(ctx context.Context) *udpUnorderedTaskRunner {
 	workers := runtime.GOMAXPROCS(0)
 	if workers <= 0 {

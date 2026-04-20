@@ -9,10 +9,6 @@ import (
 	"github.com/daeuniverse/outbound/netproxy"
 )
 
-func relayAdaptiveCopy(ctx context.Context, dst netproxy.Conn, src netproxy.Conn) (int64, error) {
-	return defaultRelayCopyEngine{}.Copy(ctx, dst, src)
-}
-
 func relayFastCopy(ctx context.Context, dst netproxy.Conn, src netproxy.Conn) (int64, error) {
 	// Non-Linux platforms: always use buffered copy.
 	// Check context cancellation before starting copy.

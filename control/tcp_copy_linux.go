@@ -10,10 +10,6 @@ import (
 	"io"
 )
 
-func relayAdaptiveCopy(ctx context.Context, dst netproxy.Conn, src netproxy.Conn) (int64, error) {
-	return defaultRelayCopyEngine{}.Copy(ctx, dst, src)
-}
-
 func relayFastCopy(ctx context.Context, dst netproxy.Conn, src netproxy.Conn) (int64, error) {
 	// shouldUseRelayFastPath guarantees both sides resolve to a *net.TCPConn.
 	// Bypass outer wrapper interfaces (*ConnSniffer, *prefixedConn) and operate

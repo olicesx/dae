@@ -316,6 +316,19 @@ type WriteCloser interface {
 	CloseWrite() error
 }
 
+type runtimeTrafficWriter struct {
+	netproxy.Conn
+	record func(int64)
+}
+
+func (w *runtimeTrafficWriter) Write(p []byte) (int, error) {
+	n, err := w.Conn.Write(p)
+	if n > 0 {
+		w.record(int64(n))
+	}
+	return n, err
+}
+
 // RelayTCP copies data bidirectionally between two connections.
 // A relayCore orchestrates shared cancellation and force-close fallback.
 func RelayTCP(lConn, rConn netproxy.Conn) (err error) {
@@ -326,7 +339,9 @@ func RelayTCP(lConn, rConn netproxy.Conn) (err error) {
 // the given context. The context can be used to cancel the relay operation
 // or set a deadline. A nil context is treated as context.Background().
 func RelayTCPContext(ctx context.Context, lConn, rConn netproxy.Conn) (err error) {
-	core := newRelayCore(lConn, rConn, defaultRelayCopyEngine{})
+	accountingLeft := &runtimeTrafficWriter{Conn: lConn, record: RecordDownloadTraffic}
+	accountingRight := &runtimeTrafficWriter{Conn: rConn, record: RecordUploadTraffic}
+	core := newRelayCore(accountingLeft, accountingRight, defaultRelayCopyEngine{})
 	return core.run(ctx)
 }
 

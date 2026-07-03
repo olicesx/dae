@@ -3619,8 +3619,23 @@ func (c *ControlPlane) closeTail() error {
 			core := c.core
 			log := c.log
 			go func() {
-				if err := core.Close(); err != nil && log != nil {
-					log.WithError(err).Warn("[Reload] Async core cleanup after staged handoff")
+				// Bound async cleanup with the same timeout used by the
+				// synchronous closeTail path. core.Close() only detaches TC
+				// filters and releases the UDP tracker here (BPF ownership
+				// has already been ejected), but netlink.FilterDel can still
+				// hang on virtual/PPPoE interfaces. Without a deadline a
+				// stuck call leaks the goroutine and leaves stale filters.
+				done := make(chan error, 1)
+				go func() { done <- core.Close() }()
+				select {
+				case err := <-done:
+					if err != nil && log != nil {
+						log.WithError(err).Warn("[Reload] Async core cleanup after staged handoff")
+					}
+				case <-time.After(controlPlaneDeferredCleanupTimeout):
+					if log != nil {
+						log.Warnf("[Reload] Async core cleanup timed out after %v; TC filters may linger", controlPlaneDeferredCleanupTimeout)
+					}
 				}
 			}()
 		} else {

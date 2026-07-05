@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -177,6 +178,7 @@ func (m *reloadManager) pendingDNSHandoffActive(current *control.ControlPlane) b
 	}
 	handoff := m.currentPendingStagedHandoff()
 	return handoff != nil &&
+		!handoff.freshDatapath &&
 		handoff.oldControlPlane != nil &&
 		handoff.oldControlPlane.SharesActiveDnsControllerWith(current)
 }
@@ -228,7 +230,7 @@ func (m *reloadManager) installPreparedDNSHandoffHooks(log *logrus.Logger, curre
 		return
 	}
 	handoff := m.currentPendingStagedHandoff()
-	if handoff == nil {
+	if handoff == nil || handoff.freshDatapath {
 		return
 	}
 	hooks := buildPreparedDNSHandoffHooks(log, dnsConfigEqual(handoff.oldConf, conf), preparedDNSHandoffHookCallbacks{
@@ -334,6 +336,42 @@ func dnsConfigEqual(oldConf *config.Config, newConf *config.Config) bool {
 		return false
 	}
 	return dnsConfigFingerprint(oldConf.Dns) == dnsConfigFingerprint(newConf.Dns)
+}
+
+// bpfDatapathChanged returns true when a config diff changes kernel datapath
+// state or userspace interpretation of kernel routing results. Such changes
+// must not use shared-BPF staged handoff because the retiring generation can
+// still accept connections while the shared maps already contain new policy.
+func bpfDatapathChanged(oldConf, newConf *config.Config) bool {
+	if oldConf == nil || newConf == nil {
+		return true
+	}
+	if !dnsConfigEqual(oldConf, newConf) {
+		return true
+	}
+	if !reflect.DeepEqual(oldConf.Routing.Rules, newConf.Routing.Rules) {
+		return true
+	}
+	if !reflect.DeepEqual(oldConf.Routing.Fallback, newConf.Routing.Fallback) {
+		return true
+	}
+	if !reflect.DeepEqual(oldConf.Group, newConf.Group) {
+		return true
+	}
+	if !reflect.DeepEqual(oldConf.Global.LanInterface, newConf.Global.LanInterface) {
+		return true
+	}
+	if !reflect.DeepEqual(oldConf.Global.WanInterface, newConf.Global.WanInterface) {
+		return true
+	}
+	if oldConf.Global.BpfConnStateMapSize != newConf.Global.BpfConnStateMapSize {
+		return true
+	}
+	if oldConf.Global.SoMarkFromDae != newConf.Global.SoMarkFromDae ||
+		oldConf.Global.SoMarkFromDaeSet != newConf.Global.SoMarkFromDaeSet {
+		return true
+	}
+	return false
 }
 
 // dnsConfigFingerprint captures only the DNS fields that affect BPF datapath

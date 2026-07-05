@@ -16,6 +16,8 @@ import (
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
+	"github.com/daeuniverse/dae/pkg/config_parser"
+	"github.com/mohae/deepcopy"
 	"github.com/sirupsen/logrus"
 )
 
@@ -634,6 +636,139 @@ func TestDNSConfigFingerprintCoversAllDnsFields(t *testing.T) {
 	}
 	for name := range covered {
 		t.Fatalf("dnsConfigFingerprint coverage references missing config.Dns.%s", name)
+	}
+}
+
+func baseReloadDatapathConfig() *config.Config {
+	return &config.Config{
+		Global: config.Global{
+			TproxyPort:            12345,
+			LanInterface:          []string{"eth0"},
+			WanInterface:          []string{"wan0"},
+			BpfConnStateMapSize:   262144,
+			SoMarkFromDae:         0x8000000,
+			SoMarkFromDaeSet:      true,
+			FallbackResolver:      "8.8.8.8:53",
+			DialMode:              "ip",
+			DisableWaitingNetwork: true,
+		},
+		Group: []config.Group{
+			{Name: "proxy", Policy: config.FunctionListOrString("fixed(0)")},
+		},
+		Routing: config.Routing{
+			Fallback: "direct",
+		},
+		Dns: config.Dns{
+			Bind:               "127.0.0.1:53",
+			IpVersionPrefer:    4,
+			Upstream:           []config.KeyableString{"google:udp://8.8.8.8:53"},
+			OptimisticCache:    true,
+			OptimisticCacheTtl: 60,
+			MaxCacheSize:       1024,
+		},
+	}
+}
+
+func equivalentReloadRoutingRule() *config_parser.RoutingRule {
+	return &config_parser.RoutingRule{
+		AndFunctions: []*config_parser.Function{
+			{
+				Name: "domain",
+				Params: []*config_parser.Param{
+					{Key: "suffix", Val: "example.com"},
+				},
+			},
+		},
+		Outbound: config_parser.Function{Name: "proxy"},
+	}
+}
+
+func TestBpfDatapathChangedIgnoresDnsRuntimeParameters(t *testing.T) {
+	oldConf := baseReloadDatapathConfig()
+	newConf := deepcopy.Copy(oldConf).(*config.Config)
+	newConf.Dns.OptimisticCache = !oldConf.Dns.OptimisticCache
+	newConf.Dns.OptimisticCacheTtl = oldConf.Dns.OptimisticCacheTtl + 30
+	newConf.Dns.MaxCacheSize = oldConf.Dns.MaxCacheSize + 2048
+
+	if bpfDatapathChanged(oldConf, newConf) {
+		t.Fatal("DNS runtime-only changes must stay on shared staged handoff")
+	}
+}
+
+func TestBpfDatapathChangedTreatsEquivalentPointerValuesAsUnchanged(t *testing.T) {
+	oldConf := baseReloadDatapathConfig()
+	newConf := baseReloadDatapathConfig()
+	oldConf.Routing.Rules = []*config_parser.RoutingRule{equivalentReloadRoutingRule()}
+	newConf.Routing.Rules = []*config_parser.RoutingRule{equivalentReloadRoutingRule()}
+
+	if oldConf.Routing.Rules[0] == newConf.Routing.Rules[0] ||
+		oldConf.Routing.Rules[0].AndFunctions[0] == newConf.Routing.Rules[0].AndFunctions[0] ||
+		oldConf.Routing.Rules[0].AndFunctions[0].Params[0] == newConf.Routing.Rules[0].AndFunctions[0].Params[0] {
+		t.Fatal("test setup must use distinct pointers")
+	}
+	if bpfDatapathChanged(oldConf, newConf) {
+		t.Fatal("equivalent routing rule values with distinct pointers must stay on shared staged handoff")
+	}
+}
+
+func TestBpfDatapathChangedDetectsKernelDatapathInputs(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*config.Config)
+	}{
+		{
+			name: "dns upstream",
+			mutate: func(conf *config.Config) {
+				conf.Dns.Upstream = []config.KeyableString{"cloudflare:udp://1.1.1.1:53"}
+			},
+		},
+		{
+			name: "routing fallback",
+			mutate: func(conf *config.Config) {
+				conf.Routing.Fallback = "block"
+			},
+		},
+		{
+			name: "group definition",
+			mutate: func(conf *config.Config) {
+				conf.Group = append(conf.Group, config.Group{Name: "backup", Policy: config.FunctionListOrString("fixed(0)")})
+			},
+		},
+		{
+			name: "lan interface",
+			mutate: func(conf *config.Config) {
+				conf.Global.LanInterface = []string{"eth1"}
+			},
+		},
+		{
+			name: "wan interface",
+			mutate: func(conf *config.Config) {
+				conf.Global.WanInterface = []string{"ppp0"}
+			},
+		},
+		{
+			name: "conn state map size",
+			mutate: func(conf *config.Config) {
+				conf.Global.BpfConnStateMapSize *= 2
+			},
+		},
+		{
+			name: "socket mark",
+			mutate: func(conf *config.Config) {
+				conf.Global.SoMarkFromDae++
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oldConf := baseReloadDatapathConfig()
+			newConf := deepcopy.Copy(oldConf).(*config.Config)
+			tt.mutate(newConf)
+			if !bpfDatapathChanged(oldConf, newConf) {
+				t.Fatal("expected datapath-affecting change")
+			}
+		})
 	}
 }
 

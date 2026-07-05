@@ -136,6 +136,7 @@ type stagedReloadHandoff struct {
 	newListener      *control.Listener
 	abortConnections bool
 	hasOverlap       bool
+	freshDatapath    bool
 }
 
 func tryQueueReloadRequest(
@@ -326,7 +327,7 @@ func (r *Runner) Run() (err error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	currCancel = cancel
 	configureTransparentHugePages(log, conf.Global.DisableTHP)
-	c, err := newControlPlane(ctx, log, nil, nil, conf, externGeoDataDirs, false)
+	c, err := newControlPlane(ctx, log, nil, nil, conf, externGeoDataDirs, false, false)
 	if err != nil {
 		cancel()
 		return err
@@ -445,17 +446,26 @@ func (r *Runner) Run() (err error) {
 			logrus.SetOutput(oldLogOutput)
 
 			portChanged := conf.Global.TproxyPort != newConf.Global.TproxyPort
-			stagedHotHandoff := !portChanged && listener != nil
+			datapathChanged := bpfDatapathChanged(conf, newConf)
+			freshDatapathReload := portChanged || datapathChanged
+			stagedHotHandoff := !freshDatapathReload && listener != nil
+			freshDatapathHandoff := freshDatapathReload && listener != nil
 
 			// New control plane.
 			obj := c.PeekBpf()
-			if !stagedHotHandoff {
+			if freshDatapathReload {
+				obj = nil
+			} else if !stagedHotHandoff {
 				obj = c.EjectBpf()
+			}
+			var reloadBpf any
+			if obj != nil {
+				reloadBpf = obj
 			}
 			if portChanged {
 				log.Warnf("[Reload] Tproxy port changed from %d to %d; will perform a full reload of eBPF programs", conf.Global.TproxyPort, newConf.Global.TproxyPort)
-				_ = obj.Close()
-				obj = nil
+			} else if datapathChanged {
+				log.Warnln("[Reload] BPF datapath config changed (routing/group/dns/iface); will perform a fresh datapath handoff")
 			}
 
 			var dnsCache map[string]*control.DnsCache
@@ -469,7 +479,7 @@ func (r *Runner) Run() (err error) {
 			if stagedHotHandoff {
 				log.Warnln("[Reload] Prepare staged same-port handoff")
 				ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
-				newC, prepareErr := newPreparedControlPlane(ctx, log, obj, dnsCache, newConf, externGeoDataDirs, dnsConfigEqual(conf, newConf))
+				newC, prepareErr := newPreparedControlPlane(ctx, log, reloadBpf, dnsCache, newConf, externGeoDataDirs, dnsConfigEqual(conf, newConf), true)
 				dnsCache = nil
 				if prepareErr != nil {
 					reloadErr := wrapReloadTimeoutError("prepare staged reload", prepareErr, reloadPrepareTimeout)
@@ -526,6 +536,71 @@ func (r *Runner) Run() (err error) {
 				continue
 			}
 
+			if freshDatapathHandoff {
+				log.Warnln("[Reload] Prepare fresh datapath handoff")
+				ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
+				newC, prepareErr := newPreparedControlPlane(ctx, log, nil, dnsCache, newConf, externGeoDataDirs, false, true)
+				dnsCache = nil
+				if prepareErr != nil {
+					reloadErr := wrapReloadTimeoutError("prepare fresh datapath reload", prepareErr, reloadPrepareTimeout)
+					reloadManager.setReloadError(reloadErr)
+					cancel()
+					log.WithError(reloadErr).Errorln("[Reload] Failed to prepare fresh datapath reload; keeping current generation active")
+					_ = sdnotify.Ready()
+					_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
+					reloadManager.reloadActive.Store(false)
+					clearReloadPending(&reloadManager.reloadPending)
+					continue
+				}
+
+				if portChanged {
+					stagedListener, err = newC.Listen(newConf.Global.TproxyPort)
+				} else {
+					stagedListener, err = listener.Clone()
+				}
+				if err != nil {
+					reloadErr := fmt.Errorf("prepare fresh datapath listener: %w", err)
+					reloadManager.setReloadError(reloadErr)
+					cancel()
+					if closeErr := newC.Close(); closeErr != nil {
+						log.WithError(closeErr).Warnln("[Reload] Failed to close prepared fresh datapath generation")
+					}
+					log.WithError(reloadErr).Errorln("[Reload] Failed to prepare fresh datapath listener; keeping current generation active")
+					_ = sdnotify.Ready()
+					_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
+					reloadManager.reloadActive.Store(false)
+					clearReloadPending(&reloadManager.reloadPending)
+					continue
+				}
+
+				oldC := c
+				oldCancel := currCancel
+				oldConf := conf
+				oldListener := listener
+
+				hasOverlap := newC.InheritDialerHealthFrom(oldC)
+				configureTransparentHugePages(log, newConf.Global.DisableTHP)
+				c = newC
+				currCancel = cancel
+				conf = newConf
+				listener = stagedListener
+				reloadManager.setPendingStagedHandoff(&stagedReloadHandoff{
+					oldControlPlane:  oldC,
+					oldCancel:        oldCancel,
+					oldConf:          oldConf,
+					oldListener:      oldListener,
+					newControlPlane:  newC,
+					newCancel:        cancel,
+					newListener:      stagedListener,
+					abortConnections: abortConnections,
+					hasOverlap:       hasOverlap,
+					freshDatapath:    true,
+				}, reloadStartedAt, reloadStartedAtMono)
+				reloadManager.beginHandoff()
+				notifyRunStateChange(runStateChanges)
+				continue
+			}
+
 			// Stop old DNS listener before creating new one to avoid port conflicts
 			if err := c.StopDNSListener(); err != nil {
 				log.Warnf("[Reload] Failed to stop old DNS listener: %v", err)
@@ -533,7 +608,7 @@ func (r *Runner) Run() (err error) {
 
 			log.Warnln("[Reload] Load new control plane")
 			ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
-			newC, err := newControlPlane(ctx, log, obj, dnsCache, newConf, externGeoDataDirs, dnsConfigEqual(conf, newConf))
+			newC, err := newControlPlane(ctx, log, reloadBpf, dnsCache, newConf, externGeoDataDirs, dnsConfigEqual(conf, newConf), true)
 			dnsCache = nil // Allow previous generation's clone to be GC'd.
 
 			var newCancel context.CancelFunc
@@ -545,12 +620,13 @@ func (r *Runner) Run() (err error) {
 				cancel()
 
 				// Load last config back.
-				if portChanged {
+				if freshDatapathReload {
 					log.Warnln("[Reload] BPF objects already replaced; attempting rollback with fresh eBPF objects")
 					obj = nil
+					reloadBpf = nil
 				}
 				ctx, cancel = context.WithTimeout(context.Background(), reloadPrepareTimeout)
-				newC, err = newControlPlane(ctx, log, obj, rollbackDNSCache, conf, externGeoDataDirs, false)
+				newC, err = newControlPlane(ctx, log, reloadBpf, rollbackDNSCache, conf, externGeoDataDirs, false, true)
 				err = wrapReloadTimeoutError("rollback control plane", err, reloadPrepareTimeout)
 				if err != nil {
 					_ = sdnotify.Stopping()
@@ -597,9 +673,10 @@ func (r *Runner) Run() (err error) {
 				}
 			}
 
-			// Non-staged paths transfer BPF/LPM ownership immediately because the
-			// old generation is no longer able to keep serving.
-			if !stagedHotHandoff {
+			// Non-staged shared-BPF paths transfer ownership immediately because
+			// the old generation is no longer able to keep serving. Fresh
+			// datapath reloads own their newly loaded BPF objects already.
+			if !stagedHotHandoff && !freshDatapathReload {
 				newC.InjectBpf(obj)
 				if c != nil {
 					newC.InheritLpmIndices(c.EjectLpmIndices())
@@ -744,7 +821,11 @@ loop:
 				// Serve.
 				reloadManager.reloading.Store(false)
 				log.Warnln("[Reload] Serve")
-				reloadManager.installPreparedDNSHandoffHooks(log, c, conf)
+				if handoff := reloadManager.currentPendingStagedHandoff(); handoff != nil && handoff.freshDatapath {
+					prepareFreshDatapathCutover(log, handoff)
+				} else {
+					reloadManager.installPreparedDNSHandoffHooks(log, c, conf)
+				}
 				readyChan := make(chan bool, 1)
 				go func() {
 					defer func() {
@@ -774,22 +855,43 @@ loop:
 					_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
 					log.WithError(reloadErr).Errorln("[Reload] Reload serve failed before becoming ready")
 					if handoff := reloadManager.currentPendingStagedHandoff(); handoff != nil {
-						rollbackStagedReloadHandoff(log, handoff)
-						if republishErr := handoff.oldControlPlane.PublishListenerSockets(handoff.oldListener); republishErr != nil {
-							log.WithError(republishErr).Errorln("[Reload] Failed to republish previous listeners after staged handoff failure")
+						if handoff.freshDatapath {
+							recoveredListener, rollbackErr := rollbackFreshDatapathReloadHandoff(log, handoff)
+							if rollbackErr != nil {
+								log.WithError(rollbackErr).Errorln("[Reload] Failed to recover previous generation after fresh datapath handoff failure")
+								fastExit = true
+								break loop
+							}
+							c = handoff.oldControlPlane
+							currCancel = handoff.oldCancel
+							conf = handoff.oldConf
+							listener = recoveredListener
+							reloadManager.clearPendingStagedHandoff()
+							if restartErr := restartRecoveredControlPlane(log, sigs, runStateChanges, c, listener); restartErr != nil {
+								log.WithError(restartErr).Errorln("[Reload] Failed to restart previous listener generation after rollback")
+								// Fresh datapath rollback already detached the old hooks and closed the old listener.
+								// If the recovered generation cannot become ready, continuing would leave traffic state ambiguous.
+								fastExit = true
+								break loop
+							}
+						} else {
+							rollbackStagedReloadHandoff(log, handoff)
+							if republishErr := handoff.oldControlPlane.PublishListenerSockets(handoff.oldListener); republishErr != nil {
+								log.WithError(republishErr).Errorln("[Reload] Failed to republish previous listeners after staged handoff failure")
+							}
+							if rebuildErr := handoff.oldControlPlane.RebuildReloadDatapath(); rebuildErr != nil {
+								log.WithError(rebuildErr).Errorln("[Reload] Failed to rebuild previous datapath after staged handoff failure")
+							}
+							c = handoff.oldControlPlane
+							currCancel = handoff.oldCancel
+							conf = handoff.oldConf
+							listener = handoff.oldListener
+							if restartErr := c.RestartDNSListener(); restartErr != nil {
+								log.WithError(restartErr).Warnln("[Reload] Failed to restart previous DNS listener after staged handoff rollback")
+							}
+							reloadManager.clearPendingStagedHandoff()
+							log.Warnln("[Reload] Restored previous listener generation after staged handoff failure")
 						}
-						if rebuildErr := handoff.oldControlPlane.RebuildReloadDatapath(); rebuildErr != nil {
-							log.WithError(rebuildErr).Errorln("[Reload] Failed to rebuild previous datapath after staged handoff failure")
-						}
-						c = handoff.oldControlPlane
-						currCancel = handoff.oldCancel
-						conf = handoff.oldConf
-						listener = handoff.oldListener
-						if restartErr := c.RestartDNSListener(); restartErr != nil {
-							log.WithError(restartErr).Warnln("[Reload] Failed to restart previous DNS listener after staged handoff rollback")
-						}
-						reloadManager.clearPendingStagedHandoff()
-						log.Warnln("[Reload] Restored previous listener generation after staged handoff failure")
 					}
 					reloadManager.finishReloadFailure()
 					continue
@@ -801,14 +903,14 @@ loop:
 					oldCancel := handoff.oldCancel
 					abortConnections := handoff.abortConnections
 					hasOverlap := handoff.hasOverlap
-					if oldC != nil {
+					if oldC != nil && !handoff.freshDatapath {
 						bpf := oldC.EjectBpf()
 						c.InjectBpf(bpf)
 						c.InheritLpmIndices(oldC.EjectLpmIndices())
 					}
 					reloadManager.clearPendingStagedHandoff()
 
-					if oldListener != nil {
+					if oldListener != nil && !handoff.freshDatapath {
 						if err := oldListener.Close(); err != nil {
 							log.WithError(err).Warnln("[Reload] Failed to close previous listener generation")
 						}
@@ -936,6 +1038,95 @@ func retireControlPlaneConnections(
 			_ = c.AbortConnections()
 		}
 	}
+}
+
+func prepareFreshDatapathCutover(log *logrus.Logger, handoff *stagedReloadHandoff) {
+	if handoff == nil || !handoff.freshDatapath {
+		return
+	}
+	if handoff.oldListener != nil {
+		if err := handoff.oldListener.Close(); err != nil && log != nil {
+			log.WithError(err).Warnln("[Reload] Failed to close previous listener before fresh datapath cutover")
+		}
+		handoff.oldListener = nil
+	}
+	if handoff.oldControlPlane != nil {
+		if err := handoff.oldControlPlane.StopDNSListener(); err != nil && log != nil {
+			log.WithError(err).Warnln("[Reload] Failed to stop previous DNS listener before fresh datapath cutover")
+		}
+		if err := handoff.oldControlPlane.DetachBpfHooks(); err != nil && log != nil {
+			log.WithError(err).Warnln("[Reload] Failed to detach previous BPF hooks before fresh datapath cutover")
+		}
+	}
+}
+
+func rollbackFreshDatapathReloadHandoff(log *logrus.Logger, handoff *stagedReloadHandoff) (*control.Listener, error) {
+	if handoff == nil || handoff.oldControlPlane == nil || handoff.oldConf == nil {
+		return nil, fmt.Errorf("missing previous generation for fresh datapath rollback")
+	}
+	if handoff.newListener != nil {
+		if err := handoff.newListener.Close(); err != nil && log != nil {
+			log.WithError(err).Warnln("[Reload] Failed to close fresh datapath listener during rollback")
+		}
+	}
+	if handoff.newCancel != nil {
+		handoff.newCancel()
+	}
+	if handoff.newControlPlane != nil {
+		if err := handoff.newControlPlane.Close(); err != nil && log != nil {
+			log.WithError(err).Warnln("[Reload] Failed to close fresh datapath control plane during rollback")
+		}
+	}
+
+	recoveredListener, err := handoff.oldControlPlane.Listen(handoff.oldConf.Global.TproxyPort)
+	if err != nil {
+		return nil, fmt.Errorf("restore previous listener: %w", err)
+	}
+	if err := handoff.oldControlPlane.RestoreDatapathForReloadRollback(); err != nil {
+		_ = recoveredListener.Close()
+		return nil, err
+	}
+	if err := handoff.oldControlPlane.RestartDNSListener(); err != nil && log != nil {
+		log.WithError(err).Warnln("[Reload] Failed to restart previous DNS listener after fresh datapath rollback")
+	}
+	log.Warnln("[Reload] Restored previous generation after fresh datapath handoff failure")
+	return recoveredListener, nil
+}
+
+func restartRecoveredControlPlane(
+	log *logrus.Logger,
+	sigs <-chan os.Signal,
+	runStateChanges chan<- struct{},
+	c *control.ControlPlane,
+	listener *control.Listener,
+) error {
+	if c == nil || listener == nil {
+		return fmt.Errorf("missing recovered control plane or listener")
+	}
+	readyChan := make(chan bool, 1)
+	go func() {
+		defer func() {
+			select {
+			case readyChan <- false:
+			default:
+			}
+		}()
+		if err := c.Serve(readyChan, listener); err != nil && log != nil {
+			log.Errorln("ListenAndServe:", err)
+		}
+		notifyRunStateChange(runStateChanges)
+	}()
+	waitResult, termSig := waitReloadReadyOrSignal(log, sigs, readyChan, reloadReadyTimeout)
+	if waitResult == reloadReadyWaitSignal && termSig != nil {
+		return fmt.Errorf("received termination signal while restoring previous generation: %v", termSig.String())
+	}
+	if waitResult == reloadReadyWaitTimeout {
+		return fmt.Errorf("restored listener timed out after %v", reloadReadyTimeout)
+	}
+	if waitResult != reloadReadyWaitReady {
+		return fmt.Errorf("restored listener failed before becoming ready")
+	}
+	return nil
 }
 
 func rollbackStagedReloadHandoff(log *logrus.Logger, handoff *stagedReloadHandoff) {
@@ -1107,12 +1298,12 @@ func shutdownAfterSignalWithHandoff(
 	return nil
 }
 
-func newControlPlane(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, dnsRoutingUnchanged bool) (c *control.ControlPlane, err error) {
-	return newControlPlaneWithMode(ctx, log, bpf, dnsCache, conf, externGeoDataDirs, false, dnsRoutingUnchanged)
+func newControlPlane(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {
+	return newControlPlaneWithMode(ctx, log, bpf, dnsCache, conf, externGeoDataDirs, false, dnsRoutingUnchanged, isReloadBuild)
 }
 
-func newPreparedControlPlane(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, dnsRoutingUnchanged bool) (c *control.ControlPlane, err error) {
-	return newControlPlaneWithMode(ctx, log, bpf, dnsCache, conf, externGeoDataDirs, true, dnsRoutingUnchanged)
+func newPreparedControlPlane(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {
+	return newControlPlaneWithMode(ctx, log, bpf, dnsCache, conf, externGeoDataDirs, true, dnsRoutingUnchanged, isReloadBuild)
 }
 
 func configureTransparentHugePages(log *logrus.Logger, disable bool) {
@@ -1134,7 +1325,7 @@ func configureTransparentHugePages(log *logrus.Logger, disable bool) {
 	}
 }
 
-func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, dnsRoutingUnchanged bool) (c *control.ControlPlane, err error) {
+func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {
 	// Deep copy to prevent modification.
 	conf = deepcopy.Copy(conf).(*config.Config)
 	if conf.Global.SoMarkFromDae == 0 {
@@ -1148,7 +1339,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	/// Get tag -> nodeList mapping.
 	tagToNodeList := map[string][]string{}
 	// On initial startup (not reload), purge stale TC filters left by any previous process.
-	if bpf == nil {
+	if bpf == nil && !isReloadBuild {
 		control.PurgeStaleTCFilters(log)
 	}
 	if len(conf.Node) > 0 {
@@ -1322,33 +1513,65 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	log.Infoln("Building control plane and routing rules...")
 	stageStart = time.Now()
 	if prepareOnly {
-		c, err = control.NewPreparedControlPlaneWithContext(
-			ctx,
-			log,
-			bpf,
-			dnsCache,
-			tagToNodeList,
-			conf.Group,
-			&conf.Routing,
-			&conf.Global,
-			&conf.Dns,
-			externGeoDataDirs,
-			dnsRoutingUnchanged,
-		)
+		if isReloadBuild {
+			c, err = control.NewPreparedReloadControlPlaneWithContext(
+				ctx,
+				log,
+				bpf,
+				dnsCache,
+				tagToNodeList,
+				conf.Group,
+				&conf.Routing,
+				&conf.Global,
+				&conf.Dns,
+				externGeoDataDirs,
+				dnsRoutingUnchanged,
+			)
+		} else {
+			c, err = control.NewPreparedControlPlaneWithContext(
+				ctx,
+				log,
+				bpf,
+				dnsCache,
+				tagToNodeList,
+				conf.Group,
+				&conf.Routing,
+				&conf.Global,
+				&conf.Dns,
+				externGeoDataDirs,
+				dnsRoutingUnchanged,
+			)
+		}
 	} else {
-		c, err = control.NewControlPlaneWithContext(
-			ctx,
-			log,
-			bpf,
-			dnsCache,
-			tagToNodeList,
-			conf.Group,
-			&conf.Routing,
-			&conf.Global,
-			&conf.Dns,
-			externGeoDataDirs,
-			dnsRoutingUnchanged,
-		)
+		if isReloadBuild {
+			c, err = control.NewReloadControlPlaneWithContext(
+				ctx,
+				log,
+				bpf,
+				dnsCache,
+				tagToNodeList,
+				conf.Group,
+				&conf.Routing,
+				&conf.Global,
+				&conf.Dns,
+				externGeoDataDirs,
+				dnsRoutingUnchanged,
+			)
+		} else {
+			c, err = control.NewControlPlaneWithContext(
+				ctx,
+				log,
+				bpf,
+				dnsCache,
+				tagToNodeList,
+				conf.Group,
+				&conf.Routing,
+				&conf.Global,
+				&conf.Dns,
+				externGeoDataDirs,
+				dnsRoutingUnchanged,
+			)
+		}
 	}
 	if err != nil {
 		return nil, err

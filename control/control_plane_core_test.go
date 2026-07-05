@@ -43,7 +43,7 @@ func TestControlPlaneCore_EjectBpfKeepsHookCleanupForClose(t *testing.T) {
 	logger := logrus.New()
 	logger.SetOutput(io.Discard)
 
-	core := newControlPlaneCore(logger, nil, nil, nil, false)
+	core := newControlPlaneCore(logger, nil, nil, nil, false, true)
 	calls := 0
 	core.addManagedBpfHookCleanup(func() error {
 		calls++
@@ -67,7 +67,7 @@ func TestControlPlaneCore_InjectBpfClaimsOwnershipForReloadGeneration(t *testing
 	logger := logrus.New()
 	logger.SetOutput(io.Discard)
 
-	core := newControlPlaneCore(logger, nil, nil, nil, true)
+	core := newControlPlaneCore(logger, nil, nil, nil, true, false)
 	if core.bpfOwned {
 		t.Fatal("expected reload generation to start without BPF ownership")
 	}
@@ -82,11 +82,67 @@ func TestControlPlaneCore_InjectBpfClaimsOwnershipForReloadGeneration(t *testing
 	}
 }
 
+func TestControlPlaneCore_FreshReloadGenerationCanOwnBpf(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+
+	core := newControlPlaneCore(logger, nil, nil, nil, true, true)
+
+	if !core.isReload {
+		t.Fatal("expected fresh reload generation to keep reload flip semantics")
+	}
+	if !core.bpfOwned {
+		t.Fatal("expected fresh reload generation to own freshly loaded BPF")
+	}
+}
+
+func TestControlPlaneCore_ResetBpfHookDetachForReattach(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+
+	core := newControlPlaneCore(logger, nil, nil, nil, true, true)
+	oldDetachCalls := 0
+	core.addManagedBpfHookCleanup(func() error {
+		oldDetachCalls++
+		return nil
+	})
+
+	if err := core.DetachBpfHooks(); err != nil {
+		t.Fatalf("DetachBpfHooks() error = %v", err)
+	}
+	if oldDetachCalls != 1 {
+		t.Fatalf("old detach calls = %d, want 1", oldDetachCalls)
+	}
+
+	core.resetBpfHookDetachForReattach()
+	if core.bpfHooksDetached {
+		t.Fatal("expected reset to clear detached state before reattach")
+	}
+	if got := len(core.bpfHookDetachFuncs); got != 0 {
+		t.Fatalf("len(bpfHookDetachFuncs) = %d, want 0 after reset", got)
+	}
+
+	newDetachCalls := 0
+	core.addManagedBpfHookCleanup(func() error {
+		newDetachCalls++
+		return nil
+	})
+	if err := core.DetachBpfHooks(); err != nil {
+		t.Fatalf("second DetachBpfHooks() error = %v", err)
+	}
+	if oldDetachCalls != 1 {
+		t.Fatalf("old detach calls after reattach = %d, want 1", oldDetachCalls)
+	}
+	if newDetachCalls != 1 {
+		t.Fatalf("new detach calls = %d, want 1", newDetachCalls)
+	}
+}
+
 func TestControlPlaneCore_InheritLpmIndicesSkipsReusedSlots(t *testing.T) {
 	logger := logrus.New()
 	logger.SetOutput(io.Discard)
 
-	core := newControlPlaneCore(logger, nil, nil, nil, true)
+	core := newControlPlaneCore(logger, nil, nil, nil, true, false)
 	core.lpmTrieIndices = []uint32{4, 5}
 
 	core.InheritLpmIndices([]uint32{1, 4, 7})
@@ -110,7 +166,7 @@ func TestControlPlaneCore_EjectLpmIndicesTransfersOwnership(t *testing.T) {
 	logger := logrus.New()
 	logger.SetOutput(io.Discard)
 
-	core := newControlPlaneCore(logger, nil, nil, nil, false)
+	core := newControlPlaneCore(logger, nil, nil, nil, false, true)
 	core.lpmTrieIndices = []uint32{2, 3, 5}
 
 	indices := core.EjectLpmIndices()
@@ -127,7 +183,7 @@ func TestControlPlaneCore_ReplaceLpmIndicesReplacesTrackedSet(t *testing.T) {
 	logger := logrus.New()
 	logger.SetOutput(io.Discard)
 
-	core := newControlPlaneCore(logger, nil, nil, nil, false)
+	core := newControlPlaneCore(logger, nil, nil, nil, false, true)
 	core.lpmTrieIndices = []uint32{2, 3, 5}
 
 	core.ReplaceLpmIndices([]uint32{7, 11})
@@ -175,7 +231,7 @@ func TestControlPlaneCore_SetupSkPidMonitorRollsBackPartialAttach(t *testing.T) 
 			TproxyWanCgSendmsg4:    &ebpf.Program{},
 			TproxyWanCgSendmsg6:    &ebpf.Program{},
 		},
-	}, nil, nil, false)
+	}, nil, nil, false, true)
 
 	if err := core.setupSkPidMonitor(); err == nil {
 		t.Fatal("setupSkPidMonitor() error = nil, want failure")

@@ -173,6 +173,36 @@ func TestCleanupPinnedConnStateMapFiles(t *testing.T) {
 	}
 }
 
+func TestCleanupEphemeralBpfPinDirs(t *testing.T) {
+	pinPath := t.TempDir()
+	for _, name := range []string{"reload-123-456", "reload-old", "domain_routing_map"} {
+		path := filepath.Join(pinPath, name)
+		if strings.HasPrefix(name, "reload-") {
+			if err := os.Mkdir(path, 0755); err != nil {
+				t.Fatalf("mkdir test pin dir %s: %v", name, err)
+			}
+			continue
+		}
+		if err := os.WriteFile(path, []byte("x"), 0644); err != nil {
+			t.Fatalf("write test pin file %s: %v", name, err)
+		}
+	}
+
+	removed := cleanupEphemeralBpfPinDirs(nil, pinPath)
+	if removed != 2 {
+		t.Fatalf("cleanupEphemeralBpfPinDirs removed %d directories, want 2", removed)
+	}
+
+	for _, name := range []string{"reload-123-456", "reload-old"} {
+		if _, err := os.Stat(filepath.Join(pinPath, name)); !os.IsNotExist(err) {
+			t.Fatalf("expected %s to be removed, stat err=%v", name, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(pinPath, "domain_routing_map")); err != nil {
+		t.Fatalf("expected unrelated pin file to remain: %v", err)
+	}
+}
+
 func TestCleanupUdpConnStateMapRemovesExpiredRoutingResult(t *testing.T) {
 	udpMap := newJanitorTestMap(t, "conn_state_map")
 	now := monotonicNowNs(t)

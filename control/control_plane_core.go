@@ -130,6 +130,7 @@ func newControlPlaneCore(log *logrus.Logger,
 	outboundId2Name map[uint8]string,
 	kernelVersion *internal.Version,
 	isReload bool,
+	bpfOwned bool,
 ) *controlPlaneCore {
 	var flip int
 	if isReload {
@@ -139,7 +140,6 @@ func newControlPlaneCore(log *logrus.Logger,
 		flip = int(atomic.LoadInt32(&coreFlip))
 	}
 	var deferFuncs []func() error
-	bpfOwned := !isReload
 	closed, toClose := context.WithCancel(context.Background())
 	ifmgr := component.NewInterfaceManager(log)
 	deferFuncs = append(deferFuncs, ifmgr.Close)
@@ -223,6 +223,14 @@ func (c *controlPlaneCore) addManagedBpfHookCleanup(detachFunc func() error) {
 		return
 	}
 	c.addBpfHookDetach(detachFunc)
+}
+
+func (c *controlPlaneCore) resetBpfHookDetachForReattach() {
+	c.bpfHookMu.Lock()
+	defer c.bpfHookMu.Unlock()
+
+	c.bpfHookDetachFuncs = nil
+	c.bpfHooksDetached = false
 }
 
 // DetachBpfHooks immediately detaches all BPF hooks from the system.

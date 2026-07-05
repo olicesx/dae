@@ -123,6 +123,7 @@ type controlPlaneBuildOptions struct {
 	delayDatapathCommit   bool
 	delayDNSListenerStart bool
 	dnsRoutingUnchanged   bool
+	isReload              bool
 }
 
 const (
@@ -316,6 +317,42 @@ func NewControlPlaneWithContext(
 		externGeoDataDirs,
 		controlPlaneBuildOptions{
 			dnsRoutingUnchanged: dnsRoutingUnchanged,
+			isReload:            _bpf != nil,
+		},
+	)
+}
+
+// NewReloadControlPlaneWithContext builds a control plane during reload even
+// when it receives fresh BPF objects instead of shared objects from the old
+// generation. Reload builds must use reload TC handle flipping and must not run
+// startup-only stale hook purges.
+func NewReloadControlPlaneWithContext(
+	ctx context.Context,
+	log *logrus.Logger,
+	_bpf any,
+	dnsCache map[string]*DnsCache,
+	tagToNodeList map[string][]string,
+	groups []config.Group,
+	routingA *config.Routing,
+	global *config.Global,
+	dnsConfig *config.Dns,
+	externGeoDataDirs []string,
+	dnsRoutingUnchanged bool,
+) (plane *ControlPlane, err error) {
+	return newControlPlaneWithContextOptions(
+		ctx,
+		log,
+		_bpf,
+		dnsCache,
+		tagToNodeList,
+		groups,
+		routingA,
+		global,
+		dnsConfig,
+		externGeoDataDirs,
+		controlPlaneBuildOptions{
+			dnsRoutingUnchanged: dnsRoutingUnchanged,
+			isReload:            true,
 		},
 	)
 }
@@ -350,6 +387,42 @@ func NewPreparedControlPlaneWithContext(
 			delayDatapathCommit:   true,
 			delayDNSListenerStart: true,
 			dnsRoutingUnchanged:   dnsRoutingUnchanged,
+			isReload:              _bpf != nil,
+		},
+	)
+}
+
+// NewPreparedReloadControlPlaneWithContext builds a reload generation without
+// mutating the kernel datapath until CommitPreparedDatapath is called.
+func NewPreparedReloadControlPlaneWithContext(
+	ctx context.Context,
+	log *logrus.Logger,
+	_bpf any,
+	dnsCache map[string]*DnsCache,
+	tagToNodeList map[string][]string,
+	groups []config.Group,
+	routingA *config.Routing,
+	global *config.Global,
+	dnsConfig *config.Dns,
+	externGeoDataDirs []string,
+	dnsRoutingUnchanged bool,
+) (plane *ControlPlane, err error) {
+	return newControlPlaneWithContextOptions(
+		ctx,
+		log,
+		_bpf,
+		dnsCache,
+		tagToNodeList,
+		groups,
+		routingA,
+		global,
+		dnsConfig,
+		externGeoDataDirs,
+		controlPlaneBuildOptions{
+			delayDatapathCommit:   true,
+			delayDNSListenerStart: true,
+			dnsRoutingUnchanged:   dnsRoutingUnchanged,
+			isReload:              true,
 		},
 	)
 }
@@ -449,6 +522,11 @@ func newControlPlaneWithContextOptions(
 		return nil, fmt.Errorf("failed to setup dae netns: %w", err)
 	}
 	pinPath := filepath.Join(consts.BpfPinRoot, consts.AppName)
+	ephemeralPinPath := false
+	if _bpf == nil && buildOpts.isReload {
+		pinPath = filepath.Join(pinPath, fmt.Sprintf("reload-%d-%d", os.Getpid(), time.Now().UnixNano()))
+		ephemeralPinPath = true
+	}
 	if err = os.MkdirAll(pinPath, 0755); err != nil && !os.IsExist(err) {
 		if os.IsNotExist(err) {
 			log.Warnln("Perhaps you are in a container environment (such as lxc). If so, please use higher virtualization (kvm/qemu).")
@@ -460,7 +538,10 @@ func newControlPlaneWithContextOptions(
 	if _bpf == nil {
 		// Conn-state maps are preserved across in-process reload via object handoff,
 		// so fresh loads should not inherit stale bpffs pins from previous processes.
-		cleanupPinnedConnStateMapFiles(log, pinPath)
+		if !ephemeralPinPath {
+			cleanupEphemeralBpfPinDirs(log, pinPath)
+			cleanupPinnedConnStateMapFiles(log, pinPath)
+		}
 		log.Infof("Loading eBPF programs and maps into the kernel...")
 		log.Infof("The loading process takes about 120MB free memory, which will be released after loading. Insufficient memory will cause loading failure.")
 	}
@@ -499,6 +580,7 @@ func newControlPlaneWithContextOptions(
 			return nil, fmt.Errorf("load eBPF objects: %w", err)
 		}
 	}
+	sharedBpfReload := _bpf != nil
 	// Ensure critical maps are always present. DNS fast-path optimizations only
 	// skip per-flow map updates, never map object creation.
 	if err = validateRequiredBpfMapsLoaded(bpf); err != nil {
@@ -512,8 +594,14 @@ func newControlPlaneWithContextOptions(
 		bpf,
 		outboundId2Name,
 		&kernelVersion,
-		_bpf != nil,
+		buildOpts.isReload,
+		!sharedBpfReload,
 	)
+	if ephemeralPinPath {
+		core.addDeferFunc(func() error {
+			return os.RemoveAll(pinPath)
+		})
+	}
 	defer func() {
 		if err != nil {
 			if plane != nil {
@@ -732,7 +820,7 @@ func newControlPlaneWithContextOptions(
 		autoConfigKernelParameter:   global.AutoConfigKernelParameter,
 		routingKernspaceSnapshot:    kernspaceSnapshot,
 		preparedDatapathCommit:      buildOpts.delayDatapathCommit,
-		sharedBpfReload:             _bpf != nil,
+		sharedBpfReload:             sharedBpfReload,
 		pendingDnsReloadCache:       dnsCache,
 		dnsRoutingUnchanged:         buildOpts.dnsRoutingUnchanged,
 		muRealDomainSet:             sync.RWMutex{},
@@ -825,12 +913,13 @@ func newControlPlaneWithContextOptions(
 		if err = plane.commitInterfaceBindings(); err != nil {
 			return nil, err
 		}
-		if plane.sharedBpfReload && !plane.dnsRoutingUnchanged {
-			if err = clearReloadDomainRoutingMap(core.bpf.Load()); err != nil {
-				return nil, fmt.Errorf("clearReloadDomainRoutingMap: %w", err)
+		skipDNSReloadReplay := plane.sharedBpfReload && plane.dnsRoutingUnchanged
+		if !skipDNSReloadReplay {
+			if bpf := core.bpf.Load(); bpf != nil {
+				if err = clearReloadDomainRoutingMap(bpf); err != nil {
+					return nil, fmt.Errorf("clearReloadDomainRoutingMap: %w", err)
+				}
 			}
-		}
-		if !plane.dnsRoutingUnchanged {
 			plane.replayDnsReloadCache()
 		}
 		plane.markReady()
@@ -1486,12 +1575,15 @@ func (c *ControlPlane) CommitPreparedDatapath() error {
 		}
 		c.core.lpmTrieIndices = lpmIndices
 	}
-	if c.sharedBpfReload && !c.dnsRoutingUnchanged {
-		if err := clearReloadDomainRoutingMap(c.core.bpf.Load()); err != nil {
-			return fmt.Errorf("clearReloadDomainRoutingMap: %w", err)
+	skipDNSReloadReplay := c.sharedBpfReload && c.dnsRoutingUnchanged
+	if !skipDNSReloadReplay {
+		if c.core != nil {
+			if bpf := c.core.bpf.Load(); bpf != nil {
+				if err := clearReloadDomainRoutingMap(bpf); err != nil {
+					return fmt.Errorf("clearReloadDomainRoutingMap: %w", err)
+				}
+			}
 		}
-	}
-	if !c.dnsRoutingUnchanged {
 		c.replayDnsReloadCache()
 	}
 	c.startConnStateJanitor()
@@ -1513,6 +1605,34 @@ func (c *ControlPlane) RebuildReloadDatapath() error {
 	c.ReplaceLpmIndices(lpmIndices)
 	if err := clearReloadDomainRoutingMap(c.core.bpf.Load()); err != nil {
 		return fmt.Errorf("rebuild clearReloadDomainRoutingMap: %w", err)
+	}
+	cache := c.CloneDnsCache()
+	c.pendingDnsReloadCache = cache
+	c.replayDnsReloadCache()
+	return nil
+}
+
+// RestoreDatapathForReloadRollback reattaches this generation's kernel hooks
+// and restores routing/DNS maps after a prepared fresh-datapath reload failed
+// during cutover.
+func (c *ControlPlane) RestoreDatapathForReloadRollback() error {
+	if c == nil || c.core == nil || c.core.PeekBpf() == nil {
+		return nil
+	}
+	c.log.Warnln("[Reload] Restoring previous generation datapath after fresh handoff failure")
+	c.core.resetBpfHookDetachForReattach()
+	if err := c.commitInterfaceBindings(); err != nil {
+		return fmt.Errorf("restore interface bindings: %w", err)
+	}
+	if c.routingKernspaceSnapshot != nil {
+		lpmIndices, err := c.routingKernspaceSnapshot.BuildKernspace(c.log, c.core.bpf.Load())
+		if err != nil {
+			return fmt.Errorf("restore routing kernspace: %w", err)
+		}
+		c.ReplaceLpmIndices(lpmIndices)
+	}
+	if err := clearReloadDomainRoutingMap(c.core.bpf.Load()); err != nil {
+		return fmt.Errorf("restore clearReloadDomainRoutingMap: %w", err)
 	}
 	cache := c.CloneDnsCache()
 	c.pendingDnsReloadCache = cache

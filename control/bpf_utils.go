@@ -481,6 +481,38 @@ func cleanupPinnedConnStateMapFiles(log *logrus.Logger, pinPath string) int {
 	return removed
 }
 
+func cleanupEphemeralBpfPinDirs(log *logrus.Logger, pinPath string) int {
+	if pinPath == "" {
+		return 0
+	}
+	entries, err := os.ReadDir(pinPath)
+	if err != nil {
+		if !os.IsNotExist(err) && log != nil {
+			log.Warnf("Failed to read BPF pin path %s: %v", pinPath, err)
+		}
+		return 0
+	}
+
+	removed := 0
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "reload-") {
+			continue
+		}
+		path := filepath.Join(pinPath, entry.Name())
+		if err := os.RemoveAll(path); err != nil {
+			if log != nil {
+				log.Warnf("Failed to remove stale reload BPF pin directory %s: %v", entry.Name(), err)
+			}
+			continue
+		}
+		removed++
+		if log != nil {
+			log.Infof("Removed stale reload BPF pin directory %s", entry.Name())
+		}
+	}
+	return removed
+}
+
 func fullLoadBpfObjects(
 	log *logrus.Logger,
 	bpf *bpfObjects,

@@ -158,14 +158,28 @@ func NewTrie(keys []string, chars *ValidChars) (*Trie, error) {
 
 	type qElt struct{ s, e, col int }
 
-	// Pre-allocate queue capacity to avoid repeated growslice.
-	// The number of trie nodes is at most the total number of characters
-	// across all keys plus one for the root node.
-	totalChars := 0
-	for _, key := range keys {
-		totalChars += len(key)
+	// Pre-compute exact queue size from sorted keys to avoid both growslice
+	// and over-allocation. For sorted distinct strings, trie node count is:
+	// 1 + Σ(len(key[i]) - LCP(key[i], key[i-1])) for i=0..n-1 (LCP(key[0], key[-1]) = 0)
+	// Each character is compared at most once, so this pass is O(totalChars).
+	nodeCount := 1 // root
+	for i, key := range keys {
+		if i == 0 {
+			nodeCount += len(key)
+			continue
+		}
+		prev := keys[i-1]
+		minLen := len(prev)
+		if len(key) < minLen {
+			minLen = len(key)
+		}
+		lcp := 0
+		for lcp < minLen && prev[lcp] == key[lcp] {
+			lcp++
+		}
+		nodeCount += len(key) - lcp
 	}
-	queue := make([]qElt, 0, totalChars+1)
+	queue := make([]qElt, 0, nodeCount)
 	queue = append(queue, qElt{0, len(keys), 0})
 
 	for i := 0; i < len(queue); i++ {

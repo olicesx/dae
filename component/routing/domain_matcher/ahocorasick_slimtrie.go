@@ -280,5 +280,9 @@ func (n *AhocorasickSlimtrie) Build() (err error) {
 	// Release unused data.
 	n.toBuildAc = nil
 	n.toBuildTrie = nil
+
+	// Reclaim temporary build allocations (BFS queues, transformed string
+	// slices) immediately so peak memory does not linger into steady state.
+	runtime.GC()
 	return nil
 }

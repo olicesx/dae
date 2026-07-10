@@ -1020,103 +1020,6 @@ func validateRequiredBpfMapsLoaded(bpf *bpfObjects) error {
 	return nil
 }
 
-const bpfRuntimeStateCopyBatchSize = 1024
-
-func copyBpfMapEntries[K any, V any](dst, src *ebpf.Map) (int, error) {
-	if dst == nil || src == nil {
-		return 0, fmt.Errorf("source and destination maps must be non-nil")
-	}
-	if dst == src {
-		return 0, nil
-	}
-
-	keys := make([]K, 0, bpfRuntimeStateCopyBatchSize)
-	values := make([]V, 0, bpfRuntimeStateCopyBatchSize)
-	total := 0
-	flush := func() error {
-		if len(keys) == 0 {
-			return nil
-		}
-		n, err := BpfMapBatchUpdate(dst, keys, values, &ebpf.BatchOptions{ElemFlags: uint64(ebpf.UpdateAny)})
-		if err != nil {
-			return err
-		}
-		if n != len(keys) {
-			return fmt.Errorf("copied %d of %d entries", n, len(keys))
-		}
-		total += n
-		keys = keys[:0]
-		values = values[:0]
-		return nil
-	}
-
-	var key K
-	var value V
-	iter := src.Iterate()
-	for iter.Next(&key, &value) {
-		keys = append(keys, key)
-		values = append(values, value)
-		if len(keys) == cap(keys) {
-			if err := flush(); err != nil {
-				return total, err
-			}
-		}
-	}
-	if err := iter.Err(); err != nil {
-		return total, err
-	}
-	if err := flush(); err != nil {
-		return total, err
-	}
-	return total, nil
-}
-
-// MigrateRuntimeBpfStateFrom copies flow state after the previous generation's
-// hooks have been detached, allowing established compatible flows to survive a
-// fresh BPF object handoff.
-func (c *ControlPlane) MigrateRuntimeBpfStateFrom(previous *ControlPlane) error {
-	if c == nil || previous == nil || c == previous || c.core == nil || previous.core == nil {
-		return fmt.Errorf("invalid control planes for BPF runtime state migration")
-	}
-	dst := c.core.PeekBpf()
-	src := previous.core.PeekBpf()
-	if dst == nil || src == nil {
-		return fmt.Errorf("missing BPF objects for runtime state migration")
-	}
-
-	previous.connStateCleanupMu.Lock()
-	defer previous.connStateCleanupMu.Unlock()
-	c.connStateCleanupMu.Lock()
-	defer c.connStateCleanupMu.Unlock()
-
-	connCount, err := copyBpfMapEntries[bpfTuplesKey, bpfConnState](dst.ConnStateMap, src.ConnStateMap)
-	if err != nil {
-		return fmt.Errorf("migrate conn_state_map: %w", err)
-	}
-	redirectCount, err := copyBpfMapEntries[bpfRedirectTuple, bpfRedirectEntry](dst.RedirectTrack, src.RedirectTrack)
-	if err != nil {
-		return fmt.Errorf("migrate redirect_track: %w", err)
-	}
-	handoffCount, err := copyBpfMapEntries[bpfTuplesKey, bpfRoutingHandoffEntry](dst.RoutingHandoffMap, src.RoutingHandoffMap)
-	if err != nil {
-		return fmt.Errorf("migrate routing_handoff_map: %w", err)
-	}
-	cookieCount, err := copyBpfMapEntries[uint64, bpfPidPname](dst.CookiePidMap, src.CookiePidMap)
-	if err != nil {
-		return fmt.Errorf("migrate cookie_pid_map: %w", err)
-	}
-
-	if c.log != nil {
-		c.log.WithFields(logrus.Fields{
-			"conn_state":     connCount,
-			"redirect_track": redirectCount,
-			"route_handoff":  handoffCount,
-			"cookie_pid":     cookieCount,
-		}).Infoln("[Reload] Migrated runtime BPF state to fresh datapath")
-	}
-	return nil
-}
-
 func (c *ControlPlane) EjectBpf() *bpfObjects {
 	if c.core == nil {
 		return nil
@@ -3811,6 +3714,23 @@ func ResetGlobalUdpState() {
 	DefaultUdpTaskPool.Close()
 	DefaultPacketSnifferSessionMgr.Close() // Close() stops janitor goroutines; safe for shutdown path
 	ResetUdpLogLimiters()
+}
+
+// ResetGlobalUdpFlowState evicts stale UDP flow state for a fresh-datapath
+// reload. Unlike ResetGlobalUdpState it only clears pooled endpoints, anyfrom
+// connections and sniffer sessions — each of which may still reference the
+// retiring generation's dialer, outbound group and cached routing result —
+// without stopping the background janitor goroutines, so the successor
+// generation reuses the same pool singletons.
+//
+// This must be called during a fresh-datapath cutover, after the old
+// generation stops accepting traffic and before the new generation starts
+// serving, so incoming flows are routed by the fresh policy instead of
+// inheriting stale decisions bound to the previous (now detached) maps.
+func ResetGlobalUdpFlowState() {
+	DefaultUdpEndpointPool.Reset()
+	DefaultAnyfromPool.Reset()
+	DefaultPacketSnifferSessionMgr.Reset()
 }
 
 func (c *ControlPlane) closeTail() error {

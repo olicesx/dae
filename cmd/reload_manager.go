@@ -338,57 +338,40 @@ func dnsConfigEqual(oldConf *config.Config, newConf *config.Config) bool {
 	return dnsConfigFingerprint(oldConf.Dns) == dnsConfigFingerprint(newConf.Dns)
 }
 
-// bpfDatapathChanged returns true when a config diff changes kernel datapath
-// state or userspace interpretation of kernel routing results. Such changes
-// must not use shared-BPF staged handoff because the retiring generation can
-// still accept connections while the shared maps already contain new policy.
+// bpfDatapathChanged returns true only when a config diff changes kernel
+// datapath inputs that cannot be applied via the staged-hot-handoff path —
+// namely BPF program constants (so_mark), TC hook attach points (interfaces),
+// or map dimensions (conn_state_map_size). These require a fresh BPF object
+// load and connection abort.
+//
+// Policy-level changes — routing rules, fallback, outbound groups, and DNS
+// routing — do NOT require a BPF reload: they are delivered via BPF map
+// updates (routing_map, domain_routing_map) and Go-side dialer rebuilds.
+// The staged-hot-handoff path handles them seamlessly through
+// CommitPreparedDatapath, which atomically applies the new routing_map,
+// clears+replays domain_routing_map, and flips TC hooks while the retiring
+// generation drains established connections on shared conn_state_map.
 func bpfDatapathChanged(oldConf, newConf *config.Config) bool {
 	if oldConf == nil || newConf == nil {
 		return true
 	}
-	if !dnsConfigEqual(oldConf, newConf) {
-		return true
-	}
-	if !reflect.DeepEqual(oldConf.Routing.Rules, newConf.Routing.Rules) {
-		return true
-	}
-	if !reflect.DeepEqual(oldConf.Routing.Fallback, newConf.Routing.Fallback) {
-		return true
-	}
-	if !reflect.DeepEqual(oldConf.Group, newConf.Group) {
-		return true
-	}
+	// Interface changes require TC hook re-attachment to different devices.
 	if !reflect.DeepEqual(oldConf.Global.LanInterface, newConf.Global.LanInterface) {
 		return true
 	}
 	if !reflect.DeepEqual(oldConf.Global.WanInterface, newConf.Global.WanInterface) {
 		return true
 	}
+	// Map dimensions are fixed at BPF load time.
 	if oldConf.Global.BpfConnStateMapSize != newConf.Global.BpfConnStateMapSize {
 		return true
 	}
+	// so_mark_from_dae is a BPF program constant (set via spec.Variables).
 	if oldConf.Global.SoMarkFromDae != newConf.Global.SoMarkFromDae ||
 		oldConf.Global.SoMarkFromDaeSet != newConf.Global.SoMarkFromDaeSet {
 		return true
 	}
 	return false
-}
-
-func freshDatapathStateCompatible(oldConf, newConf *config.Config) bool {
-	if oldConf == nil || newConf == nil {
-		return false
-	}
-	// SoMarkFromDae is compiled into the BPF program to tag dae-originated
-	// packets and prevent re-interception. If it changes, connections migrated
-	// from the old generation carry stale socket marks that no longer match the
-	// new BPF constant, causing the kernel to re-intercept them as plain traffic.
-	if oldConf.Global.SoMarkFromDae != newConf.Global.SoMarkFromDae ||
-		oldConf.Global.SoMarkFromDaeSet != newConf.Global.SoMarkFromDaeSet {
-		return false
-	}
-	return reflect.DeepEqual(oldConf.Group, newConf.Group) &&
-		reflect.DeepEqual(oldConf.Node, newConf.Node) &&
-		reflect.DeepEqual(oldConf.Subscription, newConf.Subscription)
 }
 
 // dnsConfigFingerprint captures only the DNS fields that affect BPF datapath

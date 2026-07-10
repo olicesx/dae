@@ -127,17 +127,16 @@ const (
 )
 
 type stagedReloadHandoff struct {
-	oldControlPlane     *control.ControlPlane
-	oldCancel           context.CancelFunc
-	oldConf             *config.Config
-	oldListener         *control.Listener
-	newControlPlane     *control.ControlPlane
-	newCancel           context.CancelFunc
-	newListener         *control.Listener
-	abortConnections    bool
-	hasOverlap          bool
-	freshDatapath       bool
-	preserveConnections bool
+	oldControlPlane  *control.ControlPlane
+	oldCancel        context.CancelFunc
+	oldConf          *config.Config
+	oldListener      *control.Listener
+	newControlPlane  *control.ControlPlane
+	newCancel        context.CancelFunc
+	newListener      *control.Listener
+	abortConnections bool
+	hasOverlap       bool
+	freshDatapath    bool
 }
 
 func tryQueueReloadRequest(
@@ -466,7 +465,7 @@ func (r *Runner) Run() (err error) {
 			if portChanged {
 				log.Warnf("[Reload] Tproxy port changed from %d to %d; will perform a full reload of eBPF programs", conf.Global.TproxyPort, newConf.Global.TproxyPort)
 			} else if datapathChanged {
-				log.Warnln("[Reload] BPF datapath config changed (routing/group/dns/iface); will perform a fresh datapath handoff")
+				log.Warnln("[Reload] Kernel datapath input changed (interface/somark/map-size); will perform a fresh datapath handoff")
 			}
 
 			var dnsCache map[string]*control.DnsCache
@@ -580,24 +579,22 @@ func (r *Runner) Run() (err error) {
 				oldListener := listener
 
 				hasOverlap := newC.InheritDialerHealthFrom(oldC)
-				preserveConnections := !abortConnections && hasOverlap && freshDatapathStateCompatible(oldConf, newConf)
 				configureTransparentHugePages(log, newConf.Global.DisableTHP)
 				c = newC
 				currCancel = cancel
 				conf = newConf
 				listener = stagedListener
 				reloadManager.setPendingStagedHandoff(&stagedReloadHandoff{
-					oldControlPlane:     oldC,
-					oldCancel:           oldCancel,
-					oldConf:             oldConf,
-					oldListener:         oldListener,
-					newControlPlane:     newC,
-					newCancel:           cancel,
-					newListener:         stagedListener,
-					abortConnections:    abortConnections,
-					hasOverlap:          hasOverlap,
-					freshDatapath:       true,
-					preserveConnections: preserveConnections,
+					oldControlPlane:  oldC,
+					oldCancel:        oldCancel,
+					oldConf:          oldConf,
+					oldListener:      oldListener,
+					newControlPlane:  newC,
+					newCancel:        cancel,
+					newListener:      stagedListener,
+					abortConnections: abortConnections,
+					hasOverlap:       hasOverlap,
+					freshDatapath:    true,
 				}, reloadStartedAt, reloadStartedAtMono)
 				reloadManager.beginHandoff()
 				notifyRunStateChange(runStateChanges)
@@ -1084,21 +1081,28 @@ func prepareFreshDatapathCutover(log *logrus.Logger, handoff *stagedReloadHandof
 	if err := handoff.oldControlPlane.StopDNSListener(); err != nil {
 		return fmt.Errorf("stop previous DNS listener: %w", err)
 	}
-	if !handoff.preserveConnections {
-		if log != nil {
-			log.Warnln("[Reload] Fresh datapath state is incompatible; aborting previous connections before cutover")
-		}
-		if err := handoff.oldControlPlane.AbortConnections(); err != nil {
-			return fmt.Errorf("abort incompatible previous connections: %w", err)
-		}
+	// A fresh datapath owns isolated maps and replaces multiple TC/cgroup hooks.
+	// Classic TC cannot atomically swap that set across all interfaces, so active
+	// flows cannot be preserved without a packet bypass or mixed-policy window.
+	// Abort them explicitly before detaching hooks instead of claiming a graceful
+	// handoff that the supported kernel range cannot guarantee.
+	if log != nil {
+		log.Warnln("[Reload] Fresh datapath reload requires aborting previous connections before cutover")
 	}
+	if err := handoff.oldControlPlane.AbortConnections(); err != nil {
+		return fmt.Errorf("abort previous connections for fresh datapath: %w", err)
+	}
+	// The fresh datapath loads isolated flow-state maps (conn_state_map,
+	// redirect_track, etc.). Stale UDP endpoints, anyfrom connections and
+	// sniffer sessions in the shared global pools still reference the retiring
+	// generation's dialer, outbound group and cached routing result; reusing
+	// them would apply the old policy to the new datapath. Evict them now —
+	// at this point the old listener is closed and the new generation has not
+	// started serving, so no in-flight traffic is disrupted. Janitor goroutines
+	// are left running for the successor to reuse.
+	control.ResetGlobalUdpFlowState()
 	if err := handoff.oldControlPlane.DetachBpfHooks(); err != nil {
 		return fmt.Errorf("detach previous BPF hooks: %w", err)
-	}
-	if handoff.preserveConnections {
-		if err := handoff.newControlPlane.MigrateRuntimeBpfStateFrom(handoff.oldControlPlane); err != nil {
-			return fmt.Errorf("migrate runtime BPF state: %w", err)
-		}
 	}
 	return nil
 }

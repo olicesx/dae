@@ -669,20 +669,6 @@ func baseReloadDatapathConfig() *config.Config {
 	}
 }
 
-func equivalentReloadRoutingRule() *config_parser.RoutingRule {
-	return &config_parser.RoutingRule{
-		AndFunctions: []*config_parser.Function{
-			{
-				Name: "domain",
-				Params: []*config_parser.Param{
-					{Key: "suffix", Val: "example.com"},
-				},
-			},
-		},
-		Outbound: config_parser.Function{Name: "proxy"},
-	}
-}
-
 func TestBpfDatapathChangedIgnoresDnsRuntimeParameters(t *testing.T) {
 	oldConf := baseReloadDatapathConfig()
 	newConf := deepcopy.Copy(oldConf).(*config.Config)
@@ -695,45 +681,11 @@ func TestBpfDatapathChangedIgnoresDnsRuntimeParameters(t *testing.T) {
 	}
 }
 
-func TestBpfDatapathChangedTreatsEquivalentPointerValuesAsUnchanged(t *testing.T) {
-	oldConf := baseReloadDatapathConfig()
-	newConf := baseReloadDatapathConfig()
-	oldConf.Routing.Rules = []*config_parser.RoutingRule{equivalentReloadRoutingRule()}
-	newConf.Routing.Rules = []*config_parser.RoutingRule{equivalentReloadRoutingRule()}
-
-	if oldConf.Routing.Rules[0] == newConf.Routing.Rules[0] ||
-		oldConf.Routing.Rules[0].AndFunctions[0] == newConf.Routing.Rules[0].AndFunctions[0] ||
-		oldConf.Routing.Rules[0].AndFunctions[0].Params[0] == newConf.Routing.Rules[0].AndFunctions[0].Params[0] {
-		t.Fatal("test setup must use distinct pointers")
-	}
-	if bpfDatapathChanged(oldConf, newConf) {
-		t.Fatal("equivalent routing rule values with distinct pointers must stay on shared staged handoff")
-	}
-}
-
 func TestBpfDatapathChangedDetectsKernelDatapathInputs(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*config.Config)
 	}{
-		{
-			name: "dns upstream",
-			mutate: func(conf *config.Config) {
-				conf.Dns.Upstream = []config.KeyableString{"cloudflare:udp://1.1.1.1:53"}
-			},
-		},
-		{
-			name: "routing fallback",
-			mutate: func(conf *config.Config) {
-				conf.Routing.Fallback = "block"
-			},
-		},
-		{
-			name: "group definition",
-			mutate: func(conf *config.Config) {
-				conf.Group = append(conf.Group, config.Group{Name: "backup", Policy: config.FunctionListOrString("fixed(0)")})
-			},
-		},
 		{
 			name: "lan interface",
 			mutate: func(conf *config.Config) {
@@ -772,52 +724,58 @@ func TestBpfDatapathChangedDetectsKernelDatapathInputs(t *testing.T) {
 	}
 }
 
-func TestFreshDatapathStateCompatibleRequiresStableOutboundTopology(t *testing.T) {
-	oldConf := baseReloadDatapathConfig()
-	oldConf.Group = append(oldConf.Group, config.Group{Name: "backup", Policy: config.FunctionListOrString("fixed(0)")})
-
-	equivalent := deepcopy.Copy(oldConf).(*config.Config)
-	if !freshDatapathStateCompatible(oldConf, equivalent) {
-		t.Fatal("equivalent outbound topology must preserve runtime state compatibility")
+// TestBpfDatapathChangedRoutesPolicyChangesViaStagedHandoff verifies that
+// policy-level config changes (routing rules, fallback, groups, DNS upstream)
+// do NOT trigger a fresh BPF reload. These changes are delivered via BPF map
+// updates and Go-side rebuilds, so the staged-hot-handoff path handles them
+// without aborting established connections.
+func TestBpfDatapathChangedRoutesPolicyChangesViaStagedHandoff(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*config.Config)
+	}{
+		{
+			name: "dns upstream",
+			mutate: func(conf *config.Config) {
+				conf.Dns.Upstream = []config.KeyableString{"cloudflare:udp://1.1.1.1:53"}
+			},
+		},
+		{
+			name: "routing rules",
+			mutate: func(conf *config.Config) {
+				conf.Routing.Rules = []*config_parser.RoutingRule{
+					{
+						AndFunctions: []*config_parser.Function{
+							{Name: "domain", Params: []*config_parser.Param{{Key: "suffix", Val: "new.com"}}},
+						},
+						Outbound: config_parser.Function{Name: "proxy"},
+					},
+				}
+			},
+		},
+		{
+			name: "routing fallback",
+			mutate: func(conf *config.Config) {
+				conf.Routing.Fallback = "block"
+			},
+		},
+		{
+			name: "group definition",
+			mutate: func(conf *config.Config) {
+				conf.Group = append(conf.Group, config.Group{Name: "backup", Policy: config.FunctionListOrString("fixed(0)")})
+			},
+		},
 	}
 
-	policyChanged := deepcopy.Copy(oldConf).(*config.Config)
-	policyChanged.Group[0].Policy = config.FunctionListOrString("min_moving_avg()")
-	if freshDatapathStateCompatible(oldConf, policyChanged) {
-		t.Fatal("group policy changes must not reuse old outbound runtime state")
-	}
-
-	reordered := deepcopy.Copy(oldConf).(*config.Config)
-	reordered.Group[0], reordered.Group[1] = reordered.Group[1], reordered.Group[0]
-	if freshDatapathStateCompatible(oldConf, reordered) {
-		t.Fatal("reordered groups must not reuse outbound IDs from runtime state")
-	}
-
-	removed := deepcopy.Copy(oldConf).(*config.Config)
-	removed.Group = removed.Group[:1]
-	if freshDatapathStateCompatible(oldConf, removed) {
-		t.Fatal("removed groups must not reuse outbound IDs from runtime state")
-	}
-
-	nodesChanged := deepcopy.Copy(oldConf).(*config.Config)
-	nodesChanged.Node = []config.KeyableString{"socks5://127.0.0.1:1080"}
-	if freshDatapathStateCompatible(oldConf, nodesChanged) {
-		t.Fatal("node changes must not reuse old outbound runtime state")
-	}
-
-	// SoMarkFromDae is compiled into the BPF program to tag dae-originated
-	// packets. If it changes, migrated connections carry stale socket marks
-	// that no longer match the new BPF constant and get re-intercepted.
-	markChanged := deepcopy.Copy(oldConf).(*config.Config)
-	markChanged.Global.SoMarkFromDae = 0x4000000
-	if freshDatapathStateCompatible(oldConf, markChanged) {
-		t.Fatal("so_mark_from_dae value changes must not preserve runtime state")
-	}
-
-	markUnset := deepcopy.Copy(oldConf).(*config.Config)
-	markUnset.Global.SoMarkFromDaeSet = false
-	if freshDatapathStateCompatible(oldConf, markUnset) {
-		t.Fatal("so_mark_from_dae_set changes must not preserve runtime state")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oldConf := baseReloadDatapathConfig()
+			newConf := deepcopy.Copy(oldConf).(*config.Config)
+			tt.mutate(newConf)
+			if bpfDatapathChanged(oldConf, newConf) {
+				t.Fatal("policy-level change must route through staged handoff, not fresh datapath reload")
+			}
+		})
 	}
 }
 

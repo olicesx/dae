@@ -144,6 +144,107 @@ func TestControlPlaneClose_DoesNotResetGlobalUdpPools(t *testing.T) {
 	_ = rebound.Close()
 }
 
+func TestResetGlobalUdpFlowStateClearsFlowPoolsWithoutStoppingJanitors(t *testing.T) {
+	oldEndpointPool := DefaultUdpEndpointPool
+	oldAnyfromPool := DefaultAnyfromPool
+	oldTaskPool := DefaultUdpTaskPool
+	oldSnifferPool := DefaultPacketSnifferSessionMgr
+
+	DefaultUdpEndpointPool = NewUdpEndpointPool()
+	DefaultAnyfromPool = newTestAnyfromPoolWithoutJanitor()
+	DefaultUdpTaskPool = NewUdpTaskPool()
+	DefaultPacketSnifferSessionMgr = NewPacketSnifferPool()
+
+	defer func() {
+		DefaultUdpEndpointPool.Reset()
+		DefaultAnyfromPool.Reset()
+		DefaultUdpTaskPool.Reset()
+		DefaultPacketSnifferSessionMgr.Reset()
+		DefaultUdpEndpointPool = oldEndpointPool
+		DefaultAnyfromPool = oldAnyfromPool
+		DefaultUdpTaskPool = oldTaskPool
+		DefaultPacketSnifferSessionMgr = oldSnifferPool
+	}()
+
+	// Seed a UDP endpoint referencing a (fake) retiring-generation dialer.
+	endpointKey := UdpEndpointKey{Src: netip.MustParseAddrPort("127.0.0.1:15001")}
+	endpointConn := &scriptedPacketConn{
+		reads:   make(chan scriptedPacketRead),
+		closeCh: make(chan struct{}),
+	}
+	endpoint := &UdpEndpoint{
+		conn:       endpointConn,
+		NatTimeout: DefaultNatTimeout,
+		handler:    func(_ *UdpEndpoint, _ []byte, _ netip.AddrPort) error { return nil },
+		poolRef:    DefaultUdpEndpointPool,
+		poolKey:    endpointKey,
+	}
+	endpointShard := DefaultUdpEndpointPool.shardFor(endpointKey)
+	endpointShard.mu.Lock()
+	endpointShard.pool[endpointKey] = endpoint
+	endpointShard.mu.Unlock()
+
+	// Seed an anyfrom connection.
+	anyfromConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP(anyfrom): %v", err)
+	}
+	anyfromAddr := anyfromConn.LocalAddr().(*net.UDPAddr).AddrPort()
+	anyfrom := &Anyfrom{
+		UDPConn: anyfromConn,
+		ttl:     AnyfromTimeout,
+	}
+	anyfrom.RefreshTtl()
+	anyfromShard := DefaultAnyfromPool.shardFor(anyfromAddr)
+	anyfromShard.mu.Lock()
+	anyfromShard.pool[anyfromAddr] = anyfrom
+	anyfromShard.mu.Unlock()
+
+	// Seed a packet sniffer session.
+	snifferKey := NewPacketSnifferKey(
+		netip.MustParseAddrPort("192.0.2.10:40000"),
+		netip.MustParseAddrPort("198.51.100.20:443"),
+		[]byte{0x01, 0x02, 0x03},
+	)
+	if _, isNew := DefaultPacketSnifferSessionMgr.GetOrCreate(snifferKey, nil); !isNew {
+		t.Fatal("expected test packet sniffer session to be newly created")
+	}
+
+	// Sanity: all three flow-state pools are non-empty before reset.
+	if got := countPooledUdpEndpoints(DefaultUdpEndpointPool); got != 1 {
+		t.Fatalf("pooled udp endpoint count before reset = %d, want 1", got)
+	}
+	if got := countPooledAnyfromConns(DefaultAnyfromPool); got != 1 {
+		t.Fatalf("pooled anyfrom conn count before reset = %d, want 1", got)
+	}
+	if got := countPooledPacketSniffers(DefaultPacketSnifferSessionMgr); got != 1 {
+		t.Fatalf("pooled sniffer count before reset = %d, want 1", got)
+	}
+
+	ResetGlobalUdpFlowState()
+
+	// All flow-state pools must be cleared so the fresh datapath does not reuse
+	// stale dialer / outbound / routing-cache references from the retired gen.
+	if got := countPooledUdpEndpoints(DefaultUdpEndpointPool); got != 0 {
+		t.Fatalf("pooled udp endpoint count after reset = %d, want 0", got)
+	}
+	if got := countPooledAnyfromConns(DefaultAnyfromPool); got != 0 {
+		t.Fatalf("pooled anyfrom conn count after reset = %d, want 0", got)
+	}
+	if got := countPooledPacketSniffers(DefaultPacketSnifferSessionMgr); got != 0 {
+		t.Fatalf("pooled sniffer count after reset = %d, want 0", got)
+	}
+
+	// The task pool janitor must still be running — the successor generation
+	// reuses it. Only ResetGlobalUdpState (process shutdown) may close it.
+	if DefaultUdpTaskPool.closed.Load() {
+		t.Fatal("expected UdpTaskPool to remain open after ResetGlobalUdpFlowState")
+	}
+
+	// The seeded endpoint's connection must have been closed by Reset.
+	waitForCloseSignal(t, endpointConn.closeCh, "ResetGlobalUdpFlowState closes udp endpoint")
+}
+
 func TestControlPlaneClose_TimesOutSlowDeferredCleanup(t *testing.T) {
 	oldTimeout := controlPlaneDeferredCleanupTimeout
 	controlPlaneDeferredCleanupTimeout = 50 * time.Millisecond

@@ -127,16 +127,17 @@ const (
 )
 
 type stagedReloadHandoff struct {
-	oldControlPlane  *control.ControlPlane
-	oldCancel        context.CancelFunc
-	oldConf          *config.Config
-	oldListener      *control.Listener
-	newControlPlane  *control.ControlPlane
-	newCancel        context.CancelFunc
-	newListener      *control.Listener
-	abortConnections bool
-	hasOverlap       bool
-	freshDatapath    bool
+	oldControlPlane     *control.ControlPlane
+	oldCancel           context.CancelFunc
+	oldConf             *config.Config
+	oldListener         *control.Listener
+	newControlPlane     *control.ControlPlane
+	newCancel           context.CancelFunc
+	newListener         *control.Listener
+	abortConnections    bool
+	hasOverlap          bool
+	freshDatapath       bool
+	preserveConnections bool
 }
 
 func tryQueueReloadRequest(
@@ -579,22 +580,24 @@ func (r *Runner) Run() (err error) {
 				oldListener := listener
 
 				hasOverlap := newC.InheritDialerHealthFrom(oldC)
+				preserveConnections := !abortConnections && hasOverlap && freshDatapathStateCompatible(oldConf, newConf)
 				configureTransparentHugePages(log, newConf.Global.DisableTHP)
 				c = newC
 				currCancel = cancel
 				conf = newConf
 				listener = stagedListener
 				reloadManager.setPendingStagedHandoff(&stagedReloadHandoff{
-					oldControlPlane:  oldC,
-					oldCancel:        oldCancel,
-					oldConf:          oldConf,
-					oldListener:      oldListener,
-					newControlPlane:  newC,
-					newCancel:        cancel,
-					newListener:      stagedListener,
-					abortConnections: abortConnections,
-					hasOverlap:       hasOverlap,
-					freshDatapath:    true,
+					oldControlPlane:     oldC,
+					oldCancel:           oldCancel,
+					oldConf:             oldConf,
+					oldListener:         oldListener,
+					newControlPlane:     newC,
+					newCancel:           cancel,
+					newListener:         stagedListener,
+					abortConnections:    abortConnections,
+					hasOverlap:          hasOverlap,
+					freshDatapath:       true,
+					preserveConnections: preserveConnections,
 				}, reloadStartedAt, reloadStartedAtMono)
 				reloadManager.beginHandoff()
 				notifyRunStateChange(runStateChanges)
@@ -822,7 +825,32 @@ loop:
 				reloadManager.reloading.Store(false)
 				log.Warnln("[Reload] Serve")
 				if handoff := reloadManager.currentPendingStagedHandoff(); handoff != nil && handoff.freshDatapath {
-					prepareFreshDatapathCutover(log, handoff)
+					if cutoverErr := prepareFreshDatapathCutover(log, handoff); cutoverErr != nil {
+						reloadErr := fmt.Errorf("prepare fresh datapath cutover: %w", cutoverErr)
+						reloadManager.setReloadError(reloadErr)
+						_ = sdnotify.Ready()
+						_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
+						log.WithError(reloadErr).Errorln("[Reload] Fresh datapath cutover failed; restoring previous generation")
+
+						recoveredListener, rollbackErr := rollbackFreshDatapathReloadHandoff(log, handoff)
+						if rollbackErr != nil {
+							log.WithError(rollbackErr).Errorln("[Reload] Failed to recover previous generation after cutover error")
+							fastExit = true
+							break loop
+						}
+						c = handoff.oldControlPlane
+						currCancel = handoff.oldCancel
+						conf = handoff.oldConf
+						listener = recoveredListener
+						reloadManager.clearPendingStagedHandoff()
+						if restartErr := restartRecoveredControlPlane(log, sigs, runStateChanges, c, listener); restartErr != nil {
+							log.WithError(restartErr).Errorln("[Reload] Failed to restart previous listener generation after cutover rollback")
+							fastExit = true
+							break loop
+						}
+						reloadManager.finishReloadFailure()
+						continue
+					}
 				} else {
 					reloadManager.installPreparedDNSHandoffHooks(log, c, conf)
 				}
@@ -1040,42 +1068,64 @@ func retireControlPlaneConnections(
 	}
 }
 
-func prepareFreshDatapathCutover(log *logrus.Logger, handoff *stagedReloadHandoff) {
+func prepareFreshDatapathCutover(log *logrus.Logger, handoff *stagedReloadHandoff) error {
 	if handoff == nil || !handoff.freshDatapath {
-		return
+		return fmt.Errorf("missing fresh datapath handoff")
 	}
 	if handoff.oldListener != nil {
-		if err := handoff.oldListener.Close(); err != nil && log != nil {
-			log.WithError(err).Warnln("[Reload] Failed to close previous listener before fresh datapath cutover")
+		if err := handoff.oldListener.Close(); err != nil {
+			return fmt.Errorf("close previous listener: %w", err)
 		}
 		handoff.oldListener = nil
 	}
-	if handoff.oldControlPlane != nil {
-		if err := handoff.oldControlPlane.StopDNSListener(); err != nil && log != nil {
-			log.WithError(err).Warnln("[Reload] Failed to stop previous DNS listener before fresh datapath cutover")
+	if handoff.oldControlPlane == nil || handoff.newControlPlane == nil {
+		return fmt.Errorf("missing control plane for fresh datapath cutover")
+	}
+	if err := handoff.oldControlPlane.StopDNSListener(); err != nil {
+		return fmt.Errorf("stop previous DNS listener: %w", err)
+	}
+	if !handoff.preserveConnections {
+		if log != nil {
+			log.Warnln("[Reload] Fresh datapath state is incompatible; aborting previous connections before cutover")
 		}
-		if err := handoff.oldControlPlane.DetachBpfHooks(); err != nil && log != nil {
-			log.WithError(err).Warnln("[Reload] Failed to detach previous BPF hooks before fresh datapath cutover")
+		if err := handoff.oldControlPlane.AbortConnections(); err != nil {
+			return fmt.Errorf("abort incompatible previous connections: %w", err)
 		}
 	}
+	if err := handoff.oldControlPlane.DetachBpfHooks(); err != nil {
+		return fmt.Errorf("detach previous BPF hooks: %w", err)
+	}
+	if handoff.preserveConnections {
+		if err := handoff.newControlPlane.MigrateRuntimeBpfStateFrom(handoff.oldControlPlane); err != nil {
+			return fmt.Errorf("migrate runtime BPF state: %w", err)
+		}
+	}
+	return nil
 }
 
 func rollbackFreshDatapathReloadHandoff(log *logrus.Logger, handoff *stagedReloadHandoff) (*control.Listener, error) {
 	if handoff == nil || handoff.oldControlPlane == nil || handoff.oldConf == nil {
 		return nil, fmt.Errorf("missing previous generation for fresh datapath rollback")
 	}
+	var rollbackCleanupErrs []error
 	if handoff.newListener != nil {
-		if err := handoff.newListener.Close(); err != nil && log != nil {
-			log.WithError(err).Warnln("[Reload] Failed to close fresh datapath listener during rollback")
+		if err := handoff.newListener.Close(); err != nil {
+			rollbackCleanupErrs = append(rollbackCleanupErrs, fmt.Errorf("close fresh datapath listener: %w", err))
 		}
 	}
 	if handoff.newCancel != nil {
 		handoff.newCancel()
 	}
 	if handoff.newControlPlane != nil {
+		if err := handoff.newControlPlane.DetachBpfHooks(); err != nil {
+			rollbackCleanupErrs = append(rollbackCleanupErrs, fmt.Errorf("detach fresh datapath hooks: %w", err))
+		}
 		if err := handoff.newControlPlane.Close(); err != nil && log != nil {
 			log.WithError(err).Warnln("[Reload] Failed to close fresh datapath control plane during rollback")
 		}
+	}
+	if len(rollbackCleanupErrs) > 0 {
+		return nil, errors.Join(rollbackCleanupErrs...)
 	}
 
 	recoveredListener, err := handoff.oldControlPlane.Listen(handoff.oldConf.Global.TproxyPort)
@@ -1086,10 +1136,13 @@ func rollbackFreshDatapathReloadHandoff(log *logrus.Logger, handoff *stagedReloa
 		_ = recoveredListener.Close()
 		return nil, err
 	}
-	if err := handoff.oldControlPlane.RestartDNSListener(); err != nil && log != nil {
-		log.WithError(err).Warnln("[Reload] Failed to restart previous DNS listener after fresh datapath rollback")
+	if err := handoff.oldControlPlane.RestartDNSListener(); err != nil {
+		_ = recoveredListener.Close()
+		return nil, fmt.Errorf("restart previous DNS listener: %w", err)
 	}
-	log.Warnln("[Reload] Restored previous generation after fresh datapath handoff failure")
+	if log != nil {
+		log.Warnln("[Reload] Restored previous generation after fresh datapath handoff failure")
+	}
 	return recoveredListener, nil
 }
 

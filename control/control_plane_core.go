@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/netip"
 	"os"
+	"path"
 	"regexp"
 	"sync"
 	"sync/atomic"
@@ -30,6 +31,8 @@ import (
 
 // coreFlip should be 0 or 1; accessed atomically.
 var coreFlip int32
+
+var configureNetlinkSocketTimeoutOnce sync.Once
 
 type cgroupAttachment interface {
 	io.Closer
@@ -101,6 +104,8 @@ type controlPlaneCore struct {
 	// Protected by bpfHookMu to avoid deadlock with c.mu in _bindLan/_bindWan.
 	bpfHookDetachFuncs []func() error
 	bpfHookMu          sync.Mutex
+	bpfHookDetachMu    sync.Mutex
+	bpfHookAttachWg    sync.WaitGroup
 	bpf                atomic.Pointer[bpfObjects]
 	outboundId2Name    map[uint8]string
 	// tcpRelayOffload is permanently disabled due to kernel panic issues.
@@ -110,14 +115,20 @@ type controlPlaneCore struct {
 	kernelVersion *internal.Version
 
 	flip             int
+	flipBase         int32
+	flipPending      bool
 	isReload         bool
 	bpfEjected       bool
 	bpfHooksDetached bool // Track if BPF hooks were already detached
+	bpfHooksQuiesced bool
 	retired          atomic.Bool
 
-	closed context.Context
-	close  context.CancelFunc
-	ifmgr  *component.InterfaceManager
+	closed                context.Context
+	close                 context.CancelFunc
+	ifmgr                 *component.InterfaceManager
+	interfacePatternMu    sync.Mutex
+	registeredLanPatterns map[string]struct{}
+	registeredWanPatterns map[string]struct{}
 
 	udpConnStateTracker atomic.Pointer[udpConnStateTracker]
 	domainRouting       *domainRoutingTracker
@@ -132,10 +143,19 @@ func newControlPlaneCore(log *logrus.Logger,
 	isReload bool,
 	bpfOwned bool,
 ) *controlPlaneCore {
+	configureNetlinkSocketTimeoutOnce.Do(func() {
+		if err := netlink.SetSocketTimeout(controlPlaneDeferredCleanupTimeout); err != nil && log != nil {
+			log.WithError(err).Warn("Failed to configure netlink socket timeout")
+		}
+	})
+
 	var flip int
+	var flipBase int32
+	var flipPending bool
 	if isReload {
-		flip = int(atomic.LoadInt32(&coreFlip)&1 ^ 1)
-		atomic.StoreInt32(&coreFlip, int32(flip))
+		flipBase = atomic.LoadInt32(&coreFlip) & 1
+		flip = int(flipBase ^ 1)
+		flipPending = true
 	} else {
 		flip = int(atomic.LoadInt32(&coreFlip))
 	}
@@ -144,24 +164,49 @@ func newControlPlaneCore(log *logrus.Logger,
 	ifmgr := component.NewInterfaceManager(log)
 	deferFuncs = append(deferFuncs, ifmgr.Close)
 	core := &controlPlaneCore{
-		log:                log,
-		deferFuncs:         deferFuncs,
-		bpfHookDetachFuncs: make([]func() error, 0),
-		outboundId2Name:    outboundId2Name,
-		kernelVersion:      kernelVersion,
-		flip:               flip,
-		isReload:           isReload,
-		bpfEjected:         false,
-		bpfHooksDetached:   false,
-		ifmgr:              ifmgr,
-		closed:             closed,
-		close:              toClose,
-		domainRouting:      newDomainRoutingTracker(),
-		bpfOwned:           bpfOwned,
+		log:                   log,
+		deferFuncs:            deferFuncs,
+		bpfHookDetachFuncs:    make([]func() error, 0),
+		outboundId2Name:       outboundId2Name,
+		kernelVersion:         kernelVersion,
+		flip:                  flip,
+		flipBase:              flipBase,
+		flipPending:           flipPending,
+		isReload:              isReload,
+		bpfEjected:            false,
+		bpfHooksDetached:      false,
+		bpfHooksQuiesced:      false,
+		ifmgr:                 ifmgr,
+		registeredLanPatterns: make(map[string]struct{}),
+		registeredWanPatterns: make(map[string]struct{}),
+		closed:                closed,
+		close:                 toClose,
+		domainRouting:         newDomainRoutingTracker(),
+		bpfOwned:              bpfOwned,
 	}
 	core.bpf.Store(bpf)
 	core.udpConnStateTracker.Store(acquireSharedUdpConnStateTracker(bpf))
 	return core
+}
+
+func (c *controlPlaneCore) commitBpfHookFlip() error {
+	if c == nil || !c.flipPending {
+		return nil
+	}
+	if !atomic.CompareAndSwapInt32(&coreFlip, c.flipBase, int32(c.flip)) {
+		return fmt.Errorf("BPF hook flip changed during reload: active=%d expected=%d", atomic.LoadInt32(&coreFlip)&1, c.flipBase)
+	}
+	c.flipPending = false
+	return nil
+}
+
+func (c *controlPlaneCore) activateBpfHookFlip() {
+	if c == nil {
+		return
+	}
+	atomic.StoreInt32(&coreFlip, int32(c.flip))
+	c.flipBase = int32(c.flip)
+	c.flipPending = false
 }
 
 func (c *controlPlaneCore) getUdpConnStateTracker() *udpConnStateTracker {
@@ -193,10 +238,28 @@ func (c *controlPlaneCore) Flip() {
 // addBpfHookDetach adds a BPF hook detachment function to the dedicated list.
 // These functions will be executed immediately on SIGTERM before other cleanup.
 // Uses bpfHookMu to avoid deadlock with c.mu held by callers like _bindLan/_bindWan.
-func (c *controlPlaneCore) addBpfHookDetach(detachFunc func() error) {
+func (c *controlPlaneCore) addBpfHookDetach(detachFunc func() error) bool {
 	c.bpfHookMu.Lock()
 	defer c.bpfHookMu.Unlock()
+	if c.bpfHooksQuiesced {
+		return false
+	}
 	c.bpfHookDetachFuncs = append(c.bpfHookDetachFuncs, detachFunc)
+	return true
+}
+
+func (c *controlPlaneCore) beginBpfHookAttach() bool {
+	c.bpfHookMu.Lock()
+	defer c.bpfHookMu.Unlock()
+	if c.bpfHooksQuiesced {
+		return false
+	}
+	c.bpfHookAttachWg.Add(1)
+	return true
+}
+
+func (c *controlPlaneCore) endBpfHookAttach() {
+	c.bpfHookAttachWg.Done()
 }
 
 func (c *controlPlaneCore) addDeferFunc(deferFunc func() error) bool {
@@ -216,21 +279,54 @@ func (c *controlPlaneCore) addDeferFunc(deferFunc func() error) bool {
 // ownership transfer only skips bpf.Close(), not removal of this generation's
 // TC filters from the system.
 func (c *controlPlaneCore) addManagedBpfHookCleanup(detachFunc func() error) {
-	if !c.addDeferFunc(detachFunc) {
-		if err := detachFunc(); err != nil && c.log != nil {
+	var (
+		cleanupMu sync.Mutex
+		detached  bool
+	)
+	managedDetach := func() error {
+		cleanupMu.Lock()
+		defer cleanupMu.Unlock()
+		if detached {
+			return nil
+		}
+		if err := detachFunc(); err != nil {
+			return err
+		}
+		detached = true
+		return nil
+	}
+
+	if !c.addDeferFunc(managedDetach) {
+		if err := managedDetach(); err != nil && c.log != nil {
 			c.log.WithError(err).Warn("controlPlaneCore: failed to detach hook after close began")
 		}
 		return
 	}
-	c.addBpfHookDetach(detachFunc)
+	if !c.addBpfHookDetach(managedDetach) {
+		if err := managedDetach(); err != nil && c.log != nil {
+			c.log.WithError(err).Warn("controlPlaneCore: failed to detach hook registered after detach began")
+		}
+	}
 }
 
 func (c *controlPlaneCore) resetBpfHookDetachForReattach() {
 	c.bpfHookMu.Lock()
-	defer c.bpfHookMu.Unlock()
-
 	c.bpfHookDetachFuncs = nil
 	c.bpfHooksDetached = false
+	c.bpfHooksQuiesced = false
+	c.bpfHookMu.Unlock()
+
+	c.interfacePatternMu.Lock()
+	oldIfmgr := c.ifmgr
+	c.ifmgr = component.NewInterfaceManager(c.log)
+	c.registeredLanPatterns = make(map[string]struct{})
+	c.registeredWanPatterns = make(map[string]struct{})
+	newIfmgr := c.ifmgr
+	c.interfacePatternMu.Unlock()
+	if oldIfmgr != nil {
+		_ = oldIfmgr.Close()
+	}
+	c.addDeferFunc(newIfmgr.Close)
 }
 
 // DetachBpfHooks immediately detaches all BPF hooks from the system.
@@ -238,13 +334,23 @@ func (c *controlPlaneCore) resetBpfHookDetachForReattach() {
 // even if the rest of the shutdown process takes too long and gets SIGKILL'd.
 // This is safe to call multiple times - subsequent calls will be no-ops.
 func (c *controlPlaneCore) DetachBpfHooks() error {
-	c.bpfHookMu.Lock()
-	defer c.bpfHookMu.Unlock()
+	c.bpfHookDetachMu.Lock()
+	defer c.bpfHookDetachMu.Unlock()
 
-	// Already detached, skip
+	c.bpfHookMu.Lock()
 	if c.bpfHooksDetached {
+		c.bpfHookMu.Unlock()
 		return nil
 	}
+	c.bpfHooksQuiesced = true
+	c.bpfHookMu.Unlock()
+	if c.ifmgr != nil {
+		_ = c.ifmgr.Close()
+	}
+	c.bpfHookAttachWg.Wait()
+
+	c.bpfHookMu.Lock()
+	defer c.bpfHookMu.Unlock()
 
 	c.log.Infoln("[Shutdown] Detaching BPF hooks immediately to restore network")
 
@@ -258,12 +364,12 @@ func (c *controlPlaneCore) DetachBpfHooks() error {
 		}
 	}
 
-	c.bpfHooksDetached = true
-	c.log.Infoln("[Shutdown] BPF hooks detached, network should be restored")
-
 	if len(errs) > 0 {
+		c.bpfHooksDetached = false
 		return errors.Join(errs...)
 	}
+	c.bpfHooksDetached = true
+	c.log.Infoln("[Shutdown] BPF hooks detached, network should be restored")
 	return nil
 }
 
@@ -403,25 +509,29 @@ func (c *controlPlaneCore) delQdisc(link netlink.Link) error {
 // bindLan automatically configures kernel parameters and bind to lan interface `ifname`.
 // bindLan supports lazy-bind if interface `ifname` is not found.
 // bindLan supports rebinding when the interface `ifname` is detected in the future.
-func (c *controlPlaneCore) bindLan(ifname string, autoConfigKernelParameter bool) {
-	initlinkCallback := func(link netlink.Link) {
+func (c *controlPlaneCore) bindLan(ifname string, autoConfigKernelParameter bool) error {
+	attach := func(link netlink.Link) error {
 		if link.Attrs().Name == HostVethName {
-			return
+			return nil
 		}
+		if !c.beginBpfHookAttach() {
+			return nil
+		}
+		defer c.endBpfHookAttach()
 		if autoConfigKernelParameter {
 			SetSendRedirects(link.Attrs().Name, "0")
 			SetForwarding(link.Attrs().Name, "1")
 		}
-		if err := c._bindLan(link.Attrs().Name); err != nil {
-			c.log.Errorf("bindLan: %v", err)
-		}
+		return c._bindLan(link.Attrs().Name)
 	}
 	newlinkCallback := func(link netlink.Link) {
 		if link.Attrs().Name == HostVethName {
 			return
 		}
 		c.log.Warnf("New link creation of '%v' is detected. Bind LAN program to it.", link.Attrs().Name)
-		initlinkCallback(link)
+		if err := attach(link); err != nil {
+			c.log.Errorf("bindLan: %v", err)
+		}
 	}
 	dellinkCallback := func(link netlink.Link) {
 		if link.Attrs().Name == HostVethName {
@@ -432,7 +542,10 @@ func (c *controlPlaneCore) bindLan(ifname string, autoConfigKernelParameter bool
 			c.log.Errorf("delQdisc: %v", err)
 		}
 	}
-	c.ifmgr.RegisterWithPattern(ifname, initlinkCallback, newlinkCallback, dellinkCallback)
+	if err := c.registerInterfacePattern(ifname, true, newlinkCallback, dellinkCallback); err != nil {
+		return err
+	}
+	return c.attachMatchingInterfaces(ifname, attach)
 }
 
 func (c *controlPlaneCore) _bindLan(ifname string) error {
@@ -623,21 +736,25 @@ func (c *controlPlaneCore) setupTCPRelayOffload() error {
 
 // bindWan supports lazy-bind if interface `ifname` is not found.
 // bindWan supports rebinding when the interface `ifname` is detected in the future.
-func (c *controlPlaneCore) bindWan(ifname string) {
-	initlinkCallback := func(link netlink.Link) {
+func (c *controlPlaneCore) bindWan(ifname string) error {
+	attach := func(link netlink.Link) error {
 		if link.Attrs().Name == HostVethName {
-			return
+			return nil
 		}
-		if err := c._bindWan(link.Attrs().Name); err != nil {
-			c.log.Errorf("bindWan: %v", err)
+		if !c.beginBpfHookAttach() {
+			return nil
 		}
+		defer c.endBpfHookAttach()
+		return c._bindWan(link.Attrs().Name)
 	}
 	newlinkCallback := func(link netlink.Link) {
 		if link.Attrs().Name == HostVethName {
 			return
 		}
 		c.log.Warnf("New link creation of '%v' is detected. Bind WAN program to it.", link.Attrs().Name)
-		initlinkCallback(link)
+		if err := attach(link); err != nil {
+			c.log.Errorf("bindWan: %v", err)
+		}
 	}
 	dellinkCallback := func(link netlink.Link) {
 		if link.Attrs().Name == HostVethName {
@@ -648,7 +765,62 @@ func (c *controlPlaneCore) bindWan(ifname string) {
 			c.log.Errorf("delQdisc: %v", err)
 		}
 	}
-	c.ifmgr.RegisterWithPattern(ifname, initlinkCallback, newlinkCallback, dellinkCallback)
+	if err := c.registerInterfacePattern(ifname, false, newlinkCallback, dellinkCallback); err != nil {
+		return err
+	}
+	return c.attachMatchingInterfaces(ifname, attach)
+}
+
+func (c *controlPlaneCore) registerInterfacePattern(
+	pattern string,
+	lan bool,
+	newCallback func(netlink.Link),
+	delCallback func(netlink.Link),
+) error {
+	if _, err := path.Match(pattern, ""); err != nil {
+		return fmt.Errorf("invalid interface pattern %q: %w", pattern, err)
+	}
+
+	c.interfacePatternMu.Lock()
+	defer c.interfacePatternMu.Unlock()
+	registered := c.registeredWanPatterns
+	if lan {
+		registered = c.registeredLanPatterns
+	}
+	if registered == nil {
+		registered = make(map[string]struct{})
+		if lan {
+			c.registeredLanPatterns = registered
+		} else {
+			c.registeredWanPatterns = registered
+		}
+	}
+	if _, ok := registered[pattern]; ok {
+		return nil
+	}
+	c.ifmgr.RegisterWithPattern(pattern, nil, newCallback, delCallback)
+	registered[pattern] = struct{}{}
+	return nil
+}
+
+func (c *controlPlaneCore) attachMatchingInterfaces(pattern string, attach func(netlink.Link) error) error {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return fmt.Errorf("list interfaces for pattern %q: %w", pattern, err)
+	}
+	for _, link := range links {
+		matched, matchErr := path.Match(pattern, link.Attrs().Name)
+		if matchErr != nil {
+			return fmt.Errorf("match interface pattern %q: %w", pattern, matchErr)
+		}
+		if !matched {
+			continue
+		}
+		if err := attach(link); err != nil {
+			return fmt.Errorf("attach interface %s: %w", link.Attrs().Name, err)
+		}
+	}
+	return nil
 }
 
 func (c *controlPlaneCore) _bindWan(ifname string) error {
@@ -973,16 +1145,6 @@ func (c *controlPlaneCore) ReleaseUdpConnStateTuples(keys []bpfTuplesKey) error 
 	}
 	_, err := BpfMapBatchDelete(bpf.ConnStateMap, deleteKeys)
 	return err
-}
-
-// IsBpfEjected reports whether BPF ownership has been transferred to another
-// generation via EjectBpf. When true, core.Close() is purely cleanup (TC
-// filter detach, UDP tracker release) and can run asynchronously without
-// risking the closeTail timeout.
-func (c *controlPlaneCore) IsBpfEjected() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.bpfEjected
 }
 
 // EjectBpf will resect bpf from destroying life-cycle of control plane core.

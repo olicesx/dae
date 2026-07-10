@@ -803,6 +803,83 @@ func TestRunReloadRetirementCleanupRemovesOnlyEntriesUntouchedSinceCutover(t *te
 
 }
 
+func TestMigrateRuntimeBpfStateFromCopiesFlowMaps(t *testing.T) {
+	srcConn := newJanitorTestMap(t, "conn_state_map")
+	dstConn := newJanitorTestMap(t, "conn_state_map")
+	srcRedirect := newJanitorTestMap(t, "redirect_track")
+	dstRedirect := newJanitorTestMap(t, "redirect_track")
+	srcHandoff := newJanitorTestMap(t, "routing_handoff_map")
+	dstHandoff := newJanitorTestMap(t, "routing_handoff_map")
+	srcCookie := newJanitorTestMap(t, "cookie_pid_map")
+	dstCookie := newJanitorTestMap(t, "cookie_pid_map")
+
+	connKey := tuplesKeyFromAddrPorts(
+		netip.MustParseAddrPort("192.0.2.10:40000"),
+		netip.MustParseAddrPort("198.51.100.20:443"),
+		unix.IPPROTO_TCP,
+	)
+	connValue := bpfConnState{LastSeenNs: monotonicNowNs(t)}
+	connValue.Meta.Data.HasRouting = 1
+	connValue.Meta.Data.Outbound = 3
+	if err := srcConn.Update(connKey, &connValue, ebpf.UpdateAny); err != nil {
+		t.Fatalf("update source conn state: %v", err)
+	}
+
+	redirectKey := redirectTupleFromAddrs(netip.MustParseAddr("192.0.2.10"), netip.MustParseAddr("198.51.100.20"))
+	redirectValue := bpfRedirectEntry{Ifindex: 7, LastSeenNs: connValue.LastSeenNs}
+	if err := srcRedirect.Update(redirectKey, &redirectValue, ebpf.UpdateAny); err != nil {
+		t.Fatalf("update source redirect state: %v", err)
+	}
+
+	handoffValue := bpfRoutingHandoffEntry{LastSeenNs: connValue.LastSeenNs}
+	handoffValue.Result.Outbound = 3
+	if err := srcHandoff.Update(connKey, &handoffValue, ebpf.UpdateAny); err != nil {
+		t.Fatalf("update source handoff state: %v", err)
+	}
+
+	const cookieKey uint64 = 42
+	cookieValue := bpfPidPname{LastSeenNs: connValue.LastSeenNs, Pid: 1234}
+	if err := srcCookie.Update(cookieKey, &cookieValue, ebpf.UpdateAny); err != nil {
+		t.Fatalf("update source cookie state: %v", err)
+	}
+
+	oldPlane := &ControlPlane{core: &controlPlaneCore{}}
+	oldPlane.core.bpf.Store(&bpfObjects{bpfMaps: bpfMaps{
+		ConnStateMap:      srcConn,
+		RedirectTrack:     srcRedirect,
+		RoutingHandoffMap: srcHandoff,
+		CookiePidMap:      srcCookie,
+	}})
+	newPlane := &ControlPlane{log: logrus.New(), core: &controlPlaneCore{}}
+	newPlane.core.bpf.Store(&bpfObjects{bpfMaps: bpfMaps{
+		ConnStateMap:      dstConn,
+		RedirectTrack:     dstRedirect,
+		RoutingHandoffMap: dstHandoff,
+		CookiePidMap:      dstCookie,
+	}})
+
+	if err := newPlane.MigrateRuntimeBpfStateFrom(oldPlane); err != nil {
+		t.Fatalf("MigrateRuntimeBpfStateFrom() error = %v", err)
+	}
+
+	var gotConn bpfConnState
+	if err := dstConn.Lookup(connKey, &gotConn); err != nil || gotConn.Meta.Data.Outbound != connValue.Meta.Data.Outbound {
+		t.Fatalf("migrated conn state = %+v, err=%v", gotConn, err)
+	}
+	var gotRedirect bpfRedirectEntry
+	if err := dstRedirect.Lookup(redirectKey, &gotRedirect); err != nil || gotRedirect.Ifindex != redirectValue.Ifindex {
+		t.Fatalf("migrated redirect state = %+v, err=%v", gotRedirect, err)
+	}
+	var gotHandoff bpfRoutingHandoffEntry
+	if err := dstHandoff.Lookup(connKey, &gotHandoff); err != nil || gotHandoff.Result.Outbound != handoffValue.Result.Outbound {
+		t.Fatalf("migrated handoff state = %+v, err=%v", gotHandoff, err)
+	}
+	var gotCookie bpfPidPname
+	if err := dstCookie.Lookup(cookieKey, &gotCookie); err != nil || gotCookie.Pid != cookieValue.Pid {
+		t.Fatalf("migrated cookie state = %+v, err=%v", gotCookie, err)
+	}
+}
+
 func newJanitorTestMap(t *testing.T, mapName string) *ebpf.Map {
 	t.Helper()
 

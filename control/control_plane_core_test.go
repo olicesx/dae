@@ -6,10 +6,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cilium/ebpf"
 	ciliumLink "github.com/cilium/ebpf/link"
 	"github.com/sirupsen/logrus"
+	"github.com/vishvananda/netlink"
 )
 
 func TestControlPlaneCore_Flip_Race(t *testing.T) {
@@ -83,6 +85,7 @@ func TestControlPlaneCore_InjectBpfClaimsOwnershipForReloadGeneration(t *testing
 }
 
 func TestControlPlaneCore_FreshReloadGenerationCanOwnBpf(t *testing.T) {
+	atomic.StoreInt32(&coreFlip, 0)
 	logger := logrus.New()
 	logger.SetOutput(io.Discard)
 
@@ -93,6 +96,139 @@ func TestControlPlaneCore_FreshReloadGenerationCanOwnBpf(t *testing.T) {
 	}
 	if !core.bpfOwned {
 		t.Fatal("expected fresh reload generation to own freshly loaded BPF")
+	}
+	if got := atomic.LoadInt32(&coreFlip); got != 0 {
+		t.Fatalf("coreFlip changed during preparation: got %d, want 0", got)
+	}
+	if !core.flipPending || core.flip != 1 {
+		t.Fatalf("reload flip reservation = (pending=%v, flip=%d), want (true, 1)", core.flipPending, core.flip)
+	}
+}
+
+func TestControlPlaneCore_ReloadFlipIsCommittedTransactionally(t *testing.T) {
+	atomic.StoreInt32(&coreFlip, 0)
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+
+	failedPreparation := newControlPlaneCore(logger, nil, nil, nil, true, false)
+	if failedPreparation.flip != 1 {
+		t.Fatalf("failed preparation reserved flip %d, want 1", failedPreparation.flip)
+	}
+	if got := atomic.LoadInt32(&coreFlip); got != 0 {
+		t.Fatalf("failed preparation changed active flip to %d", got)
+	}
+
+	retry := newControlPlaneCore(logger, nil, nil, nil, true, false)
+	if retry.flip != 1 {
+		t.Fatalf("retry reserved flip %d, want 1", retry.flip)
+	}
+	if err := retry.commitBpfHookFlip(); err != nil {
+		t.Fatalf("commitBpfHookFlip() error = %v", err)
+	}
+	if got := atomic.LoadInt32(&coreFlip); got != 1 {
+		t.Fatalf("active flip after commit = %d, want 1", got)
+	}
+
+	next := newControlPlaneCore(logger, nil, nil, nil, true, false)
+	if next.flip != 0 {
+		t.Fatalf("next reload reserved flip %d, want 0", next.flip)
+	}
+}
+
+func TestControlPlaneCore_HookDetachRetriesFailureAndCloseIsIdempotent(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	core := newControlPlaneCore(logger, nil, nil, nil, false, false)
+
+	attempts := 0
+	core.addManagedBpfHookCleanup(func() error {
+		attempts++
+		if attempts == 1 {
+			return fmt.Errorf("transient detach failure")
+		}
+		return nil
+	})
+
+	if err := core.DetachBpfHooks(); err == nil {
+		t.Fatal("first DetachBpfHooks() error = nil, want failure")
+	}
+	if core.bpfHooksDetached {
+		t.Fatal("failed detach must not mark hooks detached")
+	}
+	if err := core.DetachBpfHooks(); err != nil {
+		t.Fatalf("second DetachBpfHooks() error = %v", err)
+	}
+	if err := core.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("detach attempts after Close = %d, want 2", attempts)
+	}
+}
+
+func TestControlPlaneCore_HookRegisteredAfterDetachIsRemovedImmediately(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	core := newControlPlaneCore(logger, nil, nil, nil, false, false)
+
+	if err := core.DetachBpfHooks(); err != nil {
+		t.Fatalf("DetachBpfHooks() error = %v", err)
+	}
+	calls := 0
+	core.addManagedBpfHookCleanup(func() error {
+		calls++
+		return nil
+	})
+	if calls != 1 {
+		t.Fatalf("late hook cleanup calls = %d, want 1", calls)
+	}
+	if got := len(core.bpfHookDetachFuncs); got != 0 {
+		t.Fatalf("registered hook count after quiesce = %d, want 0", got)
+	}
+}
+
+func TestControlPlaneCore_DetachWaitsForInFlightHookAttach(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	core := newControlPlaneCore(logger, nil, nil, nil, false, false)
+
+	if !core.beginBpfHookAttach() {
+		t.Fatal("beginBpfHookAttach() rejected before detach")
+	}
+	detached := make(chan error, 1)
+	go func() {
+		detached <- core.DetachBpfHooks()
+	}()
+
+	select {
+	case err := <-detached:
+		t.Fatalf("DetachBpfHooks returned before attach completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	core.endBpfHookAttach()
+	if err := <-detached; err != nil {
+		t.Fatalf("DetachBpfHooks() error = %v", err)
+	}
+	if core.beginBpfHookAttach() {
+		core.endBpfHookAttach()
+		t.Fatal("beginBpfHookAttach() accepted after detach quiesced hooks")
+	}
+}
+
+func TestControlPlaneCore_AttachMatchingInterfacesIsSynchronous(t *testing.T) {
+	core := &controlPlaneCore{}
+	called := false
+	if err := core.attachMatchingInterfaces("lo", func(link netlink.Link) error {
+		called = true
+		if link.Attrs().Name != "lo" {
+			t.Fatalf("matched link = %q, want lo", link.Attrs().Name)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("attachMatchingInterfaces() error = %v", err)
+	}
+	if !called {
+		t.Fatal("attachMatchingInterfaces returned before invoking the current-link callback")
 	}
 }
 

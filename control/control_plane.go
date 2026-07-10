@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -533,6 +534,16 @@ func newControlPlaneWithContextOptions(
 		}
 		return nil, err
 	}
+	if ephemeralPinPath {
+		defer func() {
+			if err == nil {
+				return
+			}
+			if cleanupErr := os.RemoveAll(pinPath); cleanupErr != nil && log != nil {
+				log.WithError(cleanupErr).Warnf("Failed to clean reload BPF pin directory %s after build error", pinPath)
+			}
+		}()
+	}
 
 	/// Load pre-compiled programs and maps into the kernel.
 	if _bpf == nil {
@@ -922,6 +933,9 @@ func newControlPlaneWithContextOptions(
 			}
 			plane.replayDnsReloadCache()
 		}
+		if err = core.commitBpfHookFlip(); err != nil {
+			return nil, err
+		}
 		plane.markReady()
 	}
 	return plane, nil
@@ -1006,6 +1020,103 @@ func validateRequiredBpfMapsLoaded(bpf *bpfObjects) error {
 	return nil
 }
 
+const bpfRuntimeStateCopyBatchSize = 1024
+
+func copyBpfMapEntries[K any, V any](dst, src *ebpf.Map) (int, error) {
+	if dst == nil || src == nil {
+		return 0, fmt.Errorf("source and destination maps must be non-nil")
+	}
+	if dst == src {
+		return 0, nil
+	}
+
+	keys := make([]K, 0, bpfRuntimeStateCopyBatchSize)
+	values := make([]V, 0, bpfRuntimeStateCopyBatchSize)
+	total := 0
+	flush := func() error {
+		if len(keys) == 0 {
+			return nil
+		}
+		n, err := BpfMapBatchUpdate(dst, keys, values, &ebpf.BatchOptions{ElemFlags: uint64(ebpf.UpdateAny)})
+		if err != nil {
+			return err
+		}
+		if n != len(keys) {
+			return fmt.Errorf("copied %d of %d entries", n, len(keys))
+		}
+		total += n
+		keys = keys[:0]
+		values = values[:0]
+		return nil
+	}
+
+	var key K
+	var value V
+	iter := src.Iterate()
+	for iter.Next(&key, &value) {
+		keys = append(keys, key)
+		values = append(values, value)
+		if len(keys) == cap(keys) {
+			if err := flush(); err != nil {
+				return total, err
+			}
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return total, err
+	}
+	if err := flush(); err != nil {
+		return total, err
+	}
+	return total, nil
+}
+
+// MigrateRuntimeBpfStateFrom copies flow state after the previous generation's
+// hooks have been detached, allowing established compatible flows to survive a
+// fresh BPF object handoff.
+func (c *ControlPlane) MigrateRuntimeBpfStateFrom(previous *ControlPlane) error {
+	if c == nil || previous == nil || c == previous || c.core == nil || previous.core == nil {
+		return fmt.Errorf("invalid control planes for BPF runtime state migration")
+	}
+	dst := c.core.PeekBpf()
+	src := previous.core.PeekBpf()
+	if dst == nil || src == nil {
+		return fmt.Errorf("missing BPF objects for runtime state migration")
+	}
+
+	previous.connStateCleanupMu.Lock()
+	defer previous.connStateCleanupMu.Unlock()
+	c.connStateCleanupMu.Lock()
+	defer c.connStateCleanupMu.Unlock()
+
+	connCount, err := copyBpfMapEntries[bpfTuplesKey, bpfConnState](dst.ConnStateMap, src.ConnStateMap)
+	if err != nil {
+		return fmt.Errorf("migrate conn_state_map: %w", err)
+	}
+	redirectCount, err := copyBpfMapEntries[bpfRedirectTuple, bpfRedirectEntry](dst.RedirectTrack, src.RedirectTrack)
+	if err != nil {
+		return fmt.Errorf("migrate redirect_track: %w", err)
+	}
+	handoffCount, err := copyBpfMapEntries[bpfTuplesKey, bpfRoutingHandoffEntry](dst.RoutingHandoffMap, src.RoutingHandoffMap)
+	if err != nil {
+		return fmt.Errorf("migrate routing_handoff_map: %w", err)
+	}
+	cookieCount, err := copyBpfMapEntries[uint64, bpfPidPname](dst.CookiePidMap, src.CookiePidMap)
+	if err != nil {
+		return fmt.Errorf("migrate cookie_pid_map: %w", err)
+	}
+
+	if c.log != nil {
+		c.log.WithFields(logrus.Fields{
+			"conn_state":     connCount,
+			"redirect_track": redirectCount,
+			"route_handoff":  handoffCount,
+			"cookie_pid":     cookieCount,
+		}).Infoln("[Reload] Migrated runtime BPF state to fresh datapath")
+	}
+	return nil
+}
+
 func (c *ControlPlane) EjectBpf() *bpfObjects {
 	if c.core == nil {
 		return nil
@@ -1022,16 +1133,6 @@ func (c *ControlPlane) PeekBpf() *bpfObjects {
 		return nil
 	}
 	return c.core.PeekBpf()
-}
-
-// isBpfEjected reports whether BPF ownership has been transferred to another
-// generation via EjectBpf. Callers use this to decide whether core.Close()
-// can run asynchronously (it is pure cleanup when BPF has been ejected).
-func (c *ControlPlane) isBpfEjected() bool {
-	if c == nil || c.core == nil {
-		return false
-	}
-	return c.core.IsBpfEjected()
 }
 
 func (c *ControlPlane) ActiveSessionCount() int {
@@ -1252,13 +1353,27 @@ func (c *ControlPlane) InheritDialerHealthFrom(previous *ControlPlane) bool {
 				continue
 			}
 			if oldDialer := oldDialers[d.Property().Name]; oldDialer != nil {
-				d.RestoreHealthSnapshot(oldDialer.ReloadHealthSnapshot())
 				hasOverlap = true
+				if dialerHealthCheckConfigEqual(d, oldDialer) {
+					d.RestoreHealthSnapshot(oldDialer.ReloadHealthSnapshot())
+				}
 			}
 		}
 		group.EnsureReloadSelectionFloor(fallback)
 	}
 	return hasOverlap
+}
+
+func dialerHealthCheckConfigEqual(current, previous *dialer.Dialer) bool {
+	if current == nil || previous == nil || current.GlobalOption == nil || previous.GlobalOption == nil {
+		return false
+	}
+	return slices.Equal(current.TcpCheckOptionRaw.Raw, previous.TcpCheckOptionRaw.Raw) &&
+		current.TcpCheckOptionRaw.Method == previous.TcpCheckOptionRaw.Method &&
+		current.TcpCheckOptionRaw.ResolverNetwork == previous.TcpCheckOptionRaw.ResolverNetwork &&
+		slices.Equal(current.CheckDnsOptionRaw.Raw, previous.CheckDnsOptionRaw.Raw) &&
+		current.CheckDnsOptionRaw.ResolverNetwork == previous.CheckDnsOptionRaw.ResolverNetwork &&
+		current.CheckDnsOptionRaw.Somark == previous.CheckDnsOptionRaw.Somark
 }
 
 func updateConnStateJanitorPressure(
@@ -1492,7 +1607,9 @@ func (c *ControlPlane) commitInterfaceBindings() error {
 		}
 		c.lanInterface = common.Deduplicate(c.lanInterface)
 		for _, ifname := range c.lanInterface {
-			c.core.bindLan(ifname, c.autoConfigKernelParameter)
+			if err := c.core.bindLan(ifname, c.autoConfigKernelParameter); err != nil {
+				return fmt.Errorf("bind LAN interface %s: %w", ifname, err)
+			}
 		}
 	}
 
@@ -1513,7 +1630,9 @@ func (c *ControlPlane) commitInterfaceBindings() error {
 					}
 				}
 			}
-			c.core.bindWan(ifname)
+			if err := c.core.bindWan(ifname); err != nil {
+				return fmt.Errorf("bind WAN interface %s: %w", ifname, err)
+			}
 		}
 	}
 
@@ -1586,6 +1705,9 @@ func (c *ControlPlane) CommitPreparedDatapath() error {
 		}
 		c.replayDnsReloadCache()
 	}
+	if err := c.core.commitBpfHookFlip(); err != nil {
+		return err
+	}
 	c.startConnStateJanitor()
 	c.preparedDatapathCommit = false
 	return nil
@@ -1609,6 +1731,7 @@ func (c *ControlPlane) RebuildReloadDatapath() error {
 	cache := c.CloneDnsCache()
 	c.pendingDnsReloadCache = cache
 	c.replayDnsReloadCache()
+	c.core.activateBpfHookFlip()
 	return nil
 }
 
@@ -1637,6 +1760,7 @@ func (c *ControlPlane) RestoreDatapathForReloadRollback() error {
 	cache := c.CloneDnsCache()
 	c.pendingDnsReloadCache = cache
 	c.replayDnsReloadCache()
+	c.core.activateBpfHookFlip()
 	return nil
 }
 
@@ -3721,49 +3845,10 @@ func (c *ControlPlane) closeTail() error {
 	}
 
 	// Note: inConnections is cleared by AbortConnections() which should be called before Close()
-
-	// Core cleanup.
-	//
-	// When BPF has been ejected to the new generation (staged handoff),
-	// core.Close() only needs to detach TC filters (netlink.FilterDel) and
-	// release the UDP conn-state tracker — none of which are time-critical
-	// because the new generation already has its own TC filters attached.
-	// Run it asynchronously to avoid the 5 s closeTail timeout that fires
-	// during staged handoff retirement (dae#1013).
-	//
-	// We check isBpfEjected() rather than sharedBpfReload because the
-	// initial control plane (P0) has sharedBpfReload=false even though
-	// EjectBpf() has been called during the first staged handoff.
-	if c.core != nil {
-		if c.isBpfEjected() {
-			core := c.core
-			log := c.log
-			go func() {
-				// Bound async cleanup with the same timeout used by the
-				// synchronous closeTail path. core.Close() only detaches TC
-				// filters and releases the UDP tracker here (BPF ownership
-				// has already been ejected), but netlink.FilterDel can still
-				// hang on virtual/PPPoE interfaces. Without a deadline a
-				// stuck call leaks the goroutine and leaves stale filters.
-				done := make(chan error, 1)
-				go func() { done <- core.Close() }()
-				select {
-				case err := <-done:
-					if err != nil && log != nil {
-						log.WithError(err).Warn("[Reload] Async core cleanup after staged handoff")
-					}
-				case <-time.After(controlPlaneDeferredCleanupTimeout):
-					if log != nil {
-						log.Warnf("[Reload] Async core cleanup timed out after %v; TC filters may linger", controlPlaneDeferredCleanupTimeout)
-					}
-				}
-			}()
-		} else {
-			if coreErr := c.core.Close(); coreErr != nil {
-				errs = append(errs, coreErr)
-			}
-		}
-	}
+	// Note: core.Close() is invoked synchronously by ControlPlane.Close() BEFORE this
+	// function runs, so that BPF hooks and maps are guaranteed to be released before
+	// the retirement gate signals completion. Keeping it here would leave hook detach
+	// subject to the deferred-cleanup timeout and risk racing with the next reload.
 
 	// Note: ResetGlobalUdpState() is intentionally NOT called here.
 	// Global UDP pools (DefaultUdpEndpointPool, DefaultUdpTaskPool, etc.)
@@ -3828,6 +3913,19 @@ func (c *ControlPlane) Close() (err error) {
 		}()
 		stopWg.Wait()
 
+		// Close the core (BPF hooks + maps) synchronously WITHOUT timeout.
+		// core.Close() detaches BPF hooks via netlink and must complete before
+		// Close() returns; the retirement gate uses Close() completion as the
+		// signal that the old generation's TC filters and maps are released.
+		// If this were left inside the timed closeTail goroutine, a timeout
+		// would let the retirement gate release while old-generation hook
+		// detach is still running, racing with the next reload's datapath.
+		// Netlink socket timeout (set at core init) bounds individual calls.
+		var coreErr error
+		if c.core != nil {
+			coreErr = c.core.Close()
+		}
+
 		done := make(chan error, 1)
 		go func() {
 			done <- c.closeTail()
@@ -3837,14 +3935,14 @@ func (c *ControlPlane) Close() (err error) {
 		defer timer.Stop()
 
 		select {
-		case err := <-done:
-			c.closeErr = err
+		case tailErr := <-done:
+			c.closeErr = stderrors.Join(coreErr, tailErr)
 		case <-timer.C:
 			timeoutErr := fmt.Errorf("control plane close tail timed out after %v", controlPlaneDeferredCleanupTimeout)
 			if c.log != nil {
 				c.log.WithError(timeoutErr).Warn("ControlPlane.Close: continuing while tail cleanup finishes in background")
 			}
-			c.closeErr = timeoutErr
+			c.closeErr = stderrors.Join(coreErr, timeoutErr)
 		}
 	})
 

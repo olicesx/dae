@@ -374,6 +374,23 @@ func bpfDatapathChanged(oldConf, newConf *config.Config) bool {
 	return false
 }
 
+func freshDatapathStateCompatible(oldConf, newConf *config.Config) bool {
+	if oldConf == nil || newConf == nil {
+		return false
+	}
+	// SoMarkFromDae is compiled into the BPF program to tag dae-originated
+	// packets and prevent re-interception. If it changes, connections migrated
+	// from the old generation carry stale socket marks that no longer match the
+	// new BPF constant, causing the kernel to re-intercept them as plain traffic.
+	if oldConf.Global.SoMarkFromDae != newConf.Global.SoMarkFromDae ||
+		oldConf.Global.SoMarkFromDaeSet != newConf.Global.SoMarkFromDaeSet {
+		return false
+	}
+	return reflect.DeepEqual(oldConf.Group, newConf.Group) &&
+		reflect.DeepEqual(oldConf.Node, newConf.Node) &&
+		reflect.DeepEqual(oldConf.Subscription, newConf.Subscription)
+}
+
 // dnsConfigFingerprint captures only the DNS fields that affect BPF datapath
 // state (domain_routing_map, routing rules, upstream resolution). Runtime-tunable
 // parameters (OptimisticCache, OptimisticCacheTtl, MaxCacheSize) are intentionally

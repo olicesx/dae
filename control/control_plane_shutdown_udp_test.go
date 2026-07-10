@@ -175,6 +175,12 @@ func TestControlPlaneClose_TimesOutSlowDeferredCleanup(t *testing.T) {
 	if plane.ctx.Err() == nil {
 		t.Fatal("expected control plane context to be canceled on timeout path")
 	}
+	// core.Close() must complete BEFORE Close() returns, even when tail
+	// cleanup times out. The retirement gate relies on Close() completion as
+	// the signal that BPF hooks and maps are fully released.
+	if plane.core == nil || plane.core.closed.Err() == nil {
+		t.Fatal("expected core to be fully closed before Close() returned on timeout")
+	}
 
 	close(release)
 	<-done

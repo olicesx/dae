@@ -670,6 +670,89 @@ func TestInheritDialerHealthFromDoesNotReviveDeadDialerWhenGroupHasCandidate(t *
 	}
 }
 
+func TestInheritDialerHealthFromSkipsSnapshotWhenHealthCheckConfigChanges(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+
+	newTestDialer := func(name string, tcpCheckURL string) *dialer.Dialer {
+		return dialer.NewDialer(
+			direct.SymmetricDirect,
+			&dialer.GlobalOption{
+				Log: logger,
+				TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{
+					Raw:             []string{tcpCheckURL, "1.1.1.1"},
+					ResolverNetwork: "udp",
+					Method:          "HEAD",
+				},
+				CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{
+					Raw:             []string{"dns.google:53", "8.8.8.8"},
+					ResolverNetwork: "udp",
+				},
+				CheckInterval:  30 * time.Second,
+				CheckTolerance: time.Second,
+			},
+			dialer.InstanceOption{},
+			&dialer.Property{
+				Property: D.Property{Name: name},
+			},
+		)
+	}
+
+	oldDialerA := newTestDialer("node-a", "http://old-check.example/generate_204")
+	defer func() { _ = oldDialerA.Close() }()
+	oldDialerB := newTestDialer("node-b", "http://old-check.example/generate_204")
+	defer func() { _ = oldDialerB.Close() }()
+	newDialerA := newTestDialer("node-a", "http://new-check.example/generate_204")
+	defer func() { _ = newDialerA.Close() }()
+	newDialerB := newTestDialer("node-b", "http://new-check.example/generate_204")
+	defer func() { _ = newDialerB.Close() }()
+
+	oldGroup := outbound.NewDialerGroup(
+		&dialer.GlobalOption{
+			Log:            logger,
+			CheckInterval:  30 * time.Second,
+			CheckTolerance: time.Second,
+		},
+		"group-a",
+		[]*dialer.Dialer{oldDialerA, oldDialerB},
+		[]*dialer.Annotation{{}, {}},
+		outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinLastLatency},
+		func(bool, *dialer.NetworkType, bool) {},
+	)
+	defer func() { _ = oldGroup.Close() }()
+	newGroup := outbound.NewDialerGroup(
+		&dialer.GlobalOption{
+			Log:            logger,
+			CheckInterval:  30 * time.Second,
+			CheckTolerance: time.Second,
+		},
+		"group-a",
+		[]*dialer.Dialer{newDialerA, newDialerB},
+		[]*dialer.Annotation{{}, {}},
+		outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinLastLatency},
+		func(bool, *dialer.NetworkType, bool) {},
+	)
+	defer func() { _ = newGroup.Close() }()
+
+	tcp4 := &dialer.NetworkType{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4}
+	oldDialerA.ReportUnavailableForced(tcp4, nil)
+	oldDialerA.NotifyHealthCheckResult(tcp4, false, false)
+	if oldDialerA.MustGetAlive(tcp4) {
+		t.Fatal("expected source dialer A to be unavailable before inheritance")
+	}
+
+	oldCP := &ControlPlane{controlPlaneGenerationState: controlPlaneGenerationState{outbounds: []*outbound.DialerGroup{oldGroup}}}
+	newCP := &ControlPlane{controlPlaneGenerationState: controlPlaneGenerationState{outbounds: []*outbound.DialerGroup{newGroup}}}
+
+	if got := newCP.InheritDialerHealthFrom(oldCP); !got {
+		t.Fatal("expected InheritDialerHealthFrom to return true when dialers overlap")
+	}
+
+	if !newDialerA.MustGetAlive(tcp4) {
+		t.Fatal("expected changed health-check config to skip inheriting the old unavailable snapshot")
+	}
+}
+
 func TestInheritDialerHealthFromReturnsFalseWhenNoOverlap(t *testing.T) {
 	logger := logrus.New()
 	logger.SetOutput(io.Discard)

@@ -772,6 +772,55 @@ func TestBpfDatapathChangedDetectsKernelDatapathInputs(t *testing.T) {
 	}
 }
 
+func TestFreshDatapathStateCompatibleRequiresStableOutboundTopology(t *testing.T) {
+	oldConf := baseReloadDatapathConfig()
+	oldConf.Group = append(oldConf.Group, config.Group{Name: "backup", Policy: config.FunctionListOrString("fixed(0)")})
+
+	equivalent := deepcopy.Copy(oldConf).(*config.Config)
+	if !freshDatapathStateCompatible(oldConf, equivalent) {
+		t.Fatal("equivalent outbound topology must preserve runtime state compatibility")
+	}
+
+	policyChanged := deepcopy.Copy(oldConf).(*config.Config)
+	policyChanged.Group[0].Policy = config.FunctionListOrString("min_moving_avg()")
+	if freshDatapathStateCompatible(oldConf, policyChanged) {
+		t.Fatal("group policy changes must not reuse old outbound runtime state")
+	}
+
+	reordered := deepcopy.Copy(oldConf).(*config.Config)
+	reordered.Group[0], reordered.Group[1] = reordered.Group[1], reordered.Group[0]
+	if freshDatapathStateCompatible(oldConf, reordered) {
+		t.Fatal("reordered groups must not reuse outbound IDs from runtime state")
+	}
+
+	removed := deepcopy.Copy(oldConf).(*config.Config)
+	removed.Group = removed.Group[:1]
+	if freshDatapathStateCompatible(oldConf, removed) {
+		t.Fatal("removed groups must not reuse outbound IDs from runtime state")
+	}
+
+	nodesChanged := deepcopy.Copy(oldConf).(*config.Config)
+	nodesChanged.Node = []config.KeyableString{"socks5://127.0.0.1:1080"}
+	if freshDatapathStateCompatible(oldConf, nodesChanged) {
+		t.Fatal("node changes must not reuse old outbound runtime state")
+	}
+
+	// SoMarkFromDae is compiled into the BPF program to tag dae-originated
+	// packets. If it changes, migrated connections carry stale socket marks
+	// that no longer match the new BPF constant and get re-intercepted.
+	markChanged := deepcopy.Copy(oldConf).(*config.Config)
+	markChanged.Global.SoMarkFromDae = 0x4000000
+	if freshDatapathStateCompatible(oldConf, markChanged) {
+		t.Fatal("so_mark_from_dae value changes must not preserve runtime state")
+	}
+
+	markUnset := deepcopy.Copy(oldConf).(*config.Config)
+	markUnset.Global.SoMarkFromDaeSet = false
+	if freshDatapathStateCompatible(oldConf, markUnset) {
+		t.Fatal("so_mark_from_dae_set changes must not preserve runtime state")
+	}
+}
+
 func TestBuildPreparedDNSHandoffHooksReuseHookReusesControllerAndListener(t *testing.T) {
 	var reuseControllerCalls int
 	var reuseListenerCalls int

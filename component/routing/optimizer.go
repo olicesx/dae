@@ -217,6 +217,7 @@ func (o *DatReaderOptimizer) loadGeoSite(filename string, code string) (params [
 	if err != nil {
 		return nil, err
 	}
+	params = make([]*config_parser.Param, 0, len(geoSite.Domain))
 	for _, item := range geoSite.Domain {
 		if attr != "" {
 			// Filter by attr.

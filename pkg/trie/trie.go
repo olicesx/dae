@@ -158,7 +158,15 @@ func NewTrie(keys []string, chars *ValidChars) (*Trie, error) {
 
 	type qElt struct{ s, e, col int }
 
-	queue := []qElt{{0, len(keys), 0}}
+	// Pre-allocate queue capacity to avoid repeated growslice.
+	// The number of trie nodes is at most the total number of characters
+	// across all keys plus one for the root node.
+	totalChars := 0
+	for _, key := range keys {
+		totalChars += len(key)
+	}
+	queue := make([]qElt, 0, totalChars+1)
+	queue = append(queue, qElt{0, len(keys), 0})
 
 	for i := 0; i < len(queue); i++ {
 		elt := queue[i]

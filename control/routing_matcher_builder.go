@@ -709,9 +709,13 @@ func buildRoutingKernspace(
 					return
 				}
 
-				mu.Lock()
+				// LpmArrayMap.Update is safe to call concurrently:
+				// cilium/ebpf Map.Update has no internal shared mutable state
+				// (map.go:280-291, all fields immutable after NewMap), and
+				// each goroutine writes a distinct lpmIndex from the ring
+				// allocator. The syscall itself is serialized by the kernel.
+				// mu below only guards the firstErr aggregation.
 				mapErr = bpf.LpmArrayMap.Update(r.lpmIndex, m, ebpf.UpdateAny)
-				mu.Unlock()
 				if mapErr != nil {
 					_ = m.Close()
 					mu.Lock()

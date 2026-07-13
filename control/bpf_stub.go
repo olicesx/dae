@@ -234,6 +234,7 @@ func (o *bpfObjects) Close() error {
 type bpfMaps struct {
 	BpfStatsMap             *ebpf.Map `ebpf:"bpf_stats_map"`
 	CookiePidMap            *ebpf.Map `ebpf:"cookie_pid_map"`
+	DaeIfindexMap           *ebpf.Map `ebpf:"dae_ifindex_map"`
 	DomainRoutingMap        *ebpf.Map `ebpf:"domain_routing_map"`
 	EventRingbuf            *ebpf.Map `ebpf:"event_ringbuf"`
 	FastSock                *ebpf.Map `ebpf:"fast_sock"`
@@ -253,6 +254,7 @@ func (m *bpfMaps) Close() error {
 	return _BpfClose(
 		m.BpfStatsMap,
 		m.CookiePidMap,
+		m.DaeIfindexMap,
 		m.DomainRoutingMap,
 		m.EventRingbuf,
 		m.FastSock,

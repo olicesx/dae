@@ -623,5 +623,15 @@ retryLoadBpf:
 		err = daerrors.WrapBPFError(err)
 		return err
 	}
+
+	// Initialize the runtime-updatable dae0 ifindex map.
+	// PARAM.dae0_ifindex (rodata) is frozen at load time; this ARRAY map
+	// allows userspace to hot-update the ifindex if the kernel recreates dae0.
+	if bpf.DaeIfindexMap != nil {
+		ifidx := uint32(GetDaeNetns().Dae0().Attrs().Index)
+		if err = bpf.DaeIfindexMap.Update(uint32(0), ifidx, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("init dae_ifindex_map: %w", err)
+		}
+	}
 	return nil
 }

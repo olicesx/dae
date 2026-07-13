@@ -186,6 +186,7 @@ func newControlPlaneCore(log *logrus.Logger,
 	}
 	core.bpf.Store(bpf)
 	core.udpConnStateTracker.Store(acquireSharedUdpConnStateTracker(bpf))
+	core.startIfindexWatcher()
 	return core
 }
 
@@ -1243,4 +1244,60 @@ func (c *controlPlaneCore) InjectBpf(bpf *bpfObjects) {
 // this accessor instead of EjectBpf to avoid disturbing reload lifecycle.
 func (c *controlPlaneCore) PeekBpf() *bpfObjects {
 	return c.bpf.Load()
+}
+
+// startIfindexWatcher subscribes to netlink RTM_NEWLINK events and hot-updates
+// the dae_ifindex_map when dae0 is recreated with a new ifindex by the kernel.
+// This avoids silent packet loss that would otherwise require a full BPF reload.
+func (c *controlPlaneCore) startIfindexWatcher() {
+	ch := make(chan netlink.LinkUpdate)
+	done := make(chan struct{})
+	if err := netlink.LinkSubscribeWithOptions(ch, done, netlink.LinkSubscribeOptions{
+		ErrorCallback: func(err error) {
+			select {
+			case <-c.closed.Done():
+				return
+			default:
+				c.log.Debug("ifindex watcher LinkSubscribe:", err)
+			}
+		},
+		ListExisting: true,
+	}); err != nil {
+		c.log.Errorf("Failed to subscribe to link updates for ifindex watcher: %v", err)
+		return
+	}
+
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-c.closed.Done():
+				return
+			case upd, ok := <-ch:
+				if !ok {
+					return
+				}
+				if upd.Link.Attrs().Name != HostVethName {
+					continue
+				}
+				newIfindex := uint32(upd.Link.Attrs().Index)
+				bpf := c.PeekBpf()
+				if bpf == nil || bpf.DaeIfindexMap == nil {
+					continue
+				}
+				var currentIfindex uint32
+				if err := bpf.DaeIfindexMap.Lookup(uint32(0), &currentIfindex); err != nil {
+					currentIfindex = 0
+				}
+				if newIfindex == currentIfindex {
+					continue
+				}
+				if err := bpf.DaeIfindexMap.Update(uint32(0), newIfindex, ebpf.UpdateAny); err != nil {
+					c.log.Errorf("Failed to update dae_ifindex_map: %v", err)
+				} else {
+					c.log.Warnf("dae0 ifindex drift detected and recovered: %d -> %d", currentIfindex, newIfindex)
+				}
+			}
+		}
+	}()
 }

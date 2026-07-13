@@ -371,17 +371,23 @@ func (ue *UdpEndpoint) TrackUdpConnStateTuplePair(src, dst netip.AddrPort) {
 	if ue.udpConnStateTuples == nil {
 		ue.udpConnStateTuples = make(map[bpfTuplesKey]struct{}, 4)
 	}
-	newKeys := make([]bpfTuplesKey, 0, 2)
+	// Use a stack array to avoid make([]bpfTuplesKey, 0, 2) allocation on
+	// every packet. RetainUdpConnStateTuples copies keys by value, so the
+	// backing array does not need to outlive this call.
+	var newKeys [2]bpfTuplesKey
+	newKeyCount := 0
 	if _, ok := ue.udpConnStateTuples[forward]; !ok {
 		ue.udpConnStateTuples[forward] = struct{}{}
-		newKeys = append(newKeys, forward)
+		newKeys[newKeyCount] = forward
+		newKeyCount++
 	}
 	if _, ok := ue.udpConnStateTuples[reverse]; !ok {
 		ue.udpConnStateTuples[reverse] = struct{}{}
-		newKeys = append(newKeys, reverse)
+		newKeys[newKeyCount] = reverse
+		newKeyCount++
 	}
-	if len(newKeys) > 0 {
-		ue.udpConnStateOwner.RetainUdpConnStateTuples(newKeys)
+	if newKeyCount > 0 {
+		ue.udpConnStateOwner.RetainUdpConnStateTuples(newKeys[:newKeyCount])
 	}
 }
 

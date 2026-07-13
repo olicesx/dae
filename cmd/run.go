@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -327,6 +328,7 @@ func (r *Runner) Run() (err error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	currCancel = cancel
 	configureTransparentHugePages(log, conf.Global.DisableTHP)
+	configureGcMemoryLimit(log)
 	c, err := newControlPlane(ctx, log, nil, nil, conf, externGeoDataDirs, false, false)
 	if err != nil {
 		cancel()
@@ -1380,6 +1382,81 @@ func configureTransparentHugePages(log *logrus.Logger, disable bool) {
 	if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
 		log.Debugf("Configured transparent huge pages for dae process: disable=%v", disable)
 	}
+}
+
+// configureGcMemoryLimit auto-detects the cgroup v2 memory limit for the
+// current process and sets GOMEMLIMIT to 90% of it. This lets the Go runtime
+// GC proactively release memory before hitting the container/system limit,
+// which is critical for containerized deployments where GOGC's default
+// (100% heap growth) can overshoot the cgroup limit and trigger OOM kills.
+//
+// No-op when no cgroup memory limit is detected (bare metal without cgroup).
+func configureGcMemoryLimit(log *logrus.Logger) {
+	limit := detectCgroupMemLimit()
+	if limit <= 0 {
+		if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
+			log.Debug("GOMEMLIMIT: no cgroup memory limit detected, skipping")
+		}
+		return
+	}
+	// Reserve 10% headroom for non-Go allocations (eBPF maps, goroutine stacks, etc.)
+	softLimit := limit * 9 / 10
+	debug.SetMemoryLimit(softLimit)
+	if log != nil {
+		log.Infof("Configured GOMEMLIMIT=%d MiB (cgroup memory.max=%d MiB)",
+			softLimit/1024/1024, limit/1024/1024)
+	}
+}
+
+// detectCgroupMemLimit reads the cgroup v2 memory.max for the current process.
+// It walks from the process's own cgroup up to the root, returning the first
+// concrete limit found. Returns 0 if no limit is set (value is "max").
+func detectCgroupMemLimit() int64 {
+	data, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		// Not in cgroup v2 or can't read; try root-level (container case).
+		return readMemMax("/sys/fs/cgroup")
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		// cgroup v2 unified hierarchy format: "0::/path"
+		if !strings.HasPrefix(line, "0::") {
+			continue
+		}
+		cgPath := strings.TrimSpace(strings.TrimPrefix(line, "0::"))
+		for {
+			if v := readMemMax(filepath.Join("/sys/fs/cgroup", cgPath)); v > 0 {
+				return v
+			}
+			if cgPath == "/" || cgPath == "." || cgPath == "" {
+				break
+			}
+			idx := strings.LastIndexByte(cgPath, '/')
+			if idx <= 0 {
+				cgPath = "/"
+			} else {
+				cgPath = cgPath[:idx]
+			}
+		}
+	}
+	return readMemMax("/sys/fs/cgroup")
+}
+
+// readMemMax reads memory.max from a cgroup v2 directory.
+// Returns 0 if the file is missing, set to "max", or unparseable.
+func readMemMax(dir string) int64 {
+	b, err := os.ReadFile(filepath.Join(dir, "memory.max"))
+	if err != nil {
+		return 0
+	}
+	s := strings.TrimSpace(string(b))
+	if s == "max" {
+		return 0
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || v <= 0 {
+		return 0
+	}
+	return v
 }
 
 func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {

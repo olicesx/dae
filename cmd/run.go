@@ -1558,6 +1558,21 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 		}
 	}
 
+	// On reload, refuse to switch to a dead (zero-node) generation when every
+	// subscription failed to resolve. Without this guard the caller's rollback
+	// path is never taken (a zero-node build is not an error by itself), so dae
+	// would silently cut all proxied traffic until a full restart. The persisted
+	// cache in persist.d normally shields against transient failures, but when
+	// it is also missing/empty this guard is the last line of defense.
+	//
+	// A successful-but-empty fetch (subscription legitimately returned 0 nodes)
+	// is left alone — resolvingfailed is only set on a hard fetch error, so an
+	// intentional zero-node config is unaffected. Initial startup is also
+	// excluded: there is no previous generation to preserve.
+	if isReloadBuild && resolvingfailed && len(tagToNodeList) == 0 {
+		return nil, fmt.Errorf("refusing reload with 0 nodes: all subscription resolving failed; keeping the current generation")
+	}
+
 	if len(conf.Global.LanInterface) == 0 && len(conf.Global.WanInterface) == 0 {
 		log.Warnln("No interface to bind.")
 	}

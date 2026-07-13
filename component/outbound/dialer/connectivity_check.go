@@ -37,6 +37,14 @@ import (
 
 const Timeout = 10 * time.Second
 
+// ErrNoApplicableIP is a sentinel error returned by CheckFunc when the health
+// check target has no DNS record for the requested IP version (e.g. an IPv4-only
+// node has no AAAA record). It is distinguished from a plain (false, nil) skip
+// so that check() can mark the node unavailable for that network type instead
+// of preserving the initial alive=true state and silently routing traffic to a
+// dead path.
+var ErrNoApplicableIP = stderrors.New("no applicable IP for this network type")
+
 type UdpHealthDomain uint8
 
 const (
@@ -489,7 +497,7 @@ func (d *Dialer) aliveBackground() {
 					"dialer":  d.property.Name,
 					"network": typ.String(),
 				}).Debugln("Skip check due to no DNS record.")
-				return false, nil
+				return false, ErrNoApplicableIP
 			}
 			return d.HttpCheck(ctx, IdxTcp4, opt.Url, opt.Ip4, opt.Method, tcpSomark, mptcp)
 		},
@@ -511,7 +519,7 @@ func (d *Dialer) aliveBackground() {
 					"dialer":  d.property.Name,
 					"network": typ.String(),
 				}).Debugln("Skip check due to no DNS record.")
-				return false, nil
+				return false, ErrNoApplicableIP
 			}
 			return d.HttpCheck(ctx, IdxTcp6, opt.Url, opt.Ip6, opt.Method, tcpSomark, mptcp)
 		},
@@ -539,7 +547,7 @@ func (d *Dialer) aliveBackground() {
 					"link":    d.CheckDnsOptionRaw.Raw,
 					"network": typ.String(),
 				}).Debugln("Skip check due to no DNS record.")
-				return false, nil
+				return false, ErrNoApplicableIP
 			}
 			return d.DnsCheck(ctx, netip.AddrPortFrom(addr, opt.DnsPort), *network)
 		}
@@ -1121,8 +1129,9 @@ func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResu
 		if stderrors.Is(err, context.Canceled) {
 			break
 		}
-		if err == nil {
-			// No applicable IP; skip.
+		if err == nil || err == ErrNoApplicableIP {
+			// No applicable IP or a plain skip; don't retry — the DNS record
+			// will not change between two attempts within the same check cycle.
 			break
 		}
 		// Retry on actual error.

@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier-Identifier: AGPL-3.0-only
+ * SPDX-License-Identifier: AGPL-3.0-only
  * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
  */
 
@@ -22,8 +22,8 @@ import (
 //
 // Seed corpus is derived from RoutingCorpusFixtures so the fuzzer starts from
 // known-reachable input vectors (matched domains, in-range ports, etc.) and
-// explores mutations around them. Random bytes from the fuzzer are mapped into
-// the structured CorpusInput via deterministic, allocation-free helpers below.
+// explores mutations around them. A mutated fixture selector is reduced modulo
+// the corpus length, so every fuzz input exercises a real routing program.
 
 // FuzzPolicySnapshotEquivalence is the canonical Phase 1 fuzz target. For each
 // seed + mutation it builds the legacy matcher and the snapshot matcher from
@@ -31,17 +31,17 @@ import (
 //
 //  1. Equivalence: both matchers return identical (outbound, mark, must) when
 //     neither errors.
-//  2. Alias-safety: when one side errors, the other must also error. We do not
-//     require the same error text, only that neither matcher silently masks a
-//     failure as a success.
+//  2. Alias-safety: mutation of the source program after snapshot creation
+//     cannot change the snapshot matcher result.
 //  3. Hash stability: the fixture's PolicySnapshot hash is constant across
 //     repeated CloneProgram calls (snapshot hash must depend on program
 //     content, not on transient clone state).
 func FuzzPolicySnapshotEquivalence(f *testing.F) {
-	for _, fixture := range RoutingCorpusFixtures() {
+	fixtures := RoutingCorpusFixtures()
+	for fixtureIndex, fixture := range fixtures {
 		for _, tc := range fixture.Cases {
 			f.Add(
-				fixture.Name,
+				byte(fixtureIndex),
 				[]byte(tc.Input.Domain),
 				uint16(tc.Input.Src.Port()),
 				uint16(tc.Input.Dst.Port()),
@@ -54,7 +54,7 @@ func FuzzPolicySnapshotEquivalence(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T,
-		fixtureName string,
+		fixtureIndex byte,
 		domainBytes []byte,
 		srcPort uint16,
 		dstPort uint16,
@@ -63,10 +63,7 @@ func FuzzPolicySnapshotEquivalence(f *testing.F) {
 		procName []byte,
 		mac []byte,
 	) {
-		fixture, ok := findFixtureByName(fixtureName)
-		if !ok {
-			t.Skipf("unknown fixture %q (mutation renamed it)", fixtureName)
-		}
+		fixture := fixtures[int(fixtureIndex)%len(fixtures)]
 
 		// Bound the mutation surface so the fuzzer spends cycles on semantic
 		// changes rather than pathological allocations. Domain is capped to a
@@ -130,6 +127,12 @@ func FuzzPolicySnapshotEquivalence(f *testing.F) {
 				snapshot.Hash(), snapshot2.Hash())
 		}
 
+		// Mutating the original normalization after snapshot creation must not
+		// affect the immutable snapshot or the matcher built from it.
+		if len(program.Rules) > 0 && len(program.Rules[0].AndFunctions) > 0 {
+			program.Rules[0].AndFunctions[0].Name = "corrupted-after-snapshot"
+		}
+
 		cloneA, err := snapshot.CloneProgram()
 		if err != nil {
 			t.Fatalf("CloneProgram() error = %v", err)
@@ -141,7 +144,7 @@ func FuzzPolicySnapshotEquivalence(f *testing.F) {
 		snapOut, snapMark, snapMust, snapErr :=
 			matchCorpusInput(snapMatcher, input)
 
-		// 2. Alias-safety: error agreement.
+		// 2. Both matchers must agree for every complete fact vector.
 		if (legacyErr == nil) != (snapErr == nil) {
 			t.Fatalf("error mismatch: legacy=%v snap=%v (input=%+v)", legacyErr, snapErr, input)
 		}
@@ -159,17 +162,6 @@ func FuzzPolicySnapshotEquivalence(f *testing.F) {
 			t.Fatalf("must mismatch: legacy=%v snap=%v (input=%+v)", legacyMust, snapMust, input)
 		}
 	})
-}
-
-// findFixtureByName linearly scans the corpus. Corpus size is small (O(20))
-// so a map is not worth the global state.
-func findFixtureByName(name string) (CorpusFixture, bool) {
-	for _, f := range RoutingCorpusFixtures() {
-		if f.Name == name {
-			return f, true
-		}
-	}
-	return CorpusFixture{}, false
 }
 
 // buildMatcherFromProgram is the same plumbing as the corpus equivalence

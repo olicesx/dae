@@ -6,6 +6,8 @@
 package control
 
 import (
+	"context"
+	"net/netip"
 	"testing"
 
 	"github.com/daeuniverse/dae/common/consts"
@@ -45,5 +47,74 @@ func TestUdpFlowBindingKeepsRouteAndEgressSeparate(t *testing.T) {
 	endpoint := &UdpEndpoint{binding: binding}
 	if got := endpoint.FlowBinding(); got != binding {
 		t.Fatalf("FlowBinding() = %+v, want %+v", got, binding)
+	}
+}
+
+func TestUdpEndpointPoolPreservesOriginalFlowBindingOnReuse(t *testing.T) {
+	pool := NewUdpEndpointPool()
+	t.Cleanup(pool.Close)
+
+	conn := &scriptedPacketConn{
+		reads:   make(chan scriptedPacketRead),
+		closeCh: make(chan struct{}),
+	}
+	d := newTestEndpointDialer(conn)
+	t.Cleanup(func() { _ = d.Close() })
+
+	key := UdpEndpointKey{Src: netip.MustParseAddrPort("192.0.2.10:40000")}
+	firstBinding := UdpFlowBinding{
+		Route: UdpRouteBinding{
+			PolicyEpoch: 1,
+			Outbound:    consts.OutboundUserDefinedMin,
+			Mark:        11,
+		},
+		Egress: UdpEgressBinding{
+			Dialer:  d,
+			Target:  "198.51.100.1:443",
+			Network: "udp+4",
+		},
+	}
+	firstOptions := &UdpEndpointOptions{
+		Handler: func(*UdpEndpoint, []byte, netip.AddrPort) error { return nil },
+		GetDialOption: func(context.Context) (*DialOption, error) {
+			return &DialOption{
+				Dialer:  d,
+				Network: "udp+4",
+				Target:  "198.51.100.1:443",
+				Binding: firstBinding,
+			}, nil
+		},
+	}
+
+	first, isNew, err := pool.GetOrCreate(key, firstOptions)
+	if err != nil || !isNew {
+		t.Fatalf("first GetOrCreate() = (%v, %v, %v), want new endpoint", first, isNew, err)
+	}
+
+	secondBinding := firstBinding
+	secondBinding.Route.PolicyEpoch = 2
+	secondBinding.Route.Mark = 22
+	secondBinding.Egress.Target = "203.0.113.2:443"
+	secondDialCalled := false
+	secondOptions := &UdpEndpointOptions{
+		Handler: func(*UdpEndpoint, []byte, netip.AddrPort) error { return nil },
+		GetDialOption: func(context.Context) (*DialOption, error) {
+			secondDialCalled = true
+			return &DialOption{Binding: secondBinding}, nil
+		},
+	}
+
+	second, isNew, err := pool.GetOrCreate(key, secondOptions)
+	if err != nil || isNew {
+		t.Fatalf("second GetOrCreate() = (%v, %v, %v), want existing endpoint", second, isNew, err)
+	}
+	if second != first {
+		t.Fatal("reused endpoint differs from original endpoint")
+	}
+	if secondDialCalled {
+		t.Fatal("GetDialOption ran while reusing an existing endpoint")
+	}
+	if got := second.FlowBinding(); got != firstBinding {
+		t.Fatalf("reused binding = %+v, want original %+v", got, firstBinding)
 	}
 }

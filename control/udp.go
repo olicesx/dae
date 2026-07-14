@@ -198,6 +198,7 @@ type DialOption struct {
 	NetworkType   *dialer.NetworkType
 	SniffedDomain string
 	Excluded      *dialer.Dialer
+	Binding       UdpFlowBinding
 	// NowNano is an optional pre-calculated timestamp to avoid calling time.Now()
 	// in the hot path. If 0, time.Now() will be used.
 	NowNano int64
@@ -943,8 +944,9 @@ getNew:
 			Log:            c.log,
 			NowNano:        nowNano,
 			GetDialOption: func(ctx context.Context) (option *DialOption, err error) {
-				dialParam := &proxyDialParam{
-					Outbound:    consts.OutboundIndex(routingResult.Outbound),
+					dialParam := &proxyDialParam{
+						Outbound:    consts.OutboundIndex(routingResult.Outbound),
+						Must:        routingResult.Must != 0,
 					Domain:      domain,
 					Mac:         routingResult.Mac,
 					Dscp:        routingResult.Dscp,
@@ -985,7 +987,7 @@ getNew:
 					return nil, ob.ErrNoAliveDialer
 				}
 
-				return &DialOption{
+				option = &DialOption{
 					// Keep fixed-IP target even if chooseProxyDialer selected a domain target.
 					Target:        dialTarget,
 					Dialer:        res.Dialer,
@@ -995,7 +997,9 @@ getNew:
 					SniffedDomain: res.SniffedDomain,
 					Excluded:      excludedDialer,
 					NowNano:       nowNano,
-				}, nil
+				}
+				option.Binding = newUdpFlowBinding(c.PolicySnapshot(), res.OutboundIndex, res.Mark, res.Must, option)
+				return option, nil
 			},
 		})
 		if err != nil {

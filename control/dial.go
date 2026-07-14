@@ -20,6 +20,7 @@ import (
 
 type proxyDialParam struct {
 	Outbound    consts.OutboundIndex
+	Must        bool
 	Domain      string
 	Mac         [6]uint8
 	Dscp        uint8
@@ -32,11 +33,13 @@ type proxyDialParam struct {
 }
 
 type proxyDialResult struct {
+	OutboundIndex            consts.OutboundIndex
 	Outbound                *ob.DialerGroup
 	Dialer                  *dialer.Dialer
 	DialTarget              string
 	Network                 string
 	Mark                    uint32
+	Must                    bool
 	SniffedDomain           string
 	IsDialIp                bool
 	OrigNetworkType         string
@@ -106,6 +109,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	src := p.Src
 	dst := p.Dest
 	mark := p.Mark
+	must := p.Must
 
 	dialTarget, shouldReroute, dialIp := c.ChooseDialTarget(outboundIndex, dst, domain)
 	if shouldReroute {
@@ -126,7 +130,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 		if p.Network == "udp" {
 			proto = consts.L4ProtoType_UDP
 		}
-		if outboundIndex, newMark, _, err = c.Route(src, dst, domain, proto, routingResult); err != nil {
+		if outboundIndex, newMark, must, err = c.Route(src, dst, domain, proto, routingResult); err != nil {
 			return nil, err
 		}
 		mark = newMark
@@ -185,7 +189,9 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 
 	if err != nil {
 		return &proxyDialResult{
+				OutboundIndex:            outboundIndex,
 				Outbound:                outbound,
+				Must:                    must,
 				IsDialIp:                strictIpVersion,
 				OrigNetworkType:         networkType.StringWithoutDns(),
 				SelectionNetworkType:    selectionNetworkType.StringWithoutDns(),
@@ -204,6 +210,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	selectionNetworkType = endpointNetworkTypeForSelection(selectionNetworkType, admissionNetworkType)
 
 	return &proxyDialResult{
+		OutboundIndex: outboundIndex,
 		Outbound:   outbound,
 		Dialer:     d,
 		DialTarget: dialTarget,
@@ -215,6 +222,7 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 		}(),
 		SniffedDomain:           domain,
 		Mark:                    mark,
+		Must:                    must,
 		IsDialIp:                strictIpVersion,
 		OrigNetworkType:         networkType.StringWithoutDns(),
 		SelectionNetworkType:    selectionNetworkType.StringWithoutDns(),

@@ -86,6 +86,7 @@ type UdpEndpoint struct {
 
 	Dialer   *dialer.Dialer
 	Outbound *outbound.DialerGroup
+	binding  UdpFlowBinding
 
 	// Non-empty indicates this UDP Endpoint is related with a sniffed domain.
 	SniffedDomain string
@@ -138,6 +139,14 @@ type UdpEndpoint struct {
 type udpEndpointResponseCacheEntry struct {
 	bindAddr netip.AddrPort
 	conn     *Anyfrom
+}
+
+// FlowBinding returns the immutable route and egress selections made when the endpoint was created.
+func (ue *UdpEndpoint) FlowBinding() UdpFlowBinding {
+	if ue == nil {
+		return UdpFlowBinding{}
+	}
+	return ue.binding
 }
 
 type udpEndpointResponseConnSlot interface {
@@ -1563,6 +1572,7 @@ dialSuccess:
 		NatTimeout:        effectiveUdpEndpointNatTimeout(dialOption.Dialer, createOption.NatTimeout),
 		Dialer:            dialOption.Dialer,
 		Outbound:          dialOption.Outbound,
+		binding:           dialOption.Binding,
 		SniffedDomain:     dialOption.SniffedDomain,
 		DialTarget:        dialOption.Target,
 		lAddr:             key.Src,

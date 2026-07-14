@@ -122,8 +122,28 @@ File: `control/refactor_corpus_fuzz_test.go`.
 4. Builds two snapshots at different epochs from the same program and
    asserts `Hash()` equality (content-derived, not epoch-derived).
 
-Smoke: 33k executions, 0 crashes, 0 hash drifts. To extend seed coverage,
-append fixtures to `RoutingCorpusFixtures()`; seeds propagate automatically.
+Completed local smoke: 2,463 executions in five seconds, with no crashes or
+hash drifts. To extend seed coverage, append fixtures to
+`RoutingCorpusFixtures()`; seeds propagate automatically.
+
+## Generation Ownership (delivered)
+
+UDP endpoint reuse preserves the generation that created the flow. Reuse may
+refresh the endpoint lifetime, but it must not transfer its policy binding,
+drain lease, or tracked conn-state ownership to a successor control plane.
+`TestUdpEndpointPoolPreservesOriginalFlowBindingOnReuse` verifies creation,
+reuse, and close: the original generation remains active until the endpoint
+closes, and the successor generation is never charged for that existing flow.
+
+## DNS Route Projection Epochs (delivered)
+
+DNS answers and TTLs remain shared across reload, while the derived
+domain-routing bitmap is versioned by the immutable policy snapshot epoch.
+On DNS controller reuse, cached entries are cloned with a new projection and
+old queued BPF updates are discarded when their epoch no longer matches the
+active runtime. `TestDnsController_ReuseForReloadReprojectsCachedRoutes` and
+`TestDnsController_ProcessBpfUpdateTaskSkipsStaleRouteProjection` are the
+acceptance gates for this boundary.
 
 ## Open Decisions
 
@@ -162,11 +182,13 @@ order (each is a single-session chunk):
    `component/sniffing/` and `control/dns_control.go` response-routing
    call sites to identify the hook point, then add a fixture with a
    synthetic SNI-bearing QUIC ClientHello.
-3. **Phase 2 truth wiring** — connect `truth.go` to actual routing. The
-   predicate resolver `PredicateResult` needs per-function implementations
-   (Domain/Ip/Port/etc). This is a multi-session chunk; split into
-   "wire Domain predicate" first, run the full Phase 0 routing corpus to
-   prove equivalence, then iterate.
-4. **Performance baseline** — before Phase 4 (BPF epoch), record
-   throughput / allocation / latency baselines on fixed hardware per
-   Phase 0 acceptance clause 4.
+3. **Phase 2 truth wiring** — `PolicySnapshot` is currently a shadow
+   semantic layer; the production route still executes
+   `RoutingMatcher.Match`. Extract shared per-function predicate evaluation
+   (Domain, IP, port, source, process, DSCP, MAC, and fallback) from the
+   matcher, then make both the matcher and `PolicySnapshot.Evaluate` consume
+   that one result. Acceptance requires the Phase 0 corpus to compare the
+   production path directly against the snapshot, not a separately built
+   matcher.
+4. **Performance baseline** — record throughput, allocation, and latency on
+   fixed hardware before broadening the BPF publication gate.

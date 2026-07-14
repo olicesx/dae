@@ -10,12 +10,14 @@ import (
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/outbound"
+	"github.com/daeuniverse/dae/component/routing"
 )
 
 type controlPlaneGenerationState struct {
 	outbounds           []*outbound.DialerGroup
 	referencedOutbounds map[string]struct{}
 	dialMode            consts.DialMode
+	policySnapshot      *routing.PolicySnapshot
 	routingMatcher      *RoutingMatcher
 	bootstrapResolvers  []netip.AddrPort
 }
@@ -26,6 +28,7 @@ func (s *controlPlaneGenerationState) releaseRetainedState() {
 	}
 	s.outbounds = nil
 	s.referencedOutbounds = nil
+	s.policySnapshot = nil
 	s.routingMatcher = nil
 	s.bootstrapResolvers = nil
 }

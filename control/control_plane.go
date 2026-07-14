@@ -120,6 +120,8 @@ type ControlPlane struct {
 	closeErr            error
 }
 
+var policyEpochSequence atomic.Uint64
+
 type controlPlaneBuildOptions struct {
 	delayDatapathCommit   bool
 	delayDNSListenerStart bool
@@ -751,6 +753,17 @@ func newControlPlaneWithContextOptions(
 		return nil, fmt.Errorf("ApplyRulesOptimizers error:\n%w", err)
 	}
 	routingA.Rules = nil // Release.
+	policySnapshot, err := routing.NewPolicySnapshot(
+		routing.PolicyEpoch(policyEpochSequence.Add(1)),
+		routingProgram,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create routing policy snapshot: %w", err)
+	}
+	builderProgram, err := policySnapshot.CloneProgram()
+	if err != nil {
+		return nil, fmt.Errorf("clone routing policy snapshot: %w", err)
+	}
 	if log.IsLevelEnabled(logrus.DebugLevel) {
 		var debugBuilder strings.Builder
 		for _, rule := range routingProgram.Rules {
@@ -760,7 +773,7 @@ func newControlPlaneWithContextOptions(
 	}
 	// Parse rules and build.
 	log.Infoln("Building routing matcher...")
-	builder, err := NewRoutingMatcherBuilderFromProgram(log, routingProgram, outboundName2Id, core.bpf.Load())
+	builder, err := NewRoutingMatcherBuilderFromProgram(log, builderProgram, outboundName2Id, core.bpf.Load())
 	if err != nil {
 		return nil, fmt.Errorf("NewRoutingMatcherBuilder: %w", err)
 	}
@@ -818,6 +831,7 @@ func newControlPlaneWithContextOptions(
 			outbounds:           outbounds,
 			referencedOutbounds: referencedOutbounds,
 			dialMode:            dialMode,
+			policySnapshot:      policySnapshot,
 			routingMatcher:      routingMatcher,
 			bootstrapResolvers:  bootstrapResolvers,
 		},

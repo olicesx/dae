@@ -1370,6 +1370,10 @@ func (c *ControlPlane) dnsControllerOption() *DnsControllerOption {
 	if c == nil {
 		return nil
 	}
+	var routeProjectionEpoch uint64
+	if snapshot := c.PolicySnapshot(); snapshot != nil {
+		routeProjectionEpoch = uint64(snapshot.Epoch())
+	}
 	return &DnsControllerOption{
 		Log:              c.log,
 		LifecycleContext: c.ctx,
@@ -1387,14 +1391,22 @@ func (c *ControlPlane) dnsControllerOption() *DnsControllerOption {
 			}
 			return nil
 		},
+		RouteProjectionEpoch: routeProjectionEpoch,
+		ProjectCacheRoute: func(cache *DnsCache) []uint32 {
+			if cache == nil {
+				return nil
+			}
+			return c.routingMatcher.domainMatcher.MatchDomainBitmap(cache.GetFqdn())
+		},
 		NewCache: func(fqdn string, answers, ns, extra []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error) {
 			return &DnsCache{
-				DomainBitmap:     c.routingMatcher.domainMatcher.MatchDomainBitmap(fqdn),
-				NS:               ns,
-				Extra:            extra,
-				Answer:           answers,
-				Deadline:         deadline,
-				OriginalDeadline: originalDeadline,
+				RouteProjectionEpoch: routeProjectionEpoch,
+				DomainBitmap:         c.routingMatcher.domainMatcher.MatchDomainBitmap(fqdn),
+				NS:                   ns,
+				Extra:                extra,
+				Answer:               answers,
+				Deadline:             deadline,
+				OriginalDeadline:     originalDeadline,
 			}, nil
 		},
 		BestDialerChooser: c.chooseBestDnsDialer,

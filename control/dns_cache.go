@@ -33,13 +33,14 @@ const (
 )
 
 type DnsCache struct {
-	RouteOwnerKey    string
-	DomainBitmap     []uint32
-	Answer           []dnsmessage.RR
-	NS               []dnsmessage.RR
-	Extra            []dnsmessage.RR
-	Deadline         time.Time
-	OriginalDeadline time.Time // This field is not impacted by `fixed_domain_ttl`.
+	RouteOwnerKey        string
+	RouteProjectionEpoch uint64
+	DomainBitmap         []uint32
+	Answer               []dnsmessage.RR
+	NS                   []dnsmessage.RR
+	Extra                []dnsmessage.RR
+	Deadline             time.Time
+	OriginalDeadline     time.Time // This field is not impacted by `fixed_domain_ttl`.
 
 	// lastRouteSyncNano tracks when route binding was last synced to BPF.
 	lastRouteSyncNano atomic.Int64
@@ -275,9 +276,10 @@ func (c *DnsCache) FillIntoWithPacked(req *dnsmessage.Msg) []byte {
 
 func (c *DnsCache) Clone() *DnsCache {
 	newCache := &DnsCache{
-		RouteOwnerKey:    c.RouteOwnerKey,
-		Deadline:         c.Deadline,
-		OriginalDeadline: c.OriginalDeadline,
+		RouteOwnerKey:        c.RouteOwnerKey,
+		RouteProjectionEpoch: c.RouteProjectionEpoch,
+		Deadline:             c.Deadline,
+		OriginalDeadline:     c.OriginalDeadline,
 	}
 
 	if c.DomainBitmap != nil {
@@ -330,12 +332,13 @@ func (c *DnsCache) Clone() *DnsCache {
 // matcher and lifecycle bookkeeping.
 func (c *DnsCache) CloneForReload() *DnsCache {
 	newCache := &DnsCache{
-		RouteOwnerKey:    c.RouteOwnerKey,
-		Answer:           c.Answer,
-		NS:               c.NS,
-		Extra:            c.Extra,
-		Deadline:         c.Deadline,
-		OriginalDeadline: c.OriginalDeadline,
+		RouteOwnerKey:        c.RouteOwnerKey,
+		RouteProjectionEpoch: c.RouteProjectionEpoch,
+		Answer:               c.Answer,
+		NS:                   c.NS,
+		Extra:                c.Extra,
+		Deadline:             c.Deadline,
+		OriginalDeadline:     c.OriginalDeadline,
 	}
 
 	if packedPtr := c.packedResponse.Load(); packedPtr != nil && *packedPtr != nil {

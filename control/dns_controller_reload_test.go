@@ -157,6 +157,72 @@ func TestDnsController_ReuseForReloadReturnsFreshFacadeSharingStore(t *testing.T
 	require.Nil(t, reusedRT.routing)
 }
 
+func TestDnsController_ReuseForReloadReprojectsCachedRoutes(t *testing.T) {
+	controller, err := NewDnsController(nil, &DnsControllerOption{
+		Log:                  logrus.New(),
+		RouteProjectionEpoch: 1,
+		ProjectCacheRoute: func(*DnsCache) []uint32 {
+			return []uint32{1}
+		},
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, controller.Close()) }()
+
+	original := &DnsCache{
+		RouteOwnerKey:        "reload.example.1",
+		RouteProjectionEpoch: 1,
+		DomainBitmap:         []uint32{1},
+		Deadline:             time.Now().Add(time.Minute),
+	}
+	controller.dnsCache.Store(original.RouteOwnerKey, original)
+
+	reused, err := controller.ReuseForReload(&DnsControllerOption{
+		Log:                  logrus.New(),
+		RouteProjectionEpoch: 2,
+		ProjectCacheRoute: func(*DnsCache) []uint32 {
+			return []uint32{2}
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	value, ok := reused.dnsCache.Load(original.RouteOwnerKey)
+	require.True(t, ok)
+	remapped, ok := value.(*DnsCache)
+	require.True(t, ok)
+	require.NotSame(t, original, remapped)
+	require.Equal(t, uint64(2), remapped.RouteProjectionEpoch)
+	require.Equal(t, []uint32{2}, remapped.DomainBitmap)
+}
+
+func TestDnsController_ProcessBpfUpdateTaskSkipsStaleRouteProjection(t *testing.T) {
+	callbackCalled := false
+	controller, err := NewDnsController(nil, &DnsControllerOption{
+		Log:                  logrus.New(),
+		RouteProjectionEpoch: 2,
+		CacheAccessCallback: func(*DnsCache) error {
+			callbackCalled = true
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, controller.Close()) }()
+
+	cache := &DnsCache{RouteProjectionEpoch: 1}
+	require.True(t, controller.processBpfUpdateTask(&bpfUpdateTask{
+		cache:                cache,
+		now:                  time.Now(),
+		routeProjectionEpoch: 1,
+	}, false))
+	require.False(t, callbackCalled)
+
+	require.True(t, controller.processBpfUpdateTask(&bpfUpdateTask{
+		cache:                cache,
+		now:                  time.Now(),
+		routeProjectionEpoch: 2,
+	}, false))
+	require.True(t, callbackCalled)
+}
+
 func TestDnsController_ReuseForReloadUpdatesBehaviorConfig(t *testing.T) {
 	controller, err := NewDnsController(nil, &DnsControllerOption{
 		Log:                logrus.New(),

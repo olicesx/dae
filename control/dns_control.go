@@ -74,6 +74,8 @@ type DnsControllerOption struct {
 	CacheRemoveCallback   func(cache *DnsCache) (err error)
 	CacheDeleteCallback   func(cacheKey string, cache *DnsCache) (err error)
 	NewCache              func(fqdn string, answers, ns, extra []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
+	RouteProjectionEpoch  uint64
+	ProjectCacheRoute     func(cache *DnsCache) []uint32
 	BestDialerChooser     func(ctx context.Context, req *udpRequest, upstream *dns.Upstream) (*dialArgument, error)
 	TimeoutExceedCallback func(dialArgument *dialArgument, err error)
 	IpVersionPrefer       int
@@ -91,6 +93,8 @@ type dnsControllerRuntimeState struct {
 	cacheRemoveCallback   func(cache *DnsCache) (err error)
 	cacheDeleteCallback   func(cacheKey string, cache *DnsCache) (err error)
 	newCache              func(fqdn string, answers, ns, extra []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
+	routeProjectionEpoch  uint64
+	projectCacheRoute     func(cache *DnsCache) []uint32
 	bestDialerChooser     func(ctx context.Context, req *udpRequest, upstream *dns.Upstream) (*dialArgument, error)
 	timeoutExceedCallback func(dialArgument *dialArgument, err error)
 	fixedDomainTtl        map[string]int
@@ -259,10 +263,33 @@ func (c *DnsController) ReuseForReload(option *DnsControllerOption, routing *dns
 	if err := c.TryUpdateRuntime(option, routing); err != nil {
 		return nil, err
 	}
+	c.reprojectCachedRoutes(c.runtime())
 	if err := c.ResetDnsForwarders(); err != nil && c.log != nil {
 		c.log.WithError(err).Warn("failed to retire stale DNS forwarders during reload reuse")
 	}
 	return c.sharedStoreFacade(), nil
+}
+
+func (c *DnsController) reprojectCachedRoutes(rt *dnsControllerRuntimeState) {
+	if c == nil || c.dnsControllerStore == nil || rt == nil || rt.projectCacheRoute == nil {
+		return
+	}
+
+	now := time.Now()
+	c.dnsCache.Range(func(key, value any) bool {
+		cache, ok := value.(*DnsCache)
+		if !ok || cache == nil || cache.RouteProjectionEpoch == rt.routeProjectionEpoch {
+			return true
+		}
+
+		replacement := cache.Clone()
+		replacement.RouteProjectionEpoch = rt.routeProjectionEpoch
+		replacement.DomainBitmap = rt.projectCacheRoute(replacement)
+		if c.dnsCache.CompareAndSwap(key, cache, replacement) {
+			c.triggerBpfUpdateIfNeeded(replacement, now)
+		}
+		return true
+	})
 }
 
 func (c *DnsController) CloneCacheForReload() map[string]*DnsCache {
@@ -306,8 +333,9 @@ func (c *DnsController) RestoreReloadCache(entries map[string]*DnsCache, matchDo
 
 // bpfUpdateTask represents a BPF map update request.
 type bpfUpdateTask struct {
-	cache *DnsCache
-	now   time.Time
+	cache                *DnsCache
+	now                  time.Time
+	routeProjectionEpoch uint64
 }
 
 // cacheEntry represents a DNS cache entry with its access time for LRU eviction.
@@ -419,6 +447,8 @@ func (c *DnsController) updateRuntime(option *DnsControllerOption, routing *dns.
 		cacheRemoveCallback:   option.CacheRemoveCallback,
 		cacheDeleteCallback:   option.CacheDeleteCallback,
 		newCache:              option.NewCache,
+		routeProjectionEpoch:  option.RouteProjectionEpoch,
+		projectCacheRoute:     option.ProjectCacheRoute,
 		bestDialerChooser:     option.BestDialerChooser,
 		timeoutExceedCallback: option.TimeoutExceedCallback,
 		fixedDomainTtl:        option.FixedDomainTtl,
@@ -974,6 +1004,9 @@ func (c *DnsController) processBpfUpdateTask(task *bpfUpdateTask, draining bool)
 		return false
 	}
 	if rt := c.runtime(); rt != nil && rt.cacheAccessCallback != nil {
+		if task.routeProjectionEpoch != rt.routeProjectionEpoch {
+			return true
+		}
 		if err := rt.cacheAccessCallback(task.cache); err != nil {
 			if c.log != nil {
 				suffix := ""
@@ -1052,7 +1085,7 @@ func (c *DnsController) triggerBpfUpdateIfNeeded(cache *DnsCache, now time.Time)
 		return
 	}
 
-	if !c.sendBpfUpdateTask(&bpfUpdateTask{cache: cache, now: now}) {
+	if !c.sendBpfUpdateTask(&bpfUpdateTask{cache: cache, now: now, routeProjectionEpoch: rt.routeProjectionEpoch}) {
 		if c.log != nil && c.log.IsLevelEnabled(logrus.DebugLevel) {
 			c.log.Debug("BPF update queue full or closed, skipping update")
 		}

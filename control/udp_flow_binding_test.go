@@ -53,6 +53,8 @@ func TestUdpFlowBindingKeepsRouteAndEgressSeparate(t *testing.T) {
 func TestUdpEndpointPoolPreservesOriginalFlowBindingOnReuse(t *testing.T) {
 	pool := NewUdpEndpointPool()
 	t.Cleanup(pool.Close)
+	firstTracker := newControlPlaneDrainTracker()
+	secondTracker := newControlPlaneDrainTracker()
 
 	conn := &scriptedPacketConn{
 		reads:   make(chan scriptedPacketRead),
@@ -75,7 +77,8 @@ func TestUdpEndpointPoolPreservesOriginalFlowBindingOnReuse(t *testing.T) {
 		},
 	}
 	firstOptions := &UdpEndpointOptions{
-		Handler: func(*UdpEndpoint, []byte, netip.AddrPort) error { return nil },
+		Handler:      func(*UdpEndpoint, []byte, netip.AddrPort) error { return nil },
+		DrainTracker: firstTracker,
 		GetDialOption: func(context.Context) (*DialOption, error) {
 			return &DialOption{
 				Dialer:  d,
@@ -97,7 +100,8 @@ func TestUdpEndpointPoolPreservesOriginalFlowBindingOnReuse(t *testing.T) {
 	secondBinding.Egress.Target = "203.0.113.2:443"
 	secondDialCalled := false
 	secondOptions := &UdpEndpointOptions{
-		Handler: func(*UdpEndpoint, []byte, netip.AddrPort) error { return nil },
+		Handler:      func(*UdpEndpoint, []byte, netip.AddrPort) error { return nil },
+		DrainTracker: secondTracker,
 		GetDialOption: func(context.Context) (*DialOption, error) {
 			secondDialCalled = true
 			return &DialOption{Binding: secondBinding}, nil
@@ -116,5 +120,17 @@ func TestUdpEndpointPoolPreservesOriginalFlowBindingOnReuse(t *testing.T) {
 	}
 	if got := second.FlowBinding(); got != firstBinding {
 		t.Fatalf("reused binding = %+v, want original %+v", got, firstBinding)
+	}
+	if got := firstTracker.Count(); got != 1 {
+		t.Fatalf("original generation active endpoint count = %d, want 1", got)
+	}
+	if got := secondTracker.Count(); got != 0 {
+		t.Fatalf("successor generation active endpoint count = %d, want 0", got)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("close reused endpoint: %v", err)
+	}
+	if got := firstTracker.Count(); got != 0 {
+		t.Fatalf("closed endpoint left original generation count = %d, want 0", got)
 	}
 }

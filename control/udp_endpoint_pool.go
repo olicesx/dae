@@ -1154,8 +1154,8 @@ type UdpEndpointOptions struct {
 	NatTimeout time.Duration
 	// ConnStateOwner releases eBPF UDP conn-state tuples when the endpoint exits.
 	ConnStateOwner udpConnStateOwner
-	// DrainTracker keeps the owning generation alive while the endpoint remains
-	// active. Reused endpoints may transfer this ownership to the next generation.
+	// DrainTracker keeps the creating generation alive while the endpoint remains
+	// active. Reusing an endpoint never transfers this ownership.
 	DrainTracker *controlPlaneDrainTracker
 	// GetTarget is useful only if the underlay does not support Full-cone.
 	GetDialOption func(ctx context.Context) (option *DialOption, err error)
@@ -1707,9 +1707,6 @@ func (p *UdpEndpointPool) GetOrCreate(key UdpEndpointKey, createOption *UdpEndpo
 				}
 				ue.RefreshTtlWithTime(nowNano)
 			}
-			if createOption != nil {
-				ue.adoptGeneration(createOption.ConnStateOwner, createOption.DrainTracker)
-			}
 			shard.mu.RUnlock()
 			return ue, false, nil
 		}
@@ -1744,9 +1741,6 @@ func (p *UdpEndpointPool) GetOrCreate(key UdpEndpointKey, createOption *UdpEndpo
 					nowNano = createOption.NowNano
 				}
 				ue.RefreshTtlWithTime(nowNano)
-			}
-			if createOption != nil {
-				ue.adoptGeneration(createOption.ConnStateOwner, createOption.DrainTracker)
 			}
 			shard.mu.Unlock()
 			return ue, false, nil

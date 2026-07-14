@@ -20,6 +20,9 @@ Committed this session (post-cleanup):
   Phase 6 foundation for UDP. Records immutable `UdpFlowBinding` (route +
   egress) on `UdpEndpoint`. Threads `Must` and `OutboundIndex` through
   `proxyDialParam/Result` and `DialOption`.
+- `50ed80d7 test(control): add Phase 0 routing corpus and verify
+  PolicySnapshot equivalence` — Phase 0 routing corpus (20 fixtures, 46
+  cases) + Phase 1 acceptance check applied to the full corpus.
 
 Cleanup actions taken:
 - Reverted codex's destructive `deadlock_test.go` edit (deleted
@@ -41,8 +44,8 @@ Verification status post-cleanup:
 
 | Phase | Status | Notes |
 |---|---|---|
-| 0. Compatibility Corpus & Observability | NOT STARTED | next focus |
-| 1. Immutable Policy Snapshot | PARTIAL | types + unit tests only; no corpus equivalence yet |
+| 0. Compatibility Corpus & Observability | PARTIAL | routing corpus done (20 fixtures, 46 cases); DNS / TCP / UDP / QUIC / reload corpora still pending; performance baseline not yet recorded |
+| 1. Immutable Policy Snapshot | ACCEPTANCE MET (userspace) | corpus-equivalent test passes for all 20 fixtures; kernel-side equivalence and fuzz tests still pending |
 | 2. Three-Valued Evaluation | PARTIAL | `truth.go` exists, not wired into routing |
 | 3. Decision Adapter & Shadow | PARTIAL | `Decision` type exists, no shadow wiring |
 | 4. Epoch-Scoped Kernel Plan | NOT STARTED | — |
@@ -51,12 +54,38 @@ Verification status post-cleanup:
 | 7. Runtime Supervisor | NOT STARTED | — |
 | 8. Controlled Cutover | NOT STARTED | — |
 
+## Phase 0 routing corpus (delivered)
+
+Files:
+- `control/refactor_corpus.go` — `CorpusFixture`, `CorpusInput`, `CorpusExpected`,
+  `Replay(t, matcher, fixture)` driver. MAC and process-name conversion
+  helpers mirror `ControlPlane.Route` semantics.
+- `control/refactor_corpus_fixtures.go` — 20 fixtures covering every routing
+  function (Domain suffix/full/keyword, IpSet, SourceIpSet, Port,
+  SourcePort, L4Proto, IpVersion, ProcessName, Dscp, Mac, Fallback),
+  AND/OR/NOT combinations, priority ordering, mark, must, and reserved
+  outbounds (direct, block).
+- `control/refactor_corpus_test.go` — `TestPhase0RoutingCorpus_LegacyBaseline`
+  pins legacy output; `TestPhase0RoutingCorpus_PolicySnapshotEquivalent`
+  replays the corpus against a PolicySnapshot-built matcher and asserts
+  byte-identical results.
+
+To extend: append a constructor to `RoutingCorpusFixtures()` in
+`refactor_corpus_fixtures.go`. Every future phase that touches routing
+determinism MUST keep both corpus tests passing.
+
 ## Open Decisions
 
-- Phase 0 corpus: scope and fixture format TBD (see phase0-design.md once
-  written).
-- Whether to retrofit equivalence tests into already-committed Phase 1/5/6
-  partial work before moving forward.
+- Phase 0 sub-system corpora (DNS, transport, reload) — scope and format
+  still TBD. Routing corpus pattern is the template; DNS corpus should
+  cover UDP/TCP transports, stale cache hits, reject-before-cache,
+  QUIC sniffing; transport corpus should cover TCP reroute on sniff,
+  UDP full-cone/symmetric reuse, QUIC upgrade; reload corpus should
+  cover live-flow drain.
+- Whether to retrofit a fuzz target on `Replay` before tackling Phase 2.
+- Whether to record throughput / allocation / latency baselines on fixed
+  hardware before adding Phase 4 BPF epoch work (plan requires this
+  before setting a performance gate).
 
 ## Blocked
 

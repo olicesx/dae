@@ -2265,7 +2265,7 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 
 			// This goroutine performs the actual resolution.
 			// It returns the DNS response message, or an error.
-			return c.resolveForSingleflight(resCtx, dnsMessage, req, upstreamIndex, upstream, responseCacheKey, baseCacheKey)
+			return c.resolveForSingleflight(resCtx, dnsMessage, req, upstreamIndex, upstream, responseCacheKey)
 		})
 
 		if err != nil {
@@ -2314,38 +2314,48 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 	return c.handleWithResponseWriterInternal(ctx, dnsMessage, req, responseWriter, upstreamIndex, upstream, responseCacheKey, baseCacheKey)
 }
 
-func (c *DnsController) resolveForSingleflight(ctx context.Context, dnsMessage *dnsmessage.Msg, req *udpRequest, upstreamIndex consts.DnsRequestOutboundIndex, upstream *dns.Upstream, responseCacheKey string, baseCacheKey string) (*dnsmessage.Msg, error) {
-	// We need a way to capture the response message from the resolution process.
-	// Currently `handleWithResponseWriterInternal` writes to a writer or sends a packet.
-	// We need to refactor or spy on it.
+func (c *DnsController) resolveForSingleflight(
+	ctx context.Context,
+	dnsMessage *dnsmessage.Msg,
+	req *udpRequest,
+	upstreamIndex consts.DnsRequestOutboundIndex,
+	upstream *dns.Upstream,
+	responseCacheKey string,
+) (*dnsmessage.Msg, error) {
+	// Preserve the second cache lookup from the former response-writer path.
+	// Another request may have populated the entry after the outer cache miss
+	// and before this singleflight leader starts upstream resolution.
+	if resp, needRefresh := c.LookupDnsRespCache_(dnsMessage, responseCacheKey, false); resp != nil {
+		if needRefresh {
+			go c.backgroundRefresh(responseCacheKey, dnsMessage, req, upstreamIndex, upstream)
+		}
+		respMsg := new(dnsmessage.Msg)
+		if err := respMsg.Unpack(resp); err != nil {
+			return nil, fmt.Errorf("unpack cached DNS response: %w", err)
+		}
+		respMsg.Id = dnsMessage.Id
+		return respMsg, nil
+	}
 
-	// Since refactoring everything is risky, let's use a Fake ResponseWriter to capture the message.
-	capturer := &msgCapturer{}
-	err := c.handleWithResponseWriterInternal(ctx, dnsMessage, req, capturer, upstreamIndex, upstream, responseCacheKey, baseCacheKey)
+	data, err := dnsMessage.Pack()
+	if err != nil {
+		return nil, fmt.Errorf("pack DNS packet: %w", err)
+	}
+	resolution, err := c.resolveDNSUpstream(ctx, 0, req, data, upstream)
 	if err != nil {
 		return nil, err
 	}
-	if capturer.msg == nil {
-		return nil, fmt.Errorf("no response captured during singleflight resolution")
+
+	respMsg := resolution.response
+	respMsg.Id = dnsMessage.Id
+	respMsg.Compress = true
+	if err := c.NormalizeAndCacheDnsResp_(respMsg, responseCacheKey); err != nil {
+		if c.log != nil {
+			c.log.Warnf("failed to cache DNS response: %v", err)
+		}
 	}
-	return capturer.msg, nil
+	return respMsg, nil
 }
-
-type msgCapturer struct {
-	msg *dnsmessage.Msg
-}
-
-func (m *msgCapturer) LocalAddr() net.Addr  { return nil }
-func (m *msgCapturer) RemoteAddr() net.Addr { return nil }
-func (m *msgCapturer) WriteMsg(msg *dnsmessage.Msg) error {
-	m.msg = msg
-	return nil
-}
-func (m *msgCapturer) Write(b []byte) (int, error) { return 0, nil }
-func (m *msgCapturer) Close() error                { return nil }
-func (m *msgCapturer) TsigStatus() error           { return nil }
-func (m *msgCapturer) TsigTimersOnly(bool)         {}
-func (m *msgCapturer) Hijack()                     {}
 
 // handleWithResponseWriterInternal handles DNS requests with response writer.
 // When ip_version_prefer is set, it implements RFC 8305 Happy Eyeballs
@@ -2474,7 +2484,7 @@ func (c *DnsController) handleWithResponseWriter_(
 	if err != nil {
 		return fmt.Errorf("pack DNS packet: %w", err)
 	}
-	return c.dialSend(ctx, 0, req, data, dnsMessage.Id, upstream, needResp, responseWriter, responseCacheKey, baseCacheKey)
+	return c.dialSend(ctx, req, data, dnsMessage.Id, upstream, needResp, responseWriter, responseCacheKey)
 }
 
 // writeCachedResponse sends a cached DNS response to the client.
@@ -2680,21 +2690,26 @@ func (c *DnsController) applyPreferenceWait(respMsg *dnsmessage.Msg) *dnsmessage
 	return respMsg
 }
 
-func (c *DnsController) dialSend(
+type dnsUpstreamResolution struct {
+	response      *dnsmessage.Msg
+	networkType   *dialer.NetworkType
+	upstreamIndex consts.DnsResponseOutboundIndex
+	dialArgument  *dialArgument
+}
+
+// resolveDNSUpstream obtains a DNS response without writing it to the client
+// or mutating the response cache. It owns response routing and recursive
+// upstream fallback so delivery can be shared by UDP, TCP, and singleflight.
+func (c *DnsController) resolveDNSUpstream(
 	ctx context.Context,
 	invokingDepth int,
 	req *udpRequest,
 	data []byte,
-	id uint16,
 	upstream *dns.Upstream,
-	needResp bool,
-	responseWriter dnsmessage.ResponseWriter,
-	responseCacheKey string,
-	baseCacheKey string,
-) (err error) {
+) (*dnsUpstreamResolution, error) {
 	data = append([]byte(nil), data...) // defensive copy: callers may reuse the slice across recursive retries
 	if invokingDepth >= MaxDnsLookupDepth {
-		return fmt.Errorf("too deep DNS lookup invoking (depth: %v); there may be infinite loop in your DNS response routing", MaxDnsLookupDepth)
+		return nil, fmt.Errorf("too deep DNS lookup invoking (depth: %v); there may be infinite loop in your DNS response routing", MaxDnsLookupDepth)
 	}
 
 	upstreamName := "asis"
@@ -2721,11 +2736,11 @@ func (c *DnsController) dialSend(
 	// Select best dial arguments (outbound, dialer, l4proto, ipversion, etc.)
 	rt := c.runtime()
 	if rt == nil || rt.bestDialerChooser == nil {
-		return fmt.Errorf("dns controller runtime bestDialerChooser is not configured")
+		return nil, fmt.Errorf("dns controller runtime bestDialerChooser is not configured")
 	}
 	dialArg, err := rt.bestDialerChooser(ctx, req, upstream)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Dial and send.
@@ -2733,7 +2748,7 @@ func (c *DnsController) dialSend(
 	var usedDialArg *dialArgument
 	respMsg, usedDialArg, err = c.forwardWithFallback(ctx, req, upstream, dialArg, data)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	networkType := &dialer.NetworkType{
@@ -2745,11 +2760,11 @@ func (c *DnsController) dialSend(
 
 	// Route response.
 	if rt.routing == nil {
-		return fmt.Errorf("dns routing is not configured")
+		return nil, fmt.Errorf("dns routing is not configured")
 	}
 	upstreamIndex, nextUpstream, err := rt.routing.ResponseSelect(ctx, respMsg, upstream)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	switch upstreamIndex {
 	case consts.DnsResponseOutboundIndex_Accept:
@@ -2778,14 +2793,38 @@ func (c *DnsController) dialSend(
 				"next_upstream": nextUpstream.String(),
 			}).Traceln("Change DNS upstream and resend")
 		}
-		return c.dialSend(ctx, invokingDepth+1, req, data, id, nextUpstream, needResp, responseWriter, responseCacheKey, baseCacheKey)
+		return c.resolveDNSUpstream(ctx, invokingDepth+1, req, data, nextUpstream)
 	}
 
 	// Apply preference wait logic for A/AAAA responses.
 	// This must happen before logging and sending the response.
 	respMsg = c.applyPreferenceWait(respMsg)
 
-	if upstreamIndex.IsReserved() && c.log.IsLevelEnabled(logrus.DebugLevel) {
+	return &dnsUpstreamResolution{
+		response:      respMsg,
+		networkType:   networkType,
+		upstreamIndex: upstreamIndex,
+		dialArgument:  usedDialArg,
+	}, nil
+}
+
+func (c *DnsController) dialSend(
+	ctx context.Context,
+	req *udpRequest,
+	data []byte,
+	id uint16,
+	upstream *dns.Upstream,
+	needResp bool,
+	responseWriter dnsmessage.ResponseWriter,
+	responseCacheKey string,
+) (err error) {
+	resolution, err := c.resolveDNSUpstream(ctx, 0, req, data, upstream)
+	if err != nil {
+		return err
+	}
+	respMsg := resolution.response
+
+	if resolution.upstreamIndex.IsReserved() && c.log.IsLevelEnabled(logrus.DebugLevel) {
 		var (
 			qname string
 			qtype string
@@ -2796,10 +2835,10 @@ func (c *DnsController) dialSend(
 			qtype = QtypeToString(q.Qtype)
 		}
 		fields := logrus.Fields{
-			"network":  networkType.String(),
-			"outbound": usedDialArg.bestOutbound.Name,
-			"policy":   usedDialArg.bestOutbound.GetSelectionPolicy(),
-			"dialer":   usedDialArg.bestDialer.Property().Name,
+			"network":  resolution.networkType.String(),
+			"outbound": resolution.dialArgument.bestOutbound.Name,
+			"policy":   resolution.dialArgument.bestOutbound.GetSelectionPolicy(),
+			"dialer":   resolution.dialArgument.bestDialer.Property().Name,
 			"_qname":   qname,
 			"qtype":    qtype,
 			"pid":      req.routingResult.Pid,
@@ -2807,13 +2846,13 @@ func (c *DnsController) dialSend(
 			"pname":    ProcessName2String(req.routingResult.Pname[:]),
 			"mac":      Mac2String(req.routingResult.Mac[:]),
 		}
-		switch upstreamIndex {
+		switch resolution.upstreamIndex {
 		case consts.DnsResponseOutboundIndex_Accept:
-			c.log.WithFields(fields).Debugf("%v <-> %v", RefineSourceToShow(req.realSrc, req.realDst.Addr()), RefineAddrPortToShow(usedDialArg.bestTarget))
+			c.log.WithFields(fields).Debugf("%v <-> %v", RefineSourceToShow(req.realSrc, req.realDst.Addr()), RefineAddrPortToShow(resolution.dialArgument.bestTarget))
 		case consts.DnsResponseOutboundIndex_Reject:
 			c.log.WithFields(fields).Debugf("%v -> reject", RefineSourceToShow(req.realSrc, req.realDst.Addr()))
 		default:
-			return fmt.Errorf("unknown upstream: %v", upstreamIndex.String())
+			return fmt.Errorf("unknown upstream: %v", resolution.upstreamIndex.String())
 		}
 	}
 
@@ -2833,7 +2872,7 @@ func (c *DnsController) dialSend(
 		// Keep the id the same with request.
 		respMsg.Id = id
 		respMsg.Compress = true
-		// If responseWriter is provided (e.g., for singleflight), use it to write the response.
+		// If responseWriter is provided, use it to write the response.
 		if responseWriter != nil {
 			// For responseWriter path, cache synchronously because
 			// responseWriter may need the message after we return.

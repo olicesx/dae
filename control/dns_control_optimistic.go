@@ -65,8 +65,7 @@ func (c *DnsController) backgroundRefresh(cacheKey string, dnsMessage *dnsmessag
 	// triggered this refresh. Re-entering handleWithResponseWriter_ here would
 	// hit the same stale cache and mark the refresh complete without contacting
 	// upstream.
-	baseCacheKey := dnsCacheBaseKey(cacheKey)
-	if err := c.dialSend(ctx, 0, req, data, refreshMsg.Id, upstream, false, nil, cacheKey, baseCacheKey); err != nil {
+	if err := c.dialSend(ctx, req, data, refreshMsg.Id, upstream, false, nil, cacheKey); err != nil {
 		if c.log.IsLevelEnabled(logrus.DebugLevel) {
 			c.log.WithFields(logrus.Fields{
 				"cacheKey": cacheKey,

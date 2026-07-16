@@ -122,6 +122,10 @@ type controlPlaneCore struct {
 	bpfHooksDetached bool // Track if BPF hooks were already detached
 	bpfHooksQuiesced bool
 	retired          atomic.Bool
+	// outboundConnectivityMu serializes shared BPF connectivity-map ownership
+	// with health callbacks while a prepared generation is cut over or rolled back.
+	outboundConnectivityMu     sync.Mutex
+	outboundConnectivityPaused bool
 
 	closed                context.Context
 	close                 context.CancelFunc
@@ -130,10 +134,19 @@ type controlPlaneCore struct {
 	registeredLanPatterns map[string]struct{}
 	registeredWanPatterns map[string]struct{}
 
-	udpConnStateTracker atomic.Pointer[udpConnStateTracker]
-	domainRouting       *domainRoutingTracker
-	lpmTrieIndices      []uint32
-	bpfOwned            bool
+	udpConnStateTracker       atomic.Pointer[udpConnStateTracker]
+	domainRouting             *domainRoutingTracker
+	domainRoutingSlots        [routingEpochSlotCount]*domainRoutingTracker
+	domainRoutingProjectionMu [routingEpochSlotCount]sync.RWMutex
+	routingEpochMu            sync.Mutex
+	routingEpochSlot          atomic.Uint32
+	routingEpochPreviousSlot  atomic.Uint32
+	routingEpochPolicyEpoch   atomic.Uint64
+	routingEpochStaged        bool
+	routingEpochStagedSlot    uint32
+	routingEpochStagedEpoch   uint64
+	lpmTrieIndices            []uint32
+	bpfOwned                  bool
 }
 
 func newControlPlaneCore(log *logrus.Logger,
@@ -184,6 +197,11 @@ func newControlPlaneCore(log *logrus.Logger,
 		domainRouting:         newDomainRoutingTracker(),
 		bpfOwned:              bpfOwned,
 	}
+	core.domainRoutingSlots[0] = core.domainRouting
+	core.domainRoutingSlots[1] = newDomainRoutingTracker()
+	core.routingEpochSlot.Store(routingEpochSlotUnset)
+	core.routingEpochPreviousSlot.Store(routingEpochSlotUnset)
+	core.routingEpochStagedSlot = routingEpochSlotUnset
 	core.bpf.Store(bpf)
 	core.udpConnStateTracker.Store(acquireSharedUdpConnStateTracker(bpf))
 	core.startIfindexWatcher()
@@ -1063,9 +1081,6 @@ func (c *controlPlaneCore) BatchUpdateDomainRouting(cache *DnsCache) error {
 	if c == nil || cache == nil {
 		return nil
 	}
-	if c.domainRouting == nil {
-		c.domainRouting = newDomainRoutingTracker()
-	}
 	snapshot, err := buildDomainRoutingOwnerSnapshot(cache)
 	if err != nil {
 		return err
@@ -1074,7 +1089,17 @@ func (c *controlPlaneCore) BatchUpdateDomainRouting(cache *DnsCache) error {
 	if bpf == nil {
 		return nil
 	}
-	return c.domainRouting.syncOwner(bpf.DomainRoutingMap, cache.RouteOwnerKey, snapshot)
+	slot := c.RoutingEpochSlot()
+	if !validRoutingEpochSlot(slot) {
+		return fmt.Errorf("invalid domain routing epoch slot %d", slot)
+	}
+	c.domainRoutingProjectionMu[slot].RLock()
+	defer c.domainRoutingProjectionMu[slot].RUnlock()
+	tracker := c.domainRoutingTrackerForSlot(slot)
+	if tracker == nil {
+		return fmt.Errorf("domain routing tracker slot %d is unavailable", slot)
+	}
+	return tracker.syncOwnerForSlot(bpf.DomainRoutingMap, slot, cache.RouteOwnerKey, snapshot)
 }
 
 // BatchRemoveDomainRouting remove bpf map domain_routing.
@@ -1082,14 +1107,21 @@ func (c *controlPlaneCore) BatchRemoveDomainRouting(cache *DnsCache) error {
 	if c == nil || cache == nil {
 		return nil
 	}
-	if c.domainRouting == nil {
-		c.domainRouting = newDomainRoutingTracker()
-	}
 	bpf := c.PeekBpf()
 	if bpf == nil {
 		return nil
 	}
-	return c.domainRouting.syncOwner(bpf.DomainRoutingMap, cache.RouteOwnerKey, domainRoutingOwnerSnapshot{})
+	slot := c.RoutingEpochSlot()
+	if !validRoutingEpochSlot(slot) {
+		return fmt.Errorf("invalid domain routing epoch slot %d", slot)
+	}
+	c.domainRoutingProjectionMu[slot].RLock()
+	defer c.domainRoutingProjectionMu[slot].RUnlock()
+	tracker := c.domainRoutingTrackerForSlot(slot)
+	if tracker == nil {
+		return fmt.Errorf("domain routing tracker slot %d is unavailable", slot)
+	}
+	return tracker.syncOwnerForSlot(bpf.DomainRoutingMap, slot, cache.RouteOwnerKey, domainRoutingOwnerSnapshot{})
 }
 
 func (c *controlPlaneCore) RetainUdpConnStateTuples(keys []bpfTuplesKey) {
@@ -1171,6 +1203,11 @@ func (c *controlPlaneCore) EjectBpf() *bpfObjects {
 func (c *controlPlaneCore) EjectLpmIndices() []uint32 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.routingEpochEnabled() {
+		// The retiring generation keeps its slot until Close() so a later
+		// route retry cannot observe a reused LPM map while it still drains.
+		return nil
+	}
 
 	indices := c.lpmTrieIndices
 	c.lpmTrieIndices = nil
@@ -1182,6 +1219,9 @@ func (c *controlPlaneCore) EjectLpmIndices() []uint32 {
 // memory; slots already reused by the current generation are skipped.
 func (c *controlPlaneCore) InheritLpmIndices(indices []uint32) {
 	if len(indices) == 0 {
+		return
+	}
+	if c.routingEpochEnabled() {
 		return
 	}
 
@@ -1220,7 +1260,7 @@ func (c *controlPlaneCore) ReplaceLpmIndices(indices []uint32) {
 	bpf := c.bpf.Load()
 	old := c.lpmTrieIndices
 	c.lpmTrieIndices = append([]uint32(nil), indices...)
-	shouldCleanupOld := bpf != nil && bpf.LpmArrayMap != nil
+	shouldCleanupOld := bpf != nil && bpf.LpmArrayMap != nil && !c.routingEpochEnabled()
 	c.mu.Unlock()
 
 	if shouldCleanupOld {

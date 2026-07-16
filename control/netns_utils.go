@@ -6,6 +6,7 @@
 package control
 
 import (
+	stderrors "errors"
 	"fmt"
 	"net"
 	"os"
@@ -48,13 +49,18 @@ type DaeNetns struct {
 	setupDone atomic.Bool
 	mu        sync.Mutex
 
+	handlesInitialized bool
+
 	dae0, dae0peer netlink.Link
 	hostNs, daeNs  netns.NsHandle
 }
 
 func InitDaeNetns(log *logrus.Logger) {
 	once.Do(func() {
-		daeNetns = &DaeNetns{}
+		daeNetns = &DaeNetns{
+			hostNs: netns.None(),
+			daeNs:  netns.None(),
+		}
 	})
 	daeNetns.log = log
 	// Initialize kernel version for Netkit support detection
@@ -96,29 +102,69 @@ func (ns *DaeNetns) IsUsingNetkit() bool {
 }
 
 func (ns *DaeNetns) Setup() (err error) {
+	_, err = ns.SetupWithOwnership()
+	return err
+}
+
+// SetupWithOwnership creates the dae network namespace when needed and reports
+// whether this call created it. Callers that own the created namespace can
+// release it if a later construction step fails.
+func (ns *DaeNetns) SetupWithOwnership() (created bool, err error) {
 	if ns.setupDone.Load() {
-		return
+		return false, nil
 	}
 
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
 	if ns.setupDone.Load() {
-		return
+		return false, nil
+	}
+	if !ns.handlesInitialized {
+		ns.hostNs = netns.None()
+		ns.daeNs = netns.None()
+		ns.handlesInitialized = true
 	}
 	if err = ns.setup(); err != nil {
-		return
+		return true, err
 	}
 	ns.setupDone.Store(true)
-	return nil
+	return true, nil
 }
 
 func (ns *DaeNetns) Close() (err error) {
 	if ns == nil {
 		return nil
 	}
+
+	ns.mu.Lock()
+	defer ns.mu.Unlock()
+
+	if !ns.handlesInitialized {
+		ns.setupDone.Store(false)
+		return nil
+	}
 	_ = DeleteNamedNetns(NsName)
 	_ = DeleteLink(HostVethName)
-	return
+
+	var errs []error
+	if ns.daeNs.IsOpen() {
+		if e := ns.daeNs.Close(); e != nil {
+			errs = append(errs, e)
+		}
+	}
+	if ns.hostNs.IsOpen() {
+		if e := ns.hostNs.Close(); e != nil {
+			errs = append(errs, e)
+		}
+	}
+	ns.dae0 = nil
+	ns.dae0peer = nil
+	ns.hostNs = netns.None()
+	ns.daeNs = netns.None()
+	ns.useNetkit = false
+	ns.handlesInitialized = false
+	ns.setupDone.Store(false)
+	return stderrors.Join(errs...)
 }
 
 func (ns *DaeNetns) With(f func() error) (err error) {

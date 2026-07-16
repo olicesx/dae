@@ -222,13 +222,15 @@ func (r *controlPlaneDNSRuntime) noteDNSUpstreamAvailable() {
 }
 
 func (r *controlPlaneDNSRuntime) startPreparedDNSListener(ctx context.Context, log *logrus.Logger, deferFuncs *[]func() error, stop func() error) error {
+	return r.startPreparedDNSListenerWithWarmupTimeout(ctx, log, deferFuncs, stop, preparedDNSWarmupTimeout)
+}
+
+func (r *controlPlaneDNSRuntime) startPreparedDNSListenerWithWarmupTimeout(ctx context.Context, log *logrus.Logger, deferFuncs *[]func() error, stop func() error, warmupTimeout time.Duration) error {
 	if r == nil || !r.delayDNSListenerStart {
 		return nil
 	}
-	if err := r.waitDNSUpstreamAvailable(ctx, preparedDNSWarmupTimeout); err != nil {
-		if log != nil {
-			log.WithError(err).Warnln("[Reload] DNS upstream availability did not finish before DNS cutover")
-		}
+	if err := r.waitDNSUpstreamAvailable(ctx, warmupTimeout); err != nil {
+		return fmt.Errorf("wait for DNS upstream availability before prepared cutover: %w", err)
 	}
 	if r.preparedDNSReuseHook != nil {
 		if err := r.preparedDNSReuseHook(); err != nil {

@@ -38,14 +38,35 @@ type reloadManager struct {
 	pendingRetirementDone        <-chan struct{}
 	pendingReloadRequestedAt     time.Time
 	pendingReloadRequestedAtMono uint64
+	transitionMu                 sync.Mutex
+	transitionCond               *sync.Cond
+	transitionActive             bool
+	shutdownStarted              bool
+	activeRetirement             *activeRetirementTask
 }
 
+// activeRetirementTask transfers cleanup ownership of one published
+// generation to the retirement worker. The generation identity is required
+// when a canceled worker completes after a newer reload has started.
+type activeRetirementTask struct {
+	generation *runtimeGeneration
+	cancel     context.CancelFunc
+	done       chan struct{}
+}
+
+// reloadFailureCompletionHook is an internal observability seam used by
+// lifecycle tests. The production default is a no-op and does not affect
+// reload state transitions.
+var reloadFailureCompletionHook = func() {}
+
 func newReloadManager(reloadReqs chan reloadRequest, runStateChanges chan struct{}, sigs <-chan os.Signal) *reloadManager {
-	return &reloadManager{
+	m := &reloadManager{
 		reloadReqs:      reloadReqs,
 		runStateChanges: runStateChanges,
 		sigs:            sigs,
 	}
+	m.transitionCond = sync.NewCond(&m.transitionMu)
+	return m
 }
 
 func (m *reloadManager) queueReloadRequest(log *logrus.Logger, req reloadRequest) bool {
@@ -167,8 +188,10 @@ func (m *reloadManager) buildShutdownHandoff() *signalShutdownStagedHandoff {
 	return &signalShutdownStagedHandoff{
 		oldListener:     m.pendingStagedHandoff.oldListener,
 		oldControlPlane: m.pendingStagedHandoff.oldControlPlane,
+		oldCancel:       m.pendingStagedHandoff.oldCancel,
 		newListener:     m.pendingStagedHandoff.newListener,
 		newControlPlane: m.pendingStagedHandoff.newControlPlane,
+		newCancel:       m.pendingStagedHandoff.newCancel,
 	}
 }
 
@@ -252,12 +275,105 @@ func (m *reloadManager) finishReloadFailure() {
 	m.reloading.Store(false)
 	m.reloadActive.Store(false)
 	clearReloadPending(&m.reloadPending)
+	reloadFailureCompletionHook()
 }
 
 func (m *reloadManager) finishReloadSuccess() {
 	m.reloading.Store(false)
 	m.reloadActive.Store(false)
 	releaseReloadPendingAfterRetirement(&m.reloadPending, m.takePendingRetirementDone())
+}
+
+// beginReloadTransition reserves the cutover critical section. Shutdown uses
+// the same barrier so it cannot transfer generation ownership while a reload
+// is between datapath preparation and publication.
+func (m *reloadManager) beginReloadTransition() bool {
+	if m == nil {
+		return false
+	}
+	m.transitionMu.Lock()
+	defer m.transitionMu.Unlock()
+	if m.shutdownStarted || m.transitionActive {
+		return false
+	}
+	m.transitionActive = true
+	return true
+}
+
+func (m *reloadManager) endReloadTransition() {
+	if m == nil {
+		return
+	}
+	m.transitionMu.Lock()
+	if m.transitionActive {
+		m.transitionActive = false
+		m.transitionCond.Broadcast()
+	}
+	m.transitionMu.Unlock()
+}
+
+// shutdownSupervisor freezes new reload transitions, joins the current
+// retirement worker, and then atomically transfers any remaining generation
+// ownership to the shutdown caller.
+func (m *reloadManager) shutdownSupervisor(supervisor *runtimeSupervisor) runtimeSupervisorSnapshot {
+	if m == nil {
+		if supervisor == nil {
+			return runtimeSupervisorSnapshot{}
+		}
+		return supervisor.shutdown()
+	}
+	m.transitionMu.Lock()
+	m.shutdownStarted = true
+	for m.transitionActive {
+		m.transitionCond.Wait()
+	}
+	m.transitionMu.Unlock()
+
+	m.lastRetirementMu.Lock()
+	task := m.activeRetirement
+	if task != nil && task.cancel != nil {
+		task.cancel()
+	}
+	m.lastRetirementMu.Unlock()
+	if task != nil {
+		<-task.done
+		if supervisor != nil {
+			// A shutdown-owned worker may be joined after its completion
+			// notification but before it releases supervisor retirement state.
+			// The generation identity makes this cleanup idempotent.
+			supervisor.markRetirementComplete(task.generation)
+		}
+	}
+	if supervisor == nil {
+		return runtimeSupervisorSnapshot{}
+	}
+	return supervisor.shutdown()
+}
+
+func (m *reloadManager) buildShutdownHandoffWithSupervisor(snapshot runtimeSupervisorSnapshot, current *runtimeGeneration) *signalShutdownStagedHandoff {
+	if m == nil {
+		return nil
+	}
+	var handoff signalShutdownStagedHandoff
+	if snapshot.retiring != nil {
+		handoff.oldListener = snapshot.retiring.listener
+		handoff.oldControlPlane = snapshot.retiring.controlPlane
+		handoff.oldCancel = snapshot.retiring.cancel
+	}
+	if snapshot.prepared != nil {
+		handoff.newListener = snapshot.prepared.listener
+		handoff.newControlPlane = snapshot.prepared.controlPlane
+		handoff.newCancel = snapshot.prepared.cancel
+	}
+	if snapshot.active != nil && snapshot.active != current && handoff.newControlPlane == nil {
+		handoff.newListener = snapshot.active.listener
+		handoff.newControlPlane = snapshot.active.controlPlane
+		handoff.newCancel = snapshot.active.cancel
+	}
+	if handoff.oldListener == nil && handoff.oldControlPlane == nil && handoff.oldCancel == nil && handoff.newListener == nil && handoff.newControlPlane == nil && handoff.newCancel == nil {
+		return nil
+	}
+	return &handoff
 }
 
 func (m *reloadManager) startControlPlaneRetirement(
@@ -267,8 +383,13 @@ func (m *reloadManager) startControlPlaneRetirement(
 	oldCancel context.CancelFunc,
 	abortConnections bool,
 	hasOverlap bool,
+	supervisor *runtimeSupervisor,
+	retiringGeneration *runtimeGeneration,
 ) {
 	if m == nil || oldControlPlane == nil {
+		return
+	}
+	if supervisor == nil || retiringGeneration == nil || !supervisor.ownsRetiring(retiringGeneration) {
 		return
 	}
 	m.lastRetirementMu.Lock()
@@ -277,12 +398,18 @@ func (m *reloadManager) startControlPlaneRetirement(
 	}
 	retireCtx, retireCancel := context.WithCancel(context.Background())
 	m.lastRetirementCancel = retireCancel
+	retirementDone := make(chan struct{})
+	task := &activeRetirementTask{
+		generation: retiringGeneration,
+		cancel:     retireCancel,
+		done:       retirementDone,
+	}
+	m.activeRetirement = task
 	m.lastRetirementMu.Unlock()
 
 	if log != nil {
 		log.Warnln("[Reload] Retiring old control plane")
 	}
-	retirementDone := make(chan struct{})
 	// lastRetirementMu only serializes cancellation/replacement of the previous
 	// retirement goroutine. The timing metadata below belongs to the reload
 	// manager state itself, so it is read under m.mu instead. This split is safe
@@ -293,8 +420,16 @@ func (m *reloadManager) startControlPlaneRetirement(
 	staleBeforeNs := m.pendingReloadRequestedAtMono
 	m.mu.Unlock()
 
-	go func(done chan struct{}) {
-		defer close(done)
+	go func(task *activeRetirementTask) {
+		defer close(task.done)
+		defer func() {
+			m.lastRetirementMu.Lock()
+			if m.activeRetirement == task {
+				m.activeRetirement = nil
+				m.lastRetirementCancel = nil
+			}
+			m.lastRetirementMu.Unlock()
+		}()
 
 		oldControlPlane.MarkRetired()
 		retireControlPlaneConnections(log, retireCtx, oldControlPlane, abortConnections, hasOverlap, drainBudget)
@@ -308,10 +443,11 @@ func (m *reloadManager) startControlPlaneRetirement(
 		if successor != nil {
 			successor.RunReloadRetirementCleanup(staleBeforeNs)
 		}
+		supervisor.markRetirementComplete(task.generation)
 		if log != nil {
 			log.Warnln("[Reload] Retired old control plane")
 		}
-	}(retirementDone)
+	}(task)
 }
 
 func (m *reloadManager) refreshPprofServer(log *logrus.Logger, server **http.Server, port uint16) {

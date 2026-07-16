@@ -55,13 +55,15 @@ import (
 // ============================================================================
 
 type bpfRoutingResult struct {
-	Mark     uint32
-	Must     uint8
-	Mac      [6]uint8
-	Outbound uint8
-	Pname    [16]uint8
-	Pid      uint32
-	Dscp     uint8
+	Mark             uint32
+	Must             uint8
+	Mac              [6]uint8
+	Outbound         uint8
+	Pname            [16]uint8
+	Pid              uint32
+	Dscp             uint8
+	RoutingEpochSlot uint8
+	Padding          [2]uint8
 }
 
 type _bpfLpmKey struct {

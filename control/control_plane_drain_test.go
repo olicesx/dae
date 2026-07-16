@@ -7,8 +7,11 @@ package control
 
 import (
 	"context"
+	stderrors "errors"
 	"io"
 	"net"
+	"net/netip"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,6 +21,7 @@ import (
 	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 	D "github.com/daeuniverse/outbound/dialer"
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol/direct"
 	"github.com/sirupsen/logrus"
 )
@@ -109,6 +113,158 @@ func TestControlPlaneAbortConnectionsRejectsNewConnections(t *testing.T) {
 	}
 	if _, err := peerB.Write([]byte("x")); err == nil {
 		t.Fatal("expected newly registered connection to be rejected after abort")
+	}
+}
+
+func TestControlPlaneAbortConnectionsClosesOnlyOwnedUdpEndpoints(t *testing.T) {
+	oldPool := DefaultUdpEndpointPool
+	pool := NewUdpEndpointPool()
+	DefaultUdpEndpointPool = pool
+	t.Cleanup(func() {
+		pool.Close()
+		DefaultUdpEndpointPool = oldPool
+	})
+
+	owner := &controlPlaneCore{}
+	otherOwner := &controlPlaneCore{}
+	plane := &ControlPlane{core: owner}
+
+	newEndpoint := func(key UdpEndpointKey, endpointOwner udpConnStateOwner) (*UdpEndpoint, *scriptedPacketConn) {
+		conn := &scriptedPacketConn{
+			reads:   make(chan scriptedPacketRead),
+			closeCh: make(chan struct{}),
+		}
+		endpoint := &UdpEndpoint{
+			conn:              conn,
+			NatTimeout:        DefaultNatTimeout,
+			handler:           func(*UdpEndpoint, []byte, netip.AddrPort) error { return nil },
+			poolRef:           pool,
+			poolKey:           key,
+			udpConnStateOwner: endpointOwner,
+		}
+		endpoint.expiresAtNano.Store(time.Now().Add(time.Hour).UnixNano())
+		shard := pool.shardFor(key)
+		shard.mu.Lock()
+		shard.pool[key] = endpoint
+		shard.mu.Unlock()
+		return endpoint, conn
+	}
+
+	ownedKey := UdpEndpointKey{Src: netip.MustParseAddrPort("192.0.2.10:41000")}
+	foreignKey := UdpEndpointKey{Src: netip.MustParseAddrPort("192.0.2.11:41001")}
+	owned, ownedConn := newEndpoint(ownedKey, owner)
+	foreign, foreignConn := newEndpoint(foreignKey, otherOwner)
+
+	if err := plane.AbortConnections(); err != nil {
+		t.Fatalf("AbortConnections() error = %v", err)
+	}
+	if !owned.IsDead() {
+		t.Fatal("expected old-generation UDP endpoint to be retired")
+	}
+	if _, ok := pool.Get(ownedKey); ok {
+		t.Fatal("expected old-generation UDP endpoint to be removed from the pool")
+	}
+	waitForCloseSignal(t, ownedConn.closeCh, "AbortConnections closes old-generation UDP endpoint")
+
+	if foreign.IsDead() {
+		t.Fatal("unexpected retirement of endpoint owned by another generation")
+	}
+	if got, ok := pool.Get(foreignKey); !ok || got != foreign {
+		t.Fatalf("foreign endpoint after AbortConnections() = (%v, %v), want retained endpoint", got, ok)
+	}
+	select {
+	case <-foreignConn.closeCh:
+		t.Fatal("unexpected close of endpoint owned by another generation")
+	default:
+	}
+}
+
+func TestControlPlaneAbortConnectionsWaitsForInflightUdpEndpointCreation(t *testing.T) {
+	oldPool := DefaultUdpEndpointPool
+	pool := NewUdpEndpointPool()
+	DefaultUdpEndpointPool = pool
+	t.Cleanup(func() {
+		pool.Close()
+		DefaultUdpEndpointPool = oldPool
+	})
+
+	conn := &scriptedPacketConn{
+		reads:   make(chan scriptedPacketRead),
+		closeCh: make(chan struct{}),
+	}
+	dialStarted := make(chan struct{})
+	releaseDial := make(chan struct{})
+	d, underlay := newFactoryProxyEndpointDialer("hysteria2", "proxy.example:443", func() netproxy.Conn {
+		close(dialStarted)
+		<-releaseDial
+		return conn
+	})
+	owner := &controlPlaneCore{}
+	plane := newUdpReuseSimulationControlPlane(newTestFixedOutboundGroup(d))
+	plane.core = owner
+	plane.ctx = context.Background()
+
+	src := netip.MustParseAddrPort("192.0.2.20:42000")
+	dst := netip.MustParseAddrPort("198.51.100.20:443")
+	payload := []byte{0x01, 0x02, 0x03}
+	flowDecision := ClassifyUdpFlow(src, dst, payload)
+	key := flowDecision.EndpointKeyForDialWithScope("", udpEndpointRouteScope{}, false)
+	routingResult := &bpfRoutingResult{Outbound: uint8(consts.OutboundUserDefinedMin)}
+
+	handleDone := make(chan error, 1)
+	go func() {
+		handleDone <- plane.handlePkt(nil, payload, src, dst, routingResult, flowDecision, false)
+	}()
+	select {
+	case <-dialStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for UDP endpoint creation to begin")
+	}
+
+	abortDone := make(chan error, 1)
+	go func() {
+		abortDone <- plane.AbortConnections()
+	}()
+	waitForCondition(t, time.Second, "UDP endpoint admission to close", func() bool {
+		return plane.udpEndpointAdmission.closed.Load()
+	})
+	select {
+	case err := <-abortDone:
+		t.Fatalf("AbortConnections returned before in-flight creation completed: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseDial)
+	select {
+	case err := <-handleDone:
+		if err != nil {
+			t.Fatalf("handlePkt() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for in-flight UDP endpoint creation")
+	}
+	select {
+	case err := <-abortDone:
+		if err != nil {
+			t.Fatalf("AbortConnections() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for AbortConnections")
+	}
+
+	if _, ok := pool.Get(key); ok {
+		t.Fatal("expected endpoint created during abort to be removed from the pool")
+	}
+	waitForCloseSignal(t, conn.closeCh, "AbortConnections closes in-flight created UDP endpoint")
+	if got := underlay.calls.Load(); got != 1 {
+		t.Fatalf("dial calls after abort = %d, want 1", got)
+	}
+
+	if err := plane.handlePkt(nil, payload, src, dst, routingResult, flowDecision, false); err != nil {
+		t.Fatalf("handlePkt() after abort error = %v", err)
+	}
+	if got := underlay.calls.Load(); got != 1 {
+		t.Fatalf("dial calls after abort admission rejection = %d, want 1", got)
 	}
 }
 
@@ -343,6 +499,122 @@ func TestStartPreparedDNSListenerWaitsForDNSAvailabilityBeforeReuseHook(t *testi
 	case <-reuseCalled:
 	default:
 		t.Fatal("expected DNS reuse hook to run after upstream availability")
+	}
+}
+
+func TestStartPreparedDNSListenerAbortsCutoverWhenUpstreamUnavailable(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var reuseCalls atomic.Int32
+	var startCalls atomic.Int32
+	cp := &ControlPlane{
+		ctx: ctx,
+		controlPlaneDNSRuntime: controlPlaneDNSRuntime{
+			dnsUpstreamAvailable:  make(chan struct{}),
+			delayDNSListenerStart: true,
+			preparedDNSReuseHook: func() error {
+				reuseCalls.Add(1)
+				return nil
+			},
+			preparedDNSStartHook: func() error {
+				startCalls.Add(1)
+				return nil
+			},
+		},
+	}
+
+	err := cp.StartPreparedDNSListener()
+	if !stderrors.Is(err, context.Canceled) {
+		t.Fatalf("StartPreparedDNSListener() error = %v, want context canceled", err)
+	}
+	if reuseCalls.Load() != 0 || startCalls.Load() != 0 {
+		t.Fatalf("prepared DNS hooks ran after warmup failure: reuse=%d start=%d", reuseCalls.Load(), startCalls.Load())
+	}
+	if !cp.delayDNSListenerStart {
+		t.Fatal("prepared DNS listener started after warmup failure")
+	}
+	if cp.dnsListenerStopRegistered {
+		t.Fatal("prepared DNS listener registered cleanup after warmup failure")
+	}
+}
+
+func TestStartPreparedDNSListenerAbortsCutoverOnUpstreamAvailabilityTimeout(t *testing.T) {
+	var reuseCalls atomic.Int32
+	var startCalls atomic.Int32
+	cp := &ControlPlane{
+		ctx: context.Background(),
+		controlPlaneDNSRuntime: controlPlaneDNSRuntime{
+			dnsUpstreamAvailable:  make(chan struct{}),
+			delayDNSListenerStart: true,
+			preparedDNSReuseHook: func() error {
+				reuseCalls.Add(1)
+				return nil
+			},
+			preparedDNSStartHook: func() error {
+				startCalls.Add(1)
+				return nil
+			},
+		},
+	}
+
+	err := cp.startPreparedDNSListenerWithWarmupTimeout(context.Background(), nil, &cp.deferFuncs, nil, time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "dns upstream availability timed out") {
+		t.Fatalf("startPreparedDNSListenerWithWarmupTimeout() error = %v, want availability timeout", err)
+	}
+	if reuseCalls.Load() != 0 || startCalls.Load() != 0 {
+		t.Fatalf("prepared DNS hooks ran after warmup timeout: reuse=%d start=%d", reuseCalls.Load(), startCalls.Load())
+	}
+	if !cp.delayDNSListenerStart || cp.dnsListenerStopRegistered {
+		t.Fatalf("prepared DNS listener state after warmup timeout = (delayed=%v cleanup=%v), want unchanged", cp.delayDNSListenerStart, cp.dnsListenerStopRegistered)
+	}
+}
+
+func TestStartPreparedDNSListenerAllowsAvailableListenerReuse(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+
+	oldCP := &ControlPlane{log: logger}
+	listener := &DNSListener{log: logger, endpoint: Endpoint{UDP: true, Addr: "0.0.0.0:53"}}
+	listener.SwapController(oldCP)
+	oldCP.dnsListener = listener
+
+	var startCalls atomic.Int32
+	newCP := &ControlPlane{
+		log: logger,
+		ctx: context.Background(),
+		controlPlaneDNSRuntime: controlPlaneDNSRuntime{
+			dnsListener:           &DNSListener{log: logger, endpoint: Endpoint{UDP: true, Addr: "0.0.0.0:53"}},
+			dnsUpstreamAvailable:  make(chan struct{}),
+			delayDNSListenerStart: true,
+		},
+	}
+	close(newCP.dnsUpstreamAvailable)
+	newCP.preparedDNSReuseHook = func() error {
+		if !newCP.ReuseDNSListenerFrom(oldCP) {
+			return stderrors.New("reuse DNS listener")
+		}
+		return nil
+	}
+	newCP.preparedDNSStartHook = func() error {
+		startCalls.Add(1)
+		return nil
+	}
+
+	if err := newCP.StartPreparedDNSListener(); err != nil {
+		t.Fatalf("StartPreparedDNSListener() error = %v", err)
+	}
+	if oldCP.dnsListener != nil || newCP.dnsListener != listener {
+		t.Fatal("available prepared DNS listener reuse did not transfer ownership")
+	}
+	if newCP.delayDNSListenerStart {
+		t.Fatal("available prepared DNS listener reuse left delayed start enabled")
+	}
+	if !newCP.dnsListenerStopRegistered {
+		t.Fatal("available prepared DNS listener reuse did not register cleanup")
+	}
+	if startCalls.Load() != 0 {
+		t.Fatalf("prepared DNS start hook calls = %d, want 0 after listener reuse", startCalls.Load())
 	}
 }
 
@@ -809,6 +1081,98 @@ func TestInheritDialerHealthFromReturnsFalseWhenNoOverlap(t *testing.T) {
 
 	if got := newCP.InheritDialerHealthFrom(oldCP); got {
 		t.Fatal("expected InheritDialerHealthFrom to return false when no dialers overlap")
+	}
+}
+
+func TestInheritDialerHealthFromSnapshotIsolatedFromOldGenerationFlap(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+
+	newTestDialer := func(name string) *dialer.Dialer {
+		return dialer.NewDialer(
+			direct.SymmetricDirect,
+			&dialer.GlobalOption{
+				Log:            logger,
+				CheckInterval:  30 * time.Second,
+				CheckTolerance: time.Second,
+			},
+			dialer.InstanceOption{},
+			&dialer.Property{Property: D.Property{Name: name}},
+		)
+	}
+	newGroup := func(name string, members ...*dialer.Dialer) *outbound.DialerGroup {
+		annotations := make([]*dialer.Annotation, len(members))
+		for i := range annotations {
+			annotations[i] = &dialer.Annotation{}
+		}
+		return outbound.NewDialerGroup(
+			&dialer.GlobalOption{
+				Log:            logger,
+				CheckInterval:  30 * time.Second,
+				CheckTolerance: time.Second,
+			},
+			name,
+			members,
+			annotations,
+			outbound.DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinLastLatency},
+			func(bool, *dialer.NetworkType, bool) {},
+		)
+	}
+
+	oldA := newTestDialer("node-a")
+	oldB := newTestDialer("node-b")
+	firstA := newTestDialer("node-a")
+	firstB := newTestDialer("node-b")
+	secondA := newTestDialer("node-a")
+	secondB := newTestDialer("node-b")
+	for _, d := range []*dialer.Dialer{oldA, oldB, firstA, firstB, secondA, secondB} {
+		t.Cleanup(func() { _ = d.Close() })
+	}
+
+	oldGroup := newGroup("group-a", oldA, oldB)
+	firstGroup := newGroup("group-a", firstA, firstB)
+	secondGroup := newGroup("group-a", secondA, secondB)
+	for _, group := range []*outbound.DialerGroup{oldGroup, firstGroup, secondGroup} {
+		t.Cleanup(func() { _ = group.Close() })
+	}
+
+	udp4 := &dialer.NetworkType{
+		L4Proto:         consts.L4ProtoStr_UDP,
+		IpVersion:       consts.IpVersionStr_4,
+		UdpHealthDomain: dialer.UdpHealthDomainData,
+	}
+	oldA.ReportUnavailableForced(udp4, nil)
+	oldA.NotifyHealthCheckResult(udp4, false, false)
+	if oldA.MustGetAlive(udp4) {
+		t.Fatal("expected old node-a to be unavailable before preparing the first candidate")
+	}
+
+	oldCP := &ControlPlane{controlPlaneGenerationState: controlPlaneGenerationState{outbounds: []*outbound.DialerGroup{oldGroup}}}
+	firstCP := &ControlPlane{controlPlaneGenerationState: controlPlaneGenerationState{outbounds: []*outbound.DialerGroup{firstGroup}}}
+	if !firstCP.InheritDialerHealthFrom(oldCP) {
+		t.Fatal("expected first candidate to inherit overlapping dialer health")
+	}
+	if firstA.MustGetAlive(udp4) {
+		t.Fatal("expected first candidate to retain the prepared unavailable snapshot while node-b is healthy")
+	}
+
+	// The old generation may continue to receive health checks while a candidate
+	// is prepared or a reload rolls back. Its later result must not mutate the
+	// candidate's copied health state.
+	oldA.ReportAvailableTraffic(udp4)
+	if !oldA.MustGetAlive(udp4) {
+		t.Fatal("expected old node-a to recover during the simulated health flap")
+	}
+	if firstA.MustGetAlive(udp4) {
+		t.Fatal("old-generation health flap changed the already prepared candidate")
+	}
+
+	secondCP := &ControlPlane{controlPlaneGenerationState: controlPlaneGenerationState{outbounds: []*outbound.DialerGroup{secondGroup}}}
+	if !secondCP.InheritDialerHealthFrom(oldCP) {
+		t.Fatal("expected later candidate to inherit overlapping dialer health")
+	}
+	if !secondA.MustGetAlive(udp4) {
+		t.Fatal("expected later candidate to observe the recovered source snapshot")
 	}
 }
 

@@ -49,8 +49,12 @@
 #define MAX_MATCH_SET_LEN \
 	(32 * 32) // Should be sync with common/consts/ebpf_sync_spec.json.
 #endif
+#define ROUTING_EPOCH_SLOT_NUM 2
+#define ROUTING_EPOCH_SLOT_UNKNOWN 0
+#define ROUTING_EPOCH_SLOT_RESULT_SHIFT 41
+#define ROUTING_EPOCH_SLOT_RESULT_MASK 0x3
 #define MAX_LPM_SIZE 2048000
-#define MAX_LPM_NUM (MAX_MATCH_SET_LEN + 8)
+#define MAX_LPM_NUM (ROUTING_EPOCH_SLOT_NUM * MAX_MATCH_SET_LEN + 8)
 #define MAX_CONN_STATE_NUM (65536 * 4)
 #define MAX_REDIRECT_TRACK_NUM 65536
 #define MAX_ROUTING_HANDOFF_NUM 65536
@@ -134,7 +138,31 @@ struct routing_result {
 	__u8 pname[TASK_COMM_LEN];
 	__u32 pid;
 	__u8 dscp;
+	// 0 is unknown; active routing slots 0 and 1 are encoded as 1 and 2.
+	__u8 routing_epoch_slot;
+	__u8 padding[2];
 };
+
+static __always_inline __u8 routing_epoch_slot_encode(__u32 slot)
+{
+	if (slot >= ROUTING_EPOCH_SLOT_NUM)
+		return ROUTING_EPOCH_SLOT_UNKNOWN;
+	return (__u8)(slot + 1);
+}
+
+static __always_inline __u8 routing_epoch_slot_sanitize(__u8 encoded_slot)
+{
+	return encoded_slot <= ROUTING_EPOCH_SLOT_NUM ? encoded_slot :
+		ROUTING_EPOCH_SLOT_UNKNOWN;
+}
+
+static __always_inline __u8
+routing_epoch_slot_from_route_result(__s64 route_result)
+{
+	return routing_epoch_slot_sanitize(
+		(__u8)(((__u64)route_result >> ROUTING_EPOCH_SLOT_RESULT_SHIFT) &
+		       ROUTING_EPOCH_SLOT_RESULT_MASK));
+}
 
 struct tuples_key {
 	union ip6 sip;
@@ -271,29 +299,50 @@ struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__type(key, __u32);
 	__type(value, struct match_set);
-	__uint(max_entries, MAX_MATCH_SET_LEN);
+	__uint(max_entries, ROUTING_EPOCH_SLOT_NUM * MAX_MATCH_SET_LEN);
 	// __uint(pinning, LIBBPF_PIN_BY_NAME);
 } routing_map SEC(".maps");
 
-// key=0: active routing rules length in routing_map.
+// Each slot holds the active routing rules length for that epoch.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, __u32);
+	__uint(max_entries, ROUTING_EPOCH_SLOT_NUM);
+} routing_meta_map SEC(".maps");
+
+// key=0: active routing epoch slot. The zero-initialized value selects slot 0.
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__type(key, __u32);
 	__type(value, __u32);
 	__uint(max_entries, 1);
-} routing_meta_map SEC(".maps");
+} active_routing_epoch_map SEC(".maps");
+
+// Slot-to-policy-epoch metadata. It is populated before the slot is published.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, __u64);
+	__uint(max_entries, ROUTING_EPOCH_SLOT_NUM);
+} routing_epoch_map SEC(".maps");
 
 struct domain_routing {
 	__u32 bitmap[MAX_MATCH_SET_LEN / 32];
 };
 
-// domain_routing_map: domain → routing bitmap cache (HASH, no LRU).
+struct routing_epoch_ip {
+	__u32 slot;
+	__be32 addr[4];
+};
+
+// domain_routing_map: epoch+address → routing bitmap cache (HASH, no LRU).
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
-	__type(key, __be32[4]);
+	__type(key, struct routing_epoch_ip);
 	__type(value, struct domain_routing);
-	__uint(max_entries, MAX_DOMAIN_ROUTING_NUM);
+	__uint(max_entries, ROUTING_EPOCH_SLOT_NUM * MAX_DOMAIN_ROUTING_NUM);
 } domain_routing_map SEC(".maps");
 
 struct ip_port_proto {
@@ -379,6 +428,9 @@ struct conn_state {
 	__u8 padding[2];           // Alignment
 	__u8 pname[TASK_COMM_LEN]; // Process name (for WAN egress; empty for LAN)
 	__u32 pid;                 // Process ID (for WAN egress; 0 for LAN)
+	// 0 is unknown; active routing slots 0 and 1 are encoded as 1 and 2.
+	__u8 routing_epoch_slot;
+	__u8 padding_after_pid[3];
 };
 
 struct {
@@ -1027,6 +1079,7 @@ struct route_ctx {
 	struct lpm_key lpm_key_saddr, lpm_key_daddr, lpm_key_mac;
 	__u32 domain_word_idx;
 	__u32 domain_word_bits;
+	__u32 routing_epoch_slot;
 	bool domain_word_cached;
 	__u8 route_state;
 };
@@ -1077,7 +1130,8 @@ struct conntrack_args {
 	__u32 mark;
 	__u32 pid;
 	__u8 mac[6];
-	__u8 padding[2];
+	__u8 routing_epoch_slot;
+	__u8 padding;
 	__u8 pname[TASK_COMM_LEN];
 };
 
@@ -1091,7 +1145,8 @@ struct {
 static __always_inline void
 conntrack_args_set(struct conntrack_args *a,
 		   __u8 *outbound, __u32 *mark, __u8 *must, __u8 *mac,
-		   __u8 dscp, const char *pname, __u32 pid)
+		   __u8 dscp, const char *pname, __u32 pid,
+		   __u8 routing_epoch_slot)
 {
 	__u8 flags = 0;
 
@@ -1100,6 +1155,7 @@ conntrack_args_set(struct conntrack_args *a,
 	a->dscp = dscp;
 	a->mark = 0;
 	a->pid = 0;
+	a->routing_epoch_slot = ROUTING_EPOCH_SLOT_UNKNOWN;
 	__builtin_memset(a->mac, 0, sizeof(a->mac));
 	__builtin_memset(a->pname, 0, sizeof(a->pname));
 
@@ -1108,6 +1164,8 @@ conntrack_args_set(struct conntrack_args *a,
 		a->outbound = *outbound;
 		a->mark = *mark;
 		a->must = *must;
+		a->routing_epoch_slot =
+			routing_epoch_slot_sanitize(routing_epoch_slot);
 	}
 	if (mac) {
 		flags |= CT_ARGS_HAS_MAC;
@@ -1132,8 +1190,18 @@ route_match_lpm(struct route_ctx *ctx, const struct match_set *match_set,
 		struct lpm_key *lpm_key)
 {
 	struct map_lpm_type *lpm;
+	__u32 lpm_index;
 
-	lpm = bpf_map_lookup_elem(&lpm_array_map, &match_set->index);
+	if (unlikely(ctx->routing_epoch_slot >= ROUTING_EPOCH_SLOT_NUM ||
+		     match_set->index >= MAX_MATCH_SET_LEN)) {
+		ctx->result = -EFAULT;
+		return 1;
+	}
+
+	lpm_index = ctx->routing_epoch_slot * MAX_MATCH_SET_LEN +
+		match_set->index;
+
+	lpm = bpf_map_lookup_elem(&lpm_array_map, &lpm_index);
 	if (unlikely(!lpm)) {
 		ctx->result = -EFAULT;
 		return 1;
@@ -1159,20 +1227,24 @@ route_select_lpm_key(struct route_ctx *ctx, __u8 match_type)
 static __always_inline int route_match_domain_set(struct route_ctx *ctx,
 						  __u32 index)
 {
-	__u32 bitmap_word_idx = index / 32;
+	__u32 bitmap_word_idx;
 	struct domain_routing *domain_routing;
 
-	if (unlikely(bitmap_word_idx >= MAX_MATCH_SET_LEN / 32)) {
+	if (unlikely(index >= MAX_MATCH_SET_LEN)) {
 		ctx->result = -EFAULT;
 		return 1;
 	}
+	bitmap_word_idx = index >> 5;
 
 	if (!ctx->domain_word_cached || ctx->domain_word_idx != bitmap_word_idx) {
 		// Refresh one 32-rule bitmap word at a time.
-		__be32 daddr[4];
+		struct routing_epoch_ip daddr = {
+			.slot = ctx->routing_epoch_slot,
+		};
 
-		__builtin_memcpy(daddr, ctx->lpm_key_daddr.data, sizeof(daddr));
-		domain_routing = bpf_map_lookup_elem(&domain_routing_map, daddr);
+		__builtin_memcpy(daddr.addr, ctx->lpm_key_daddr.data,
+				 sizeof(daddr.addr));
+		domain_routing = bpf_map_lookup_elem(&domain_routing_map, &daddr);
 		ctx->domain_word_idx = bitmap_word_idx;
 		if (domain_routing)
 			ctx->domain_word_bits =
@@ -1380,16 +1452,25 @@ static __noinline int route_loop_cb(__u32 index, void *data)
 	const __u32 *pname = &ctx->flag[2];
 	__u8 is_wan = ctx->is_wan;
 	__u8 dscp = ctx->flag[6];
+	volatile __u32 logical_index;
 
 	// Rule is like: domain(suffix:baidu.com, suffix:google.com) && port(443) ->
 	// proxy Subrule is like: domain(suffix:baidu.com, suffix:google.com) Match
 	// set is like: suffix:baidu.com
-	if (unlikely(index >= MAX_MATCH_SET_LEN)) {
+	// Preserve the callback's u32 bound in the verifier.
+	logical_index = index;
+
+	if (unlikely(logical_index >= MAX_MATCH_SET_LEN)) {
 		ctx->result = -EFAULT;
 		return 1;
 	}
 
-	__u32 k = index; // Clone to pass code checker.
+	if (unlikely(ctx->routing_epoch_slot >= ROUTING_EPOCH_SLOT_NUM)) {
+		ctx->result = -EFAULT;
+		return 1;
+	}
+
+	__u32 k = ctx->routing_epoch_slot * MAX_MATCH_SET_LEN + logical_index;
 
 	match_set = bpf_map_lookup_elem(&routing_map, &k);
 	if (unlikely(!match_set)) {
@@ -1399,7 +1480,7 @@ static __noinline int route_loop_cb(__u32 index, void *data)
 
 	if (!(ctx->route_state &
 	      (ROUTE_STATE_BAD_RULE | ROUTE_STATE_GOOD_SUBRULE))) {
-		if (route_eval_match(ctx, match_set, k, l4proto_type,
+		if (route_eval_match(ctx, match_set, logical_index, l4proto_type,
 				     ipversion_type, pname, is_wan, dscp))
 			return 1;
 	} else {
@@ -1467,10 +1548,21 @@ static __noinline __s64 route(const __u32 *flag, const void *l4hdr,
 			 IPV6_BYTE_LENGTH);
 	__builtin_memcpy(ctx->lpm_key_mac.data, mac, IPV6_BYTE_LENGTH);
 
+	__u32 active_routing_epoch_slot = 0;
+	__u32 *active_routing_epoch_slot_ptr =
+		bpf_map_lookup_elem(&active_routing_epoch_map, &zero_key);
 	__u32 active_rules_len = MAX_MATCH_SET_LEN;
 	__u32 *active_rules_len_ptr =
-		bpf_map_lookup_elem(&routing_meta_map, &zero_key);
+		NULL;
 	int ret;
+
+	if (active_routing_epoch_slot_ptr) {
+		active_routing_epoch_slot = *active_routing_epoch_slot_ptr;
+		if (unlikely(active_routing_epoch_slot >= ROUTING_EPOCH_SLOT_NUM))
+			return -EFAULT;
+	}
+	ctx->routing_epoch_slot = active_routing_epoch_slot;
+	active_rules_len_ptr = bpf_map_lookup_elem(&routing_meta_map, &active_routing_epoch_slot);
 
 	if (active_rules_len_ptr && *active_rules_len_ptr <= MAX_MATCH_SET_LEN)
 		active_rules_len = *active_rules_len_ptr;
@@ -1481,8 +1573,12 @@ static __noinline __s64 route(const __u32 *flag, const void *l4hdr,
 	ret = bpf_loop(active_rules_len, route_loop_cb, &loop_ctx, 0);
 	if (unlikely(ret < 0))
 		return ret;
-	if (ctx->result >= 0)
-		return ctx->result;
+	if (ctx->result >= 0) {
+		// Preserve the policy slot alongside the existing packed result bits.
+		return ctx->result |
+		       ((__s64)routing_epoch_slot_encode(ctx->routing_epoch_slot)
+			<< ROUTING_EPOCH_SLOT_RESULT_SHIFT);
+	}
 #ifdef __DEBUG_ROUTING
 	bpf_printk(
 		"No match_set hits. Did coder forget to sync common/consts/ebpf_sync_spec.json with enum MatchType?");
@@ -1555,7 +1651,8 @@ static __always_inline void
 fill_routing_result(struct routing_result *dst,
 		    __u32 mark, __u8 must, __u8 outbound,
 		    const __u8 mac[6], __u8 dscp,
-		    const char *pname, __u32 pid)
+		    const char *pname, __u32 pid,
+		    __u8 routing_epoch_slot)
 {
 	__builtin_memset(dst, 0, sizeof(*dst));
 	dst->mark = mark;
@@ -1563,6 +1660,8 @@ fill_routing_result(struct routing_result *dst,
 	dst->outbound = outbound;
 	dst->pid = pid;
 	dst->dscp = dscp;
+	dst->routing_epoch_slot =
+		routing_epoch_slot_sanitize(routing_epoch_slot);
 	if (mac)
 		__builtin_memcpy(dst->mac, mac, sizeof(dst->mac));
 	if (pname)
@@ -1756,6 +1855,7 @@ __mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 				__builtin_memcpy(state->pname, args->pname,
 						 TASK_COMM_LEN);
 			state->pid = args->pid;
+			state->routing_epoch_slot = args->routing_epoch_slot;
 			publish_routing_meta(&state->meta, meta);
 		}
 		return state;
@@ -1778,6 +1878,7 @@ __mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 		if (args->flags & CT_ARGS_HAS_PNAME)
 			__builtin_memcpy(new_state.pname, args->pname,
 					 TASK_COMM_LEN);
+		new_state.routing_epoch_slot = args->routing_epoch_slot;
 	}
 
 	int ret = bpf_map_update_elem(&conn_state_map, key,
@@ -1806,7 +1907,8 @@ __mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 static __always_inline struct conn_state *
 mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 	      __u8 *outbound, __u32 *mark, __u8 *must, __u8 *mac,
-	      __u8 dscp, const char *pname, __u32 pid)
+	      __u8 dscp, const char *pname, __u32 pid,
+	      __u8 routing_epoch_slot)
 {
 	__u32 zero = 0;
 	struct conntrack_args *args =
@@ -1814,7 +1916,8 @@ mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 
 	if (unlikely(!args))
 		return NULL;
-	conntrack_args_set(args, outbound, mark, must, mac, dscp, pname, pid);
+	conntrack_args_set(args, outbound, mark, must, mac, dscp, pname, pid,
+			   routing_epoch_slot);
 	return __mark_udp_seen(key, is_wan_ingress_direction, args);
 }
 
@@ -1886,6 +1989,7 @@ __mark_tcp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 				__builtin_memcpy(state->pname, args->pname,
 						 TASK_COMM_LEN);
 			state->pid = args->pid;
+			state->routing_epoch_slot = args->routing_epoch_slot;
 			publish_routing_meta(&state->meta, meta);
 		}
 
@@ -1913,6 +2017,7 @@ __mark_tcp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 			if (args->flags & CT_ARGS_HAS_PNAME)
 				__builtin_memcpy(new_state.pname, args->pname,
 						 TASK_COMM_LEN);
+			new_state.routing_epoch_slot = args->routing_epoch_slot;
 		}
 
 		int ret = bpf_map_update_elem(&conn_state_map, key,
@@ -1946,7 +2051,8 @@ static __always_inline struct conn_state *
 mark_tcp_seen(struct tuples_key *key, const struct tcphdr *tcph,
 	      bool is_wan_ingress_direction,
 	      __u8 *outbound, __u32 *mark, __u8 *must, __u8 *mac,
-	      __u8 dscp, const char *pname, __u32 pid)
+	      __u8 dscp, const char *pname, __u32 pid,
+	      __u8 routing_epoch_slot)
 {
 	__u32 zero = 0;
 	struct conntrack_args *args =
@@ -1954,7 +2060,8 @@ mark_tcp_seen(struct tuples_key *key, const struct tcphdr *tcph,
 
 	if (unlikely(!args))
 		return NULL;
-	conntrack_args_set(args, outbound, mark, must, mac, dscp, pname, pid);
+	conntrack_args_set(args, outbound, mark, must, mac, dscp, pname, pid,
+			   routing_epoch_slot);
 
 	__u8 tcp_flags = 0;
 
@@ -2010,7 +2117,7 @@ static __noinline int do_tproxy_lan_egress(struct __sk_buff *skb, __u32 link_h_l
 		// janitor backstop expires.
 		mark_tcp_seen(&reversed_tuples_key, &ctx->tcph, true,
 			      NULL, NULL, NULL, NULL,
-			      0, NULL, 0);
+			      0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 	} else if (ctx->l4proto == IPPROTO_UDP) {
 		if (ctx->udph.source == bpf_htons(53) || ctx->udph.dest == bpf_htons(53))
 			return TC_ACT_PIPE;
@@ -2023,7 +2130,7 @@ static __noinline int do_tproxy_lan_egress(struct __sk_buff *skb, __u32 link_h_l
 		copy_reversed_tuples(&tuples.five, &reversed_tuples_key);
 		mark_udp_seen(&reversed_tuples_key, true,
 			      NULL, NULL, NULL, NULL,
-			      0, NULL, 0);
+			      0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 	}
 
 	return TC_ACT_PIPE;
@@ -2048,7 +2155,8 @@ wan_outbound_is_alive(struct __sk_buff *skb, __u8 outbound, __u8 l4proto,
 static __noinline int
 redirect_lan_packet_to_control_plane(struct __sk_buff *skb, __u32 link_h_len,
 				     struct parsed_packet *pkt,
-				     __u64 routing_meta_raw)
+				     __u64 routing_meta_raw,
+				     __u8 routing_epoch_slot)
 {
 	union routing_meta routing_meta = {
 		.raw = routing_meta_raw,
@@ -2068,6 +2176,8 @@ redirect_lan_packet_to_control_plane(struct __sk_buff *skb, __u32 link_h_len,
 	handoff.result.must = routing_meta.data.must;
 	handoff.result.outbound = routing_meta.data.outbound;
 	handoff.result.dscp = routing_meta.data.dscp;
+	handoff.result.routing_epoch_slot =
+		routing_epoch_slot_sanitize(routing_epoch_slot);
 	__builtin_memcpy(handoff.result.mac, pkt->ethh.h_source, 6);
 	bpf_map_update_elem(&routing_handoff_map, &pkt->tuples.five,
 			    &handoff, BPF_ANY);
@@ -2117,7 +2227,8 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 		// Track TCP connection state; reuse returned pointer.
 		tcp_state = mark_tcp_seen(&pkt->tuples.five, &pkt->tcph, false,
 					  NULL, NULL, NULL, NULL,
-					  0, NULL, 0);
+					  0, NULL, 0,
+					  ROUTING_EPOCH_SLOT_UNKNOWN);
 		// No cached state for an established packet: keep the historical
 		// passthrough behavior instead of recomputing routing.
 		if (!tcp_state)
@@ -2148,7 +2259,8 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 					   pkt->tuples.five.dport))
 			return TC_ACT_SHOT;
 		return redirect_lan_packet_to_control_plane(
-			skb, link_h_len, pkt, tcp_state->meta.raw);
+			skb, link_h_len, pkt, tcp_state->meta.raw,
+			tcp_state->routing_epoch_slot);
 	}
 
 	// Routing for new connection.
@@ -2162,14 +2274,16 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 		// cascade deletion when the connection expires.
 		tcp_state = mark_tcp_seen(&pkt->tuples.five, &pkt->tcph, false,
 					  NULL, NULL, NULL, NULL,
-					  pkt->tuples.dscp, NULL, 0);
+					  pkt->tuples.dscp, NULL, 0,
+					  ROUTING_EPOCH_SLOT_UNKNOWN);
 		route_flag[0] = L4ProtoType_TCP;
 	} else {
 		if (!is_short_lived_udp_traffic(&pkt->tuples.five)) {
 			// Fast path: Check conn state for established UDP flows
 			udp_state = mark_udp_seen(&pkt->tuples.five, false,
 						  NULL, NULL, NULL, NULL,
-						  pkt->tuples.dscp, NULL, 0);
+						  pkt->tuples.dscp, NULL, 0,
+						  ROUTING_EPOCH_SLOT_UNKNOWN);
 			if (udp_state && udp_state->is_wan_ingress_direction) {
 				// Replay (outbound) of an inbound flow => direct.
 				return TC_ACT_OK;
@@ -2195,7 +2309,8 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 				// Update conn state timestamp for this fast path packet
 				udp_state->last_seen_ns = bpf_ktime_get_ns();
 				return redirect_lan_packet_to_control_plane(
-					skb, link_h_len, pkt, udp_state->meta.raw);
+					skb, link_h_len, pkt, udp_state->meta.raw,
+					udp_state->routing_epoch_slot);
 			}
 		}
 		route_flag[0] = L4ProtoType_UDP;
@@ -2288,6 +2403,8 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 	__u8 outbound = s64_ret & 0xff;
 	__u32 mark = s64_ret >> 8;
 	__u8 must = (s64_ret >> 40) & 1;
+	__u8 routing_epoch_slot =
+		routing_epoch_slot_from_route_result(s64_ret);
 
 	// Cache routing in conn state (skip DNS to avoid map churn).
 	if (pkt->l4proto == IPPROTO_UDP &&
@@ -2296,12 +2413,14 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 	} else if (pkt->l4proto == IPPROTO_TCP && tcp_state) {
 		// Directly update the TCP conn state we already looked up
 		__builtin_memcpy(tcp_state->mac, pkt->ethh.h_source, 6);
+		tcp_state->routing_epoch_slot = routing_epoch_slot;
 		union routing_meta _m = build_routing_meta(outbound, mark, must,
-							    pkt->tuples.dscp);
+						    pkt->tuples.dscp);
 		publish_routing_meta(&tcp_state->meta, _m);
 	} else if (pkt->l4proto == IPPROTO_UDP && udp_state) {
 		// Directly update the UDP conn state we already looked up
 		__builtin_memcpy(udp_state->mac, pkt->ethh.h_source, 6);
+		udp_state->routing_epoch_slot = routing_epoch_slot;
 		union routing_meta _m = build_routing_meta(outbound, mark, must,
 							    pkt->tuples.dscp);
 		publish_routing_meta(&udp_state->meta, _m);
@@ -2359,7 +2478,8 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 		goto block;
 	return redirect_lan_packet_to_control_plane(
 		skb, link_h_len, pkt,
-		build_routing_meta(outbound, mark, must, pkt->tuples.dscp).raw);
+		build_routing_meta(outbound, mark, must, pkt->tuples.dscp).raw,
+		routing_epoch_slot);
 
 direct:
 	return TC_ACT_OK;
@@ -2444,7 +2564,7 @@ static __noinline int do_tproxy_wan_ingress(struct __sk_buff *skb, __u32 link_h_
 		copy_reversed_tuples(&tuples.five, &reversed_tuples_key);
 		mark_tcp_seen(&reversed_tuples_key, &ctx->tcph, true,
 			      NULL, NULL, NULL, NULL,
-			      0, NULL, 0);
+			      0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 	} else if (ctx->l4proto == IPPROTO_UDP) {
 		if (ctx->udph.source == bpf_htons(53) || ctx->udph.dest == bpf_htons(53))
 			return TC_ACT_PIPE;
@@ -2457,7 +2577,7 @@ static __noinline int do_tproxy_wan_ingress(struct __sk_buff *skb, __u32 link_h_
 		copy_reversed_tuples(&tuples.five, &reversed_tuples_key);
 		mark_udp_seen(&reversed_tuples_key, true,
 			      NULL, NULL, NULL, NULL,
-			      0, NULL, 0);
+			      0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 	}
 
 	return TC_ACT_PIPE;
@@ -2518,6 +2638,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 	const char *handoff_pname = NULL;
 	__u32 handoff_pid = 0;
 	__u8 handoff_mac[6] = {};
+	__u8 routing_epoch_slot = ROUTING_EPOCH_SLOT_UNKNOWN;
 	__u32 scratch_key = 0;
 	struct wan_egress_route_scratch *scratch =
 		bpf_map_lookup_elem(&wan_egress_route_scratch_map, &scratch_key);
@@ -2562,6 +2683,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 		outbound = s64_ret & 0xff;
 		mark = s64_ret >> 8;
 		must = (s64_ret >> 40) & 1;
+		routing_epoch_slot = routing_epoch_slot_from_route_result(s64_ret);
 		scratch->must_val = must;
 
 		__u8 dscp = tuples->dscp;
@@ -2588,7 +2710,8 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 
 		struct conn_state *tcp_conn = mark_tcp_seen(
 			&tuples->five, tcph, false, outbound_ptr, mark_ptr,
-			must_ptr, scratch->mac, dscp, pname_str, pid_val);
+			must_ptr, scratch->mac, dscp, pname_str, pid_val,
+			routing_epoch_slot);
 
 		if (!tcp_conn) {
 			if (outbound == OUTBOUND_DIRECT && mark == 0)
@@ -2611,7 +2734,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 		struct conn_state *tcp_conn = mark_tcp_seen(
 			&tuples->five, tcph, false,
 			NULL, NULL, NULL, NULL,
-			0, NULL, 0);
+			0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 
 		if (!tcp_conn || !tcp_conn->meta.data.has_routing)
 			return TC_ACT_OK;
@@ -2623,6 +2746,8 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 		__builtin_memcpy(scratch->mac, tcp_conn->mac, 6);
 		handoff_pname = (const char *)tcp_conn->pname;
 		handoff_pid = tcp_conn->pid;
+		routing_epoch_slot =
+			routing_epoch_slot_sanitize(tcp_conn->routing_epoch_slot);
 	}
 
 	if (!wan_egress_needs_control_plane(outbound, mark)) {
@@ -2645,7 +2770,8 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 	struct routing_result routing_result = {};
 
 	fill_routing_result(&routing_result, mark, must, outbound, handoff_mac,
-			    tuples->dscp, handoff_pname, handoff_pid);
+			    tuples->dscp, handoff_pname, handoff_pid,
+			    routing_epoch_slot);
 	/* TCP has embedded conn-state routing metadata; handoff is best-effort. */
 	publish_routing_handoff(&tuples->five, &routing_result);
 
@@ -2673,6 +2799,7 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 	__u8 mac[6] = {};
 	const char *handoff_pname = NULL;
 	__u32 handoff_pid = 0;
+	__u8 routing_epoch_slot = ROUTING_EPOCH_SLOT_UNKNOWN;
 
 	__u32 scratch_key = 0;
 	struct wan_egress_route_scratch *scratch =
@@ -2687,14 +2814,14 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 	else
 		scratch->flag[1] = IpVersionType_6;
 	scratch->flag[6] = tuples->dscp;
-
 	if (pid_is_control_plane(skb, &pid_pname))
 		return TC_ACT_OK;
 
 	if (!is_short_lived_udp_traffic(&tuples->five)) {
 		udp_conn_state = mark_udp_seen(&tuples->five, false,
 					       NULL, NULL, NULL, NULL,
-					       0, NULL, 0);
+					       0, NULL, 0,
+					       ROUTING_EPOCH_SLOT_UNKNOWN);
 		if (udp_conn_state && udp_conn_state->is_wan_ingress_direction)
 			return TC_ACT_OK;
 
@@ -2705,6 +2832,8 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 			__builtin_memcpy(mac, udp_conn_state->mac, 6);
 			handoff_pname = (const char *)udp_conn_state->pname;
 			handoff_pid = udp_conn_state->pid;
+			routing_epoch_slot = routing_epoch_slot_sanitize(
+				udp_conn_state->routing_epoch_slot);
 			goto fast_path_skip_routing;
 		}
 	}
@@ -2740,6 +2869,7 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 	outbound = s64_ret & 0xff;
 	mark = s64_ret >> 8;
 	must = (s64_ret >> 40) & 1;
+	routing_epoch_slot = routing_epoch_slot_from_route_result(s64_ret);
 
 fast_path_skip_routing:
 		if (udp_conn_state && tuples->five.dport != bpf_htons(53)) {
@@ -2751,6 +2881,7 @@ fast_path_skip_routing:
 							 TASK_COMM_LEN);
 					udp_conn_state->pid = pid_pname->pid;
 				}
+				udp_conn_state->routing_epoch_slot = routing_epoch_slot;
 				union routing_meta _m = build_routing_meta(outbound,
 								   mark,
 								   must,
@@ -2783,7 +2914,8 @@ fast_path_skip_routing:
 							      udp_conn_state);
 
 	fill_routing_result(&routing_result, mark, must, outbound, mac,
-			    tuples->dscp, handoff_pname, handoff_pid);
+			    tuples->dscp, handoff_pname, handoff_pid,
+			    routing_epoch_slot);
 	if (publish_routing_handoff(&tuples->five, &routing_result) &&
 	    handoff_mandatory)
 		return TC_ACT_SHOT;

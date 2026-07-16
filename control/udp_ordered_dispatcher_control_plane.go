@@ -1,0 +1,41 @@
+/*
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
+ */
+
+package control
+
+func (c *ControlPlane) submitOrderedUDPIngress(key UdpFlowKey, run, discard UdpTask) bool {
+	if c != nil && c.udpOrderedDispatcher != nil {
+		return c.udpOrderedDispatcher.submit(key, run, discard)
+	}
+	return DefaultUdpTaskPool.EmitTask(key, run)
+}
+
+func (c *ControlPlane) closeUDPOrderedDispatcher() {
+	if c == nil || c.udpOrderedDispatcher == nil {
+		return
+	}
+	c.udpOrderedDispatcher.close()
+}
+
+func (c *ControlPlane) waitUDPOrderedDispatcher() {
+	if c == nil || c.udpOrderedDispatcher == nil {
+		return
+	}
+	c.udpOrderedDispatcher.wait()
+}
+
+func (c *ControlPlane) closeUDPReplyDispatcher() {
+	if c == nil || c.udpReplyDispatcher == nil {
+		return
+	}
+	c.udpReplyDispatcher.close()
+}
+
+func (c *ControlPlane) waitUDPReplyDispatcher() {
+	if c == nil || c.udpReplyDispatcher == nil {
+		return
+	}
+	c.udpReplyDispatcher.wait()
+}

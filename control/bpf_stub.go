@@ -8,6 +8,7 @@
 package control
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -43,6 +44,12 @@ type bpfDaeParam struct {
 type bpfDomainRouting struct {
 	_      structs.HostLayout
 	Bitmap [32]uint32
+}
+
+type bpfRoutingEpochIp struct {
+	_    structs.HostLayout
+	Slot uint32
+	Addr [4]uint32
 }
 
 type bpfMatchSet struct {
@@ -90,14 +97,16 @@ type bpfRedirectTuple struct {
 }
 
 type bpfRoutingResult struct {
-	_        structs.HostLayout
-	Mark     uint32
-	Must     uint8
-	Mac      [6]uint8
-	Outbound uint8
-	Pname    [16]uint8
-	Pid      uint32
-	Dscp     uint8
+	_                structs.HostLayout
+	Mark             uint32
+	Must             uint8
+	Mac              [6]uint8
+	Outbound         uint8
+	Pname            [16]uint8
+	Pid              uint32
+	Dscp             uint8
+	RoutingEpochSlot uint8
+	Padding          [2]uint8
 }
 
 type bpfRoutingHandoffEntry struct {
@@ -139,10 +148,12 @@ type bpfConnState struct {
 			HasRouting uint8
 		}
 	}
-	Mac   [6]uint8
-	_     [2]byte
-	Pname [16]uint8
-	Pid   uint32
+	Mac              [6]uint8
+	_                [2]byte
+	Pname            [16]uint8
+	Pid              uint32
+	RoutingEpochSlot uint8
+	PaddingAfterPid  [3]uint8
 }
 
 type bpfDaeEvent struct {
@@ -197,6 +208,7 @@ type bpfProgramSpecs struct {
 }
 
 type bpfMapSpecs struct {
+	ActiveRoutingEpochMap   *ebpf.MapSpec `ebpf:"active_routing_epoch_map"`
 	BpfStatsMap             *ebpf.MapSpec `ebpf:"bpf_stats_map"`
 	CookiePidMap            *ebpf.MapSpec `ebpf:"cookie_pid_map"`
 	DomainRoutingMap        *ebpf.MapSpec `ebpf:"domain_routing_map"`
@@ -208,6 +220,7 @@ type bpfMapSpecs struct {
 	RedirectTrack           *ebpf.MapSpec `ebpf:"redirect_track"`
 	RoutingHandoffMap       *ebpf.MapSpec `ebpf:"routing_handoff_map"`
 	RoutingMap              *ebpf.MapSpec `ebpf:"routing_map"`
+	RoutingEpochMap         *ebpf.MapSpec `ebpf:"routing_epoch_map"`
 	RoutingMetaMap          *ebpf.MapSpec `ebpf:"routing_meta_map"`
 	ConnStateMap            *ebpf.MapSpec `ebpf:"conn_state_map"`
 	UnusedLpmType           *ebpf.MapSpec `ebpf:"unused_lpm_type"`
@@ -232,6 +245,7 @@ func (o *bpfObjects) Close() error {
 }
 
 type bpfMaps struct {
+	ActiveRoutingEpochMap   *ebpf.Map `ebpf:"active_routing_epoch_map"`
 	BpfStatsMap             *ebpf.Map `ebpf:"bpf_stats_map"`
 	CookiePidMap            *ebpf.Map `ebpf:"cookie_pid_map"`
 	DaeIfindexMap           *ebpf.Map `ebpf:"dae_ifindex_map"`
@@ -244,6 +258,7 @@ type bpfMaps struct {
 	RedirectTrack           *ebpf.Map `ebpf:"redirect_track"`
 	RoutingHandoffMap       *ebpf.Map `ebpf:"routing_handoff_map"`
 	RoutingMap              *ebpf.Map `ebpf:"routing_map"`
+	RoutingEpochMap         *ebpf.Map `ebpf:"routing_epoch_map"`
 	RoutingMetaMap          *ebpf.Map `ebpf:"routing_meta_map"`
 	ConnStateMap            *ebpf.Map `ebpf:"conn_state_map"`
 	UnusedLpmType           *ebpf.Map `ebpf:"unused_lpm_type"`
@@ -252,6 +267,7 @@ type bpfMaps struct {
 
 func (m *bpfMaps) Close() error {
 	return _BpfClose(
+		m.ActiveRoutingEpochMap,
 		m.BpfStatsMap,
 		m.CookiePidMap,
 		m.DaeIfindexMap,
@@ -264,6 +280,7 @@ func (m *bpfMaps) Close() error {
 		m.RedirectTrack,
 		m.RoutingHandoffMap,
 		m.RoutingMap,
+		m.RoutingEpochMap,
 		m.RoutingMetaMap,
 		m.ConnStateMap,
 		m.UnusedLpmType,
@@ -385,11 +402,15 @@ func BpfMapBatchUpdate(m *ebpf.Map, keys interface{}, values interface{}, opts *
 }
 
 func (r bpfPortRange) Encode() (b [16]byte) {
+	binary.LittleEndian.PutUint16(b[:2], r.PortStart)
+	binary.LittleEndian.PutUint16(b[2:], r.PortEnd)
 	return
 }
 
 func ParsePortRange(b []byte) (portStart, portEnd uint16) {
-	return 0, 0
+	portStart = binary.LittleEndian.Uint16(b[:2])
+	portEnd = binary.LittleEndian.Uint16(b[2:])
+	return portStart, portEnd
 }
 
 func cidrToBpfLpmKey(prefix any) _bpfLpmKey {

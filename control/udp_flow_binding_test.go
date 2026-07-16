@@ -34,13 +34,14 @@ func TestUdpFlowBindingKeepsRouteAndEgressSeparate(t *testing.T) {
 		Network:       "udp+4",
 		NetworkType:   &networkType,
 		SniffedDomain: "example.com",
+		IsDialIp:      true,
 	}
 	binding := newUdpFlowBinding(snapshot, 7, 42, true, option)
 
 	if binding.Route.PolicyEpoch != snapshot.Epoch() || binding.Route.Outbound != 7 || binding.Route.Mark != 42 || !binding.Route.Must {
 		t.Fatalf("route binding = %+v", binding.Route)
 	}
-	if binding.Egress.Target != option.Target || binding.Egress.Network != option.Network || binding.Egress.NetworkType != networkType || binding.Egress.SniffedDomain != option.SniffedDomain {
+	if binding.Egress.Target != option.Target || binding.Egress.Network != option.Network || binding.Egress.NetworkType != networkType || binding.Egress.SniffedDomain != option.SniffedDomain || binding.Egress.IsDialIp != option.IsDialIp {
 		t.Fatalf("egress binding = %+v", binding.Egress)
 	}
 

@@ -159,8 +159,20 @@ func (t *domainRoutingTracker) syncOwner(
 	ownerKey string,
 	snapshot domainRoutingOwnerSnapshot,
 ) error {
+	return t.syncOwnerForSlot(m, 0, ownerKey, snapshot)
+}
+
+func (t *domainRoutingTracker) syncOwnerForSlot(
+	m *ebpf.Map,
+	slot uint32,
+	ownerKey string,
+	snapshot domainRoutingOwnerSnapshot,
+) error {
 	if ownerKey == "" {
 		return fmt.Errorf("empty domain routing owner key")
+	}
+	if !validRoutingEpochSlot(slot) {
+		return fmt.Errorf("invalid domain routing epoch slot %d", slot)
 	}
 
 	t.mu.Lock()
@@ -175,9 +187,9 @@ func (t *domainRoutingTracker) syncOwner(
 		affected[key] = struct{}{}
 	}
 
-	keysToUpdate := make([][4]uint32, 0, len(affected))
+	keysToUpdate := make([]bpfRoutingEpochIp, 0, len(affected))
 	valuesToUpdate := make([]bpfDomainRouting, 0, len(affected))
-	keysToDelete := make([][4]uint32, 0, len(affected))
+	keysToDelete := make([]bpfRoutingEpochIp, 0, len(affected))
 
 	for key := range affected {
 		desiredBitmap, present := t.desiredBitmapForKeyLocked(key, ownerKey, snapshot)
@@ -185,10 +197,10 @@ func (t *domainRoutingTracker) syncOwner(
 		switch {
 		case !present:
 			if current != nil {
-				keysToDelete = append(keysToDelete, key)
+				keysToDelete = append(keysToDelete, bpfRoutingEpochIp{Slot: slot, Addr: key})
 			}
 		case current == nil || current.merged != desiredBitmap:
-			keysToUpdate = append(keysToUpdate, key)
+			keysToUpdate = append(keysToUpdate, bpfRoutingEpochIp{Slot: slot, Addr: key})
 			valuesToUpdate = append(valuesToUpdate, desiredBitmap)
 		}
 	}

@@ -50,3 +50,29 @@ func TestUdpEndpointRoutingCache_HitAndExpire(t *testing.T) {
 	require.False(t, ok)
 	require.Nil(t, got)
 }
+
+func TestUdpEndpointRouteBindingPersistsBeyondCacheTTL(t *testing.T) {
+	oldTTL := UdpRoutingResultCacheTtl
+	UdpRoutingResultCacheTtl = 10 * time.Millisecond
+	defer func() { UdpRoutingResultCacheTtl = oldTTL }()
+
+	ue := &UdpEndpoint{}
+	dst := netip.MustParseAddrPort("203.0.113.42:443")
+	otherDst := netip.MustParseAddrPort("203.0.113.43:443")
+	const l4proto = uint8(17)
+	routingResult := &bpfRoutingResult{Mark: 77, Outbound: 3, Dscp: 12}
+	ue.UpdateCachedRoutingResult(dst, l4proto, routingResult)
+
+	time.Sleep(2 * UdpRoutingResultCacheTtl)
+	if cached, ok := ue.GetCachedRoutingResult(dst, l4proto); ok || cached != nil {
+		t.Fatal("short-lived routing cache remained valid after its TTL")
+	}
+	bound, ok := ue.GetBoundRoutingResult(dst, l4proto)
+	require.True(t, ok)
+	require.NotNil(t, bound)
+	require.Equal(t, routingResult.Mark, bound.Mark)
+	require.Equal(t, routingResult.Outbound, bound.Outbound)
+	if other, ok := ue.GetBoundRoutingResult(otherDst, l4proto); ok || other != nil {
+		t.Fatal("route binding matched a different original destination")
+	}
+}

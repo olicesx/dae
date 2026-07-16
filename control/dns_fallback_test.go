@@ -83,7 +83,7 @@ func TestDnsForwarder_TcpUdpFallback_UdpFailThenTcp(t *testing.T) {
 	upstream := &dns.Upstream{Scheme: dns.UpstreamScheme_TCP_UDP, Hostname: "dns.example", Port: 53}
 	primary := &dialArgument{l4proto: consts.L4ProtoStr_UDP}
 
-	resp, usedDialArg, err := ctrl.forwardWithFallback(context.Background(), &udpRequest{}, upstream, primary, []byte{0, 1, 2, 3})
+	resp, usedDialArg, err := ctrl.forwardWithFallbackSnapshot(context.Background(), DnsRequestSnapshot{}, upstream, primary, []byte{0, 1, 2, 3})
 	require.NoError(t, err)
 	require.Equal(t, consts.L4ProtoStr_TCP, usedDialArg.l4proto)
 	require.Same(t, want, resp)

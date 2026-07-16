@@ -34,17 +34,29 @@ type scriptedPacketRead struct {
 }
 
 type scriptedPacketConn struct {
-	reads       chan scriptedPacketRead
-	writeErr    error
-	writeN      int
-	forceWriteN bool
-	closeCh     chan struct{}
-	closeCalls  atomic.Int32
+	reads          chan scriptedPacketRead
+	writeErr       error
+	writeN         int
+	forceWriteN    bool
+	writeStarted   chan struct{}
+	writeRelease   <-chan struct{}
+	writeStartOnce sync.Once
+	closeCh        chan struct{}
+	closeCalls     atomic.Int32
+	readCalls      atomic.Int32
 }
 
 type scriptedTransportPacketConn struct {
 	*scriptedPacketConn
 	transportDone chan struct{}
+}
+
+type scriptedPacketReceiverConn struct {
+	*scriptedPacketConn
+	receiverMu sync.Mutex
+	receiver   netproxy.PacketReceiveHandler
+	registered atomic.Int32
+	stopped    atomic.Int32
 }
 
 type scriptedDialer struct {
@@ -72,6 +84,7 @@ func (c *scriptedPacketConn) Write(b []byte) (int, error) {
 }
 
 func (c *scriptedPacketConn) ReadFrom(p []byte) (int, netip.AddrPort, error) {
+	c.readCalls.Add(1)
 	select {
 	case <-c.closeCh:
 		return 0, netip.AddrPort{}, io.EOF
@@ -84,7 +97,48 @@ func (c *scriptedPacketConn) ReadFrom(p []byte) (int, netip.AddrPort, error) {
 	}
 }
 
+func (c *scriptedPacketReceiverConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHandler) (func(), bool) {
+	if handler == nil {
+		return nil, false
+	}
+	c.receiverMu.Lock()
+	if c.receiver != nil {
+		c.receiverMu.Unlock()
+		return nil, false
+	}
+	c.receiver = handler
+	c.registered.Add(1)
+	c.receiverMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			c.receiverMu.Lock()
+			c.receiver = nil
+			c.stopped.Add(1)
+			c.receiverMu.Unlock()
+		})
+	}, true
+}
+
+func (c *scriptedPacketReceiverConn) deliver(packet *netproxy.ReceivedPacket) bool {
+	c.receiverMu.Lock()
+	receiver := c.receiver
+	c.receiverMu.Unlock()
+	if receiver == nil {
+		return false
+	}
+	return receiver(packet)
+}
+
 func (c *scriptedPacketConn) WriteTo(b []byte, _ string) (int, error) {
+	if c.writeStarted != nil {
+		c.writeStartOnce.Do(func() {
+			close(c.writeStarted)
+		})
+	}
+	if c.writeRelease != nil {
+		<-c.writeRelease
+	}
 	if c.writeErr != nil {
 		return 0, c.writeErr
 	}
@@ -357,6 +411,135 @@ func TestUdpEndpointPool_CreateEndpointLocked_UsesCallerContextCancellation(t *t
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("timed out waiting for endpoint creation to honor caller cancellation")
+	}
+}
+
+func TestUdpEndpointPoolGetOrCreate_ConcurrentSameKeyDialsOnceAndPreservesInitialBinding(t *testing.T) {
+	pool := NewUdpEndpointPool()
+	t.Cleanup(pool.Close)
+
+	conn := &scriptedPacketConn{
+		reads:   make(chan scriptedPacketRead),
+		closeCh: make(chan struct{}),
+	}
+	underlay := &scriptedDialer{conns: []netproxy.Conn{conn}}
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	dialer := componentdialer.NewDialer(
+		underlay,
+		&componentdialer.GlobalOption{
+			Log:           logger,
+			CheckInterval: time.Second,
+		},
+		componentdialer.InstanceOption{DisableCheck: true},
+		&componentdialer.Property{},
+	)
+	t.Cleanup(func() {
+		_ = dialer.Close()
+	})
+
+	key := UdpEndpointKey{
+		Src: netip.MustParseAddrPort("192.0.2.10:40000"),
+		Dst: netip.MustParseAddrPort("198.51.100.20:443"),
+	}
+	initialBinding := UdpFlowBinding{
+		Route: UdpRouteBinding{
+			PolicyEpoch: 17,
+			Outbound:    consts.OutboundUserDefinedMin,
+			Mark:        0x1234,
+			Must:        true,
+		},
+		Egress: UdpEgressBinding{
+			Dialer:  dialer,
+			Target:  key.Dst.String(),
+			Network: "udp+4",
+		},
+	}
+
+	const callers = 16
+	firstCreateStarted := make(chan struct{})
+	releaseFirstCreate := make(chan struct{})
+	var getDialOptionCalls atomic.Int32
+	options := &UdpEndpointOptions{
+		Handler:    func(*UdpEndpoint, []byte, netip.AddrPort) error { return nil },
+		NatTimeout: time.Second,
+		GetDialOption: func(context.Context) (*DialOption, error) {
+			if getDialOptionCalls.Add(1) == 1 {
+				close(firstCreateStarted)
+				<-releaseFirstCreate
+			}
+			return &DialOption{
+				Dialer:  dialer,
+				Network: "udp+4",
+				Target:  key.Dst.String(),
+				Binding: initialBinding,
+			}, nil
+		},
+	}
+
+	type getOrCreateResult struct {
+		endpoint *UdpEndpoint
+		isNew    bool
+		err      error
+	}
+	start := make(chan struct{})
+	results := make(chan getOrCreateResult, callers)
+	var entered atomic.Int32
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			entered.Add(1)
+			endpoint, isNew, err := pool.GetOrCreate(key, options)
+			results <- getOrCreateResult{endpoint: endpoint, isNew: isNew, err: err}
+		}()
+	}
+	close(start)
+
+	select {
+	case <-firstCreateStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first endpoint creation")
+	}
+	waitForCondition(t, 2*time.Second, "all concurrent GetOrCreate calls to start", func() bool {
+		return entered.Load() == callers
+	})
+	close(releaseFirstCreate)
+	wg.Wait()
+	close(results)
+
+	var endpoint *UdpEndpoint
+	newCount := 0
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("GetOrCreate() error = %v", result.err)
+		}
+		if endpoint == nil {
+			endpoint = result.endpoint
+		} else if result.endpoint != endpoint {
+			t.Fatalf("GetOrCreate() returned endpoint %p, want %p", result.endpoint, endpoint)
+		}
+		if result.isNew {
+			newCount++
+		}
+	}
+
+	if endpoint == nil {
+		t.Fatal("GetOrCreate() returned no endpoint")
+	}
+	if got := newCount; got != 1 {
+		t.Fatalf("new endpoint count = %d, want 1", got)
+	}
+	if got := getDialOptionCalls.Load(); got != 1 {
+		t.Fatalf("GetDialOption calls = %d, want 1", got)
+	}
+	if got := underlay.idx.Load(); got != 1 {
+		t.Fatalf("DialContext calls = %d, want 1", got)
+	}
+	if got := endpoint.FlowBinding(); got != initialBinding {
+		t.Fatalf("FlowBinding() = %+v, want %+v", got, initialBinding)
 	}
 }
 
@@ -861,6 +1044,171 @@ func TestUdpEndpointPool_TransportLifecycleSharesSingleBucketPerTransport(t *tes
 	}
 }
 
+func TestUdpEndpointPool_ResetStopsOpenTransportWatcher(t *testing.T) {
+	pool := NewUdpEndpointPool()
+	defer pool.Close()
+	transportDone := make(chan struct{})
+	conn := &scriptedTransportPacketConn{
+		scriptedPacketConn: &scriptedPacketConn{
+			reads:   make(chan scriptedPacketRead),
+			closeCh: make(chan struct{}),
+		},
+		transportDone: transportDone,
+	}
+	key := UdpEndpointKey{Src: netip.MustParseAddrPort("127.0.0.1:16003")}
+	ue := &UdpEndpoint{
+		conn:       conn,
+		NatTimeout: QuicNatTimeout,
+		handler:    func(_ *UdpEndpoint, _ []byte, _ netip.AddrPort) error { return nil },
+		poolRef:    pool,
+		poolKey:    key,
+	}
+	shard := pool.shardFor(key)
+	shard.mu.Lock()
+	shard.pool[key] = ue
+	shard.mu.Unlock()
+	pool.registerEndpoint(ue)
+
+	actual, ok := pool.transportIndex.Load((<-chan struct{})(transportDone))
+	if !ok {
+		t.Fatal("expected open transport watcher to be indexed")
+	}
+	bucket := actual.(*udpEndpointTransportBucket)
+
+	pool.Reset()
+	waitForCloseSignal(t, conn.closeCh, "reset should close the endpoint")
+	select {
+	case <-bucket.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("transport watcher did not stop after pool reset")
+	}
+	if _, ok := pool.transportIndex.Load((<-chan struct{})(transportDone)); ok {
+		t.Fatal("open transport watcher remained indexed after pool reset")
+	}
+
+	// The transport can outlive the pool reset; closing it after the watcher has
+	// stopped must not trigger a second retirement path.
+	close(transportDone)
+}
+
+func TestUdpEndpointPool_TransportLifecycleRecreatesBucketAfterEndpointClose(t *testing.T) {
+	pool := NewUdpEndpointPool()
+	defer pool.Close()
+	transportDone := make(chan struct{})
+
+	newEndpoint := func(port uint16) (*UdpEndpoint, *scriptedTransportPacketConn, *udpEndpointTransportBucket) {
+		conn := &scriptedTransportPacketConn{
+			scriptedPacketConn: &scriptedPacketConn{
+				reads:   make(chan scriptedPacketRead),
+				closeCh: make(chan struct{}),
+			},
+			transportDone: transportDone,
+		}
+		key := UdpEndpointKey{Src: netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)}
+		ue := &UdpEndpoint{
+			conn:       conn,
+			NatTimeout: QuicNatTimeout,
+			handler:    func(_ *UdpEndpoint, _ []byte, _ netip.AddrPort) error { return nil },
+			poolRef:    pool,
+			poolKey:    key,
+		}
+		shard := pool.shardFor(key)
+		shard.mu.Lock()
+		shard.pool[key] = ue
+		shard.mu.Unlock()
+		pool.registerEndpoint(ue)
+		actual, ok := pool.transportIndex.Load((<-chan struct{})(transportDone))
+		if !ok {
+			t.Fatal("expected transport watcher to be indexed")
+		}
+		return ue, conn, actual.(*udpEndpointTransportBucket)
+	}
+
+	first, firstConn, firstBucket := newEndpoint(16004)
+	if err := first.Close(); err != nil {
+		t.Fatalf("close first endpoint: %v", err)
+	}
+	waitForCloseSignal(t, firstConn.closeCh, "closing first endpoint")
+
+	second, secondConn, secondBucket := newEndpoint(16005)
+	if firstBucket == secondBucket {
+		t.Fatal("closed transport bucket was reused for a new endpoint")
+	}
+	close(transportDone)
+	waitForCloseSignal(t, secondConn.closeCh, "shared transport shutdown after bucket recreation")
+	if !second.IsDead() {
+		t.Fatal("second endpoint was not retired by transport shutdown")
+	}
+}
+
+func TestUdpEndpointPool_ResetConcurrentTransportRegistration(t *testing.T) {
+	pool := NewUdpEndpointPool()
+	defer pool.Close()
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for worker := 0; worker < 4; worker++ {
+		worker := worker
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for iteration := 0; iteration < 32; iteration++ {
+				transportDone := make(chan struct{})
+				port := uint16(17000 + worker*32 + iteration)
+				key := UdpEndpointKey{Src: netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)}
+				ue := &UdpEndpoint{
+					conn: &scriptedTransportPacketConn{
+						scriptedPacketConn: &scriptedPacketConn{
+							reads:   make(chan scriptedPacketRead),
+							closeCh: make(chan struct{}),
+						},
+						transportDone: transportDone,
+					},
+					NatTimeout: QuicNatTimeout,
+					handler:    func(_ *UdpEndpoint, _ []byte, _ netip.AddrPort) error { return nil },
+					poolRef:    pool,
+					poolKey:    key,
+				}
+				shard := pool.shardFor(key)
+				shard.mu.Lock()
+				shard.pool[key] = ue
+				shard.mu.Unlock()
+				pool.registerEndpoint(ue)
+				if iteration%2 == 0 {
+					_ = ue.Close()
+				}
+			}
+		}()
+	}
+
+	resetDone := make(chan struct{})
+	go func() {
+		defer close(resetDone)
+		<-start
+		for iteration := 0; iteration < 32; iteration++ {
+			pool.Reset()
+		}
+	}()
+	close(start)
+	wg.Wait()
+	select {
+	case <-resetDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrent transport reset did not complete")
+	}
+
+	pool.Reset()
+	var indexed int
+	pool.transportIndex.Range(func(any, any) bool {
+		indexed++
+		return true
+	})
+	if indexed != 0 {
+		t.Fatalf("transport index entries after concurrent reset = %d, want 0", indexed)
+	}
+}
+
 func TestUdpEndpointStart_HardReadErrorClosesConn(t *testing.T) {
 	pool := NewUdpEndpointPool()
 	key := UdpEndpointKey{Src: netip.MustParseAddrPort("127.0.0.1:15003")}
@@ -1283,6 +1631,88 @@ func TestUdpEndpointPoolInvalidateDialerNetworkType_PreservesForwardedUnrepliedE
 	}
 }
 
+func TestUdpEndpointPoolInvalidateDialerNetworkType_PreservesSuccessfulInitialWrite(t *testing.T) {
+	pool := NewUdpEndpointPool()
+	writeStarted := make(chan struct{})
+	writeRelease := make(chan struct{})
+	defer func() {
+		select {
+		case <-writeRelease:
+		default:
+			close(writeRelease)
+		}
+	}()
+
+	conn := &scriptedPacketConn{
+		reads:        make(chan scriptedPacketRead),
+		closeCh:      make(chan struct{}),
+		writeStarted: writeStarted,
+		writeRelease: writeRelease,
+	}
+	d := newTestEndpointDialer()
+	networkType := componentdialer.NetworkType{
+		L4Proto:         consts.L4ProtoStr_UDP,
+		IpVersion:       consts.IpVersionStr_6,
+		UdpHealthDomain: componentdialer.UdpHealthDomainData,
+	}
+	key := UdpEndpointKey{Src: netip.MustParseAddrPort("[::1]:11603")}
+	ue := &UdpEndpoint{
+		conn:                conn,
+		NatTimeout:          time.Second,
+		Dialer:              d,
+		handler:             func(_ *UdpEndpoint, _ []byte, _ netip.AddrPort) error { return nil },
+		poolRef:             pool,
+		poolKey:             key,
+		endpointNetworkType: networkType,
+	}
+	defer func() { _ = ue.Close() }()
+
+	shard := pool.shardFor(key)
+	shard.mu.Lock()
+	shard.pool[key] = ue
+	shard.mu.Unlock()
+	pool.registerEndpoint(ue)
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := ue.WriteTo([]byte("payload"), "[2001:db8::30]:443")
+		writeDone <- err
+	}()
+	select {
+	case <-writeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the first UDP write to begin")
+	}
+
+	removed := pool.InvalidateDialerNetworkType(d, &networkType)
+	if removed != 0 {
+		t.Fatalf("removed = %d, want 0 while the first write is in flight", removed)
+	}
+	if got := conn.closeCalls.Load(); got != 0 {
+		t.Fatalf("close calls during first write = %d, want 0", got)
+	}
+
+	close(writeRelease)
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("first write failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the first UDP write to complete")
+	}
+
+	if !ue.hasSent.Load() {
+		t.Fatal("expected successful initial write to mark the endpoint as forwarded")
+	}
+	if ue.IsDead() {
+		t.Fatal("expected successful initial write to keep the endpoint live")
+	}
+	if got, ok := pool.Get(key); !ok || got != ue {
+		t.Fatal("expected successful initial write to remain reusable after health invalidation")
+	}
+}
+
 func TestUdpEndpointPoolUnregisterKeepsDialerBucketForReuse(t *testing.T) {
 	pool := NewUdpEndpointPool()
 
@@ -1644,6 +2074,275 @@ func TestUdpEndpointStart_ProxyBackedEndpointAcceptsFirstReplyWithoutPeerMatch(t
 	if !ue.hasReply.Load() {
 		t.Fatal("expected proxy-backed endpoint to promote after first reply")
 	}
+}
+
+func TestUdpEndpointStart_UsesGenerationReplyDispatcher(t *testing.T) {
+	conn := &scriptedPacketConn{
+		reads: make(chan scriptedPacketRead, 3),
+	}
+	dispatcher := newUDPReplyDispatcher(1, 2, udpEndpointReplyQueueSize)
+	t.Cleanup(func() {
+		dispatcher.close()
+		dispatcher.wait()
+	})
+
+	handled := make(chan string, 2)
+	ue := &UdpEndpoint{
+		conn:            conn,
+		NatTimeout:      QuicNatTimeout,
+		Dialer:          newTestProxyEndpointDialer("hysteria2", "proxy.example:443"),
+		replyDispatcher: dispatcher,
+		replySlots:      make(chan struct{}, udpEndpointReplyQueueSize),
+		replyStop:       make(chan struct{}),
+		handler: func(_ *UdpEndpoint, data []byte, _ netip.AddrPort) error {
+			handled <- string(data)
+			return nil
+		},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ue.start()
+	}()
+	conn.reads <- scriptedPacketRead{data: []byte("first"), from: netip.MustParseAddrPort("198.51.100.1:1111")}
+	conn.reads <- scriptedPacketRead{data: []byte("second"), from: netip.MustParseAddrPort("198.51.100.1:1111")}
+	conn.reads <- scriptedPacketRead{err: io.EOF}
+
+	select {
+	case got := <-handled:
+		if got != "first" {
+			t.Fatalf("first gated reply = %q, want first", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first gated reply")
+	}
+	select {
+	case got := <-handled:
+		if got != "second" {
+			t.Fatalf("second gated reply = %q, want second", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for second gated reply")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for gated endpoint read loop to exit")
+	}
+}
+
+func TestUdpEndpointStart_UsesTransportOwnedPacketReceiver(t *testing.T) {
+	conn := &scriptedPacketReceiverConn{
+		scriptedPacketConn: &scriptedPacketConn{reads: make(chan scriptedPacketRead)},
+	}
+	dispatcher := newUDPReplyDispatcher(1, 2, udpEndpointReplyQueueSize)
+	t.Cleanup(func() {
+		dispatcher.close()
+		dispatcher.wait()
+	})
+
+	handled := make(chan string, 1)
+	var releases atomic.Int32
+	ue := &UdpEndpoint{
+		conn:              conn,
+		NatTimeout:        QuicNatTimeout,
+		Dialer:            newTestProxyEndpointDialer("hysteria2", "proxy.example:443"),
+		replyDispatcher:   dispatcher,
+		replySlots:        make(chan struct{}, udpEndpointReplyQueueSize),
+		replyStop:         make(chan struct{}),
+		replyDrainTracker: newControlPlaneDrainTracker(),
+		hasReply:          atomic.Bool{},
+		handler: func(_ *UdpEndpoint, data []byte, _ netip.AddrPort) error {
+			handled <- string(data)
+			return nil
+		},
+	}
+	ue.hasReply.Store(true)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ue.start()
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("transport-owned receiver registration did not return")
+	}
+	if got := conn.registered.Load(); got != 1 {
+		t.Fatalf("receiver registrations = %d, want 1", got)
+	}
+	if got := conn.readCalls.Load(); got != 0 {
+		t.Fatalf("ReadFrom calls = %d, want 0 when receiver is registered", got)
+	}
+
+	packet := netproxy.NewReceivedPacket(
+		[]byte("transport reply"),
+		netip.MustParseAddrPort("198.51.100.1:1111"),
+		nil,
+		func() { releases.Add(1) },
+	)
+	if !conn.deliver(packet) {
+		t.Fatal("transport receiver rejected a valid packet")
+	}
+	select {
+	case got := <-handled:
+		if got != "transport reply" {
+			t.Fatalf("handled reply = %q, want transport reply", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for transport-owned reply")
+	}
+	if err := ue.Close(); err != nil {
+		t.Fatalf("UdpEndpoint.Close() error = %v", err)
+	}
+	if got := conn.stopped.Load(); got != 1 {
+		t.Fatalf("receiver unregister calls = %d, want 1", got)
+	}
+	if got := releases.Load(); got != 1 {
+		t.Fatalf("received packet releases = %d, want 1", got)
+	}
+}
+
+func TestUdpEndpointCloseDrainsAcceptedRepliesWithGenerationDispatcher(t *testing.T) {
+	dispatcher := newUDPReplyDispatcher(1, 1, udpEndpointReplyQueueSize)
+	t.Cleanup(func() {
+		dispatcher.close()
+		dispatcher.wait()
+	})
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handled := make(chan string, 2)
+	ue := &UdpEndpoint{
+		replyDispatcher: dispatcher,
+		replySlots:      make(chan struct{}, udpEndpointReplyQueueSize),
+		replyStop:       make(chan struct{}),
+		handler: func(_ *UdpEndpoint, data []byte, _ netip.AddrPort) error {
+			handled <- string(data)
+			if string(data) == "first" {
+				close(started)
+				<-release
+			}
+			return nil
+		},
+	}
+	from := netip.MustParseAddrPort("198.51.100.1:1111")
+	if !ue.submitReply(udpEndpointReply{data: pool.PB([]byte("first")), from: from}) {
+		t.Fatal("submit first reply")
+	}
+	if !ue.submitReply(udpEndpointReply{data: pool.PB([]byte("second")), from: from}) {
+		t.Fatal("submit second reply")
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first reply did not start")
+	}
+
+	if err := ue.Close(); err != nil {
+		t.Fatalf("UdpEndpoint.Close() error = %v", err)
+	}
+	close(release)
+	dispatcher.closeInputAndWait(ue)
+	ue.replyTasks.Wait()
+
+	for _, want := range []string{"first", "second"} {
+		select {
+		case got := <-handled:
+			if got != want {
+				t.Fatalf("drained reply = %q, want %q", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for drained reply %q", want)
+		}
+	}
+}
+
+func TestUdpEndpointSubmitReplyRejectedReleasesBufferOnce(t *testing.T) {
+	oldPut := putUdpEndpointReplyData
+	defer func() {
+		putUdpEndpointReplyData = oldPut
+	}()
+
+	var released atomic.Int32
+	putUdpEndpointReplyData = func(pool.PB) {
+		released.Add(1)
+	}
+
+	dispatcher := newUDPReplyDispatcher(1, 1, 1)
+	dispatcher.close()
+	ue := &UdpEndpoint{
+		replyDispatcher:   dispatcher,
+		replySlots:        make(chan struct{}, 1),
+		replyStop:         make(chan struct{}),
+		replyDrainTracker: newControlPlaneDrainTracker(),
+	}
+
+	if ue.submitReply(udpEndpointReply{data: pool.PB([]byte("rejected"))}) {
+		t.Fatal("submitReply() accepted a task after dispatcher close")
+	}
+	putUdpEndpointReplyData(pool.PB([]byte("rejected")))
+
+	if got := released.Load(); got != 1 {
+		t.Fatalf("reply buffer releases = %d, want 1", got)
+	}
+}
+
+func TestUdpEndpointTransportReplyBackpressureKeepsReceiverAlive(t *testing.T) {
+	dispatcher := newUDPReplyDispatcher(1, 1, 1)
+	t.Cleanup(func() {
+		dispatcher.close()
+		dispatcher.wait()
+	})
+
+	started := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var secondReleased atomic.Int32
+	ue := &UdpEndpoint{
+		replyDispatcher:   dispatcher,
+		replySlots:        make(chan struct{}, 1),
+		replyStop:         make(chan struct{}),
+		replyDrainTracker: newControlPlaneDrainTracker(),
+		handler: func(_ *UdpEndpoint, data []byte, _ netip.AddrPort) error {
+			if string(data) == "first" {
+				close(started)
+				<-releaseFirst
+			}
+			return nil
+		},
+	}
+	from := netip.MustParseAddrPort("198.51.100.1:1111")
+	accepted, keepReceiver := ue.submitReplyFromReceiver(udpEndpointReply{
+		data: pool.PB([]byte("first")),
+		from: from,
+	})
+	if !accepted || !keepReceiver {
+		t.Fatalf("first transport reply = accepted:%v keep:%v, want true/true", accepted, keepReceiver)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first transport reply did not start")
+	}
+
+	accepted, keepReceiver = ue.submitReplyFromReceiver(udpEndpointReply{
+		data: pool.PB([]byte("second")),
+		from: from,
+		release: func() {
+			secondReleased.Add(1)
+		},
+	})
+	if accepted || !keepReceiver {
+		t.Fatalf("full transport reply = accepted:%v keep:%v, want false/true", accepted, keepReceiver)
+	}
+	if got := secondReleased.Load(); got != 1 {
+		t.Fatalf("full transport reply releases = %d, want 1", got)
+	}
+
+	close(releaseFirst)
+	ue.replyTasks.Wait()
 }
 
 func TestEffectiveUdpEndpointNatTimeout_LongLivedProtocolsUseQuicFloor(t *testing.T) {

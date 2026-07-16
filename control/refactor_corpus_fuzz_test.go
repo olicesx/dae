@@ -14,28 +14,25 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// This file satisfies the Phase 1 acceptance clause: "Unit tests and fuzz
-// tests cover aliasing and deterministic hashing." It also guards the broader
-// semantic contract: for any input the legacy userspace matcher accepts, a
-// matcher built from a cloned PolicySnapshot program MUST produce a
-// byte-identical decision (outbound, mark, must).
+// This file satisfies the Phase 2 acceptance clause: the immutable compiled
+// policy plan must preserve the legacy userspace matcher's decisions for every
+// complete fact vector the fuzzer generates.
 //
 // Seed corpus is derived from RoutingCorpusFixtures so the fuzzer starts from
 // known-reachable input vectors (matched domains, in-range ports, etc.) and
 // explores mutations around them. A mutated fixture selector is reduced modulo
 // the corpus length, so every fuzz input exercises a real routing program.
 
-// FuzzPolicySnapshotEquivalence is the canonical Phase 1 fuzz target. For each
-// seed + mutation it builds the legacy matcher and the snapshot matcher from
-// the SAME fixture, then asserts:
+// FuzzPolicySnapshotEquivalence is the canonical compiled-policy fuzz target.
+// For each seed + mutation it builds the legacy matcher and compiled adapter
+// from the SAME fixture, then asserts:
 //
 //  1. Equivalence: both matchers return identical (outbound, mark, must) when
 //     neither errors.
-//  2. Alias-safety: mutation of the source program after snapshot creation
-//     cannot change the snapshot matcher result.
+//  2. Alias-safety: mutation of the source program after compilation cannot
+//     change the compiled matcher result.
 //  3. Hash stability: the fixture's PolicySnapshot hash is constant across
-//     repeated CloneProgram calls (snapshot hash must depend on program
-//     content, not on transient clone state).
+//     equivalent programs at different epochs.
 func FuzzPolicySnapshotEquivalence(f *testing.F) {
 	fixtures := RoutingCorpusFixtures()
 	for fixtureIndex, fixture := range fixtures {
@@ -110,6 +107,10 @@ func FuzzPolicySnapshotEquivalence(f *testing.F) {
 		if err != nil {
 			t.Fatalf("NewPolicySnapshot() error = %v", err)
 		}
+		compiled, err := snapshot.Compile(logrus.New(), fixture.OutboundIDs)
+		if err != nil {
+			t.Fatalf("Compile() error = %v", err)
+		}
 
 		// 3. Hash stability: hash depends on content, not on epoch or
 		// transient clone state. Build a second snapshot at a different epoch
@@ -127,19 +128,15 @@ func FuzzPolicySnapshotEquivalence(f *testing.F) {
 				snapshot.Hash(), snapshot2.Hash())
 		}
 
-		// Mutating the original normalization after snapshot creation must not
-		// affect the immutable snapshot or the matcher built from it.
+		// Mutating the original normalization after compilation must not affect
+		// the immutable compiled policy or the matcher built from it.
 		if len(program.Rules) > 0 && len(program.Rules[0].AndFunctions) > 0 {
 			program.Rules[0].AndFunctions[0].Name = "corrupted-after-snapshot"
 		}
 
-		cloneA, err := snapshot.CloneProgram()
+		snapMatcher, err := buildMatcherFromCompiledPolicy(compiled)
 		if err != nil {
-			t.Fatalf("CloneProgram() error = %v", err)
-		}
-		snapMatcher, err := buildMatcherFromProgram(fixture, cloneA)
-		if err != nil {
-			t.Fatalf("buildMatcherFromProgram() error = %v", err)
+			t.Fatalf("buildMatcherFromCompiledPolicy() error = %v", err)
 		}
 		snapOut, snapMark, snapMust, snapErr :=
 			matchCorpusInput(snapMatcher, input)
@@ -164,12 +161,10 @@ func FuzzPolicySnapshotEquivalence(f *testing.F) {
 	})
 }
 
-// buildMatcherFromProgram is the same plumbing as the corpus equivalence
-// test's snapshot branch, factored out so the fuzz target can reuse it.
-func buildMatcherFromProgram(fixture CorpusFixture, program *routing.NormalizedProgram) (*RoutingMatcher, error) {
-	builder, err := NewRoutingMatcherBuilderFromProgram(
-		logrus.New(), program, fixture.OutboundIDs, nil,
-	)
+// buildMatcherFromCompiledPolicy adapts the immutable policy plan for the
+// fuzz target without touching a live BPF runtime.
+func buildMatcherFromCompiledPolicy(compiled *routing.CompiledPolicy) (*RoutingMatcher, error) {
+	builder, err := NewRoutingMatcherBuilderFromCompiledPolicy(logrus.New(), compiled, nil)
 	if err != nil {
 		return nil, err
 	}

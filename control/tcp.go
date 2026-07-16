@@ -107,7 +107,7 @@ func retryRetrieveRoutingResult(ctx context.Context, retrieve func() (*bpfRoutin
 	return nil, lastErr
 }
 
-func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn) (err error) {
+func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn, ownership *incomingConnectionLease) (err error) {
 	defer func() { _ = lConn.Close() }()
 
 	// Get tuples and outbound first so we can decide whether sniffing is needed.
@@ -135,6 +135,38 @@ func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn) (err erro
 			return fmt.Errorf("failed to retrieve target info %v: %v", dst.String(), err)
 		}
 	}
+	owner, ownerErr := c.routingEpochExecutionOwner(routingResult)
+	if ownerErr != nil {
+		return fmt.Errorf("select TCP routing epoch owner: %w", ownerErr)
+	}
+	if owner != c {
+		if ownership != nil {
+			if !ownership.transfer(owner) {
+				return fmt.Errorf("transfer TCP routing epoch owner: %w", errRoutingEpochOwnerUnavailable)
+			}
+		} else {
+			release, ok := owner.acquireRoutingEpochExecutionLease()
+			if !ok {
+				return fmt.Errorf("acquire TCP routing epoch owner: %w", errRoutingEpochOwnerUnavailable)
+			}
+			defer release()
+		}
+		return owner.handleConnWithRoutingResult(owner.ctx, lConn, src, dst, routingResult)
+	}
+	return c.handleConnWithRoutingResult(ctx, lConn, src, dst, routingResult)
+}
+
+func (c *ControlPlane) handleConnWithRoutingResult(
+	ctx context.Context,
+	lConn net.Conn,
+	src netip.AddrPort,
+	dst netip.AddrPort,
+	routingResult *bpfRoutingResult,
+) (err error) {
+	// Keep the accepted connection for lifecycle indexing even when DNS probing
+	// or sniffing wraps the relay-side reader below.
+	ingressConn := lConn
+
 	// DNS Fast Path: Check for DNS-over-TCP traffic (port 53).
 	// DNS is a stateless protocol and doesn't need the connection tracking
 	// features that TCP relay provides. This optimization handles DNS queries
@@ -217,17 +249,7 @@ func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn) (err erro
 		}
 	}
 
-	dialParam := &proxyDialParam{
-		Outbound:    consts.OutboundIndex(routingResult.Outbound),
-		Domain:      domain,
-		Mac:         routingResult.Mac,
-		ProcessName: routingResult.Pname,
-		Dscp:        routingResult.Dscp,
-		Src:         src,
-		Dest:        dst,
-		Mark:        routingResult.Mark,
-		Network:     "tcp",
-	}
+	dialParam := tcpProxyDialParamFromRoutingResult(routingResult, domain, src, dst)
 	// Dial and relay.
 	rConn, res, err := c.routeDial(ctx, dialParam)
 	if err != nil {
@@ -248,6 +270,11 @@ func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn) (err erro
 		return fmt.Errorf("failed to dial %v: %w", dst, err)
 	}
 	defer func() { _ = rConn.Close() }()
+	flow, registered := c.registerTCPFlow(src, dst, ingressConn, rConn, res.Binding)
+	if !registered {
+		return nil
+	}
+	defer c.unregisterTCPFlow(flow)
 
 	offloaded := false
 	offloadReason := ""
@@ -282,6 +309,7 @@ func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn) (err erro
 
 type RouteDialParam struct {
 	Outbound    consts.OutboundIndex
+	Must        bool
 	Domain      string
 	Mac         [6]uint8
 	Dscp        uint8
@@ -296,9 +324,32 @@ func (c *ControlPlane) RouteDialTcp(p *RouteDialParam) (conn netproxy.Conn, err 
 }
 
 func (c *ControlPlane) RouteDialTcpContext(ctx context.Context, p *RouteDialParam) (conn netproxy.Conn, err error) {
-	dialParam := &proxyDialParam{
+	conn, _, err = c.routeDial(ctx, p.toProxyDialParam())
+	return conn, err
+}
+
+func tcpProxyDialParamFromRoutingResult(routingResult *bpfRoutingResult, domain string, src, dst netip.AddrPort) *proxyDialParam {
+	return &proxyDialParam{
+		Outbound:    consts.OutboundIndex(routingResult.Outbound),
+		Must:        routingResult.Must != 0,
+		Domain:      domain,
+		DomainKnown: true,
+		Mac:         routingResult.Mac,
+		Dscp:        routingResult.Dscp,
+		ProcessName: routingResult.Pname,
+		Src:         src,
+		Dest:        dst,
+		Mark:        routingResult.Mark,
+		Network:     "tcp",
+	}
+}
+
+func (p *RouteDialParam) toProxyDialParam() *proxyDialParam {
+	return &proxyDialParam{
 		Outbound:    p.Outbound,
+		Must:        p.Must,
 		Domain:      p.Domain,
+		DomainKnown: true,
 		Mac:         p.Mac,
 		Dscp:        p.Dscp,
 		ProcessName: p.ProcessName,
@@ -307,8 +358,6 @@ func (c *ControlPlane) RouteDialTcpContext(ctx context.Context, p *RouteDialPara
 		Mark:        p.Mark,
 		Network:     "tcp",
 	}
-	conn, _, err = c.routeDial(ctx, dialParam)
-	return conn, err
 }
 
 type WriteCloser interface {
@@ -629,7 +678,7 @@ func (c *ControlPlane) handleTCPDnsFastPath(ctx context.Context, lConn net.Conn,
 		uploadRecord:   c.runtimeUploadRecorder(),
 		downloadRecord: c.runtimeDownloadRecorder(),
 	}
-	recordUpload := req.uploadRecorder()
+	recordUpload := c.runtimeUploadRecorder()
 	if frameLen > 0 {
 		recordUpload(int64(frameLen))
 	}

@@ -142,14 +142,14 @@ func shouldRejectNewUdpDialSelection(res *proxyDialResult) bool {
 	return !res.Dialer.MustGetAlive(networkType)
 }
 
-func (c *ControlPlane) checkUdpEndpointHealth(ue *UdpEndpoint, ueKey UdpEndpointKey, isFastPath bool) bool {
-	if ue == nil || ue.Dialer == nil {
+func (c *ControlPlane) checkUdpEndpointHealth(ue *UdpEndpoint, _ UdpEndpointKey, isFastPath bool) bool {
+	if ue == nil || ue.Dialer == nil || ue.IsDead() {
 		return false
 	}
 	if ue.Outbound != nil && ue.Outbound.GetSelectionPolicy() == consts.DialerSelectionPolicy_Fixed {
 		return true
 	}
-	if ue.hasSent.Load() || ue.hasReply.Load() {
+	if ue.survivesDialerHealthInvalidation() {
 		// Once an endpoint has forwarded real traffic, treat it as a live session.
 		// Control-plane health should gate only new dial selection; existing UDP
 		// sessions must be retired by actual data-plane failures or timeout, not
@@ -161,6 +161,9 @@ func (c *ControlPlane) checkUdpEndpointHealth(ue *UdpEndpoint, ueKey UdpEndpoint
 	// Only endpoints that have never forwarded a packet are safe to cull based
 	// on health probes alone.
 	if !ue.Dialer.MustGetAlive(&networkType) {
+		if !ue.retireIfUnforwardedForDialerHealth() {
+			return !ue.IsDead()
+		}
 		if c.log.IsLevelEnabled(logrus.DebugLevel) {
 			path := "UDP"
 			if isFastPath {
@@ -171,7 +174,6 @@ func (c *ControlPlane) checkUdpEndpointHealth(ue *UdpEndpoint, ueKey UdpEndpoint
 				"alive":  ue.Dialer.MustGetAlive(&networkType),
 			}).Debugf("Re-selecting outbound for existing %s endpoint due to dialer health.", path)
 		}
-		_ = DefaultUdpEndpointPool.Remove(ueKey, ue)
 		return false
 	}
 	return true
@@ -197,6 +199,7 @@ type DialOption struct {
 	Network       string
 	NetworkType   *dialer.NetworkType
 	SniffedDomain string
+	IsDialIp      bool
 	Excluded      *dialer.Dialer
 	Binding       UdpFlowBinding
 	// NowNano is an optional pre-calculated timestamp to avoid calling time.Now()
@@ -493,6 +496,20 @@ func forwardUdpEndpointReplyToClient(log *logrus.Logger, ue *UdpEndpoint, data [
 }
 
 func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision, skipSniffing bool) (err error) {
+	owner, release, ownerErr := c.acquireRoutingEpochExecutionOwner(routingResult)
+	if ownerErr != nil {
+		return fmt.Errorf("select UDP routing epoch owner: %w", ownerErr)
+	}
+	if release != nil {
+		defer release()
+	}
+	if owner != c {
+		return owner.handlePktOwned(lConn, data, src, realDst, routingResult, flowDecision, skipSniffing)
+	}
+	return c.handlePktOwned(lConn, data, src, realDst, routingResult, flowDecision, skipSniffing)
+}
+
+func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision, skipSniffing bool) (err error) {
 	var realSrc netip.AddrPort
 	var domain string
 	var ueKey UdpEndpointKey
@@ -574,6 +591,11 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, realDst n
 	}
 	ueKey = flowDecision.EndpointKeyForInitialLookupWithScope(routeScope, forceSymmetricKey)
 	ue, ueExists = DefaultUdpEndpointPool.Get(ueKey)
+	if ueExists {
+		observePhase1UDPKeyProbe(phase1UDPKeyProbePrimary, phase1UDPKeyProbeHit)
+	} else {
+		observePhase1UDPKeyProbe(phase1UDPKeyProbePrimary, phase1UDPKeyProbeMiss)
+	}
 	if !ueExists && !forceSymmetricKey {
 		if ueKey.Dst.Port() != 0 {
 			// Sniff-eligible UDP can re-enter here with a symmetric lookup even
@@ -583,10 +605,17 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, realDst n
 			// same 4-tuple and start another read loop.
 			srcOnlyKey := flowDecision.FullConeNatEndpointKeyWithScope(routeScope)
 			if srcOnlyKey != ueKey {
-				if candidate, ok := DefaultUdpEndpointPool.Get(srcOnlyKey); ok && candidate.DialTarget == realDst.String() {
-					ueKey = srcOnlyKey
-					ue = candidate
-					ueExists = true
+				if candidate, ok := DefaultUdpEndpointPool.Get(srcOnlyKey); ok {
+					if candidate.DialTarget != realDst.String() {
+						observePhase1UDPKeyProbe(phase1UDPKeyProbeSibling, phase1UDPKeyProbeTargetMismatch)
+					} else {
+						observePhase1UDPKeyProbe(phase1UDPKeyProbeSibling, phase1UDPKeyProbeHit)
+						ueKey = srcOnlyKey
+						ue = candidate
+						ueExists = true
+					}
+				} else {
+					observePhase1UDPKeyProbe(phase1UDPKeyProbeSibling, phase1UDPKeyProbeMiss)
 				}
 			}
 		} else {
@@ -597,10 +626,17 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, realDst n
 			// single-instanced.
 			symmetricKey := flowDecision.SymmetricNatEndpointKeyWithScope(routeScope)
 			if symmetricKey != ueKey {
-				if candidate, ok := DefaultUdpEndpointPool.Get(symmetricKey); ok && candidate.DialTarget == realDst.String() {
-					ueKey = symmetricKey
-					ue = candidate
-					ueExists = true
+				if candidate, ok := DefaultUdpEndpointPool.Get(symmetricKey); ok {
+					if candidate.DialTarget != realDst.String() {
+						observePhase1UDPKeyProbe(phase1UDPKeyProbeSibling, phase1UDPKeyProbeTargetMismatch)
+					} else {
+						observePhase1UDPKeyProbe(phase1UDPKeyProbeSibling, phase1UDPKeyProbeHit)
+						ueKey = symmetricKey
+						ue = candidate
+						ueExists = true
+					}
+				} else {
+					observePhase1UDPKeyProbe(phase1UDPKeyProbeSibling, phase1UDPKeyProbeMiss)
 				}
 			}
 		}
@@ -609,6 +645,11 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, realDst n
 		if fallbackKey, ok := flowDecision.InitialLookupFallbackKeyWithScope(routeScope, forceSymmetricKey); ok {
 			ueKey = fallbackKey
 			ue, ueExists = DefaultUdpEndpointPool.Get(ueKey)
+			if ueExists {
+				observePhase1UDPKeyProbe(phase1UDPKeyProbeFallback, phase1UDPKeyProbeHit)
+			} else {
+				observePhase1UDPKeyProbe(phase1UDPKeyProbeFallback, phase1UDPKeyProbeMiss)
+			}
 		}
 	}
 	if ueExists {
@@ -850,6 +891,7 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, realDst n
 				sniffer.Mu.Unlock()
 			}()
 			if sniffer.NeedMore() {
+				c.observePendingRoute(realSrc, realDst, consts.L4ProtoType_UDP, routingResult)
 				return nil
 			}
 
@@ -938,16 +980,19 @@ getNew:
 			Handler: func(ue *UdpEndpoint, data []byte, from netip.AddrPort) (err error) {
 				return forwardUdpEndpointReplyToClient(c.log, ue, data, from, realSrc, nil, c.runtimeDownloadRecorder())
 			},
-			NatTimeout:     natTimeout,
-			ConnStateOwner: c.core,
-			DrainTracker:   c.drainTracker,
-			Log:            c.log,
-			NowNano:        nowNano,
+			NatTimeout:      natTimeout,
+			ConnStateOwner:  c.core,
+			DrainTracker:    c.drainTracker,
+			admissionGate:   &c.udpEndpointAdmission,
+			Log:             c.log,
+			NowNano:         nowNano,
+			replyDispatcher: c.udpReplyDispatcher,
 			GetDialOption: func(ctx context.Context) (option *DialOption, err error) {
-					dialParam := &proxyDialParam{
-						Outbound:    consts.OutboundIndex(routingResult.Outbound),
-						Must:        routingResult.Must != 0,
+				dialParam := &proxyDialParam{
+					Outbound:    consts.OutboundIndex(routingResult.Outbound),
+					Must:        routingResult.Must != 0,
 					Domain:      domain,
+					DomainKnown: true,
 					Mac:         routingResult.Mac,
 					Dscp:        routingResult.Dscp,
 					ProcessName: routingResult.Pname,
@@ -995,6 +1040,7 @@ getNew:
 					Network:       res.Network,
 					NetworkType:   res.SelectionNetworkTypeObj,
 					SniffedDomain: res.SniffedDomain,
+					IsDialIp:      res.IsDialIp,
 					Excluded:      excludedDialer,
 					NowNano:       nowNano,
 				}
@@ -1003,7 +1049,8 @@ getNew:
 			},
 		})
 		if err != nil {
-			if stderrors.Is(err, ob.ErrNoAliveDialer) || stderrors.Is(err, ErrEndpointFailed) {
+			if stderrors.Is(err, ob.ErrNoAliveDialer) || stderrors.Is(err, ErrEndpointFailed) ||
+				stderrors.Is(err, errUdpEndpointAdmissionClosed) {
 				// Already emitted a rate-limited diagnostic log above, or hit negative cache.
 				return nil
 			}

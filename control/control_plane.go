@@ -56,9 +56,19 @@ type ControlPlane struct {
 	listenIp   string
 
 	controlPlaneGenerationState
-	inConnections        sync.Map
-	rejectNewConnections atomic.Bool
-	drainTracker         *controlPlaneDrainTracker
+	inConnections         sync.Map
+	tcpFlows              tcpFlowRegistry
+	rejectNewConnections  atomic.Bool
+	udpEndpointAdmission  udpEndpointAdmissionGate
+	udpIngressAdmission   routingEpochIngressGate
+	drainTracker          *controlPlaneDrainTracker
+	routingEpochPeerMu    sync.RWMutex
+	routingEpochPeer      *ControlPlane
+	routingEpochSlot      atomic.Uint32
+	routingEpochSlotKnown atomic.Bool
+	// routingEpochExecutionClosed prevents a retiring generation from
+	// accepting work delegated by its staged reload peer.
+	routingEpochExecutionClosed atomic.Bool
 
 	controlPlaneDNSRuntime
 	dnsHandoffMu         sync.Mutex
@@ -99,6 +109,8 @@ type ControlPlane struct {
 	mptcp                          bool
 	udpRouteScopeSensitive         bool
 	udpUnorderedRunner             *udpUnorderedTaskRunner
+	udpOrderedDispatcher           *udpOrderedDispatcher
+	udpReplyDispatcher             *udpReplyDispatcher
 	failedQuicDcidCache            *failedQuicDcidCache
 	lastConnectionErrorLogTime     atomic.Int64
 	lastDnsFastPathErrorLogTime    atomic.Int64
@@ -109,15 +121,62 @@ type ControlPlane struct {
 	autoConfigKernelParameter      bool
 	routingKernspaceSnapshot       *routingKernspaceSnapshot
 	pendingDnsReloadCache          map[string]*DnsCache
+	dnsReloadCacheSourceMu         sync.Mutex
+	dnsReloadCacheSource           func() map[string]*DnsCache
 	sharedBpfReload                bool
+	semanticRefactorFeatures       SemanticRefactorFeatureSet
 	// dnsRoutingUnchanged indicates that DNS routing configuration (excluding
 	// runtime-tunable parameters like OptimisticCache) did not change from the
-	// previous generation. When true, CommitPreparedDatapath skips clearing
-	// and replaying domain_routing_map to avoid a race window where the old
-	// control plane loses domain routing on the shared BPF map (dae#1013).
+	// previous generation. It is retained for staged DNS handoff decisions;
+	// routing epoch projection is always isolated by its target slot.
 	dnsRoutingUnchanged bool
 	closeOnce           sync.Once
 	closeErr            error
+	serveHooksMu        sync.RWMutex
+	serveHooks          *ServeLifecycleHooks
+}
+
+// ServeLifecycleHooks provides optional integration hooks for the three
+// prepared-generation boundaries in Serve. The production path leaves every
+// hook nil and calls the normal ControlPlane implementation directly.
+type ServeLifecycleHooks struct {
+	// CommitPreparedDatapath replaces the prepared BPF commit when non-nil.
+	CommitPreparedDatapath func() error
+	// PublishListenerSockets replaces listener FD publication when non-nil.
+	PublishListenerSockets func(*Listener) error
+	// ActivatePreparedRuntime replaces DNS/runtime activation when non-nil.
+	ActivatePreparedRuntime func() error
+}
+
+// SetServeLifecycleHooks installs optional lifecycle hooks and returns a
+// restore function. It is intended for controlled integration tests and
+// internal lifecycle adapters; nil hooks preserve the default behavior.
+func (c *ControlPlane) SetServeLifecycleHooks(hooks ServeLifecycleHooks) (restore func()) {
+	if c == nil {
+		return func() {}
+	}
+	c.serveHooksMu.Lock()
+	previous := c.serveHooks
+	copy := hooks
+	c.serveHooks = &copy
+	c.serveHooksMu.Unlock()
+	return func() {
+		c.serveHooksMu.Lock()
+		c.serveHooks = previous
+		c.serveHooksMu.Unlock()
+	}
+}
+
+func (c *ControlPlane) serveLifecycleHooks() ServeLifecycleHooks {
+	if c == nil {
+		return ServeLifecycleHooks{}
+	}
+	c.serveHooksMu.RLock()
+	defer c.serveHooksMu.RUnlock()
+	if c.serveHooks == nil {
+		return ServeLifecycleHooks{}
+	}
+	return *c.serveHooks
 }
 
 var policyEpochSequence atomic.Uint64
@@ -450,6 +509,7 @@ func newControlPlaneWithContextOptions(
 	// preparation deadline expires.  The caller's ctx is NOT used as a parent
 	// for any perennnial context below.
 	_ = ctx
+	refactorFeatures := semanticRefactorFeatureGateSnapshot()
 
 	// Clear failed QUIC DCID cache on reload/startup.
 	// Network conditions may have changed, so we should allow retrying sniffing
@@ -521,9 +581,24 @@ func newControlPlaneWithContextOptions(
 		return nil, err
 	}
 
-	if err = GetDaeNetns().Setup(); err != nil {
-		return nil, fmt.Errorf("failed to setup dae netns: %w", err)
+	daeNetns := GetDaeNetns()
+	netnsCreated, setupErr := daeNetns.SetupWithOwnership()
+	if setupErr != nil {
+		if netnsCreated {
+			if cleanupErr := daeNetns.Close(); cleanupErr != nil && log != nil {
+				log.WithError(cleanupErr).Warn("failed to clean dae netns after setup failure")
+			}
+		}
+		return nil, fmt.Errorf("failed to setup dae netns: %w", setupErr)
 	}
+	defer func() {
+		if err == nil || !netnsCreated {
+			return
+		}
+		if cleanupErr := daeNetns.Close(); cleanupErr != nil && log != nil {
+			log.WithError(cleanupErr).Warn("failed to clean dae netns after control plane build failure")
+		}
+	}()
 	pinPath := filepath.Join(consts.BpfPinRoot, consts.AppName)
 	ephemeralPinPath := false
 	if _bpf == nil && buildOpts.isReload {
@@ -610,6 +685,13 @@ func newControlPlaneWithContextOptions(
 		buildOpts.isReload,
 		!sharedBpfReload,
 	)
+	// A prepared shared-BPF routing-epoch generation must not overwrite the
+	// active generation's health map while it is still only a candidate. The
+	// runtime supervisor resumes its writes after publish, or leaves it paused
+	// while rollback restores the old generation.
+	if buildOpts.delayDatapathCommit && sharedBpfReload && refactorFeatures.RoutingEpoch {
+		core.pauseOutboundConnectivityUpdates()
+	}
 	if ephemeralPinPath {
 		core.addDeferFunc(func() error {
 			return os.RemoveAll(pinPath)
@@ -760,9 +842,17 @@ func newControlPlaneWithContextOptions(
 	if err != nil {
 		return nil, fmt.Errorf("create routing policy snapshot: %w", err)
 	}
-	builderProgram, err := policySnapshot.CloneProgram()
+	if refactorFeatures.RoutingEpoch {
+		if _, err = core.PrepareRoutingEpoch(policySnapshot.Epoch(), sharedBpfReload); err != nil {
+			return nil, fmt.Errorf("prepare routing epoch: %w", err)
+		}
+		if err = core.clearDomainRoutingSlot(core.RoutingEpochSlot()); err != nil {
+			return nil, fmt.Errorf("clear inactive domain routing epoch: %w", err)
+		}
+	}
+	compiledPolicy, err := policySnapshot.Compile(log, outboundName2Id)
 	if err != nil {
-		return nil, fmt.Errorf("clone routing policy snapshot: %w", err)
+		return nil, fmt.Errorf("compile routing policy snapshot: %w", err)
 	}
 	if log.IsLevelEnabled(logrus.DebugLevel) {
 		var debugBuilder strings.Builder
@@ -773,15 +863,34 @@ func newControlPlaneWithContextOptions(
 	}
 	// Parse rules and build.
 	log.Infoln("Building routing matcher...")
-	builder, err := NewRoutingMatcherBuilderFromProgram(log, builderProgram, outboundName2Id, core.bpf.Load())
-	if err != nil {
-		return nil, fmt.Errorf("NewRoutingMatcherBuilder: %w", err)
+	var builder *RoutingMatcherBuilder
+	if refactorFeatures.CompiledPolicy {
+		builder, err = NewRoutingMatcherBuilderFromCompiledPolicy(log, compiledPolicy, core.bpf.Load())
+		if err != nil {
+			return nil, fmt.Errorf("NewRoutingMatcherBuilderFromCompiledPolicy: %w", err)
+		}
+	} else {
+		builderProgram, cloneErr := policySnapshot.CloneProgram()
+		if cloneErr != nil {
+			return nil, fmt.Errorf("clone routing policy snapshot: %w", cloneErr)
+		}
+		builder, err = NewRoutingMatcherBuilderFromProgram(log, builderProgram, outboundName2Id, core.bpf.Load())
+		if err != nil {
+			return nil, fmt.Errorf("NewRoutingMatcherBuilder: %w", err)
+		}
 	}
 	kernspaceSnapshot := builder.KernspaceSnapshot()
 	if !buildOpts.delayDatapathCommit {
 		log.Infoln("Loading routing rules into kernel space (BPF)...")
 		var lpmIndices []uint32
-		if lpmIndices, err = kernspaceSnapshot.BuildKernspace(log, core.bpf.Load()); err != nil {
+		if refactorFeatures.RoutingEpoch {
+			if lpmIndices, err = kernspaceSnapshot.BuildKernspaceForSlot(log, core.bpf.Load(), core.RoutingEpochSlot()); err != nil {
+				return nil, fmt.Errorf("routing kernspace snapshot: %w", err)
+			}
+			if err = core.StageRoutingEpoch(); err != nil {
+				return nil, fmt.Errorf("stage routing epoch: %w", err)
+			}
+		} else if lpmIndices, err = kernspaceSnapshot.BuildKernspace(log, core.bpf.Load()); err != nil {
 			return nil, fmt.Errorf("routing kernspace snapshot: %w", err)
 		}
 		core.lpmTrieIndices = lpmIndices
@@ -792,6 +901,14 @@ func newControlPlaneWithContextOptions(
 	routingMatcher, err := builder.BuildUserspace()
 	if err != nil {
 		return nil, fmt.Errorf("RoutingMatcherBuilder.BuildUserspace: %w", err)
+	}
+	var decisionShadow *phase4DecisionShadow
+	if setting := phase4DecisionShadowSettingValue.Load(); setting != nil {
+		decisionShadow, err = newPhase4DecisionShadowWithProcessState(policySnapshot, compiledPolicy, setting.sampleEvery, setting.state)
+		if err != nil {
+			return nil, fmt.Errorf("create phase 4 decision shadow: %w", err)
+		}
+		decisionShadow.setLiveMatcher(routingMatcher)
 	}
 
 	// Get referenced outbounds to limit health checks.
@@ -833,6 +950,7 @@ func newControlPlaneWithContextOptions(
 			dialMode:            dialMode,
 			policySnapshot:      policySnapshot,
 			routingMatcher:      routingMatcher,
+			decisionShadow:      decisionShadow,
 			bootstrapResolvers:  bootstrapResolvers,
 		},
 		controlPlaneDNSRuntime:      newControlPlaneDNSRuntime(buildOpts.delayDNSListenerStart),
@@ -848,6 +966,7 @@ func newControlPlaneWithContextOptions(
 		sharedBpfReload:             sharedBpfReload,
 		pendingDnsReloadCache:       dnsCache,
 		dnsRoutingUnchanged:         buildOpts.dnsRoutingUnchanged,
+		semanticRefactorFeatures:    refactorFeatures,
 		muRealDomainSet:             sync.RWMutex{},
 		realDomainSet:               bloom.NewWithEstimates(2048, 0.001),
 		tcpSniffNegSet:              make(map[tcpSniffNegKey]tcpSniffNegEntry),
@@ -938,20 +1057,40 @@ func newControlPlaneWithContextOptions(
 		if err = plane.commitInterfaceBindings(); err != nil {
 			return nil, err
 		}
-		skipDNSReloadReplay := plane.sharedBpfReload && plane.dnsRoutingUnchanged
-		if !skipDNSReloadReplay {
-			if bpf := core.bpf.Load(); bpf != nil {
-				if err = clearReloadDomainRoutingMap(bpf); err != nil {
-					return nil, fmt.Errorf("clearReloadDomainRoutingMap: %w", err)
+		if plane.semanticRefactorFeatures.RoutingEpoch {
+			if err = plane.replayDnsReloadCache(); err != nil {
+				return nil, fmt.Errorf("replay DNS reload cache: %w", err)
+			}
+			if err = core.PublishRoutingEpoch(); err != nil {
+				return nil, fmt.Errorf("publish routing epoch: %w", err)
+			}
+		} else {
+			skipDNSReloadReplay := plane.sharedBpfReload && plane.dnsRoutingUnchanged
+			if !skipDNSReloadReplay {
+				if bpf := core.bpf.Load(); bpf != nil {
+					if err = clearReloadDomainRoutingMap(bpf); err != nil {
+						return nil, fmt.Errorf("clearReloadDomainRoutingMap: %w", err)
+					}
+				}
+				if err = plane.replayDnsReloadCache(); err != nil {
+					return nil, fmt.Errorf("replay DNS reload cache: %w", err)
 				}
 			}
-			plane.replayDnsReloadCache()
 		}
 		if err = core.commitBpfHookFlip(); err != nil {
+			if plane.semanticRefactorFeatures.RoutingEpoch {
+				if rollbackErr := core.RollbackRoutingEpoch(); rollbackErr != nil {
+					return nil, stderrors.Join(err, rollbackErr)
+				}
+			}
 			return nil, err
 		}
 		plane.markReady()
 	}
+	// UDP listener serving starts only after the control plane is returned, so
+	// the generation-owned dispatcher is complete before first traffic.
+	plane.udpOrderedDispatcher = newUDPOrderedDispatcherForFeatures(plane.semanticRefactorFeatures)
+	plane.udpReplyDispatcher = newUDPReplyDispatcherForFeatures(plane.semanticRefactorFeatures)
 	return plane, nil
 }
 
@@ -998,15 +1137,42 @@ func ParseGroupOverrideOption(group config.Group, global config.Global, log *log
 	return nil, nil
 }
 
-// clearReloadDomainRoutingMap keeps reload behavior aligned with main:
-// only clear domain_routing_map on reload.
-//
-// IMPORTANT:
-// Scheme3 (Embedded Design): Connection-state maps are preserved across in-process
-// reload by handing the live BPF objects to the new control plane. Do NOT clear
-// them here, otherwise established flows may lose cached state and get rerouted.
+// clearReloadDomainRoutingMap clears slot zero for callers that operate on a
+// fresh datapath. Shared reloads must use clearReloadDomainRoutingMapSlot so
+// they never erase the still-readable active plan.
 func clearReloadDomainRoutingMap(bpf *bpfObjects) error {
-	return BpfMapBatchDeleteAll[[4]uint32, bpfDomainRouting](bpf.DomainRoutingMap)
+	return clearReloadDomainRoutingMapSlot(bpf, 0)
+}
+
+func clearReloadDomainRoutingMapSlot(bpf *bpfObjects, slot uint32) error {
+	if bpf == nil || bpf.DomainRoutingMap == nil {
+		return nil
+	}
+	if !validRoutingEpochSlot(slot) {
+		return fmt.Errorf("invalid domain routing epoch slot %d", slot)
+	}
+
+	var (
+		key   bpfRoutingEpochIp
+		value bpfDomainRouting
+		keys  []bpfRoutingEpochIp
+		iter  = bpf.DomainRoutingMap.Iterate()
+	)
+	for iter.Next(&key, &value) {
+		if key.Slot == slot {
+			keys = append(keys, key)
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("iterate domain routing slot %d: %w", slot, err)
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	if _, err := BpfMapBatchDelete(bpf.DomainRoutingMap, keys); err != nil {
+		return fmt.Errorf("clear domain routing slot %d: %w", slot, err)
+	}
+	return nil
 }
 
 // validateRequiredBpfMapsLoaded checks maps that are required by both DNS and
@@ -1025,6 +1191,8 @@ func validateRequiredBpfMapsLoaded(bpf *bpfObjects) error {
 		{name: "routing_handoff_map", m: bpf.RoutingHandoffMap},
 		{name: "routing_map", m: bpf.RoutingMap},
 		{name: "routing_meta_map", m: bpf.RoutingMetaMap},
+		{name: "active_routing_epoch_map", m: bpf.ActiveRoutingEpochMap},
+		{name: "routing_epoch_map", m: bpf.RoutingEpochMap},
 	}
 	for _, r := range required {
 		if r.m == nil {
@@ -1106,6 +1274,51 @@ func (c *ControlPlane) CloneDnsCache() map[string]*DnsCache {
 		return nil
 	}
 	return c.cloneDnsCache()
+}
+
+// SetReloadDnsCacheSource installs the previous generation's cache snapshot
+// source for a prepared shared-BPF reload. It is consumed at datapath commit.
+func (c *ControlPlane) SetReloadDnsCacheSource(source func() map[string]*DnsCache) {
+	if c == nil {
+		return
+	}
+	c.dnsReloadCacheSourceMu.Lock()
+	c.dnsReloadCacheSource = source
+	c.dnsReloadCacheSourceMu.Unlock()
+}
+
+// ClearReloadDnsCacheSource releases the previous generation cache source.
+func (c *ControlPlane) ClearReloadDnsCacheSource() {
+	c.SetReloadDnsCacheSource(nil)
+}
+
+func (c *ControlPlane) cloneDnsReloadCacheForCutover() (map[string]*DnsCache, bool) {
+	if c == nil || !c.sharedBpfReload || !c.preparedDatapathCommit {
+		return nil, false
+	}
+	c.dnsReloadCacheSourceMu.Lock()
+	defer c.dnsReloadCacheSourceMu.Unlock()
+	if c.dnsReloadCacheSource == nil {
+		return nil, false
+	}
+	return c.dnsReloadCacheSource(), true
+}
+
+// refreshDnsReloadCacheForCutover replaces the early preparation snapshot
+// with one taken immediately before the target routing epoch is published.
+func (c *ControlPlane) refreshDnsReloadCacheForCutover() (bool, error) {
+	cache, ok := c.cloneDnsReloadCacheForCutover()
+	if !ok {
+		return false, nil
+	}
+	if c.core == nil {
+		return false, fmt.Errorf("refresh DNS reload cache without control-plane core")
+	}
+	if err := c.core.clearDomainRoutingSlot(c.core.RoutingEpochSlot()); err != nil {
+		return false, fmt.Errorf("clear target domain routing slot: %w", err)
+	}
+	c.pendingDnsReloadCache = cache
+	return true, nil
 }
 
 func (c *ControlPlane) ActiveDnsController() *DnsController {
@@ -1375,9 +1588,10 @@ func (c *ControlPlane) dnsControllerOption() *DnsControllerOption {
 		routeProjectionEpoch = uint64(snapshot.Epoch())
 	}
 	return &DnsControllerOption{
-		Log:              c.log,
-		LifecycleContext: c.ctx,
-		ConcurrencyLimit: 0,
+		Log:                c.log,
+		LifecycleContext:   c.ctx,
+		ConcurrencyLimit:   0,
+		UseResolvePipeline: c.semanticRefactorFeatures.DNSResolver,
 		CacheAccessCallback: func(cache *DnsCache) (err error) {
 			if err = c.core.BatchUpdateDomainRouting(cache); err != nil {
 				return fmt.Errorf("BatchUpdateDomainRouting: %w", err)
@@ -1409,7 +1623,8 @@ func (c *ControlPlane) dnsControllerOption() *DnsControllerOption {
 				OriginalDeadline:     originalDeadline,
 			}, nil
 		},
-		BestDialerChooser: c.chooseBestDnsDialer,
+		BestDialerSnapshotChooser: c.chooseBestDnsDialerSnapshot,
+		BestDialerChooser:         c.chooseBestDnsDialer,
 		TimeoutExceedCallback: func(dialArgument *dialArgument, err error) {
 			if commonerrors.IsIgnorableConnectionError(err) {
 				return
@@ -1571,27 +1786,37 @@ func (c *ControlPlane) commitInterfaceBindings() error {
 	return nil
 }
 
-func (c *ControlPlane) replayDnsReloadCache() {
+func (c *ControlPlane) replayDnsReloadCache() error {
 	if c == nil || c.dnsController == nil || c.pendingDnsReloadCache == nil {
-		return
+		return nil
 	}
-	count := c.dnsController.RestoreReloadCache(c.pendingDnsReloadCache, c.routingMatcher.domainMatcher.MatchDomainBitmap, time.Now())
+	count, err := c.dnsController.RestoreReloadCacheAndProject(
+		c.pendingDnsReloadCache,
+		c.routingMatcher.domainMatcher.MatchDomainBitmap,
+		time.Now(),
+	)
+	if err != nil {
+		return err
+	}
 	if count > 0 {
 		c.log.Infof("Restored %d DNS cache entries from previous control plane", count)
 	}
 	c.pendingDnsReloadCache = nil
+	return nil
 }
 
 func (c *ControlPlane) registerIncomingConnection(conn net.Conn) bool {
 	if c == nil || conn == nil {
 		return false
 	}
-	if c.rejectNewConnections.Load() {
+	incomingConnectionOwnershipMu.Lock()
+	defer incomingConnectionOwnershipMu.Unlock()
+	if !c.acceptsRoutingEpochExecutionLocked() {
 		_ = conn.Close()
 		return false
 	}
 	c.inConnections.Store(conn, struct{}{})
-	if c.rejectNewConnections.Load() {
+	if !c.acceptsRoutingEpochExecutionLocked() {
 		c.inConnections.Delete(conn)
 		_ = conn.Close()
 		return false
@@ -1603,6 +1828,8 @@ func (c *ControlPlane) unregisterIncomingConnection(conn net.Conn) {
 	if c == nil || conn == nil {
 		return
 	}
+	incomingConnectionOwnershipMu.Lock()
+	defer incomingConnectionOwnershipMu.Unlock()
 	c.inConnections.Delete(conn)
 }
 
@@ -1615,26 +1842,69 @@ func (c *ControlPlane) CommitPreparedDatapath() error {
 	if err := c.commitInterfaceBindings(); err != nil {
 		return err
 	}
+	if c.core == nil {
+		c.startConnStateJanitor()
+		c.preparedDatapathCommit = false
+		return nil
+	}
 	if c.routingKernspaceSnapshot != nil {
 		c.log.Infoln("Loading routing rules into kernel space (BPF)...")
-		lpmIndices, err := c.routingKernspaceSnapshot.BuildKernspace(c.log, c.core.bpf.Load())
+		var (
+			lpmIndices []uint32
+			err        error
+		)
+		if c.semanticRefactorFeatures.RoutingEpoch {
+			lpmIndices, err = c.routingKernspaceSnapshot.BuildKernspaceForSlot(
+				c.log,
+				c.core.bpf.Load(),
+				c.core.RoutingEpochSlot(),
+			)
+		} else {
+			lpmIndices, err = c.routingKernspaceSnapshot.BuildKernspace(c.log, c.core.bpf.Load())
+		}
 		if err != nil {
 			return fmt.Errorf("routing kernspace snapshot: %w", err)
 		}
 		c.core.lpmTrieIndices = lpmIndices
+		if c.semanticRefactorFeatures.RoutingEpoch {
+			if err := c.core.StageRoutingEpoch(); err != nil {
+				return fmt.Errorf("stage routing epoch: %w", err)
+			}
+		}
 	}
-	skipDNSReloadReplay := c.sharedBpfReload && c.dnsRoutingUnchanged
-	if !skipDNSReloadReplay {
-		if c.core != nil {
+	if c.semanticRefactorFeatures.RoutingEpoch {
+		refreshedDnsReloadCache, err := c.refreshDnsReloadCacheForCutover()
+		if err != nil {
+			return fmt.Errorf("refresh DNS reload cache for cutover: %w", err)
+		}
+		if err := c.replayDnsReloadCache(); err != nil {
+			return fmt.Errorf("replay DNS reload cache: %w", err)
+		}
+		if refreshedDnsReloadCache {
+			c.ClearReloadDnsCacheSource()
+		}
+		if err := c.core.PublishRoutingEpoch(); err != nil {
+			return fmt.Errorf("publish routing epoch: %w", err)
+		}
+	} else {
+		skipDNSReloadReplay := c.sharedBpfReload && c.dnsRoutingUnchanged
+		if !skipDNSReloadReplay {
 			if bpf := c.core.bpf.Load(); bpf != nil {
 				if err := clearReloadDomainRoutingMap(bpf); err != nil {
 					return fmt.Errorf("clearReloadDomainRoutingMap: %w", err)
 				}
 			}
+			if err := c.replayDnsReloadCache(); err != nil {
+				return fmt.Errorf("replay DNS reload cache: %w", err)
+			}
 		}
-		c.replayDnsReloadCache()
 	}
 	if err := c.core.commitBpfHookFlip(); err != nil {
+		if c.semanticRefactorFeatures.RoutingEpoch {
+			if rollbackErr := c.core.RollbackRoutingEpoch(); rollbackErr != nil {
+				return stderrors.Join(err, rollbackErr)
+			}
+		}
 		return err
 	}
 	c.startConnStateJanitor()
@@ -1648,6 +1918,14 @@ func (c *ControlPlane) RebuildReloadDatapath() error {
 	if c == nil || c.routingKernspaceSnapshot == nil || c.core == nil || c.core.PeekBpf() == nil {
 		return nil
 	}
+	if c.core.routingEpochEnabled() {
+		c.log.Warnln("[Reload] Rolling back to the previous routing epoch after staged handoff failure")
+		if err := c.core.PublishRoutingEpoch(); err != nil {
+			return fmt.Errorf("publish previous routing epoch: %w", err)
+		}
+		c.core.activateBpfHookFlip()
+		return nil
+	}
 	c.log.Warnln("[Reload] Rebuilding previous generation datapath after staged handoff failure")
 	lpmIndices, err := c.routingKernspaceSnapshot.BuildKernspace(c.log, c.core.bpf.Load())
 	if err != nil {
@@ -1659,7 +1937,9 @@ func (c *ControlPlane) RebuildReloadDatapath() error {
 	}
 	cache := c.CloneDnsCache()
 	c.pendingDnsReloadCache = cache
-	c.replayDnsReloadCache()
+	if err := c.replayDnsReloadCache(); err != nil {
+		return fmt.Errorf("rebuild DNS reload cache: %w", err)
+	}
 	c.core.activateBpfHookFlip()
 	return nil
 }
@@ -1677,18 +1957,51 @@ func (c *ControlPlane) RestoreDatapathForReloadRollback() error {
 		return fmt.Errorf("restore interface bindings: %w", err)
 	}
 	if c.routingKernspaceSnapshot != nil {
-		lpmIndices, err := c.routingKernspaceSnapshot.BuildKernspace(c.log, c.core.bpf.Load())
+		var (
+			lpmIndices []uint32
+			err        error
+		)
+		if c.semanticRefactorFeatures.RoutingEpoch {
+			lpmIndices, err = c.routingKernspaceSnapshot.BuildKernspaceForSlot(
+				c.log,
+				c.core.bpf.Load(),
+				c.core.RoutingEpochSlot(),
+			)
+		} else {
+			lpmIndices, err = c.routingKernspaceSnapshot.BuildKernspace(c.log, c.core.bpf.Load())
+		}
 		if err != nil {
 			return fmt.Errorf("restore routing kernspace: %w", err)
 		}
 		c.ReplaceLpmIndices(lpmIndices)
+		if c.semanticRefactorFeatures.RoutingEpoch {
+			if err := c.core.StageRoutingEpoch(); err != nil {
+				return fmt.Errorf("restore routing epoch: %w", err)
+			}
+		}
 	}
-	if err := clearReloadDomainRoutingMap(c.core.bpf.Load()); err != nil {
-		return fmt.Errorf("restore clearReloadDomainRoutingMap: %w", err)
+	if c.semanticRefactorFeatures.RoutingEpoch {
+		if err := c.core.clearDomainRoutingSlot(c.core.RoutingEpochSlot()); err != nil {
+			return fmt.Errorf("restore clearReloadDomainRoutingMap: %w", err)
+		}
+		cache := c.CloneDnsCache()
+		c.pendingDnsReloadCache = cache
+		if err := c.replayDnsReloadCache(); err != nil {
+			return fmt.Errorf("restore DNS reload cache: %w", err)
+		}
+		if err := c.core.PublishRoutingEpoch(); err != nil {
+			return fmt.Errorf("restore publish routing epoch: %w", err)
+		}
+	} else {
+		if err := clearReloadDomainRoutingMap(c.core.bpf.Load()); err != nil {
+			return fmt.Errorf("restore clearReloadDomainRoutingMap: %w", err)
+		}
+		cache := c.CloneDnsCache()
+		c.pendingDnsReloadCache = cache
+		if err := c.replayDnsReloadCache(); err != nil {
+			return fmt.Errorf("restore DNS reload cache: %w", err)
+		}
 	}
-	cache := c.CloneDnsCache()
-	c.pendingDnsReloadCache = cache
-	c.replayDnsReloadCache()
 	c.core.activateBpfHookFlip()
 	return nil
 }
@@ -2044,17 +2357,17 @@ func chooseDnsDialerCandidate(preferred, penalized *dnsDialerCandidate) (*dnsDia
 	return nil, false
 }
 
-func buildDnsDialerSnapshotKey(req *udpRequest, upstream *dns.Upstream) (dnsDialerSnapshotKey, bool) {
-	if req == nil || upstream == nil {
+func buildDnsDialerSnapshotKeyForSnapshot(snapshot DnsRequestSnapshot, upstream *dns.Upstream) (dnsDialerSnapshotKey, bool) {
+	if upstream == nil {
 		return dnsDialerSnapshotKey{}, false
 	}
 
-	realSrc := req.realSrc
+	realSrc := snapshot.RealSrc
 	// DNS fast path: exempt source port from cache key to enable cache reuse.
 	// DNS queries use random source ports; including the port would completely invalidate the cache.
 	// Routing decisions do not depend on the DNS query's source port (port is only for transport layer multiplexing).
-	if req.realDst.Port() == 53 {
-		realSrc = netip.AddrPortFrom(req.realSrc.Addr(), 0)
+	if snapshot.RealDst.Port() == 53 {
+		realSrc = netip.AddrPortFrom(snapshot.RealSrc.Addr(), 0)
 	}
 
 	key := dnsDialerSnapshotKey{
@@ -2064,13 +2377,20 @@ func buildDnsDialerSnapshotKey(req *udpRequest, upstream *dns.Upstream) (dnsDial
 		upstreamIp6: upstream.Ip6,
 	}
 
-	if req.routingResult != nil {
-		key.routingPname = req.routingResult.Pname
-		key.routingMac = req.routingResult.Mac
-		key.routingDscp = req.routingResult.Dscp
+	if routingResult := snapshot.routingResultForRoute(); routingResult != nil {
+		key.routingPname = routingResult.Pname
+		key.routingMac = routingResult.Mac
+		key.routingDscp = routingResult.Dscp
 	}
 
 	return key, true
+}
+
+func buildDnsDialerSnapshotKey(req *udpRequest, upstream *dns.Upstream) (dnsDialerSnapshotKey, bool) {
+	if req == nil {
+		return dnsDialerSnapshotKey{}, false
+	}
+	return buildDnsDialerSnapshotKeyForSnapshot(dnsRequestSnapshotFromUDPRequest(req), upstream)
 }
 
 func (c *ControlPlane) loadDnsDialerSnapshot(key dnsDialerSnapshotKey, now time.Time) (*dialArgument, bool) {
@@ -3156,13 +3476,26 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 		}
 	}()
 	udpConn := listener.packetConn.(*net.UDPConn)
-	if err := c.CommitPreparedDatapath(); err != nil {
+	hooks := c.serveLifecycleHooks()
+	commitPreparedDatapath := c.CommitPreparedDatapath
+	if hooks.CommitPreparedDatapath != nil {
+		commitPreparedDatapath = hooks.CommitPreparedDatapath
+	}
+	if err := commitPreparedDatapath(); err != nil {
 		return err
 	}
-	if err := c.publishListenerSockets(listener); err != nil {
+	publishListenerSockets := c.publishListenerSockets
+	if hooks.PublishListenerSockets != nil {
+		publishListenerSockets = hooks.PublishListenerSockets
+	}
+	if err := publishListenerSockets(listener); err != nil {
 		return err
 	}
-	if err := c.activatePreparedRuntime(); err != nil {
+	activatePreparedRuntime := c.activatePreparedRuntime
+	if hooks.ActivatePreparedRuntime != nil {
+		activatePreparedRuntime = hooks.ActivatePreparedRuntime
+	}
+	if err := activatePreparedRuntime(); err != nil {
 		return err
 	}
 
@@ -3190,20 +3523,19 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				}
 				return
 			}
-			drainRelease := c.acquireDrainTicket()
-			go func(lconn net.Conn, release func()) {
-				defer release()
-				if !c.registerIncomingConnection(lconn) {
+			go func(lconn net.Conn) {
+				ownership, ok := c.acquireIncomingConnectionLease(lconn)
+				if !ok {
 					return
 				}
-				defer c.unregisterIncomingConnection(lconn)
+				defer ownership.release()
 				// Keep the ControlPlane lifecycle context so shutdown/reload can cancel
 				// in-flight connection handling. Dial timeout is applied independently
 				// inside RouteDialTcp and is not reduced by sniffing time.
-				if err := c.handleConn(c.ctx, lconn); err != nil {
+				if err := c.handleConn(c.ctx, lconn, ownership); err != nil {
 					c.log.Warnln("handleConn:", err)
 				}
-			}(lconn, drainRelease)
+			}(lconn)
 		}
 	}
 	go serveTCP(listener.tcp4Listener)
@@ -3222,10 +3554,15 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			}
 			// Debug:
 			// t := time.Now()
+			if !c.udpIngressAdmission.tryAcquire() {
+				pktBuf.Put()
+				return
+			}
 			task := func() {
 				data := pktBuf
 
 				defer data.Put()
+				defer c.udpIngressAdmission.release()
 				var routingResult *bpfRoutingResult
 				var freshRoutingResult *bpfRoutingResult
 
@@ -3255,18 +3592,25 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 					if dnsMessage, _ := ChooseNatTimeout(data, true); dnsMessage != nil {
 						dnsRoutingResult := &bpfRoutingResult{
 							Outbound: uint8(consts.OutboundControlPlaneRouting),
-							Mark:     c.soMarkFromDae,
 						}
 						if rr, retrieveErr := c.core.RetrieveRoutingResult(convergeSrc, realDst, unix.IPPROTO_UDP); retrieveErr == nil {
 							dnsRoutingResult = rr
-							if dnsRoutingResult.Mark == 0 {
-								dnsRoutingResult.Mark = c.soMarkFromDae
-							}
 						} else if !stderrors.Is(retrieveErr, ebpf.ErrKeyNotExist) && c.log.IsLevelEnabled(logrus.DebugLevel) {
 							c.log.WithFields(logrus.Fields{
 								"src": convergeSrc.String(),
 								"dst": realDst.String(),
 							}).WithError(retrieveErr).Debug("UDP routing tuple lookup failed for DNS ingress fast path; fallback to minimal routing metadata")
+						}
+						handler, release, ownerErr := c.acquireRoutingEpochExecutionOwner(dnsRoutingResult)
+						if ownerErr != nil {
+							c.log.WithError(ownerErr).Warn("DNS ingress routing epoch owner is unavailable")
+							return
+						}
+						if release != nil {
+							defer release()
+						}
+						if dnsRoutingResult.Mark == 0 {
+							dnsRoutingResult.Mark = handler.soMarkFromDae
 						}
 						req := &udpRequest{
 							realSrc:       convergeSrc,
@@ -3276,14 +3620,14 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 							routingResult: dnsRoutingResult,
 						}
 
-						dnsController := c.ActiveDnsController()
+						dnsController := handler.ActiveDnsController()
 						if dnsController == nil {
 							return
 						}
-						if e := dnsController.Handle_(c.dnsRequestContext(c.ctx, dnsController), dnsMessage, req); e != nil {
+						if e := dnsController.Handle_(handler.dnsRequestContext(handler.ctx, dnsController), dnsMessage, req); e != nil {
 							if stderrors.Is(e, ErrDNSQueryConcurrencyLimitExceeded) {
-								if c.log.IsLevelEnabled(logrus.DebugLevel) {
-									c.log.WithFields(logrus.Fields{
+								if handler.log.IsLevelEnabled(logrus.DebugLevel) {
+									handler.log.WithFields(logrus.Fields{
 										"src": convergeSrc.String(),
 										"dst": realDst.String(),
 									}).Debug("DNS query concurrency limit exceeded in fast path")
@@ -3291,16 +3635,16 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 								return
 							}
 							if stderrors.Is(e, ErrDNSTruncated) {
-								if c.log.IsLevelEnabled(logrus.DebugLevel) {
-									c.log.WithFields(logrus.Fields{
+								if handler.log.IsLevelEnabled(logrus.DebugLevel) {
+									handler.log.WithFields(logrus.Fields{
 										"src":      convergeSrc.String(),
 										"dst":      realDst.String(),
 										"question": dnsMessage.Question,
 									}).Debug("DNS ingress fast path got truncated UDP response; returning TC=1 to client")
 								}
 								if sendErr := dnsController.sendDnsTruncatedResponse_(dnsMessage, req, nil); sendErr != nil {
-									if c.log.IsLevelEnabled(logrus.WarnLevel) && c.allowDnsFastPathServfailLog(time.Now()) {
-										c.log.WithError(stderrors.Join(e, sendErr)).WithFields(logrus.Fields{
+									if handler.log.IsLevelEnabled(logrus.WarnLevel) && handler.allowDnsFastPathServfailLog(time.Now()) {
+										handler.log.WithError(stderrors.Join(e, sendErr)).WithFields(logrus.Fields{
 											"src": convergeSrc.String(),
 											"dst": realDst.String(),
 										}).Warn("Failed to send truncated DNS response in DNS fast path")
@@ -3308,8 +3652,8 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 								}
 								return
 							}
-							if c.log.IsLevelEnabled(logrus.WarnLevel) && c.allowDnsFastPathErrorLog(time.Now()) {
-								c.log.WithFields(logrus.Fields{
+							if handler.log.IsLevelEnabled(logrus.WarnLevel) && handler.allowDnsFastPathErrorLog(time.Now()) {
+								handler.log.WithFields(logrus.Fields{
 									"src":      convergeSrc.String(),
 									"dst":      realDst.String(),
 									"question": dnsMessage.Question,
@@ -3317,17 +3661,17 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 								}).Warn("DNS ingress fast path failed; sending SERVFAIL response")
 							}
 							if sendErr := dnsController.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeServerFailure, "ServeFail (dns ingress fast path)", req, nil); sendErr != nil {
-								if c.log.IsLevelEnabled(logrus.WarnLevel) && c.allowDnsFastPathServfailLog(time.Now()) {
-									c.log.WithError(stderrors.Join(e, sendErr)).WithFields(logrus.Fields{
+								if handler.log.IsLevelEnabled(logrus.WarnLevel) && handler.allowDnsFastPathServfailLog(time.Now()) {
+									handler.log.WithError(stderrors.Join(e, sendErr)).WithFields(logrus.Fields{
 										"src": convergeSrc.String(),
 										"dst": realDst.String(),
 									}).Warn("Failed to send SERVFAIL response in DNS fast path")
 								}
 								return
 							}
-						} else if c.log.IsLevelEnabled(logrus.TraceLevel) {
+						} else if handler.log.IsLevelEnabled(logrus.TraceLevel) {
 							// Success logging for DNS fast path (trace level only)
-							c.log.WithFields(logrus.Fields{
+							handler.log.WithFields(logrus.Fields{
 								"src":      convergeSrc.String(),
 								"dst":      realDst.String(),
 								"question": dnsMessage.Question,
@@ -3337,17 +3681,17 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 					}
 				}
 
-				if !c.udpRouteScopeSensitive {
+				if !c.udpRouteScopeSensitive && c.ownsActiveRoutingEpoch() {
 					if ue, ok := DefaultUdpEndpointPool.Get(flowDecision.CachedRoutingEndpointKey()); ok {
-						if cached, cacheHit := ue.GetCachedRoutingResult(realDst, unix.IPPROTO_UDP); cacheHit {
-							routingResult = cached
+						if bound, bindingHit := ue.GetBoundRoutingResult(realDst, unix.IPPROTO_UDP); bindingHit {
+							routingResult = bound
 						}
 					}
 					if routingResult == nil {
 						if fallbackKey, ok := flowDecision.CachedRoutingFallbackKey(); ok {
 							if ue, ok := DefaultUdpEndpointPool.Get(fallbackKey); ok {
-								if cached, cacheHit := ue.GetCachedRoutingResult(realDst, unix.IPPROTO_UDP); cacheHit {
-									routingResult = cached
+								if bound, bindingHit := ue.GetBoundRoutingResult(realDst, unix.IPPROTO_UDP); bindingHit {
+									routingResult = bound
 								}
 							}
 						}
@@ -3397,7 +3741,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 					return
 				}
 
-				if !c.udpRouteScopeSensitive && freshRoutingResult != nil {
+				if !c.udpRouteScopeSensitive && c.ownsActiveRoutingEpoch() && freshRoutingResult != nil {
 					updatedCache := false
 					if ue, ok := DefaultUdpEndpointPool.Get(flowDecision.CachedRoutingEndpointKey()); ok {
 						ue.UpdateCachedRoutingResult(realDst, unix.IPPROTO_UDP, freshRoutingResult)
@@ -3419,9 +3763,15 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			// Direct goroutine dispatch remains only for narrow low-latency
 			// exceptions where queue handoff is less valuable than minimal overhead
 			// (DNS, SIP/RTP, STUN).
+			discardTask := func() {
+				c.udpIngressAdmission.release()
+				pktBuf.Put()
+			}
 			switch flowDecision.DispatchStrategy() {
 			case StrategyOrderedIngress:
-				DefaultUdpTaskPool.EmitTask(flowDecision.Key, task)
+				if !c.submitOrderedUDPIngress(flowDecision.Key, task, discardTask) {
+					discardTask()
+				}
 			case StrategyDirectGoroutine:
 				// DNS, VoIP, and other low-latency exception traffic bypasses the
 				// ordered per-flow queue and runs immediately.
@@ -3429,7 +3779,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			default:
 				// Defensive fallback for unknown future strategy values.
 				if !c.udpUnorderedRunner.Submit(flowDecision.Key, task) {
-					pktBuf.Put()
+					discardTask()
 				}
 			}
 			// if d := time.Since(t); d > 100*time.Millisecond {
@@ -3576,8 +3926,14 @@ func (c *ControlPlane) ListenAndServe(readyChan chan<- bool, port uint16) (liste
 func (c *ControlPlane) chooseBestDnsDialer(
 	ctx context.Context, req *udpRequest, dnsUpstream *dns.Upstream,
 ) (*dialArgument, error) {
+	return c.chooseBestDnsDialerSnapshot(ctx, dnsRequestSnapshotFromUDPRequest(req), dnsUpstream)
+}
+
+func (c *ControlPlane) chooseBestDnsDialerSnapshot(
+	ctx context.Context, snapshot DnsRequestSnapshot, dnsUpstream *dns.Upstream,
+) (*dialArgument, error) {
 	now := time.Now()
-	snapshotKey, snapshotEnabled := buildDnsDialerSnapshotKey(req, dnsUpstream)
+	snapshotKey, snapshotEnabled := buildDnsDialerSnapshotKeyForSnapshot(snapshot, dnsUpstream)
 	if snapshotEnabled {
 		if cachedDialArg, hit := c.loadDnsDialerSnapshot(snapshotKey, now); hit {
 			return cachedDialArg, nil
@@ -3609,7 +3965,15 @@ func (c *ControlPlane) chooseBestDnsDialer(
 			default:
 				return nil, fmt.Errorf("unexpected ipversion: %v", ver)
 			}
-			outboundIndex, mark, _, err := c.Route(req.realSrc, netip.AddrPortFrom(dAddr, dnsUpstream.Port), dnsUpstream.Hostname, proto.ToL4ProtoType(), req.routingResult)
+			outboundIndex, mark, _, err := c.routeWithDomainFacts(
+				snapshot.RealSrc,
+				netip.AddrPortFrom(dAddr, dnsUpstream.Port),
+				dnsUpstream.Hostname,
+				proto.ToL4ProtoType(),
+				snapshot.routingResultForRoute(),
+				true,
+				routing.EvidenceDNSAssociation,
+			)
 			if err != nil {
 				return nil, err
 			}
@@ -3687,23 +4051,34 @@ func (c *ControlPlane) AbortConnections() (err error) {
 	if c == nil {
 		return nil
 	}
-	c.rejectNewConnections.Store(true)
+	connections, flows, errs := c.takeIncomingConnectionsForAbort()
+	c.closeUDPOrderedDispatcher()
+	c.udpIngressAdmission.closeAndWait()
+	c.waitUDPOrderedDispatcher()
+	// Wait for endpoint creation already admitted by this generation before
+	// scanning the shared pool. New creation attempts are rejected once closed.
+	c.udpEndpointAdmission.closeAndWait()
 
-	var errs []error
-	c.inConnections.Range(func(key, value any) bool {
-		// Use comma-ok pattern for type safety to prevent panic if key is not net.Conn
-		conn, ok := key.(net.Conn)
-		if !ok {
-			// Unexpected type in inConnections - this should never happen
-			errs = append(errs, fmt.Errorf("unexpected type %T in inConnections", key))
-			return true
-		}
+	for _, conn := range connections {
 		if cerr := conn.Close(); cerr != nil {
 			errs = append(errs, cerr)
 		}
-		c.inConnections.Delete(key)
-		return true
-	})
+	}
+	for _, flow := range flows {
+		if flow.Egress == nil {
+			continue
+		}
+		if cerr := flow.Egress.Close(); cerr != nil && !commonerrors.IsClosedConnection(cerr) {
+			errs = append(errs, cerr)
+		}
+	}
+	if c.core != nil {
+		if udpErr := DefaultUdpEndpointPool.AbortEndpointsOwnedBy(c.core); udpErr != nil {
+			errs = append(errs, udpErr)
+		}
+	}
+	c.closeUDPReplyDispatcher()
+	c.waitUDPReplyDispatcher()
 
 	return stderrors.Join(errs...)
 }
@@ -3729,7 +4104,7 @@ func (c *ControlPlane) MarkRetired() {
 	if c == nil || c.core == nil {
 		return
 	}
-	c.core.retired.Store(true)
+	c.core.markOutboundConnectivityRetired()
 }
 
 // ResetGlobalUdpState clears all global UDP-related pools.
@@ -3827,12 +4202,15 @@ func (c *ControlPlane) releaseRetainedState() {
 	c.wanInterface = nil
 	c.lanInterface = nil
 	c.udpUnorderedRunner = nil
+	c.udpOrderedDispatcher = nil
+	c.udpReplyDispatcher = nil
 	c.failedQuicDcidCache = nil
 	c.listenerPublishMu.Lock()
 	c.listenerFiles = nil
 	c.listenerPublishMu.Unlock()
 	c.routingKernspaceSnapshot = nil
 	c.pendingDnsReloadCache = nil
+	c.ClearReloadDnsCacheSource()
 	c.core = nil
 }
 
@@ -3840,12 +4218,19 @@ func (c *ControlPlane) Close() (err error) {
 	if c == nil {
 		return nil
 	}
+	c.closeRoutingEpochExecution()
+	c.ClearReloadDnsCacheSource()
 
 	c.closeOnce.Do(func() {
 		c.unpublishRuntimeStats()
 		if c.cancel != nil {
 			c.cancel()
 		}
+		c.closeUDPOrderedDispatcher()
+		c.udpIngressAdmission.closeAndWait()
+		c.waitUDPOrderedDispatcher()
+		c.closeUDPReplyDispatcher()
+		c.waitUDPReplyDispatcher()
 
 		var stopWg sync.WaitGroup
 		stopWg.Add(2)
@@ -3891,6 +4276,7 @@ func (c *ControlPlane) Close() (err error) {
 			c.closeErr = stderrors.Join(coreErr, timeoutErr)
 		}
 	})
+	c.UnlinkRoutingEpochPeer(nil)
 
 	return c.closeErr
 }

@@ -7,6 +7,8 @@ package control
 
 import (
 	"context"
+	stderrors "errors"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -50,9 +52,7 @@ func udpCacheMissFixture() DnsCorpusFixture {
 			{
 				Name: "cold_query_forwards_and_returns_dialtarget_ip",
 				Query: func() *dnsmessage.Msg {
-					msg := new(dnsmessage.Msg)
-					msg.SetQuestion("cache-miss.test.", dnsmessage.TypeA)
-					return msg
+					return corpusDnsQuery(0x1001, "cache-miss.test.", dnsmessage.TypeA)
 				},
 				Expected: DnsCorpusExpected{
 					HasRcode:       true,
@@ -60,6 +60,10 @@ func udpCacheMissFixture() DnsCorpusFixture {
 					HasAnswerCount: true,
 					AnswerCount:    1,
 					AnswerIPv4:     "1.1.1.1", // matches defaultUdpRequest realDst
+					HasAnswerTTL:   true,
+					AnswerTTLMin:   1,
+					AnswerTTLMax:   60,
+					WireHex:        "1001818000010001000000000a63616368652d6d697373047465737400000100010a63616368652d6d6973730474657374000001000100000000000401010101",
 				},
 				PostAssert: func(t *testing.T, _ *DnsController, _ *dnsmessage.Msg) {
 					if got := forwardCalls.Load(); got != 1 {
@@ -115,24 +119,17 @@ func rejectBeforeCacheFixture() DnsCorpusFixture {
 					// return if reject did not short-circuit. If the refactor
 					// ever serves this cached answer, the test catches it.
 					key := ctrl.cacheKey("reject.test.", dnsmessage.TypeA)
-					if err := ctrl.UpdateDnsCacheTtlWithKey(
-						key, "reject.test.", dnsmessage.TypeA,
-						dnsAResponseMsg("reject.test.", "9.9.9.9").Answer,
-						nil, nil, 60,
-					); err != nil {
-						t.Fatalf("UpdateDnsCacheTtlWithKey error = %v", err)
-					}
+					installCorpusCache(t, ctrl, key, "reject.test.", dnsmessage.TypeA, dnsAResponseMsg("reject.test.", "9.9.9.9").Answer, 300)
 				},
 				Query: func() *dnsmessage.Msg {
-					msg := new(dnsmessage.Msg)
-					msg.SetQuestion("reject.test.", dnsmessage.TypeA)
-					return msg
+					return corpusDnsQuery(0x1003, "reject.test.", dnsmessage.TypeA)
 				},
 				Expected: DnsCorpusExpected{
 					HasRcode:       true,
 					Rcode:          dnsmessage.RcodeSuccess,
 					HasAnswerCount: true,
 					AnswerCount:    0,
+					WireHex:        "1003818000010000000000000672656a65637404746573740000010001",
 				},
 				PostAssert: func(t *testing.T, _ *DnsController, _ *dnsmessage.Msg) {
 					if got := forwardCalls.Load(); got != 0 {
@@ -177,18 +174,10 @@ func udpCacheHitFixture() DnsCorpusFixture {
 						baseKey, req,
 						consts.DnsRequestOutboundIndex_AsIs, nil,
 					)
-					if err := ctrl.UpdateDnsCacheTtlWithKey(
-						cacheKey, "cache-hit.test.", dnsmessage.TypeA,
-						dnsAResponseMsg("cache-hit.test.", "203.0.113.42").Answer,
-						nil, nil, 60,
-					); err != nil {
-						t.Fatalf("UpdateDnsCacheTtlWithKey error = %v", err)
-					}
+					installCorpusCache(t, ctrl, cacheKey, "cache-hit.test.", dnsmessage.TypeA, dnsAResponseMsg("cache-hit.test.", "203.0.113.42").Answer, 300)
 				},
 				Query: func() *dnsmessage.Msg {
-					msg := new(dnsmessage.Msg)
-					msg.SetQuestion("cache-hit.test.", dnsmessage.TypeA)
-					return msg
+					return corpusDnsQuery(0x1002, "cache-hit.test.", dnsmessage.TypeA)
 				},
 				Expected: DnsCorpusExpected{
 					HasRcode:       true,
@@ -196,10 +185,137 @@ func udpCacheHitFixture() DnsCorpusFixture {
 					HasAnswerCount: true,
 					AnswerCount:    1,
 					AnswerIPv4:     "203.0.113.42", // the cached IP, not the factory IP
+					HasAnswerTTL:   true,
+					AnswerTTLMin:   300,
+					AnswerTTLMax:   300,
+					WireHex:        "1002818000010001000000000963616368652d686974047465737400000100010963616368652d68697404746573740000010001000000000004cb00712a",
 				},
 				PostAssert: func(t *testing.T, _ *DnsController, _ *dnsmessage.Msg) {
 					if got := forwardCalls.Load(); got != 0 {
 						t.Fatalf("upstream forward calls = %d, want 0", got)
+					}
+				},
+			},
+		},
+	}
+}
+
+// udpCacheHitAAAAFixture pins the warm-cache IPv6 path. Keeping this as a
+// separate fixture makes the qtype and cache-key family explicit in the
+// legacy-vs-pipeline differential rather than relying on an A-only cache case.
+func udpCacheHitAAAAFixture() DnsCorpusFixture {
+	var forwardCalls atomic.Int32
+	return DnsCorpusFixture{
+		Name:        "udp_cache_hit_aaaa",
+		Description: "Warm AAAA cache: cached IPv6 answer is served without contacting upstream",
+		BuildConfig: func() *config.Dns {
+			return &config.Dns{
+				Routing: config.DnsRouting{
+					Request:  config.DnsRequestRouting{Fallback: "asis"},
+					Response: config.DnsResponseRouting{Fallback: "accept"},
+				},
+			}
+		},
+		ForwarderFactory: func(upstream *componentdns.Upstream, dialArg dialArgument, _ *logrus.Logger) (DnsForwarder, error) {
+			return &stubDnsForwarder{forward: func(ctx context.Context, data []byte) (*dnsmessage.Msg, error) {
+				forwardCalls.Add(1)
+				return dnsAAAAResponseMsg("aaaa-cache.test.", "2001:db8::99"), nil
+			}}, nil
+		},
+		Cases: []DnsCorpusCase{
+			{
+				Name: "warm_aaaa_cache_returns_cached_ipv6",
+				PreState: func(t *testing.T, ctrl *DnsController) {
+					req := defaultUdpRequest()
+					baseKey := ctrl.cacheKey("aaaa-cache.test.", dnsmessage.TypeAAAA)
+					cacheKey := ctrl.responseCacheKey(
+						baseKey, req,
+						consts.DnsRequestOutboundIndex_AsIs, nil,
+					)
+					installCorpusCache(t, ctrl, cacheKey, "aaaa-cache.test.", dnsmessage.TypeAAAA,
+						dnsAAAAResponseMsg("aaaa-cache.test.", "2001:db8::42").Answer, 300)
+				},
+				Query: func() *dnsmessage.Msg {
+					return corpusDnsQuery(0x1006, "aaaa-cache.test.", dnsmessage.TypeAAAA)
+				},
+				Expected: DnsCorpusExpected{
+					HasRcode:       true,
+					Rcode:          dnsmessage.RcodeSuccess,
+					HasAnswerCount: true,
+					AnswerCount:    1,
+					AnswerIPv6:     "2001:db8::42",
+					HasAnswerTTL:   true,
+					AnswerTTLMin:   300,
+					AnswerTTLMax:   300,
+					WireHex:        "1006818000010001000000000a616161612d6361636865047465737400001c00010a616161612d6361636865047465737400001c000100000000001020010db8000000000000000000000042",
+				},
+				PostAssert: func(t *testing.T, _ *DnsController, _ *dnsmessage.Msg) {
+					if got := forwardCalls.Load(); got != 0 {
+						t.Fatalf("upstream forward calls = %d, want 0", got)
+					}
+				},
+			},
+		},
+	}
+}
+
+// negativeResponseFixture pins the upstream negative-response boundary. A
+// successful transport carrying NXDOMAIN must still be delivered to the
+// caller, but it must not become a positive address cache entry that hides a
+// later retry.
+func negativeResponseFixture() DnsCorpusFixture {
+	var forwardCalls atomic.Int32
+	return DnsCorpusFixture{
+		Name:        "negative_upstream_response",
+		Description: "NXDOMAIN is delivered and is not stored as an address cache entry",
+		BuildConfig: func() *config.Dns {
+			return &config.Dns{
+				Routing: config.DnsRouting{
+					Request:  config.DnsRequestRouting{Fallback: "asis"},
+					Response: config.DnsResponseRouting{Fallback: "accept"},
+				},
+			}
+		},
+		ForwarderFactory: func(upstream *componentdns.Upstream, dialArg dialArgument, _ *logrus.Logger) (DnsForwarder, error) {
+			return &stubDnsForwarder{forward: func(context.Context, []byte) (*dnsmessage.Msg, error) {
+				forwardCalls.Add(1)
+				return dnsNegativeResponseMsg("negative.test."), nil
+			}}, nil
+		},
+		Cases: []DnsCorpusCase{
+			{
+				Name: "nxdomain_is_delivered",
+				Query: func() *dnsmessage.Msg {
+					return corpusDnsQuery(0x1007, "negative.test.", dnsmessage.TypeA)
+				},
+				Expected: DnsCorpusExpected{
+					HasRcode:       true,
+					Rcode:          dnsmessage.RcodeNameError,
+					HasAnswerCount: true,
+					AnswerCount:    0,
+					WireHex:        "100781030001000000000000086e6567617469766504746573740000010001",
+				},
+				PostAssert: func(t *testing.T, _ *DnsController, _ *dnsmessage.Msg) {
+					if got := forwardCalls.Load(); got != 1 {
+						t.Fatalf("upstream forward calls = %d, want 1", got)
+					}
+				},
+			},
+			{
+				Name: "nxdomain_is_not_reused_as_positive_cache",
+				Query: func() *dnsmessage.Msg {
+					return corpusDnsQuery(0x1008, "negative.test.", dnsmessage.TypeA)
+				},
+				Expected: DnsCorpusExpected{
+					HasRcode:       true,
+					Rcode:          dnsmessage.RcodeNameError,
+					HasAnswerCount: true,
+					AnswerCount:    0,
+					WireHex:        "100881030001000000000000086e6567617469766504746573740000010001",
+				},
+				PostAssert: func(t *testing.T, _ *DnsController, _ *dnsmessage.Msg) {
+					if got := forwardCalls.Load(); got != 2 {
+						t.Fatalf("upstream forward calls = %d, want 2", got)
 					}
 				},
 			},
@@ -258,9 +374,7 @@ func udpCacheStaleOptimisticFixture() DnsCorpusFixture {
 					cache.deadlineNano.Store(expiredAt.UnixNano())
 				},
 				Query: func() *dnsmessage.Msg {
-					msg := new(dnsmessage.Msg)
-					msg.SetQuestion("stale.test.", dnsmessage.TypeA)
-					return msg
+					return corpusDnsQuery(0x1004, "stale.test.", dnsmessage.TypeA)
 				},
 				Expected: DnsCorpusExpected{
 					HasRcode:       true,
@@ -281,4 +395,111 @@ func udpCacheStaleOptimisticFixture() DnsCorpusFixture {
 			},
 		},
 	}
+}
+
+// tcpUdpFallbackFixture pins the user-observable tcp+udp fallback path. A
+// request selects the named upstream, its UDP attempt fails, and the same
+// request succeeds over TCP. This covers the complete request routing and
+// delivery path rather than only calling forwardWithFallback directly.
+func tcpUdpFallbackFixture() DnsCorpusFixture {
+	var udpCalls atomic.Int32
+	var tcpCalls atomic.Int32
+	return DnsCorpusFixture{
+		Name:        "tcp_udp_fallback",
+		Description: "Named tcp+udp upstream falls back from failed UDP to TCP",
+		BuildConfig: func() *config.Dns {
+			return &config.Dns{
+				Upstream: []config.KeyableString{
+					"fallback:tcp+udp://192.0.2.53:53",
+				},
+				Routing: config.DnsRouting{
+					Request:  config.DnsRequestRouting{Fallback: "fallback"},
+					Response: config.DnsResponseRouting{Fallback: "accept"},
+				},
+			}
+		},
+		BestDialerChooser: func(ctx context.Context, req *udpRequest, upstream *componentdns.Upstream) (*dialArgument, error) {
+			switch upstream.Scheme {
+			case componentdns.UpstreamScheme_TCP_UDP:
+				return &dialArgument{
+					l4proto:    consts.L4ProtoStr_UDP,
+					ipversion:  consts.IpVersionStr_4,
+					bestTarget: req.realDst,
+				}, nil
+			case componentdns.UpstreamScheme_TCP:
+				return &dialArgument{
+					l4proto:    consts.L4ProtoStr_TCP,
+					ipversion:  consts.IpVersionStr_4,
+					bestTarget: req.realDst,
+				}, nil
+			default:
+				return nil, stderrors.New("unexpected upstream scheme")
+			}
+		},
+		ForwarderFactory: func(upstream *componentdns.Upstream, dialArg dialArgument, _ *logrus.Logger) (DnsForwarder, error) {
+			switch dialArg.l4proto {
+			case consts.L4ProtoStr_UDP:
+				udpCalls.Add(1)
+				return &stubDnsForwarder{forward: func(context.Context, []byte) (*dnsmessage.Msg, error) {
+					return nil, stderrors.New("udp transport failed")
+				}}, nil
+			case consts.L4ProtoStr_TCP:
+				tcpCalls.Add(1)
+				return &stubDnsForwarder{forward: func(context.Context, []byte) (*dnsmessage.Msg, error) {
+					return dnsAResponseMsg("tcp-fallback.test.", "198.51.100.53"), nil
+				}}, nil
+			default:
+				return nil, stderrors.New("unexpected transport")
+			}
+		},
+		Cases: []DnsCorpusCase{
+			{
+				Name: "udp_failure_returns_tcp_answer",
+				Query: func() *dnsmessage.Msg {
+					return corpusDnsQuery(0x1005, "tcp-fallback.test.", dnsmessage.TypeA)
+				},
+				Expected: DnsCorpusExpected{
+					HasRcode:       true,
+					Rcode:          dnsmessage.RcodeSuccess,
+					HasAnswerCount: true,
+					AnswerCount:    1,
+					AnswerIPv4:     "198.51.100.53",
+					HasAnswerTTL:   true,
+					AnswerTTLMin:   1,
+					AnswerTTLMax:   60,
+					WireHex:        "1005818000010001000000000c7463702d66616c6c6261636b047465737400000100010c7463702d66616c6c6261636b04746573740000010001000000000004c6336435",
+				},
+				PostAssert: func(t *testing.T, _ *DnsController, _ *dnsmessage.Msg) {
+					if got := udpCalls.Load(); got != 1 {
+						t.Fatalf("UDP forward calls = %d, want 1", got)
+					}
+					if got := tcpCalls.Load(); got != 1 {
+						t.Fatalf("TCP forward calls = %d, want 1", got)
+					}
+				},
+			},
+		},
+	}
+}
+
+func dnsAAAAResponseMsg(name, address string) *dnsmessage.Msg {
+	return &dnsmessage.Msg{
+		MsgHdr: dnsmessage.MsgHdr{
+			Response:           true,
+			RecursionAvailable: true,
+		},
+		Question: []dnsmessage.Question{{Name: name, Qtype: dnsmessage.TypeAAAA, Qclass: dnsmessage.ClassINET}},
+		Answer: []dnsmessage.RR{&dnsmessage.AAAA{
+			Hdr:  dnsmessage.RR_Header{Name: name, Rrtype: dnsmessage.TypeAAAA, Class: dnsmessage.ClassINET, Ttl: 60},
+			AAAA: net.ParseIP(address).To16(),
+		}},
+	}
+}
+
+func dnsNegativeResponseMsg(name string) *dnsmessage.Msg {
+	msg := new(dnsmessage.Msg)
+	msg.SetReply(&dnsmessage.Msg{})
+	msg.SetQuestion(name, dnsmessage.TypeA)
+	msg.Rcode = dnsmessage.RcodeNameError
+	return msg
 }

@@ -20,15 +20,15 @@ func TestBpfMapBatchDeleteAllDeletesLargeMapInChunks(t *testing.T) {
 	const totalEntries = bpfMapBatchDeleteAllChunkSize*2 + bpfMapBatchDeleteAllLookupSize + 7
 	populateDomainRoutingMapForTest(t, domainMap, totalEntries)
 
-	if got := countMapEntriesForTest[[4]uint32, bpfDomainRouting](t, domainMap); got != totalEntries {
+	if got := countMapEntriesForTest[bpfRoutingEpochIp, bpfDomainRouting](t, domainMap); got != totalEntries {
 		t.Fatalf("domain_routing_map entry count before cleanup = %d, want %d", got, totalEntries)
 	}
 
-	if err := BpfMapBatchDeleteAll[[4]uint32, bpfDomainRouting](domainMap); err != nil {
+	if err := BpfMapBatchDeleteAll[bpfRoutingEpochIp, bpfDomainRouting](domainMap); err != nil {
 		t.Fatalf("BpfMapBatchDeleteAll returned error: %v", err)
 	}
 
-	if got := countMapEntriesForTest[[4]uint32, bpfDomainRouting](t, domainMap); got != 0 {
+	if got := countMapEntriesForTest[bpfRoutingEpochIp, bpfDomainRouting](t, domainMap); got != 0 {
 		t.Fatalf("domain_routing_map entry count after cleanup = %d, want 0", got)
 	}
 }
@@ -47,7 +47,7 @@ func TestBpfMapBatchDeleteAllFallsBackWhenBatchLookupUnsupported(t *testing.T) {
 		bpfMapBatchLookup = oldLookup
 	})
 
-	if err := BpfMapBatchDeleteAll[[4]uint32, bpfDomainRouting](domainMap); err != nil {
+	if err := BpfMapBatchDeleteAll[bpfRoutingEpochIp, bpfDomainRouting](domainMap); err != nil {
 		t.Fatalf("BpfMapBatchDeleteAll fallback returned error: %v", err)
 	}
 
@@ -55,7 +55,7 @@ func TestBpfMapBatchDeleteAllFallsBackWhenBatchLookupUnsupported(t *testing.T) {
 		t.Fatal("expected batch lookup to be attempted when batch delete simulation is disabled")
 	}
 
-	if got := countMapEntriesForTest[[4]uint32, bpfDomainRouting](t, domainMap); got != 0 {
+	if got := countMapEntriesForTest[bpfRoutingEpochIp, bpfDomainRouting](t, domainMap); got != 0 {
 		t.Fatalf("domain_routing_map entry count after fallback cleanup = %d, want 0", got)
 	}
 }
@@ -64,7 +64,10 @@ func populateDomainRoutingMapForTest(t *testing.T, m *ebpf.Map, entries int) {
 	t.Helper()
 	var value bpfDomainRouting
 	for i := range entries {
-		key := [4]uint32{uint32(i + 1), uint32((i + 1) * 3), 0, 0}
+		key := bpfRoutingEpochIp{
+			Slot: uint32(i % routingEpochSlotCount),
+			Addr: [4]uint32{uint32(i + 1), uint32((i + 1) * 3), 0, 0},
+		}
 		if err := m.Update(&key, &value, ebpf.UpdateAny); err != nil {
 			t.Fatalf("update domain_routing_map entry %d: %v", i, err)
 		}

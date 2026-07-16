@@ -6,6 +6,7 @@
 package control
 
 import (
+	"encoding/binary"
 	"net/netip"
 	"testing"
 
@@ -15,6 +16,65 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRoutingEpochSlotBase(t *testing.T) {
+	maxEntries := uint32(consts.MaxMatchSetLen)
+	tests := []struct {
+		name    string
+		slot    uint32
+		want    uint32
+		wantErr bool
+	}{
+		{name: "first slot", slot: 0, want: 0},
+		{name: "second slot", slot: 1, want: maxEntries},
+		{name: "invalid slot", slot: uint32(routingEpochSlotCount), wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := routingEpochSlotBase(tt.slot)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestBuildKernspaceForSlotRejectsInvalidSlot(t *testing.T) {
+	builder := &RoutingMatcherBuilder{}
+	_, err := builder.BuildKernspaceForSlot(logrus.New(), uint32(routingEpochSlotCount))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid routing epoch slot")
+}
+
+func TestRewriteKernRulesWithRingLpmIndexKeepsIndexesSlotLocal(t *testing.T) {
+	maxEntries := uint32(consts.MaxMatchSetLen)
+	rules := []bpfMatchSet{
+		{Type: uint8(consts.MatchType_IpSet)},
+		{Type: uint8(consts.MatchType_SourceIpSet)},
+		{Type: uint8(consts.MatchType_Fallback)},
+	}
+	binary.LittleEndian.PutUint32(rules[0].Value[:4], 0)
+	binary.LittleEndian.PutUint32(rules[1].Value[:4], 1)
+
+	kernRules, err := rewriteKernRulesWithRingLpmIndex(rules, maxEntries-1, 2)
+	require.NoError(t, err)
+
+	firstIndex := binary.LittleEndian.Uint32(kernRules[0].Value[:4])
+	secondIndex := binary.LittleEndian.Uint32(kernRules[1].Value[:4])
+	require.Equal(t, maxEntries-1, firstIndex)
+	require.Equal(t, uint32(0), secondIndex)
+	require.Less(t, firstIndex, maxEntries)
+	require.Less(t, secondIndex, maxEntries)
+
+	slotBase, err := routingEpochSlotBase(1)
+	require.NoError(t, err)
+	require.Equal(t, slotBase+firstIndex, uint32(2)*maxEntries-1)
+	require.Equal(t, slotBase+secondIndex, maxEntries)
+}
 
 func TestReserveLpmRingSlotsReturnsCurrentIndexForZeroCount(t *testing.T) {
 	old := globalNextLpmIndex.Load()

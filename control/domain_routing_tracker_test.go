@@ -55,7 +55,7 @@ func TestDomainRoutingTrackerMergesSharedIPAcrossOwners(t *testing.T) {
 	cacheB := domainRoutingACache("cache-b", "203.0.113.10", domainRoutingBitmap(0x2))
 	ip := netip.MustParseAddr("203.0.113.10")
 	ip16 := ip.As16()
-	ipKey := common.Ipv6ByteSliceToUint32Array(ip16[:])
+	ipKey := bpfRoutingEpochIp{Slot: 0, Addr: common.Ipv6ByteSliceToUint32Array(ip16[:])}
 
 	if err := core.BatchUpdateDomainRouting(cacheA); err != nil {
 		t.Fatalf("BatchUpdateDomainRouting(cacheA): %v", err)
@@ -129,10 +129,10 @@ func TestDomainRoutingTrackerReplacesOwnerSnapshotWithoutLeakingRefs(t *testing.
 
 	ip20Addr := netip.MustParseAddr("203.0.113.20")
 	ip20Bytes := ip20Addr.As16()
-	ip20 := common.Ipv6ByteSliceToUint32Array(ip20Bytes[:])
+	ip20 := bpfRoutingEpochIp{Slot: 0, Addr: common.Ipv6ByteSliceToUint32Array(ip20Bytes[:])}
 	ip21Addr := netip.MustParseAddr("203.0.113.21")
 	ip21Bytes := ip21Addr.As16()
-	ip21 := common.Ipv6ByteSliceToUint32Array(ip21Bytes[:])
+	ip21 := bpfRoutingEpochIp{Slot: 0, Addr: common.Ipv6ByteSliceToUint32Array(ip21Bytes[:])}
 
 	if err := core.BatchUpdateDomainRouting(first); err != nil {
 		t.Fatalf("BatchUpdateDomainRouting(first): %v", err)
@@ -160,5 +160,62 @@ func TestDomainRoutingTrackerReplacesOwnerSnapshotWithoutLeakingRefs(t *testing.
 	}
 	if err := domainMap.Lookup(&ip20, &got); !stderrors.Is(err, ebpf.ErrKeyNotExist) {
 		t.Fatalf("Lookup(ip20 after remove) err = %v, want %v", err, ebpf.ErrKeyNotExist)
+	}
+}
+
+func TestDomainRoutingTrackerKeepsEpochSlotsIndependent(t *testing.T) {
+	domainMap := newJanitorTestMap(t, "domain_routing_map")
+	core := &controlPlaneCore{
+		domainRouting: newDomainRoutingTracker(),
+	}
+	core.bpf.Store(&bpfObjects{
+		bpfMaps: bpfMaps{
+			DomainRoutingMap: domainMap,
+		},
+	})
+
+	cache := domainRoutingACache("shared-owner", "203.0.113.30", domainRoutingBitmap(0x1))
+	ip := netip.MustParseAddr("203.0.113.30")
+	ipBytes := ip.As16()
+	addr := common.Ipv6ByteSliceToUint32Array(ipBytes[:])
+
+	core.routingEpochSlot.Store(0)
+	if err := core.BatchUpdateDomainRouting(cache); err != nil {
+		t.Fatalf("slot zero BatchUpdateDomainRouting() error = %v", err)
+	}
+
+	cache.DomainBitmap = domainRoutingBitmap(0x2)
+	core.routingEpochSlot.Store(1)
+	if err := core.BatchUpdateDomainRouting(cache); err != nil {
+		t.Fatalf("slot one BatchUpdateDomainRouting() error = %v", err)
+	}
+
+	var got bpfDomainRouting
+	key0 := bpfRoutingEpochIp{Slot: 0, Addr: addr}
+	if err := domainMap.Lookup(&key0, &got); err != nil {
+		t.Fatalf("Lookup(slot zero): %v", err)
+	}
+	if got.Bitmap[0] != 0x1 {
+		t.Fatalf("slot zero bitmap = %#x, want %#x", got.Bitmap[0], uint32(0x1))
+	}
+	key1 := bpfRoutingEpochIp{Slot: 1, Addr: addr}
+	if err := domainMap.Lookup(&key1, &got); err != nil {
+		t.Fatalf("Lookup(slot one): %v", err)
+	}
+	if got.Bitmap[0] != 0x2 {
+		t.Fatalf("slot one bitmap = %#x, want %#x", got.Bitmap[0], uint32(0x2))
+	}
+
+	if err := core.BatchRemoveDomainRouting(cache); err != nil {
+		t.Fatalf("slot one BatchRemoveDomainRouting() error = %v", err)
+	}
+	if err := domainMap.Lookup(&key1, &got); !stderrors.Is(err, ebpf.ErrKeyNotExist) {
+		t.Fatalf("Lookup(slot one after remove) err = %v, want %v", err, ebpf.ErrKeyNotExist)
+	}
+	if err := domainMap.Lookup(&key0, &got); err != nil {
+		t.Fatalf("Lookup(slot zero after slot one remove): %v", err)
+	}
+	if got.Bitmap[0] != 0x1 {
+		t.Fatalf("slot zero bitmap after slot one remove = %#x, want %#x", got.Bitmap[0], uint32(0x1))
 	}
 }

@@ -32,10 +32,10 @@ func TestResolveForSingleflightRechecksCache(t *testing.T) {
 	const cacheKey = "singleflight-cache-key"
 	controller.dnsCache.Store(cacheKey, cache)
 
-	response, err := controller.resolveForSingleflight(
+	result, err := controller.resolveForSingleflightSnapshot(
 		context.Background(),
 		query,
-		&udpRequest{},
+		DnsRequestSnapshot{},
 		0,
 		nil,
 		cacheKey,
@@ -43,11 +43,14 @@ func TestResolveForSingleflightRechecksCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveForSingleflight() error = %v", err)
 	}
-	if response.Id != query.Id {
-		t.Fatalf("response ID = %d, want %d", response.Id, query.Id)
+	if result == nil || result.Response == nil {
+		t.Fatal("resolveForSingleflightSnapshot() returned no DNS response")
 	}
-	if len(response.Answer) != 1 {
-		t.Fatalf("answer count = %d, want 1", len(response.Answer))
+	if result.Response.Id != query.Id {
+		t.Fatalf("response ID = %d, want %d", result.Response.Id, query.Id)
+	}
+	if len(result.Response.Answer) != 1 {
+		t.Fatalf("answer count = %d, want 1", len(result.Response.Answer))
 	}
 }
 

@@ -8,6 +8,8 @@ on:
       - "**/*.h"
       - "go.mod"
       - "go.sum"
+      - "scripts/semantic-refactor-live-smoke.sh"
+      - "install/empty.dae"
       - ".github/workflows/kernel-test.yml"
   push:
     branches:
@@ -19,6 +21,8 @@ on:
       - "**/*.h"
       - "go.mod"
       - "go.sum"
+      - "scripts/semantic-refactor-live-smoke.sh"
+      - "install/empty.dae"
       - ".github/workflows/kernel-test.yml"
 
 jobs:
@@ -58,6 +62,12 @@ jobs:
           exit 1
         fi
 
+    - name: Verify generated eBPF and kernel C sources
+      run: |
+        set -euo pipefail
+        make ebpf-sync-check
+        make ebpf-lint
+
     - name: Store executable
       uses: actions/upload-artifact@v7
       with:
@@ -96,6 +106,17 @@ jobs:
 
             apt update
             apt install -y unzip
+
+      - name: Check real-BPF reload lifecycle
+        uses: cilium/little-vm-helper@v0.0.28
+        with:
+          provision: 'false'
+          cmd: |
+            set -euo pipefail
+            /host/scripts/semantic-refactor-live-smoke.sh /host/dae/dae /host/install/empty.dae 16
+            test ! -e /sys/fs/bpf/dae
+            ! ip link show dae0 >/dev/null 2>&1
+            ! ip netns list 2>/dev/null | grep -q '^daens'
 
       - name: Setup network
         uses: cilium/little-vm-helper@v0.0.28

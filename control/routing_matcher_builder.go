@@ -41,6 +41,7 @@ type RoutingMatcherBuilder struct {
 	bpf                *bpfObjects
 	rules              []bpfMatchSet
 	compiledRules      []compiledRoutingMatch
+	predicateGroups    []routingMatcherPredicateGroupSpan
 	simulatedLpmTries  [][]netip.Prefix
 	simulatedDomainSet []routing.DomainSet
 	// packetMetadataSensitiveRouting is true when routing rules depend on
@@ -159,16 +160,39 @@ func NewRoutingMatcherBuilderFromProgram(log *logrus.Logger, program *routing.No
 }
 
 func (b *RoutingMatcherBuilder) registerProgramParsers(rulesBuilder *routing.RulesBuilder) {
-	rulesBuilder.RegisterFunctionParser(consts.Function_Domain, routing.PlainParserFactory(b.addDomain))
-	rulesBuilder.RegisterFunctionParser(consts.Function_Ip, routing.IpParserFactory(b.addIp))
-	rulesBuilder.RegisterFunctionParser(consts.Function_SourceIp, routing.IpParserFactory(b.addSourceIp))
-	rulesBuilder.RegisterFunctionParser(consts.Function_Port, routing.PortRangeParserFactory(b.addPort))
-	rulesBuilder.RegisterFunctionParser(consts.Function_SourcePort, routing.PortRangeParserFactory(b.addSourcePort))
-	rulesBuilder.RegisterFunctionParser(consts.Function_L4Proto, routing.L4ProtoParserFactory(b.addL4Proto))
-	rulesBuilder.RegisterFunctionParser(consts.Function_Mac, routing.MacParserFactory(b.addSourceMac))
-	rulesBuilder.RegisterFunctionParser(consts.Function_ProcessName, routing.ProcessNameParserFactory(b.addProcessName))
-	rulesBuilder.RegisterFunctionParser(consts.Function_Dscp, routing.UintParserFactory(b.addDscp))
-	rulesBuilder.RegisterFunctionParser(consts.Function_IpVersion, routing.IpVersionParserFactory(b.addIpVersion))
+	b.registerProgramParser(rulesBuilder, consts.Function_Domain, routing.PlainParserFactory(b.addDomain))
+	b.registerProgramParser(rulesBuilder, consts.Function_Ip, routing.IpParserFactory(b.addIp))
+	b.registerProgramParser(rulesBuilder, consts.Function_SourceIp, routing.IpParserFactory(b.addSourceIp))
+	b.registerProgramParser(rulesBuilder, consts.Function_Port, routing.PortRangeParserFactory(b.addPort))
+	b.registerProgramParser(rulesBuilder, consts.Function_SourcePort, routing.PortRangeParserFactory(b.addSourcePort))
+	b.registerProgramParser(rulesBuilder, consts.Function_L4Proto, routing.L4ProtoParserFactory(b.addL4Proto))
+	b.registerProgramParser(rulesBuilder, consts.Function_Mac, routing.MacParserFactory(b.addSourceMac))
+	b.registerProgramParser(rulesBuilder, consts.Function_ProcessName, routing.ProcessNameParserFactory(b.addProcessName))
+	b.registerProgramParser(rulesBuilder, consts.Function_Dscp, routing.UintParserFactory(b.addDscp))
+	b.registerProgramParser(rulesBuilder, consts.Function_IpVersion, routing.IpVersionParserFactory(b.addIpVersion))
+}
+
+func (b *RoutingMatcherBuilder) registerProgramParser(rulesBuilder *routing.RulesBuilder, name string, parser routing.FunctionParser) {
+	rulesBuilder.RegisterFunctionParser(name, func(
+		log *logrus.Logger,
+		function *config_parser.Function,
+		key string,
+		values []string,
+		overrideOutbound *routing.Outbound,
+	) error {
+		start := len(b.compiledRules)
+		if err := parser(log, function, key, values, overrideOutbound); err != nil {
+			return err
+		}
+		b.predicateGroups = append(b.predicateGroups, routingMatcherPredicateGroupSpan{
+			name:  function.Name,
+			key:   key,
+			not:   function.Not,
+			start: start,
+			end:   len(b.compiledRules),
+		})
+		return nil
+	})
 }
 
 func (b *RoutingMatcherBuilder) outboundToId(outbound string) (uint8, error) {
@@ -534,11 +558,18 @@ func (b *RoutingMatcherBuilder) addFallback(fallbackOutbound config.FunctionOrSt
 	return nil
 }
 
-// globalNextLpmIndex is process-wide to avoid reusing the same lpm_array_map
-// slots during hot-reload windows where old and new rules may overlap briefly.
-// BuildKernspace is expected to run serially; atomic protects against
-// accidental concurrent invocation.
+// globalNextLpmIndex allocates local LPM indexes across builds. It reduces
+// reuse when a slot is rebuilt and preserves the legacy slot-zero allocation
+// behavior. BuildKernspace is expected to run serially; atomic protects
+// against accidental concurrent invocation.
 var globalNextLpmIndex atomic.Uint32
+
+func routingEpochSlotBase(slot uint32) (uint32, error) {
+	if !validRoutingEpochSlot(slot) {
+		return 0, fmt.Errorf("invalid routing epoch slot %d", slot)
+	}
+	return slot * uint32(consts.MaxMatchSetLen), nil
+}
 
 func getNextRingLpmIndex(count uint32) uint32 {
 	maxEntries := uint32(consts.MaxMatchSetLen)
@@ -607,11 +638,29 @@ func buildRoutingKernspace(
 	simulatedLpmTries [][]netip.Prefix,
 	dedupCount int,
 ) (usedIndices []uint32, err error) {
+	return buildRoutingKernspaceForSlot(log, bpf, rules, simulatedLpmTries, dedupCount, 0)
+}
+
+func buildRoutingKernspaceForSlot(
+	log *logrus.Logger,
+	bpf *bpfObjects,
+	rules []bpfMatchSet,
+	simulatedLpmTries [][]netip.Prefix,
+	dedupCount int,
+	slot uint32,
+) (usedIndices []uint32, err error) {
+	slotBase, err := routingEpochSlotBase(slot)
+	if err != nil {
+		return nil, err
+	}
 	if bpf == nil {
 		return nil, fmt.Errorf("nil bpf objects")
 	}
 	if len(rules) == 0 {
 		return nil, fmt.Errorf("no routing rules to build")
+	}
+	if len(rules) > consts.MaxMatchSetLen {
+		return nil, fmt.Errorf("too many routing rules: %d > %d", len(rules), consts.MaxMatchSetLen)
 	}
 
 	lpmCount := uint32(len(simulatedLpmTries))
@@ -712,15 +761,17 @@ func buildRoutingKernspace(
 				// LpmArrayMap.Update is safe to call concurrently:
 				// cilium/ebpf Map.Update has no internal shared mutable state
 				// (map.go:280-291, all fields immutable after NewMap), and
-				// each goroutine writes a distinct lpmIndex from the ring
-				// allocator. The syscall itself is serialized by the kernel.
+				// each goroutine writes a distinct local LPM index from the ring
+				// allocator within this slot. The syscall itself is serialized by
+				// the kernel.
 				// mu below only guards the firstErr aggregation.
-				mapErr = bpf.LpmArrayMap.Update(r.lpmIndex, m, ebpf.UpdateAny)
+				mapIndex := slotBase + r.lpmIndex
+				mapErr = bpf.LpmArrayMap.Update(mapIndex, m, ebpf.UpdateAny)
 				if mapErr != nil {
 					_ = m.Close()
 					mu.Lock()
 					if firstErr == nil {
-						firstErr = fmt.Errorf("update lpm_array_map[%d]: %w", r.lpmIndex, mapErr)
+						firstErr = fmt.Errorf("update lpm_array_map[%d]: %w", mapIndex, mapErr)
 					}
 					mu.Unlock()
 					return
@@ -740,7 +791,8 @@ func buildRoutingKernspace(
 			if err != nil {
 				return nil, fmt.Errorf("newLpmMap: %w", err)
 			}
-			if err = bpf.LpmArrayMap.Update(r.lpmIndex, m, ebpf.UpdateAny); err != nil {
+			mapIndex := slotBase + r.lpmIndex
+			if err = bpf.LpmArrayMap.Update(mapIndex, m, ebpf.UpdateAny); err != nil {
 				_ = m.Close()
 				return nil, fmt.Errorf("update: %w", err)
 			}
@@ -759,12 +811,15 @@ func buildRoutingKernspace(
 		return nil, err
 	}
 	routingsKeys := common.ARangeU32(routingsLen)
+	for i := range routingsKeys {
+		routingsKeys[i] += slotBase
+	}
 	if _, err = BpfMapBatchUpdate(bpf.RoutingMap, routingsKeys, kernRules, &ebpf.BatchOptions{
 		ElemFlags: uint64(ebpf.UpdateAny),
 	}); err != nil {
 		return nil, fmt.Errorf("BpfMapBatchUpdate: %w", err)
 	}
-	if err = bpf.RoutingMetaMap.Update(uint32(0), routingsLen, ebpf.UpdateAny); err != nil {
+	if err = bpf.RoutingMetaMap.Update(slot, routingsLen, ebpf.UpdateAny); err != nil {
 		return nil, fmt.Errorf("update routing_meta_map: %w", err)
 	}
 	log.Infof("Routing match set len: %v/%v", len(rules), consts.MaxMatchSetLen)
@@ -773,7 +828,7 @@ func buildRoutingKernspace(
 	// Since lpmCount includes duplicates, we use results to get the mapped ring indices.
 	uniqueIndices := make(map[uint32]struct{})
 	for _, r := range results {
-		uniqueIndices[r.lpmIndex] = struct{}{}
+		uniqueIndices[slotBase+r.lpmIndex] = struct{}{}
 	}
 	usedIndices = make([]uint32, 0, len(uniqueIndices))
 	for idx := range uniqueIndices {
@@ -784,17 +839,30 @@ func buildRoutingKernspace(
 }
 
 func (b *RoutingMatcherBuilder) BuildKernspace(log *logrus.Logger) (usedIndices []uint32, err error) {
+	return b.BuildKernspaceForSlot(log, 0)
+}
+
+// BuildKernspaceForSlot constructs routing data in one kernel routing epoch
+// slot. Match-set LPM indexes remain slot-local; only BPF map keys receive the
+// slot offset.
+func (b *RoutingMatcherBuilder) BuildKernspaceForSlot(log *logrus.Logger, slot uint32) (usedIndices []uint32, err error) {
 	if b == nil {
 		return nil, fmt.Errorf("nil routing matcher builder")
 	}
-	return buildRoutingKernspace(log, b.bpf, b.rules, b.simulatedLpmTries, len(b.lpmDedup))
+	return buildRoutingKernspaceForSlot(log, b.bpf, b.rules, b.simulatedLpmTries, len(b.lpmDedup), slot)
 }
 
 func (s *routingKernspaceSnapshot) BuildKernspace(log *logrus.Logger, bpf *bpfObjects) (usedIndices []uint32, err error) {
+	return s.BuildKernspaceForSlot(log, bpf, 0)
+}
+
+// BuildKernspaceForSlot constructs this immutable routing snapshot in one
+// kernel routing epoch slot.
+func (s *routingKernspaceSnapshot) BuildKernspaceForSlot(log *logrus.Logger, bpf *bpfObjects, slot uint32) (usedIndices []uint32, err error) {
 	if s == nil {
 		return nil, fmt.Errorf("nil routing kernspace snapshot")
 	}
-	return buildRoutingKernspace(log, bpf, s.rules, s.simulatedLpmTries, s.dedupCount)
+	return buildRoutingKernspaceForSlot(log, bpf, s.rules, s.simulatedLpmTries, s.dedupCount, slot)
 }
 
 func (b *RoutingMatcherBuilder) BuildUserspace() (matcher *RoutingMatcher, err error) {
@@ -882,6 +950,7 @@ func (b *RoutingMatcherBuilder) BuildUserspace() (matcher *RoutingMatcher, err e
 		lpmMatcher:      lpmMatcher,
 		domainMatcher:   domainMatcher,
 		compiledMatches: compiledMatches,
+		predicateGroups: append([]routingMatcherPredicateGroupSpan(nil), b.predicateGroups...),
 	}
 
 	// Memory optimization: Release large temporary data structures
@@ -890,6 +959,7 @@ func (b *RoutingMatcherBuilder) BuildUserspace() (matcher *RoutingMatcher, err e
 	b.simulatedLpmTries = nil
 	b.rules = nil
 	b.compiledRules = nil
+	b.predicateGroups = nil
 	b.lpmDedup = nil
 
 	return matcher, nil

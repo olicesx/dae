@@ -8,6 +8,7 @@ package control
 import (
 	"context"
 	"net"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -194,6 +195,73 @@ func TestDnsController_ReuseForReloadReprojectsCachedRoutes(t *testing.T) {
 	require.Equal(t, []uint32{2}, remapped.DomainBitmap)
 }
 
+func TestDnsController_ReprojectCachedRoutesSkipsProjectionAfterRuntimeSwap(t *testing.T) {
+	projectionStarted := make(chan struct{})
+	allowProjection := make(chan struct{})
+	controller, err := NewDnsController(nil, &DnsControllerOption{
+		Log:                  logrus.New(),
+		RouteProjectionEpoch: 1,
+		ProjectCacheRoute: func(*DnsCache) []uint32 {
+			close(projectionStarted)
+			<-allowProjection
+			return []uint32{1}
+		},
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, controller.Close()) }()
+
+	original := &DnsCache{
+		RouteOwnerKey:        "reproject.example.1",
+		RouteProjectionEpoch: 0,
+		DomainBitmap:         []uint32{0},
+		Deadline:             time.Now().Add(time.Minute),
+	}
+	controller.dnsCache.Store(original.RouteOwnerKey, original)
+
+	oldRuntime := controller.runtime()
+	done := make(chan struct{})
+	go func() {
+		controller.reprojectCachedRoutes(oldRuntime)
+		close(done)
+	}()
+
+	select {
+	case <-projectionStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old route projection did not start")
+	}
+
+	require.NoError(t, controller.TryUpdateRuntime(&DnsControllerOption{
+		Log:                  logrus.New(),
+		RouteProjectionEpoch: 2,
+		ProjectCacheRoute: func(*DnsCache) []uint32 {
+			return []uint32{2}
+		},
+	}, nil))
+	close(allowProjection)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old route projection did not finish")
+	}
+
+	value, ok := controller.dnsCache.Load(original.RouteOwnerKey)
+	require.True(t, ok)
+	require.Same(t, original, value)
+	require.Equal(t, uint64(0), original.RouteProjectionEpoch)
+	require.Equal(t, []uint32{0}, original.DomainBitmap)
+
+	controller.reprojectCachedRoutes(controller.runtime())
+	value, ok = controller.dnsCache.Load(original.RouteOwnerKey)
+	require.True(t, ok)
+	remapped, ok := value.(*DnsCache)
+	require.True(t, ok)
+	require.NotSame(t, original, remapped)
+	require.Equal(t, uint64(2), remapped.RouteProjectionEpoch)
+	require.Equal(t, []uint32{2}, remapped.DomainBitmap)
+}
+
 func TestDnsController_ProcessBpfUpdateTaskSkipsStaleRouteProjection(t *testing.T) {
 	callbackCalled := false
 	controller, err := NewDnsController(nil, &DnsControllerOption{
@@ -215,6 +283,9 @@ func TestDnsController_ProcessBpfUpdateTaskSkipsStaleRouteProjection(t *testing.
 	}, false))
 	require.False(t, callbackCalled)
 
+	// A task for the current runtime may run only after the cache entry has
+	// been rebuilt with that runtime's projection epoch.
+	cache.RouteProjectionEpoch = 2
 	require.True(t, controller.processBpfUpdateTask(&bpfUpdateTask{
 		cache:                cache,
 		now:                  time.Now(),
@@ -317,4 +388,145 @@ func TestDnsController_CloneAndRestoreReloadCache(t *testing.T) {
 	restoredCache := value.(*DnsCache)
 	require.Equal(t, []uint32{9, 7}, restoredCache.DomainBitmap)
 	require.True(t, restored.HasDnsKnowledge("reload.example.1"))
+}
+
+func TestDnsController_RestoreReloadCacheAndProjectCompletesBeforeReturn(t *testing.T) {
+	now := time.Now()
+	projected := make(chan *DnsCache, 1)
+	controller, err := NewDnsController(nil, &DnsControllerOption{
+		Log:                  logrus.New(),
+		RouteProjectionEpoch: 9,
+		ProjectCacheRoute: func(*DnsCache) []uint32 {
+			return []uint32{9}
+		},
+		CacheAccessCallback: func(cache *DnsCache) error {
+			projected <- cache
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, controller.Close()) }()
+
+	entry := &DnsCache{
+		RouteOwnerKey: "projected.example.1",
+		Deadline:      now.Add(time.Minute),
+		Answer: []dnsmessage.RR{&dnsmessage.A{
+			Hdr: dnsmessage.RR_Header{
+				Name:   "projected.example.",
+				Rrtype: dnsmessage.TypeA,
+				Class:  dnsmessage.ClassINET,
+				Ttl:    120,
+			},
+			A: net.IPv4(203, 0, 113, 9),
+		}},
+	}
+
+	count, err := controller.RestoreReloadCacheAndProject(map[string]*DnsCache{
+		entry.RouteOwnerKey: entry,
+	}, nil, now)
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+
+	select {
+	case cache := <-projected:
+		require.NotSame(t, entry, cache)
+		require.Equal(t, uint64(9), cache.RouteProjectionEpoch)
+		require.Equal(t, []uint32{9}, cache.DomainBitmap)
+	case <-time.After(time.Second):
+		t.Fatal("synchronous reload projection did not finish before return")
+	}
+}
+
+func TestDnsController_RestoreReloadCacheRetriesChangedRouteProjection(t *testing.T) {
+	type update struct {
+		epoch  uint64
+		bitmap []uint32
+	}
+
+	updates := make(chan update, 2)
+	var runtimeProjectionCalls atomic.Int32
+	controller, err := NewDnsController(nil, &DnsControllerOption{
+		Log:                  logrus.New(),
+		RouteProjectionEpoch: 1,
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, controller.Close()) }()
+
+	now := time.Now()
+	entry := &DnsCache{
+		RouteOwnerKey:        "reload.example.1",
+		RouteProjectionEpoch: 1,
+		DomainBitmap:         []uint32{7},
+		Answer: []dnsmessage.RR{&dnsmessage.A{
+			Hdr: dnsmessage.RR_Header{
+				Name:   "reload.example.",
+				Rrtype: dnsmessage.TypeA,
+				Class:  dnsmessage.ClassINET,
+				Ttl:    120,
+			},
+			A: net.IPv4(1, 2, 3, 4),
+		}},
+		Deadline:         now.Add(time.Minute),
+		OriginalDeadline: now.Add(time.Minute),
+	}
+
+	var matcherCalls atomic.Int32
+	count := controller.RestoreReloadCache(map[string]*DnsCache{
+		entry.RouteOwnerKey: entry,
+	}, func(fqdn string) []uint32 {
+		require.Equal(t, "reload.example.", fqdn)
+		if matcherCalls.Add(1) == 1 {
+			require.NoError(t, controller.TryUpdateRuntime(&DnsControllerOption{
+				Log:                  logrus.New(),
+				RouteProjectionEpoch: 2,
+				ProjectCacheRoute: func(*DnsCache) []uint32 {
+					runtimeProjectionCalls.Add(1)
+					return []uint32{2}
+				},
+				CacheAccessCallback: func(cache *DnsCache) error {
+					updates <- update{
+						epoch:  cache.RouteProjectionEpoch,
+						bitmap: slices.Clone(cache.DomainBitmap),
+					}
+					return nil
+				},
+			}, nil))
+			return []uint32{1}
+		}
+		return []uint32{2}
+	}, now)
+
+	require.Equal(t, 1, count)
+	require.EqualValues(t, 1, matcherCalls.Load())
+	require.Equal(t, uint64(1), entry.RouteProjectionEpoch)
+	require.Equal(t, []uint32{7}, entry.DomainBitmap)
+
+	value, ok := controller.dnsCache.Load(entry.RouteOwnerKey)
+	require.True(t, ok)
+	restored, ok := value.(*DnsCache)
+	require.True(t, ok)
+	require.NotSame(t, entry, restored)
+	require.Equal(t, uint64(2), restored.RouteProjectionEpoch)
+	require.Equal(t, []uint32{2}, restored.DomainBitmap)
+
+	require.EqualValues(t, 1, runtimeProjectionCalls.Load())
+	controller.reprojectCachedRoutes(controller.runtime())
+	require.EqualValues(t, 1, runtimeProjectionCalls.Load(), "already restored entries must not be reprojected again")
+
+	var bpfUpdate update
+	require.Eventually(t, func() bool {
+		select {
+		case bpfUpdate = <-updates:
+			return true
+		default:
+			return false
+		}
+	}, 2*time.Second, 10*time.Millisecond)
+	require.Equal(t, uint64(2), bpfUpdate.epoch)
+	require.Equal(t, []uint32{2}, bpfUpdate.bitmap)
+	select {
+	case stale := <-updates:
+		t.Fatalf("reload enqueued a stale or redundant route projection: %+v", stale)
+	case <-time.After(100 * time.Millisecond):
+	}
 }

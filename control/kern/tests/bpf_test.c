@@ -27,6 +27,13 @@ struct {
 	},
 };
 
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, struct domain_routing);
+	__uint(max_entries, 1);
+} test_domain_routing_scratch_map SEC(".maps");
+
 struct test_routing_cache_ctx {
 	struct tuples_key key;
 	struct routing_result result;
@@ -73,6 +80,159 @@ setup_cached_routing_result(__u32 saddr, __u32 daddr,
 	conn_state.meta.data.must = 0;
 
 	return bpf_map_update_elem(&conn_state_map, &ctx->key, &conn_state, BPF_ANY);
+}
+
+static __always_inline int
+set_routing_epoch_port_rule(__u32 slot, __u16 port, __u8 outbound)
+{
+	struct match_set match_set = {};
+	struct port_range port_range = {port, port};
+	__u32 routing_key = slot * MAX_MATCH_SET_LEN;
+	__u32 rules_len = 1;
+
+	if (slot >= ROUTING_EPOCH_SLOT_NUM)
+		return TC_ACT_SHOT;
+
+	match_set.port_range = port_range;
+	match_set.type = MatchType_Port;
+	match_set.outbound = outbound;
+
+	if (bpf_map_update_elem(&routing_map, &routing_key, &match_set, BPF_ANY))
+		return TC_ACT_SHOT;
+	if (bpf_map_update_elem(&routing_meta_map, &slot, &rules_len, BPF_ANY))
+		return TC_ACT_SHOT;
+	return TC_ACT_OK;
+}
+
+static __always_inline int
+setup_routing_epoch_lan_ingress(struct __sk_buff *skb, __u32 active_slot)
+{
+	__u32 slot_zero = 0;
+	int ret;
+
+	if (set_routing_epoch_port_rule(0, 443, OUTBOUND_USER_DEFINED_MIN))
+		return TC_ACT_SHOT;
+	if (set_routing_epoch_port_rule(1, 443,
+				       OUTBOUND_USER_DEFINED_MIN + 1))
+		return TC_ACT_SHOT;
+	if (bpf_map_update_elem(&active_routing_epoch_map, &zero_key,
+				&active_slot, BPF_ANY))
+		return TC_ACT_SHOT;
+
+	ret = do_tproxy_lan_ingress(skb, ETH_HLEN);
+	if (bpf_map_update_elem(&active_routing_epoch_map, &zero_key,
+				&slot_zero, BPF_ANY))
+		return TC_ACT_SHOT;
+	return ret;
+}
+
+static __always_inline int
+set_routing_epoch_domain_rule(__u32 slot, __u8 outbound, __u32 bitmap)
+{
+	struct match_set domain_rule = {};
+	struct match_set fallback_rule = {};
+	struct routing_epoch_ip ip_key = {};
+	struct domain_routing *projection;
+	__u32 scratch_key = 0;
+	__u32 domain_key = slot * MAX_MATCH_SET_LEN;
+	__u32 fallback_key = domain_key + 1;
+	__u32 rules_len = 2;
+
+	if (slot >= ROUTING_EPOCH_SLOT_NUM)
+		return TC_ACT_SHOT;
+
+	domain_rule.type = MatchType_DomainSet;
+	domain_rule.outbound = outbound;
+	if (bpf_map_update_elem(&routing_map, &domain_key, &domain_rule,
+				BPF_ANY))
+		return TC_ACT_SHOT;
+
+	fallback_rule.type = MatchType_Fallback;
+	fallback_rule.outbound = OUTBOUND_USER_DEFINED_MIN + 2;
+	if (bpf_map_update_elem(&routing_map, &fallback_key, &fallback_rule,
+				BPF_ANY))
+		return TC_ACT_SHOT;
+	if (bpf_map_update_elem(&routing_meta_map, &slot, &rules_len,
+				BPF_ANY))
+		return TC_ACT_SHOT;
+
+	// The packet generator below targets 198.51.100.20.
+	ip_key.slot = slot;
+	ip_key.addr[2] = bpf_htonl(0xffff);
+	ip_key.addr[3] = bpf_htonl(0xc6336414);
+	projection = bpf_map_lookup_elem(&test_domain_routing_scratch_map,
+					 &scratch_key);
+	if (!projection)
+		return TC_ACT_SHOT;
+	__builtin_memset(projection, 0, sizeof(*projection));
+	projection->bitmap[0] = bitmap;
+	return bpf_map_update_elem(&domain_routing_map, &ip_key, projection,
+				   BPF_ANY);
+}
+
+static __always_inline int
+setup_routing_epoch_domain_lan_ingress(struct __sk_buff *skb,
+						__u32 active_slot)
+{
+	__u32 zero_key = 0;
+	int ret;
+
+	// Only slot zero projects this destination into the domain rule.
+	if (set_routing_epoch_domain_rule(0, OUTBOUND_USER_DEFINED_MIN, 1))
+		return TC_ACT_SHOT;
+	if (set_routing_epoch_domain_rule(1, OUTBOUND_USER_DEFINED_MIN + 1, 0))
+		return TC_ACT_SHOT;
+	if (bpf_map_update_elem(&active_routing_epoch_map, &zero_key,
+				&active_slot, BPF_ANY))
+		return TC_ACT_SHOT;
+
+	ret = do_tproxy_lan_ingress(skb, ETH_HLEN);
+	zero_key = 0;
+	if (bpf_map_update_elem(&active_routing_epoch_map, &zero_key,
+				&zero_key, BPF_ANY))
+		return TC_ACT_SHOT;
+	return ret;
+}
+
+static __always_inline int
+check_routing_epoch_lan_ingress(struct __sk_buff *skb,
+				__u32 expected_status_code,
+				__u32 saddr, __u32 daddr,
+				__u16 sport, __u16 dport,
+				__u8 expected_outbound,
+				__u8 expected_epoch_slot)
+{
+	struct tuples_key key = {};
+	struct conn_state *conn_state;
+	struct routing_handoff_entry *handoff;
+
+	if (check_tcp_conn_state_ipv4_tcp(skb, expected_status_code,
+					     saddr, daddr, sport, dport,
+					     expected_outbound, 0, true))
+		return TC_ACT_SHOT;
+
+	key.sip.u6_addr32[2] = bpf_htonl(0xffff);
+	key.sip.u6_addr32[3] = bpf_htonl(saddr);
+	key.dip.u6_addr32[2] = bpf_htonl(0xffff);
+	key.dip.u6_addr32[3] = bpf_htonl(daddr);
+	key.sport = bpf_htons(sport);
+	key.dport = bpf_htons(dport);
+	key.l4proto = IPPROTO_TCP;
+
+	conn_state = bpf_map_lookup_elem(&conn_state_map, &key);
+	if (!conn_state || conn_state->routing_epoch_slot != expected_epoch_slot) {
+		bpf_printk("conn_state routing epoch slot mismatch\n");
+		return TC_ACT_SHOT;
+	}
+
+	handoff = bpf_map_lookup_elem(&routing_handoff_map, &key);
+	if (!handoff || handoff->result.outbound != expected_outbound ||
+	    handoff->result.routing_epoch_slot != expected_epoch_slot) {
+		bpf_printk("routing handoff epoch attribution mismatch\n");
+		return TC_ACT_SHOT;
+	}
+
+	return TC_ACT_OK;
 }
 
 SEC("tc/pktgen/dport_match")
@@ -681,6 +841,98 @@ int testcheck_lan_ingress_tcp_dscp_conn_state(struct __sk_buff *skb)
 						  0, 10, true);
 }
 
+SEC("tc/pktgen/routing_epoch_slot_zero_handoff")
+int testpktgen_routing_epoch_slot_zero_handoff(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb,
+			    IPV4(192,168,0,10), IPV4(1,1,1,1),
+			    24560, 443);
+}
+
+SEC("tc/setup/routing_epoch_slot_zero_handoff")
+int testsetup_routing_epoch_slot_zero_handoff(struct __sk_buff *skb)
+{
+	return setup_routing_epoch_lan_ingress(skb, 0);
+}
+
+SEC("tc/check/routing_epoch_slot_zero_handoff")
+int testcheck_routing_epoch_slot_zero_handoff(struct __sk_buff *skb)
+{
+	return check_routing_epoch_lan_ingress(skb, TC_ACT_REDIRECT,
+						   IPV4(192,168,0,10), IPV4(1,1,1,1),
+						   24560, 443,
+						   OUTBOUND_USER_DEFINED_MIN,
+						   routing_epoch_slot_encode(0));
+}
+
+SEC("tc/pktgen/routing_epoch_slot_one_handoff")
+int testpktgen_routing_epoch_slot_one_handoff(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb,
+			    IPV4(192,168,0,11), IPV4(1,1,1,1),
+			    24561, 443);
+}
+
+SEC("tc/setup/routing_epoch_slot_one_handoff")
+int testsetup_routing_epoch_slot_one_handoff(struct __sk_buff *skb)
+{
+	return setup_routing_epoch_lan_ingress(skb, 1);
+}
+
+SEC("tc/check/routing_epoch_slot_one_handoff")
+int testcheck_routing_epoch_slot_one_handoff(struct __sk_buff *skb)
+{
+	return check_routing_epoch_lan_ingress(skb, TC_ACT_REDIRECT,
+						   IPV4(192,168,0,11), IPV4(1,1,1,1),
+						   24561, 443,
+						   OUTBOUND_USER_DEFINED_MIN + 1,
+						   routing_epoch_slot_encode(1));
+}
+
+SEC("tc/pktgen/routing_epoch_domain_projection_slot_zero")
+int testpktgen_routing_epoch_domain_projection_slot_zero(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb, IPV4(192,168,0,1), IPV4(198,51,100,20),
+			    19233, 443);
+}
+
+SEC("tc/setup/routing_epoch_domain_projection_slot_zero")
+int testsetup_routing_epoch_domain_projection_slot_zero(struct __sk_buff *skb)
+{
+	return setup_routing_epoch_domain_lan_ingress(skb, 0);
+}
+
+SEC("tc/check/routing_epoch_domain_projection_slot_zero")
+int testcheck_routing_epoch_domain_projection_slot_zero(struct __sk_buff *skb)
+{
+	return check_routing_epoch_lan_ingress(
+		skb, TC_ACT_REDIRECT, IPV4(192,168,0,1),
+		IPV4(198,51,100,20), 19233, 443, OUTBOUND_USER_DEFINED_MIN,
+		routing_epoch_slot_encode(0));
+}
+
+SEC("tc/pktgen/routing_epoch_domain_projection_slot_one")
+int testpktgen_routing_epoch_domain_projection_slot_one(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb, IPV4(192,168,0,1), IPV4(198,51,100,20),
+			    19233, 443);
+}
+
+SEC("tc/setup/routing_epoch_domain_projection_slot_one")
+int testsetup_routing_epoch_domain_projection_slot_one(struct __sk_buff *skb)
+{
+	return setup_routing_epoch_domain_lan_ingress(skb, 1);
+}
+
+SEC("tc/check/routing_epoch_domain_projection_slot_one")
+int testcheck_routing_epoch_domain_projection_slot_one(struct __sk_buff *skb)
+{
+	return check_routing_epoch_lan_ingress(
+		skb, TC_ACT_REDIRECT, IPV4(192,168,0,1),
+		IPV4(198,51,100,20), 19233, 443, OUTBOUND_USER_DEFINED_MIN + 2,
+		routing_epoch_slot_encode(1));
+}
+
 SEC("tc/pktgen/lan_ingress_tcp_ipv6_dscp_conn_state")
 int testpktgen_lan_ingress_tcp_ipv6_dscp_conn_state(struct __sk_buff *skb)
 {
@@ -888,7 +1140,7 @@ int testsetup_wan_egress_direct_mark_reroute(struct __sk_buff *skb)
 
 	if (!mark_tcp_seen(&key, &tcph, false,
 			   &outbound, &mark, &must, NULL,
-			   0, NULL, 0))
+			   0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN))
 		return TC_ACT_SHOT;
 
 	return TC_ACT_OK;
@@ -927,8 +1179,10 @@ int testsetup_conntrack_args_scratch_reset(struct __sk_buff *skb)
 	if (!args)
 		return TC_ACT_SHOT;
 
-	conntrack_args_set(args, &outbound, &mark, &must, NULL, 11, pname, 99);
-	conntrack_args_set(args, NULL, NULL, NULL, NULL, 0, NULL, 0);
+	conntrack_args_set(args, &outbound, &mark, &must, NULL, 11, pname, 99,
+			   ROUTING_EPOCH_SLOT_UNKNOWN);
+	conntrack_args_set(args, NULL, NULL, NULL, NULL, 0, NULL, 0,
+			   ROUTING_EPOCH_SLOT_UNKNOWN);
 
 	if (args->flags != 0) {
 		bpf_printk("args->flags(%u) != 0\n", args->flags);

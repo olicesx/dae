@@ -19,6 +19,7 @@ type controlPlaneGenerationState struct {
 	dialMode            consts.DialMode
 	policySnapshot      *routing.PolicySnapshot
 	routingMatcher      *RoutingMatcher
+	decisionShadow      *phase4DecisionShadow
 	bootstrapResolvers  []netip.AddrPort
 }
 
@@ -30,5 +31,6 @@ func (s *controlPlaneGenerationState) releaseRetainedState() {
 	s.referencedOutbounds = nil
 	s.policySnapshot = nil
 	s.routingMatcher = nil
+	s.decisionShadow = nil
 	s.bootstrapResolvers = nil
 }

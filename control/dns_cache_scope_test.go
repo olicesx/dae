@@ -136,6 +136,9 @@ func setScopedBestDialerChooser(ctrl *DnsController, chooser func(ctx context.Co
 	updated := *rt
 	updated.bestDialerChooser = chooser
 	ctrl.runtimeState.Store(&updated)
+	if ctrl.dnsControllerStore != nil {
+		ctrl.dnsControllerStore.runtimeState.Store(&updated)
+	}
 }
 
 func TestDnsController_AsIsCacheIsScopedByResolver(t *testing.T) {

@@ -29,6 +29,7 @@ func RoutingCorpusFixtures() []CorpusFixture {
 		domainSuffixFixture(),
 		domainFullFixture(),
 		domainKeywordFixture(),
+		domainRegexFixture(),
 		ipSetFixture(),
 		sourceIpSetFixture(),
 		portFixture(),
@@ -41,8 +42,11 @@ func RoutingCorpusFixtures() []CorpusFixture {
 		andCombinationFixture(),
 		orAcrossRulesFixture(),
 		notInversionFixture(),
+		multiKeyPositiveFixture(),
+		multiKeyNegationFixture(),
 		markRuleFixture(),
 		mustRuleFixture(),
+		mustRulesContinuationFixture(),
 		reservedOutboundFixture(),
 		priorityFirstWinsFixture(),
 		fallbackOnlyFixture(),
@@ -143,6 +147,37 @@ func domainKeywordFixture() CorpusFixture {
 			{
 				Name:     "no_keyword_falls_back",
 				Input:    CorpusInput{Src: staticSrcV4(), Dst: staticDstV4(), Domain: "plain.example", L4Proto: consts.L4ProtoType_TCP},
+				Expected: CorpusExpected{Outbound: consts.OutboundDirect},
+			},
+		},
+	}
+}
+
+func domainRegexFixture() CorpusFixture {
+	return CorpusFixture{
+		Name:        "domain_regex",
+		Description: "RoutingDomainKey_Regex matches the complete configured regular expression",
+		Rules: []*config_parser.RoutingRule{{
+			AndFunctions: []*config_parser.Function{{
+				Name: consts.Function_Domain,
+				Params: []*config_parser.Param{{
+					Key: string(consts.RoutingDomainKey_Regex),
+					Val: `^edge-[0-9]+\.example\.test$`,
+				}},
+			}},
+			Outbound: config_parser.Function{Name: "proxy"},
+		}},
+		Fallback:    config.FunctionOrString("direct"),
+		OutboundIDs: stdOutboundIDs(),
+		Cases: []CorpusCase{
+			{
+				Name:     "numeric_edge_domain_matches",
+				Input:    CorpusInput{Src: staticSrcV4(), Dst: staticDstV4(), Domain: "edge-42.example.test", L4Proto: consts.L4ProtoType_TCP},
+				Expected: CorpusExpected{Outbound: consts.OutboundUserDefinedMin},
+			},
+			{
+				Name:     "non_numeric_edge_domain_falls_back",
+				Input:    CorpusInput{Src: staticSrcV4(), Dst: staticDstV4(), Domain: "edge-blue.example.test", L4Proto: consts.L4ProtoType_TCP},
 				Expected: CorpusExpected{Outbound: consts.OutboundDirect},
 			},
 		},
@@ -566,6 +601,127 @@ func notInversionFixture() CorpusFixture {
 	}
 }
 
+func multiKeyPositiveFixture() CorpusFixture {
+	return CorpusFixture{
+		Name:        "multi_key_domain_positive",
+		Description: "Parameter keys in one positive domain function are ORed in legacy lowering order",
+		Rules: []*config_parser.RoutingRule{{
+			AndFunctions: []*config_parser.Function{{
+				Name: consts.Function_Domain,
+				Params: []*config_parser.Param{
+					{Key: string(consts.RoutingDomainKey_Full), Val: "first.key.test"},
+					{Key: string(consts.RoutingDomainKey_Suffix), Val: "middle.key.test"},
+					{Key: string(consts.RoutingDomainKey_Keyword), Val: "last-key"},
+				},
+			}},
+			Outbound: config_parser.Function{Name: "proxy"},
+		}},
+		Fallback:    config.FunctionOrString("direct"),
+		OutboundIDs: stdOutboundIDs(),
+		Cases: []CorpusCase{
+			{
+				Name:     "first_key_full_matches",
+				Input:    CorpusInput{Src: staticSrcV4(), Dst: staticDstV4(), Domain: "first.key.test", L4Proto: consts.L4ProtoType_TCP},
+				Expected: CorpusExpected{Outbound: consts.OutboundUserDefinedMin},
+			},
+			{
+				Name:     "middle_key_suffix_matches",
+				Input:    CorpusInput{Src: staticSrcV4(), Dst: staticDstV4(), Domain: "www.middle.key.test", L4Proto: consts.L4ProtoType_TCP},
+				Expected: CorpusExpected{Outbound: consts.OutboundUserDefinedMin},
+			},
+			{
+				Name:     "last_key_keyword_matches",
+				Input:    CorpusInput{Src: staticSrcV4(), Dst: staticDstV4(), Domain: "edge-last-key.example", L4Proto: consts.L4ProtoType_TCP},
+				Expected: CorpusExpected{Outbound: consts.OutboundUserDefinedMin},
+			},
+			{
+				Name:     "no_key_matches_falls_back",
+				Input:    CorpusInput{Src: staticSrcV4(), Dst: staticDstV4(), Domain: "other.test", L4Proto: consts.L4ProtoType_TCP},
+				Expected: CorpusExpected{Outbound: consts.OutboundDirect},
+			},
+		},
+	}
+}
+
+func multiKeyNegationFixture() CorpusFixture {
+	return CorpusFixture{
+		Name:        "multi_key_domain_negation",
+		Description: "Negated domain parameter keys and values all exclude the first rule before ordered later rules compete",
+		Rules: []*config_parser.RoutingRule{
+			{
+				AndFunctions: []*config_parser.Function{
+					{
+						Name: consts.Function_Domain,
+						Not:  true,
+						Params: []*config_parser.Param{
+							{Key: string(consts.RoutingDomainKey_Full), Val: "api.example.com"},
+							{Key: string(consts.RoutingDomainKey_Suffix), Val: "example.com"},
+						},
+					},
+					{
+						Name: consts.Function_Domain,
+						Not:  true,
+						Params: []*config_parser.Param{
+							{Key: string(consts.RoutingDomainKey_Suffix), Val: "blocked.example"},
+							{Key: string(consts.RoutingDomainKey_Suffix), Val: "denied.example"},
+						},
+					},
+				},
+				Outbound: config_parser.Function{Name: "proxy"},
+			},
+			{
+				AndFunctions: []*config_parser.Function{{
+					Name: consts.Function_Domain,
+					Params: []*config_parser.Param{{
+						Key: string(consts.RoutingDomainKey_Full),
+						Val: "api.example.com",
+					}},
+				}},
+				Outbound: config_parser.Function{Name: "block"},
+			},
+			{
+				AndFunctions: []*config_parser.Function{{
+					Name: consts.Function_Domain,
+					Params: []*config_parser.Param{{
+						Key: string(consts.RoutingDomainKey_Suffix),
+						Val: "example.com",
+					}},
+				}},
+				Outbound: config_parser.Function{Name: "myapp"},
+			},
+		},
+		Fallback:    config.FunctionOrString("direct"),
+		OutboundIDs: stdOutboundIDs(),
+		Cases: []CorpusCase{
+			{
+				Name:     "full_and_suffix_match_reaches_exact_competitor",
+				Input:    CorpusInput{Src: staticSrcV4(), Dst: staticDstV4(), Domain: "api.example.com", L4Proto: consts.L4ProtoType_TCP},
+				Expected: CorpusExpected{Outbound: consts.OutboundBlock},
+			},
+			{
+				Name:     "suffix_match_reaches_later_suffix_competitor",
+				Input:    CorpusInput{Src: staticSrcV4(), Dst: staticDstV4(), Domain: "www.example.com", L4Proto: consts.L4ProtoType_TCP},
+				Expected: CorpusExpected{Outbound: consts.OutboundUserDefinedMin + 1},
+			},
+			{
+				Name:     "first_same_key_value_excludes_negated_rule",
+				Input:    CorpusInput{Src: staticSrcV4(), Dst: staticDstV4(), Domain: "cdn.blocked.example", L4Proto: consts.L4ProtoType_TCP},
+				Expected: CorpusExpected{Outbound: consts.OutboundDirect},
+			},
+			{
+				Name:     "second_same_key_value_excludes_negated_rule",
+				Input:    CorpusInput{Src: staticSrcV4(), Dst: staticDstV4(), Domain: "cdn.denied.example", L4Proto: consts.L4ProtoType_TCP},
+				Expected: CorpusExpected{Outbound: consts.OutboundDirect},
+			},
+			{
+				Name:     "unrelated_domain_uses_first_negated_rule",
+				Input:    CorpusInput{Src: staticSrcV4(), Dst: staticDstV4(), Domain: "other.test", L4Proto: consts.L4ProtoType_TCP},
+				Expected: CorpusExpected{Outbound: consts.OutboundUserDefinedMin},
+			},
+		},
+	}
+}
+
 // --- mark / must / reserved / priority / fallback -------------------------
 
 func markRuleFixture() CorpusFixture {
@@ -631,6 +787,119 @@ func mustRuleFixture() CorpusFixture {
 				Name:     "fallback_is_not_must",
 				Input:    CorpusInput{Src: staticSrcV4(), Dst: staticDstV4(), Domain: "other.test", L4Proto: consts.L4ProtoType_TCP},
 				Expected: CorpusExpected{Outbound: consts.OutboundDirect, Must: false},
+			},
+		},
+	}
+}
+
+func mustRulesContinuationFixture() CorpusFixture {
+	return CorpusFixture{
+		Name:        "must_rules_continuation",
+		Description: "must_rules carries must into a later rule or fallback, while direct(must) remains terminal",
+		Rules: []*config_parser.RoutingRule{
+			{
+				AndFunctions: []*config_parser.Function{
+					{
+						Name: consts.Function_ProcessName,
+						Params: []*config_parser.Param{{
+							Val: "mosdns",
+						}},
+					},
+					{
+						Name: consts.Function_L4Proto,
+						Params: []*config_parser.Param{{
+							Val: "udp",
+						}},
+					},
+					{
+						Name: consts.Function_Port,
+						Params: []*config_parser.Param{{
+							Val: "53",
+						}},
+					},
+				},
+				Outbound: config_parser.Function{Name: consts.OutboundMustRules.String()},
+			},
+			{
+				AndFunctions: []*config_parser.Function{{
+					Name: consts.Function_Domain,
+					Params: []*config_parser.Param{{
+						Key: string(consts.RoutingDomainKey_Suffix),
+						Val: "route.example",
+					}},
+				}},
+				Outbound: config_parser.Function{Name: "proxy"},
+			},
+			{
+				AndFunctions: []*config_parser.Function{{
+					Name: consts.Function_Domain,
+					Params: []*config_parser.Param{{
+						Key: string(consts.RoutingDomainKey_Suffix),
+						Val: "must-direct.example",
+					}},
+				}},
+				Outbound: config_parser.Function{
+					Name:   "direct",
+					Params: []*config_parser.Param{{Val: "must"}},
+				},
+			},
+		},
+		Fallback:    config.FunctionOrString("direct"),
+		OutboundIDs: stdOutboundIDs(),
+		Cases: []CorpusCase{
+			{
+				Name: "sentinel_continues_to_later_rule",
+				Input: CorpusInput{
+					Src:         staticSrcV4(),
+					Dst:         netMustParseAddrPort("198.51.100.20:53"),
+					Domain:      "api.route.example",
+					L4Proto:     consts.L4ProtoType_UDP,
+					ProcessName: pname("mosdns"),
+				},
+				Expected: CorpusExpected{Outbound: consts.OutboundUserDefinedMin, Must: true},
+			},
+			{
+				Name: "sentinel_carries_must_into_fallback",
+				Input: CorpusInput{
+					Src:         staticSrcV4(),
+					Dst:         netMustParseAddrPort("198.51.100.20:53"),
+					Domain:      "other.test",
+					L4Proto:     consts.L4ProtoType_UDP,
+					ProcessName: pname("mosdns"),
+				},
+				Expected: CorpusExpected{Outbound: consts.OutboundDirect, Must: true},
+			},
+			{
+				Name: "non_matching_sentinel_does_not_set_must",
+				Input: CorpusInput{
+					Src:         staticSrcV4(),
+					Dst:         netMustParseAddrPort("198.51.100.20:53"),
+					Domain:      "api.route.example",
+					L4Proto:     consts.L4ProtoType_UDP,
+					ProcessName: pname("curl"),
+				},
+				Expected: CorpusExpected{Outbound: consts.OutboundUserDefinedMin},
+			},
+			{
+				Name: "sentinel_is_scoped_to_udp_dns",
+				Input: CorpusInput{
+					Src:         staticSrcV4(),
+					Dst:         netMustParseAddrPort("198.51.100.20:53"),
+					Domain:      "api.route.example",
+					L4Proto:     consts.L4ProtoType_TCP,
+					ProcessName: pname("mosdns"),
+				},
+				Expected: CorpusExpected{Outbound: consts.OutboundUserDefinedMin},
+			},
+			{
+				Name: "terminal_must_direct_does_not_require_sentinel",
+				Input: CorpusInput{
+					Src:     staticSrcV4(),
+					Dst:     staticDstV4(),
+					Domain:  "api.must-direct.example",
+					L4Proto: consts.L4ProtoType_TCP,
+				},
+				Expected: CorpusExpected{Outbound: consts.OutboundDirect, Must: true},
 			},
 		},
 	}

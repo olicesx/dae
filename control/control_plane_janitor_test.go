@@ -861,6 +861,7 @@ func newRoutingHandoffEntryForTest(lastSeenNs uint64, result bpfRoutingResult) b
 	entry.Result.Pname = result.Pname
 	entry.Result.Pid = result.Pid
 	entry.Result.Dscp = result.Dscp
+	entry.Result.RoutingEpochSlot = result.RoutingEpochSlot
 	return entry
 }
 

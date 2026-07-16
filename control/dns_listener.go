@@ -350,7 +350,8 @@ func (h *dnsHandler) ServeDNS(w dnsmessage.ResponseWriter, r *dnsmessage.Msg) {
 		realDst = netip.AddrPortFrom(dnsFallbackAddr(preferV6), 53)
 	}
 
-	// Create routing result (fake)
+	// DNS listener traffic has no transparent-flow handoff, so it supplies
+	// fixed control-plane routing facts to the compatibility request adapter.
 	routingResult := &bpfRoutingResult{
 		Outbound: uint8(consts.OutboundControlPlaneRouting),
 		Mark:     0,
@@ -361,12 +362,11 @@ func (h *dnsHandler) ServeDNS(w dnsmessage.ResponseWriter, r *dnsmessage.Msg) {
 		Dscp:     0,
 	}
 
-	// Handle the DNS request using the existing DNS controller
 	udpReq := &udpRequest{
 		realSrc:        clientIPPort,
 		realDst:        realDst,
 		src:            clientIPPort,
-		lConn:          nil, // Not used in this context
+		lConn:          nil,
 		routingResult:  routingResult,
 		uploadRecord:   uploadRecord,
 		downloadRecord: downloadRecord,

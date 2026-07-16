@@ -220,13 +220,14 @@ func NewUdpTaskPool() *UdpTaskPool {
 }
 
 // EmitTask makes sure packets with the same UDP flow key are sent in order.
-func (p *UdpTaskPool) EmitTask(key UdpFlowKey, task UdpTask) {
+func (p *UdpTaskPool) EmitTask(key UdpFlowKey, task UdpTask) bool {
 	q := p.acquireQueue(key)
 	if q == nil {
-		return
+		return false
 	}
 	q.enqueue(task)
 	q.refs.Add(-1)
+	return true
 }
 
 func (p *UdpTaskPool) acquireQueue(key UdpFlowKey) *UdpTaskQueue {

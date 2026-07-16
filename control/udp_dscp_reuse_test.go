@@ -92,10 +92,16 @@ func TestHandlePkt_DscpControlPlaneRoutingReusesEndpointForSameFlow(t *testing.T
 	if got := countPooledUdpEndpoints(DefaultUdpEndpointPool); got != 1 {
 		t.Fatalf("pooled endpoints after first packet = %d, want 1", got)
 	}
-	if _, ok := DefaultUdpEndpointPool.Get(key); !ok {
+	endpoint, ok := DefaultUdpEndpointPool.Get(key)
+	if !ok {
 		t.Fatalf("expected endpoint %v to exist after first packet", key)
 	}
+	bound := endpoint.FlowBinding()
 
+	// Must is part of the policy result but not the route-scope key. A later
+	// packet must keep the established endpoint binding instead of selecting a
+	// new dialer from the changed per-packet result.
+	routingResult.Must = 1
 	if err := cp.handlePkt(nil, payload, src, dst, routingResult, flowDecision, false); err != nil {
 		t.Fatalf("second handlePkt: %v", err)
 	}
@@ -104,6 +110,9 @@ func TestHandlePkt_DscpControlPlaneRoutingReusesEndpointForSameFlow(t *testing.T
 	}
 	if got := countPooledUdpEndpoints(DefaultUdpEndpointPool); got != 1 {
 		t.Fatalf("pooled endpoints after second packet = %d, want 1", got)
+	}
+	if got := endpoint.FlowBinding(); got.Route != bound.Route || got.Egress.Dialer != bound.Egress.Dialer || got.Egress.Target != bound.Egress.Target {
+		t.Fatalf("flow binding changed on ordinary packet: got %+v, want %+v", got, bound)
 	}
 }
 

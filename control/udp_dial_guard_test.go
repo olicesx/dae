@@ -272,3 +272,75 @@ func TestCheckUdpEndpointHealth_ForwardedEndpointIgnoresTransientDialerHealth(t 
 		t.Fatal("expected forwarded endpoint to remain pooled")
 	}
 }
+
+func TestCheckUdpEndpointHealth_PreservesSuccessfulInitialWrite(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	writeStarted := make(chan struct{})
+	writeRelease := make(chan struct{})
+	defer func() {
+		select {
+		case <-writeRelease:
+		default:
+			close(writeRelease)
+		}
+	}()
+
+	d := newTestEndpointDialer()
+	networkType := componentdialer.NetworkType{
+		L4Proto:         consts.L4ProtoStr_UDP,
+		IpVersion:       consts.IpVersionStr_6,
+		UdpHealthDomain: componentdialer.UdpHealthDomainData,
+	}
+	key := UdpEndpointKey{Src: netip.MustParseAddrPort("[2001:db8::1]:12347")}
+	conn := &scriptedPacketConn{
+		reads:        make(chan scriptedPacketRead),
+		closeCh:      make(chan struct{}),
+		writeStarted: writeStarted,
+		writeRelease: writeRelease,
+	}
+	ue := &UdpEndpoint{
+		conn:                conn,
+		Dialer:              d,
+		lAddr:               key.Src,
+		log:                 logger,
+		poolRef:             NewUdpEndpointPool(),
+		poolKey:             key,
+		endpointNetworkType: networkType,
+	}
+	defer func() { _ = ue.Close() }()
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := ue.WriteTo([]byte("payload"), "[2001:db8::30]:443")
+		writeDone <- err
+	}()
+	select {
+	case <-writeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the first UDP write to begin")
+	}
+
+	d.ReportUnavailableForced(&networkType, nil)
+	controlPlane := &ControlPlane{log: logger}
+	if !controlPlane.checkUdpEndpointHealth(ue, key, false) {
+		t.Fatal("expected health check to preserve an endpoint with a successful write in flight")
+	}
+	if got := conn.closeCalls.Load(); got != 0 {
+		t.Fatalf("close calls during first write = %d, want 0", got)
+	}
+
+	close(writeRelease)
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("first write failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the first UDP write to complete")
+	}
+
+	if !ue.hasSent.Load() || ue.IsDead() {
+		t.Fatal("expected successful initial write to leave the endpoint live")
+	}
+}

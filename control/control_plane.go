@@ -3475,7 +3475,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			}
 		}
 	}()
-	udpConn := listener.packetConn.(*net.UDPConn)
+	var udpConn *net.UDPConn
 	hooks := c.serveLifecycleHooks()
 	commitPreparedDatapath := c.CommitPreparedDatapath
 	if hooks.CommitPreparedDatapath != nil {
@@ -3497,6 +3497,14 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 	}
 	if err := activatePreparedRuntime(); err != nil {
 		return err
+	}
+	if listener == nil {
+		return fmt.Errorf("nil listener")
+	}
+	var ok bool
+	udpConn, ok = listener.packetConn.(*net.UDPConn)
+	if !ok || udpConn == nil {
+		return fmt.Errorf("listener packet connection is not UDP")
 	}
 
 	c.markReady()

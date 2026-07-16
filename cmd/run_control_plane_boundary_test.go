@@ -485,11 +485,11 @@ func TestRunnerFreshReloadFailureProcessHelper(t *testing.T) {
 	})
 
 	var listenCalls atomic.Int32
-	var cloneCalls atomic.Int32
-	listenControlPlaneFunc = func(c *control.ControlPlane, port uint16) (*control.Listener, error) {
+	listenControlPlaneFunc = func(_ *control.ControlPlane, _ uint16) (*control.Listener, error) {
 		listenCalls.Add(1)
-		return c.Listen(port)
+		return &control.Listener{}, nil
 	}
+	var cloneCalls atomic.Int32
 	cloneControlListenerFunc = func(listener *control.Listener) (*control.Listener, error) {
 		cloneCalls.Add(1)
 		return listener.Clone()
@@ -667,12 +667,12 @@ func TestRunnerStagedWarmupFailureProcessHelper(t *testing.T) {
 	})
 
 	var listenCalls atomic.Int32
+	listenControlPlaneFunc = func(_ *control.ControlPlane, _ uint16) (*control.Listener, error) {
+		listenCalls.Add(1)
+		return &control.Listener{}, nil
+	}
 	var cloneCalls atomic.Int32
 	var linkCalls atomic.Int32
-	listenControlPlaneFunc = func(c *control.ControlPlane, port uint16) (*control.Listener, error) {
-		listenCalls.Add(1)
-		return c.Listen(port)
-	}
 	cloneControlListenerFunc = func(listener *control.Listener) (*control.Listener, error) {
 		cloneCalls.Add(1)
 		return listener.Clone()
@@ -860,12 +860,12 @@ func TestRunnerLiveStageFailureProcessHelper(t *testing.T) {
 	})
 
 	var listenCalls atomic.Int32
+	listenControlPlaneFunc = func(_ *control.ControlPlane, _ uint16) (*control.Listener, error) {
+		listenCalls.Add(1)
+		return &control.Listener{}, nil
+	}
 	var cloneCalls atomic.Int32
 	var linkCalls atomic.Int32
-	listenControlPlaneFunc = func(c *control.ControlPlane, port uint16) (*control.Listener, error) {
-		listenCalls.Add(1)
-		return c.Listen(port)
-	}
 	cloneControlListenerFunc = func(listener *control.Listener) (*control.Listener, error) {
 		cloneCalls.Add(1)
 		return listener.Clone()

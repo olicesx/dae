@@ -37,6 +37,7 @@ func newControlPlaneBoundaryConfig(t *testing.T) *config.Config {
 	conf.Global.DisableWaitingNetwork = true
 	conf.Global.LanInterface = []string{"lan0"}
 	conf.Global.WanInterface = []string{"wan0"}
+	conf.Global.TproxyPort = 0
 	conf.Node = []config.KeyableString{"node-a"}
 	return conf
 }
@@ -713,6 +714,7 @@ func TestRunnerStagedWarmupFailureProcessHelper(t *testing.T) {
 		t.Fatalf("emptyConfig() error = %v", err)
 	}
 	conf.Global.DisableWaitingNetwork = true
+	conf.Global.TproxyPort = 0
 	runDone := make(chan error, 1)
 	go func() {
 		runDone <- newRunner(logrus.New(), conf, nil).Run()
@@ -903,6 +905,7 @@ func TestRunnerLiveStageFailureProcessHelper(t *testing.T) {
 		t.Fatalf("emptyConfig() error = %v", err)
 	}
 	conf.Global.DisableWaitingNetwork = true
+	conf.Global.TproxyPort = 0
 	runDone := make(chan error, 1)
 	go func() {
 		runDone <- newRunner(logrus.New(), conf, nil).Run()

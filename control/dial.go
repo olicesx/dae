@@ -190,23 +190,23 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 
 	strictIpVersion := dialIp
 	d, _, admissionNetworkType, err := outbound.SelectWithExclusionResult(selectionNetworkType, strictIpVersion, p.Excluded)
-	switch {
-	case err == nil:
+	switch err {
+	case nil:
 		observePhase1Dial(phase1DialOperationSelectPrimary, phase1TransportForNetwork(p.Network), phase1DialOutcomeSuccess)
-	case err == ob.ErrNoAliveDialer:
+	case ob.ErrNoAliveDialer:
 		observePhase1Dial(phase1DialOperationSelectPrimary, phase1TransportForNetwork(p.Network), phase1DialOutcomeNoAlive)
 	default:
 		observePhase1Dial(phase1DialOperationSelectPrimary, phase1TransportForNetwork(p.Network), phase1DialOutcomeFailure)
 	}
-	if err != nil && err == ob.ErrNoAliveDialer {
+	if err == ob.ErrNoAliveDialer {
 		// Fallback for UDP/TCP: if selection failed (probably due to health check fail),
 		// try the other IP version if strictIpVersion is not absolutely required by domain routing.
 		altType := alternateNetworkType(selectionNetworkType)
 		d, _, admissionNetworkType, err = outbound.SelectWithExclusionResult(altType, false, p.Excluded)
-		switch {
-		case err == nil:
+		switch err {
+		case nil:
 			observePhase1Dial(phase1DialOperationSelectAlternateFamily, phase1TransportForNetwork(p.Network), phase1DialOutcomeSuccess)
-		case err == ob.ErrNoAliveDialer:
+		case ob.ErrNoAliveDialer:
 			observePhase1Dial(phase1DialOperationSelectAlternateFamily, phase1TransportForNetwork(p.Network), phase1DialOutcomeNoAlive)
 		default:
 			observePhase1Dial(phase1DialOperationSelectAlternateFamily, phase1TransportForNetwork(p.Network), phase1DialOutcomeFailure)

@@ -26,6 +26,8 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+type controlPlaneBoundaryContextKey struct{}
+
 func newControlPlaneBoundaryConfig(t *testing.T) *config.Config {
 	t.Helper()
 	conf, err := emptyConfig()
@@ -100,7 +102,7 @@ func TestNewControlPlaneWithModeDelegatesAllGenerationModes(t *testing.T) {
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			conf := newControlPlaneBoundaryConfig(t)
-			ctx := context.WithValue(context.Background(), struct{}{}, testCase.name)
+			ctx := context.WithValue(context.Background(), controlPlaneBoundaryContextKey{}, testCase.name)
 			bpf := &struct{ name string }{name: testCase.name}
 			dnsCacheMarker := &control.DnsCache{}
 			dnsCache := map[string]*control.DnsCache{
@@ -344,7 +346,7 @@ func TestControlPlaneConstructionProcessHelper(t *testing.T) {
 		if gotPlane != nil {
 			t.Fatalf("iteration %d returned a control plane after failed construction", iteration)
 		}
-		want := error(wantErr)
+		want := wantErr
 		if iteration%3 == 0 {
 			want = context.Canceled
 		}
@@ -353,7 +355,7 @@ func TestControlPlaneConstructionProcessHelper(t *testing.T) {
 		}
 	}
 
-	fmt.Fprintln(os.Stdout, "control-plane-construction-process-helper-ok")
+	_, _ = fmt.Fprintln(os.Stdout, "control-plane-construction-process-helper-ok")
 }
 
 func TestRunnerConstructionFailureReleasesSemanticFeatureGate(t *testing.T) {
@@ -586,7 +588,7 @@ func TestRunnerFreshReloadFailureProcessHelper(t *testing.T) {
 	if got := countProcessFileDescriptors(t); got > baselineFDs {
 		t.Fatalf("process file descriptors after fresh rollback cycles = %d, baseline = %d", got, baselineFDs)
 	}
-	fmt.Fprintln(os.Stdout, "runner-fresh-reload-failure-process-helper-ok")
+	_, _ = fmt.Fprintln(os.Stdout, "runner-fresh-reload-failure-process-helper-ok")
 }
 
 const runnerStagedWarmupFailureProcessHelperEnv = "DAE_RUNNER_STAGED_WARMUP_FAILURE_PROCESS_HELPER"
@@ -746,7 +748,7 @@ func TestRunnerStagedWarmupFailureProcessHelper(t *testing.T) {
 	if buildCalls.Load() < 2 || cloneCalls.Load() != 1 || linkCalls.Load() != 1 || listenCalls.Load() != 1 || serveCalls.Load() != 2 {
 		t.Fatalf("staged operation counts = builds=%d clones=%d links=%d listens=%d serves=%d", buildCalls.Load(), cloneCalls.Load(), linkCalls.Load(), listenCalls.Load(), serveCalls.Load())
 	}
-	fmt.Fprintln(os.Stdout, "runner-staged-warmup-failure-process-helper-ok")
+	_, _ = fmt.Fprintln(os.Stdout, "runner-staged-warmup-failure-process-helper-ok")
 }
 
 const runnerLiveStageFailureProcessHelperEnv = "DAE_RUNNER_LIVE_STAGE_FAILURE_PROCESS_HELPER"
@@ -937,5 +939,5 @@ func TestRunnerLiveStageFailureProcessHelper(t *testing.T) {
 	if buildCalls.Load() != 2 || listenCalls.Load() != 1 || cloneCalls.Load() != 1 || linkCalls.Load() != 1 || serveCalls.Load() != 2 {
 		t.Fatalf("%s stage operation counts = builds=%d listens=%d clones=%d links=%d serves=%d", kind, buildCalls.Load(), listenCalls.Load(), cloneCalls.Load(), linkCalls.Load(), serveCalls.Load())
 	}
-	fmt.Fprintln(os.Stdout, "runner-live-stage-failure-process-helper-ok")
+	_, _ = fmt.Fprintln(os.Stdout, "runner-live-stage-failure-process-helper-ok")
 }

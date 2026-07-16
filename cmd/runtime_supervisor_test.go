@@ -525,7 +525,7 @@ func TestRuntimeSupervisorProcessHelper(t *testing.T) {
 	for _, tracked := range all {
 		assertCleaned(tracked)
 	}
-	fmt.Fprintln(os.Stdout, "runtime-supervisor-process-helper-ok")
+	_, _ = fmt.Fprintln(os.Stdout, "runtime-supervisor-process-helper-ok")
 }
 
 func TestRuntimeSupervisorConcurrentPublishRollbackAndShutdown(t *testing.T) {

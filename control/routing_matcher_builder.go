@@ -624,23 +624,6 @@ func rewriteKernRulesWithRingLpmIndex(rules []bpfMatchSet, allocStartIdx uint32,
 	return kernRules, nil
 }
 
-// BuildKernspace constructs BPF maps and loads routing rules into kernel space.
-//
-// IMPORTANT: This method MUST be called serially (not concurrently). The control plane
-// ensures serialization through higher-level locks. Concurrent invocations will cause
-// race conditions in globalNextLpmIndex allocation and LPM map updates.
-//
-// Thread Safety: NOT thread-safe. Caller must ensure mutual exclusion.
-func buildRoutingKernspace(
-	log *logrus.Logger,
-	bpf *bpfObjects,
-	rules []bpfMatchSet,
-	simulatedLpmTries [][]netip.Prefix,
-	dedupCount int,
-) (usedIndices []uint32, err error) {
-	return buildRoutingKernspaceForSlot(log, bpf, rules, simulatedLpmTries, dedupCount, 0)
-}
-
 func buildRoutingKernspaceForSlot(
 	log *logrus.Logger,
 	bpf *bpfObjects,

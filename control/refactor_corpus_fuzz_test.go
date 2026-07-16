@@ -40,8 +40,8 @@ func FuzzPolicySnapshotEquivalence(f *testing.F) {
 			f.Add(
 				byte(fixtureIndex),
 				[]byte(tc.Input.Domain),
-				uint16(tc.Input.Src.Port()),
-				uint16(tc.Input.Dst.Port()),
+				tc.Input.Src.Port(),
+				tc.Input.Dst.Port(),
 				byte(tc.Input.L4Proto),
 				tc.Input.Dscp,
 				append(tc.Input.ProcessName[:0:0], tc.Input.ProcessName[:]...),

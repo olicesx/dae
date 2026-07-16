@@ -1470,6 +1470,8 @@ func (g *udpEndpointAdmissionGate) closeAndWait() {
 	}
 	g.closed.Store(true)
 	g.mu.Lock()
+	// This lock/unlock pair waits for in-flight admission checks to finish.
+	//nolint:staticcheck // The empty critical section is an intentional synchronization barrier.
 	g.mu.Unlock()
 }
 

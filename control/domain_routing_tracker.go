@@ -154,14 +154,6 @@ func (t *domainRoutingTracker) applyOwnerSnapshotLocked(ownerKey string, snapsho
 	}
 }
 
-func (t *domainRoutingTracker) syncOwner(
-	m *ebpf.Map,
-	ownerKey string,
-	snapshot domainRoutingOwnerSnapshot,
-) error {
-	return t.syncOwnerForSlot(m, 0, ownerKey, snapshot)
-}
-
 func (t *domainRoutingTracker) syncOwnerForSlot(
 	m *ebpf.Map,
 	slot uint32,

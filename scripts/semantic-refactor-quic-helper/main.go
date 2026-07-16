@@ -61,7 +61,7 @@ func runHTTP3Client(target string) {
 		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS13, NextProtos: []string{"h3"}},
 		QUICConfig:      &quic.Config{HandshakeIdleTimeout: 10 * time.Second},
 	}
-	defer transport.Close()
+	defer func() { _ = transport.Close() }()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		fatalf("create HTTP/3 request: %v", err)
@@ -90,7 +90,7 @@ func runServer(address string) {
 	if err != nil {
 		fatalf("listen QUIC: %v", err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 
 	for {
 		conn, err := listener.Accept(context.Background())
@@ -102,7 +102,7 @@ func runServer(address string) {
 }
 
 func serveConnection(conn quic.Connection) {
-	defer conn.CloseWithError(0, "smoke connection complete")
+	defer func() { _ = conn.CloseWithError(0, "smoke connection complete") }()
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		message, err := conn.ReceiveDatagram(ctx)
@@ -133,7 +133,7 @@ func runClient(address, payload string) {
 	if err != nil {
 		fatalf("dial QUIC: %v", err)
 	}
-	defer conn.CloseWithError(0, "smoke client complete")
+	defer func() { _ = conn.CloseWithError(0, "smoke client complete") }()
 
 	message := []byte(payload)
 	started := time.Now()

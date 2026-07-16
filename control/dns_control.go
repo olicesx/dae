@@ -379,11 +379,12 @@ func (c *DnsController) restoreReloadCache(entries map[string]*DnsCache, matchDo
 			if rt != nil {
 				restored.RouteProjectionEpoch = rt.routeProjectionEpoch
 			}
-			if rt != nil && rt.projectCacheRoute != nil {
+			switch {
+			case rt != nil && rt.projectCacheRoute != nil:
 				restored.DomainBitmap = rt.projectCacheRoute(restored)
-			} else if matchDomainBitmap != nil {
+			case matchDomainBitmap != nil:
 				restored.DomainBitmap = matchDomainBitmap(restored.GetFqdn())
-			} else if v.DomainBitmap != nil {
+			case v.DomainBitmap != nil:
 				restored.DomainBitmap = append([]uint32(nil), v.DomainBitmap...)
 			}
 
@@ -786,6 +787,8 @@ func (c *DnsController) Close() error {
 	// Wait for any in-flight projection callback before cache teardown. A task
 	// that arrives after this barrier observes bpfUpdateClosed and is discarded.
 	c.cacheProjectionMu.Lock()
+	// This lock/unlock pair is an intentional barrier for in-flight projection callbacks.
+	//nolint:staticcheck // The empty critical section provides the required wait barrier.
 	c.cacheProjectionMu.Unlock()
 
 	if bpfWorkerDone != nil || janitorDone != nil || evictorDone != nil {
@@ -953,10 +956,6 @@ func dnsCacheBaseKey(cacheKey string) string {
 		return before
 	}
 	return cacheKey
-}
-
-func (c *DnsController) responseCacheScope(req *udpRequest, upstreamIndex consts.DnsRequestOutboundIndex, upstream *dns.Upstream) string {
-	return c.responseCacheScopeForSnapshot(dnsRequestSnapshotFromUDPRequest(req), upstreamIndex, upstream)
 }
 
 func (c *DnsController) responseCacheKey(baseKey string, req *udpRequest, upstreamIndex consts.DnsRequestOutboundIndex, upstream *dns.Upstream) string {
@@ -2187,13 +2186,6 @@ type udpRequest struct {
 	routingResult  *bpfRoutingResult
 	uploadRecord   func(int64)
 	downloadRecord func(int64)
-}
-
-func (r *udpRequest) uploadRecorder() func(int64) {
-	if r == nil {
-		return RecordUploadTraffic
-	}
-	return normalizeTrafficRecord(r.uploadRecord)
 }
 
 func (r *udpRequest) downloadRecorder() func(int64) {

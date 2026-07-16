@@ -239,7 +239,6 @@ jobs:
             set -ex
 
             docker exec dae curl 1.1.1.1:443
-            cat /host/dae.log | grep -F -- '<-> 1.1.1.1:443'
             cat /host/v2ray.access.log | grep -q 'accepted tcp:1.1.1.1:443'
 
       - name: Check WAN IPv4 UDP
@@ -250,7 +249,6 @@ jobs:
             set -ex
 
             docker exec dae dig @1.1.1.1 one.one.one.one
-            cat /host/dae.log | grep -F -- '<-> 1.1.1.1:53'
             cat /host/v2ray.access.log | grep -q 'accepted udp:1.1.1.1:53'
 
       - name: Check WAN IPv6 TCP
@@ -262,7 +260,7 @@ jobs:
 
             docker exec dae nc -v -w1 2606:4700:4700::1111 443 &> /host/nc.log
             cat /host/nc.log | grep -q 'succeeded!'
-            cat /host/dae.log | grep -F -- '<-> [2606:4700:4700::1111]:443'
+            cat /host/v2ray.access.log | grep -F -- 'accepted tcp' | grep -F -- '2606:4700:4700::1111' | grep -F -- ':443'
 
       - name: Check WAN IPv6 UDP
         uses: cilium/little-vm-helper@v0.0.28
@@ -275,7 +273,7 @@ jobs:
               docker exec dae dig @2606:4700:4700::1111 one.one.one.one && break
               sleep 2
             done
-            cat /host/dae.log | grep -F -- '<-> [2606:4700:4700::1111]:53'
+            cat /host/v2ray.access.log | grep -F -- 'accepted udp' | grep -F -- '2606:4700:4700::1111' | grep -F -- ':53'
 
       - name: Setup WAN UDP port conflict
         uses: cilium/little-vm-helper@v0.0.28
@@ -308,7 +306,6 @@ jobs:
             set -ex
 
             docker exec dae dig @1.1.1.1 one.one.one.one
-            cat /host/dae.log | grep -F -- '<-> 1.1.1.1:53'
             cat /host/v2ray.access.log | grep -q 'accepted udp:1.1.1.1:53'
 
       - name: Check WAN IPv6 UDP with port conflict
@@ -322,7 +319,7 @@ jobs:
               docker exec dae dig @2606:4700:4700::1111 one.one.one.one && break
               sleep 2
             done
-            cat /host/dae.log | grep -F -- '<-> [2606:4700:4700::1111]:53'
+            cat /host/v2ray.access.log | grep -F -- 'accepted udp' | grep -F -- '2606:4700:4700::1111' | grep -F -- ':53'
 
       - name: Setup LAN
         uses: cilium/little-vm-helper@v0.0.28
@@ -418,7 +415,6 @@ jobs:
             set -ex
 
             docker exec dae ip net e dae curl 1.0.0.1
-            cat /host/dae.log | grep -F -- '<-> 1.0.0.1:80'
             cat /host/v2ray.access.log | grep -q 'accepted tcp:1.0.0.1:80'
 
       - name: Check LAN IPv4 UDP
@@ -429,7 +425,6 @@ jobs:
             set -ex
 
             docker exec dae ip net e dae dig @8.8.4.4 one.one.one.one
-            cat /host/dae.log | grep -F -- '<-> 8.8.4.4:53'
             cat /host/v2ray.access.log | grep -q 'accepted udp:8.8.4.4:53'
 
       - name: Check LAN IPv6 TCP
@@ -441,7 +436,7 @@ jobs:
 
             docker exec dae ip net e dae nc -v -w1 2606:4700:4700::1001 80 &> /host/nc.log
             cat /host/nc.log | grep -q 'succeeded!'
-            cat /host/dae.log | grep -F -- '<-> [2606:4700:4700::1001]:80'
+            cat /host/v2ray.access.log | grep -F -- 'accepted tcp' | grep -F -- '2606:4700:4700::1001' | grep -F -- ':80'
 
       - name: Check LAN IPv6 UDP
         uses: cilium/little-vm-helper@v0.0.28
@@ -454,7 +449,7 @@ jobs:
               docker exec dae ip net e dae dig @2001:4860:4860::8844 one.one.one.one && break
               sleep 2
             done
-            cat /host/dae.log | grep -F -- '<-> [2001:4860:4860::8844]:53'
+            cat /host/v2ray.access.log | grep -F -- 'accepted udp' | grep -F -- '2001:4860:4860::8844' | grep -F -- ':53'
 
       - name: Setup LAN UDP port conflict
         uses: cilium/little-vm-helper@v0.0.28
@@ -497,7 +492,6 @@ jobs:
             set -ex
 
             docker exec dae ip net e dae dig @8.8.4.4 one.one.one.one
-            cat /host/dae.log | grep -F -- '<-> 8.8.4.4:53'
             cat /host/v2ray.access.log | grep -q 'accepted udp:8.8.4.4:53'
 
       - name: Check LAN IPv6 UDP with port conflict
@@ -511,4 +505,4 @@ jobs:
               docker exec dae ip net e dae dig @2001:4860:4860::8844 one.one.one.one && break
               sleep 2
             done
-            cat /host/dae.log | grep -F -- '<-> [2001:4860:4860::8844]:53'
+            cat /host/v2ray.access.log | grep -F -- 'accepted udp' | grep -F -- '2001:4860:4860::8844' | grep -F -- ':53'

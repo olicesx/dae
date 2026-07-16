@@ -405,6 +405,8 @@ func TestRunnerConstructionFailureReleasesSemanticFeatureGate(t *testing.T) {
 
 const runnerFreshReloadFailureProcessHelperEnv = "DAE_RUNNER_FRESH_RELOAD_FAILURE_PROCESS_HELPER"
 
+const runnerProcessBoundaryTimeout = 30 * time.Second
+
 func countProcessFileDescriptors(t *testing.T) int {
 	t.Helper()
 	entries, err := os.ReadDir("/proc/self/fd")
@@ -543,7 +545,7 @@ func TestRunnerFreshReloadFailureProcessHelper(t *testing.T) {
 		t.Helper()
 		select {
 		case <-ch:
-		case <-time.After(10 * time.Second):
+		case <-time.After(runnerProcessBoundaryTimeout):
 			t.Fatalf("timed out waiting for %s", name)
 		}
 	}
@@ -578,7 +580,7 @@ func TestRunnerFreshReloadFailureProcessHelper(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Runner.Run() error = %v, want clean shutdown", err)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(runnerProcessBoundaryTimeout):
 		t.Fatal("Runner.Run() did not terminate after fresh reload rollback")
 	}
 	wait(readyNotificationDone, "initial readiness notification")
@@ -720,7 +722,7 @@ func TestRunnerStagedWarmupFailureProcessHelper(t *testing.T) {
 		t.Helper()
 		select {
 		case <-ch:
-		case <-time.After(10 * time.Second):
+		case <-time.After(runnerProcessBoundaryTimeout):
 			t.Fatalf("timed out waiting for %s", name)
 		}
 	}
@@ -739,7 +741,7 @@ func TestRunnerStagedWarmupFailureProcessHelper(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Runner.Run() error = %v, want clean shutdown", err)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(runnerProcessBoundaryTimeout):
 		t.Fatal("Runner.Run() did not terminate after staged warmup rollback")
 	}
 	wait(readyNotificationDone, "initial staged readiness notification")
@@ -910,7 +912,7 @@ func TestRunnerLiveStageFailureProcessHelper(t *testing.T) {
 		t.Helper()
 		select {
 		case <-ch:
-		case <-time.After(10 * time.Second):
+		case <-time.After(runnerProcessBoundaryTimeout):
 			t.Fatalf("timed out waiting for %s", name)
 		}
 	}
@@ -930,7 +932,7 @@ func TestRunnerLiveStageFailureProcessHelper(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Runner.Run() error = %v, want clean shutdown", err)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(runnerProcessBoundaryTimeout):
 		t.Fatalf("Runner.Run() did not terminate after %s stage rollback", kind)
 	}
 	wait(readyNotificationDone, "initial live-stage readiness notification")

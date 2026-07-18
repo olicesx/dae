@@ -71,11 +71,30 @@ var (
 	beginReloadProxyFailureSuppression = outbounddialer.BeginReloadProxyFailureSuppression
 	endReloadProxyFailureSuppression   = outbounddialer.EndReloadProxyFailureSuppression
 	resetReloadProxyRuntimeState       = outbounddialer.ResetGlobalProxyStateForReload
-	listenControlPlaneFunc             = func(c *control.ControlPlane, port uint16) (*control.Listener, error) { return c.Listen(port) }
-	cloneControlListenerFunc           = func(listener *control.Listener) (*control.Listener, error) { return listener.Clone() }
-	linkRoutingEpochPeerFunc           = func(oldPlane, newPlane *control.ControlPlane) error { return oldPlane.LinkRoutingEpochPeer(newPlane) }
-	serveControlPlaneFunc              = func(c *control.ControlPlane, readyChan chan<- bool, listener *control.Listener) error {
+	listenControlPlaneFunc             = func(c *control.ControlPlane, port uint16) (*control.Listener, error) {
+		listener, err := c.Listen(port)
+		if err != nil {
+			return nil, err
+		}
+		if err := listener.ValidateCurrentNetns(); err != nil {
+			_ = listener.Close()
+			return nil, err
+		}
+		return listener, nil
+	}
+	cloneControlListenerFunc = func(listener *control.Listener) (*control.Listener, error) { return listener.Clone() }
+	linkRoutingEpochPeerFunc = func(oldPlane, newPlane *control.ControlPlane) error { return oldPlane.LinkRoutingEpochPeer(newPlane) }
+	serveControlPlaneFunc    = func(c *control.ControlPlane, readyChan chan<- bool, listener *control.Listener) error {
 		return c.Serve(readyChan, listener)
+	}
+	restoreListenerSocketsFunc = func(c *control.ControlPlane, listener *control.Listener) error {
+		return c.PublishListenerSockets(listener)
+	}
+	restoreReloadDatapathFunc = func(c *control.ControlPlane) error {
+		return c.RebuildReloadDatapath()
+	}
+	restoreDNSListenerFunc = func(c *control.ControlPlane) error {
+		return c.RestartDNSListener()
 	}
 	withDaeNetnsRequiredFunc = func(op string, f func() error) error {
 		return control.GetDaeNetns().WithRequired(op, f)
@@ -138,6 +157,10 @@ const (
 	reloadReadyWaitTimeout
 )
 
+func canRecoverReloadReadinessFailure(result reloadReadyWaitResult) bool {
+	return result == reloadReadyWaitFailed
+}
+
 type stagedReloadHandoff struct {
 	preparedGeneration    *runtimeGeneration
 	oldControlPlane       *control.ControlPlane
@@ -152,6 +175,7 @@ type stagedReloadHandoff struct {
 	freshDatapath         bool
 	preparedDNSHandoff    bool
 	bpfTransferred        bool
+	sharedBpfHandoff      bool
 	routingEpochReady     bool
 	oldConnectivityPaused bool
 	freshCutoverStarted   bool
@@ -222,8 +246,29 @@ func clearReloadPending(flag *atomic.Bool) {
 	clearRejectedReloadProgress()
 }
 
-func shouldUseStagedRoutingEpochHandoff(routingEpochEnabled, freshDatapathReload, listenerPresent bool) bool {
-	return routingEpochEnabled && !freshDatapathReload && listenerPresent
+func shouldUseStagedHotHandoff(freshDatapathReload, listenerPresent bool) bool {
+	return !freshDatapathReload && listenerPresent
+}
+
+func listenControlPlaneInDaeNetns(c *control.ControlPlane, port uint16) (*control.Listener, error) {
+	var listener *control.Listener
+	err := withDaeNetnsRequiredFunc("listen control plane", func() error {
+		var listenErr error
+		listener, listenErr = listenControlPlaneFunc(c, port)
+		return listenErr
+	})
+	if err != nil {
+		if listener != nil {
+			if closeErr := listener.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("close listener after netns failure: %w", closeErr))
+			}
+		}
+		return nil, fmt.Errorf("listen in dae netns: %w", err)
+	}
+	if listener == nil {
+		return nil, fmt.Errorf("listen in dae netns: listener is nil")
+	}
+	return listener, nil
 }
 
 func releaseReloadPendingAfterRetirement(flag *atomic.Bool, retirementDone <-chan struct{}) {
@@ -389,15 +434,11 @@ func (r *Runner) Run() (err error) {
 	})
 
 	// Serve tproxy TCP/UDP server util signals.
-	var listener *control.Listener
-	if listenErr := withDaeNetnsRequiredFunc("listen in dae netns", func() error {
-		var err error
-		listener, err = listenControlPlaneFunc(c, conf.Global.TproxyPort)
-		return err
-	}); listenErr != nil {
+	listener, listenErr := listenControlPlaneInDaeNetns(c, conf.Global.TproxyPort)
+	if listenErr != nil {
 		cancel()
 		_ = c.Close()
-		return fmt.Errorf("listen in dae netns: %w", listenErr)
+		return listenErr
 	}
 	if supervisorErr := runtimeSupervisor.replaceActive(&runtimeGeneration{
 		controlPlane: c,
@@ -455,6 +496,13 @@ func (r *Runner) Run() (err error) {
 	reloadReqs := make(chan reloadRequest, 1)
 	reloadManager := newReloadManager(reloadReqs, runStateChanges, sigs)
 	fastExit := false
+	var fatalRunErr error
+	failRun := func(err error) {
+		fastExit = true
+		fatalRunErr = errors.Join(fatalRunErr, err)
+		reloadManager.setReloadError(fatalRunErr)
+		_ = setRunSignalProgress(consts.ReloadError, fatalRunErr.Error())
+	}
 
 	go func() {
 		for req := range reloadManager.reloadReqs {
@@ -519,7 +567,7 @@ func (r *Runner) Run() (err error) {
 			portChanged := conf.Global.TproxyPort != newConf.Global.TproxyPort
 			datapathChanged := bpfDatapathChanged(conf, newConf)
 			freshDatapathReload := portChanged || datapathChanged
-			stagedHotHandoff := shouldUseStagedRoutingEpochHandoff(routingEpochHandoffEnabled, freshDatapathReload, listener != nil)
+			stagedHotHandoff := shouldUseStagedHotHandoff(freshDatapathReload, listener != nil)
 			freshDatapathHandoff := freshDatapathReload && listener != nil
 			if !reloadManager.beginReloadTransition() {
 				reloadErr := errRuntimeSupervisorClosed
@@ -600,25 +648,27 @@ func (r *Runner) Run() (err error) {
 				oldCancel := currCancel
 				oldConf := conf
 				oldListener := listener
-				if err := linkRoutingEpochPeerFunc(oldC, newC); err != nil {
-					reloadErr := fmt.Errorf("link staged routing epochs: %w", err)
-					reloadManager.setReloadError(reloadErr)
-					if closeErr := stagedListener.Close(); closeErr != nil {
-						log.WithError(closeErr).Warnln("[Reload] Failed to close staged listener after epoch link failure")
+				if routingEpochHandoffEnabled {
+					if err := linkRoutingEpochPeerFunc(oldC, newC); err != nil {
+						reloadErr := fmt.Errorf("link staged routing epochs: %w", err)
+						reloadManager.setReloadError(reloadErr)
+						if closeErr := stagedListener.Close(); closeErr != nil {
+							log.WithError(closeErr).Warnln("[Reload] Failed to close staged listener after epoch link failure")
+						}
+						if closeErr := (&runtimeGeneration{controlPlane: newC, cancel: cancel}).cleanup(); closeErr != nil {
+							log.WithError(closeErr).Warnln("[Reload] Failed to close staged generation after epoch link failure")
+						}
+						log.WithError(reloadErr).Errorln("[Reload] Failed to prepare staged reload; keeping current generation active")
+						_ = sdnotify.Ready()
+						_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
+						reloadManager.reloadActive.Store(false)
+						clearReloadPending(&reloadManager.reloadPending)
+						releaseReloadTransition()
+						continue
 					}
-					if closeErr := (&runtimeGeneration{controlPlane: newC, cancel: cancel}).cleanup(); closeErr != nil {
-						log.WithError(closeErr).Warnln("[Reload] Failed to close staged generation after epoch link failure")
-					}
-					log.WithError(reloadErr).Errorln("[Reload] Failed to prepare staged reload; keeping current generation active")
-					_ = sdnotify.Ready()
-					_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
-					reloadManager.reloadActive.Store(false)
-					clearReloadPending(&reloadManager.reloadPending)
-					releaseReloadTransition()
-					continue
 				}
 
-				if conf.Dns.IpVersionPrefer == newConf.Dns.IpVersionPrefer {
+				if routingEpochHandoffEnabled && conf.Dns.IpVersionPrefer == newConf.Dns.IpVersionPrefer {
 					newC.SetReloadDnsCacheSource(oldC.CloneDnsCache)
 				}
 				hasOverlap := newC.InheritDialerHealthFrom(oldC)
@@ -675,7 +725,8 @@ func (r *Runner) Run() (err error) {
 					abortConnections:   abortConnections,
 					hasOverlap:         hasOverlap,
 					preparedDNSHandoff: true,
-					routingEpochReady:  true,
+					sharedBpfHandoff:   true,
+					routingEpochReady:  routingEpochHandoffEnabled,
 				}, reloadStartedAt, reloadStartedAtMono)
 				reloadManager.beginHandoff()
 				releaseReloadTransition()
@@ -702,7 +753,7 @@ func (r *Runner) Run() (err error) {
 				}
 
 				if portChanged {
-					stagedListener, err = listenControlPlaneFunc(newC, newConf.Global.TproxyPort)
+					stagedListener, err = listenControlPlaneInDaeNetns(newC, newConf.Global.TproxyPort)
 				} else {
 					stagedListener, err = cloneControlListenerFunc(listener)
 				}
@@ -834,7 +885,7 @@ func (r *Runner) Run() (err error) {
 			}
 
 			if stagedListener == nil {
-				stagedListener, err = listenControlPlaneFunc(newC, newConf.Global.TproxyPort)
+				stagedListener, err = listenControlPlaneInDaeNetns(newC, newConf.Global.TproxyPort)
 				if err != nil {
 					reloadErr := fmt.Errorf("prepare new listener: %w", err)
 					reloadManager.setReloadError(reloadErr)
@@ -1003,17 +1054,11 @@ loop:
 							default:
 							}
 						}()
-						if runErr := withDaeNetnsRequiredFunc("listen and serve in dae netns", func() error {
-							if listener, err = listenControlPlaneFunc(c, conf.Global.TproxyPort); err != nil {
-								log.Errorln("Listen:", err)
-								return err
-							}
-							if err = serveControlPlaneFunc(c, readyChan, listener); err != nil {
-								log.Errorln("Serve:", err)
-							}
-							return err
-						}); runErr != nil {
-							log.Errorln("GetDaeNetns.With:", runErr)
+						listener, err = listenControlPlaneInDaeNetns(c, conf.Global.TproxyPort)
+						if err != nil {
+							log.Errorln("Listen:", err)
+						} else if err = serveControlPlaneFunc(c, readyChan, listener); err != nil {
+							log.Errorln("Serve:", err)
 						}
 						notifyRunStateChange(runStateChanges)
 					}()
@@ -1032,6 +1077,10 @@ loop:
 						_ = sdnotify.Ready()
 						_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
 						log.WithError(reloadErr).Errorln("[Reload] Reload listener failed before becoming ready")
+						if !canRecoverReloadReadinessFailure(waitResult) {
+							failRun(reloadErr)
+							break loop
+						}
 						reloadManager.reloading.Store(false)
 						reloadManager.reloadActive.Store(false)
 						clearReloadPending(&reloadManager.reloadPending)
@@ -1075,7 +1124,7 @@ loop:
 							recoveredListener, rollbackErr := rollbackFreshDatapathReloadHandoff(log, handoff)
 							if rollbackErr != nil {
 								log.WithError(rollbackErr).Errorln("[Reload] Failed to recover previous generation from malformed fresh handoff")
-								fastExit = true
+								failRun(errors.Join(reloadErr, fmt.Errorf("recover malformed fresh handoff: %w", rollbackErr)))
 								break loop
 							}
 							listener = recoveredListener
@@ -1086,16 +1135,22 @@ loop:
 								conf:         handoff.oldConf,
 							}); err != nil {
 								log.WithError(err).Errorln("[Reload] Failed to restore supervisor from malformed fresh handoff")
-								fastExit = true
+								failRun(errors.Join(reloadErr, fmt.Errorf("restore supervisor from malformed fresh handoff: %w", err)))
 								break loop
 							}
 							if restartErr := restartRecoveredControlPlane(log, sigs, runStateChanges, handoff.oldControlPlane, listener); restartErr != nil {
 								log.WithError(restartErr).Errorln("[Reload] Failed to restart previous generation from malformed fresh handoff")
-								fastExit = true
+								failRun(errors.Join(reloadErr, fmt.Errorf("restart previous generation from malformed fresh handoff: %w", restartErr)))
 								break loop
 							}
 						} else {
-							rollbackStagedReloadHandoff(log, handoff)
+							if restoreErr := restoreStagedReloadHandoff(log, handoff); restoreErr != nil {
+								reloadManager.setReloadError(errors.Join(reloadErr, restoreErr))
+								log.WithError(restoreErr).Errorln("[Reload] Failed to recover previous generation from malformed staged handoff")
+								reloadManager.clearPendingStagedHandoff()
+								failRun(errors.Join(reloadErr, fmt.Errorf("recover malformed staged handoff: %w", restoreErr)))
+								break loop
+							}
 						}
 						reloadManager.clearPendingStagedHandoff()
 						reloadManager.finishReloadFailure()
@@ -1117,7 +1172,7 @@ loop:
 						recoveredListener, rollbackErr := rollbackFreshDatapathReloadHandoff(log, handoff)
 						if rollbackErr != nil {
 							log.WithError(rollbackErr).Errorln("[Reload] Failed to recover previous generation after cutover error")
-							fastExit = true
+							failRun(errors.Join(reloadErr, fmt.Errorf("recover previous generation after cutover error: %w", rollbackErr)))
 							break loop
 						}
 						listener = recoveredListener
@@ -1128,13 +1183,13 @@ loop:
 							conf:         handoff.oldConf,
 						}); err != nil {
 							log.WithError(err).Errorln("[Reload] Failed to restore supervisor after fresh datapath rollback")
-							fastExit = true
+							failRun(errors.Join(reloadErr, fmt.Errorf("restore supervisor after fresh datapath rollback: %w", err)))
 							break loop
 						}
 						reloadManager.clearPendingStagedHandoff()
 						if restartErr := restartRecoveredControlPlane(log, sigs, runStateChanges, handoff.oldControlPlane, listener); restartErr != nil {
 							log.WithError(restartErr).Errorln("[Reload] Failed to restart previous listener generation after cutover rollback")
-							fastExit = true
+							failRun(errors.Join(reloadErr, fmt.Errorf("restart previous generation after cutover rollback: %w", restartErr)))
 							break loop
 						}
 						reloadManager.finishReloadFailure()
@@ -1143,10 +1198,10 @@ loop:
 				} else if handoff != nil && handoff.preparedDNSHandoff {
 					reloadManager.installPreparedDNSHandoffHooks(log, serveControlPlane, serveConf)
 				}
-				if handoff != nil && handoff.routingEpochReady && !handoff.freshDatapath && !handoff.oldConnectivityPaused {
+				if handoff != nil && handoff.sharedBpfHandoff && !handoff.freshDatapath && !handoff.oldConnectivityPaused {
 					// The prepared generation already suppresses its own health-map
 					// writes. Pause the active generation before CommitPreparedDatapath
-					// publishes the shared BPF epoch so stale health probes cannot
+					// publishes shared BPF state so stale health probes cannot
 					// overwrite the candidate's connectivity state.
 					if handoff.oldControlPlane != nil {
 						handoff.oldControlPlane.PauseOutboundConnectivityUpdates()
@@ -1174,20 +1229,27 @@ loop:
 				}
 				if waitResult != reloadReadyWaitReady {
 					reloadErr := fmt.Errorf("reload serve failed before becoming ready")
-					if waitResult == reloadReadyWaitTimeout {
+					if !canRecoverReloadReadinessFailure(waitResult) {
 						reloadErr = fmt.Errorf("reload serve timed out after %v", reloadReadyTimeout)
 					}
 					reloadManager.setReloadError(reloadErr)
 					_ = sdnotify.Ready()
 					_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
 					log.WithError(reloadErr).Errorln("[Reload] Reload serve failed before becoming ready")
+					if waitResult == reloadReadyWaitTimeout {
+						// Serve may still be mutating shared BPF state. Do not race a
+						// rollback against a late commit; terminate and let the service
+						// manager start from a clean datapath instead.
+						failRun(reloadErr)
+						break loop
+					}
 					if handoff := reloadManager.currentPendingStagedHandoff(); handoff != nil {
 						runtimeSupervisor.rollbackPrepared(handoff.preparedGeneration)
 						if handoff.freshDatapath {
 							recoveredListener, rollbackErr := rollbackFreshDatapathReloadHandoff(log, handoff)
 							if rollbackErr != nil {
 								log.WithError(rollbackErr).Errorln("[Reload] Failed to recover previous generation after fresh datapath handoff failure")
-								fastExit = true
+								failRun(errors.Join(reloadErr, fmt.Errorf("recover previous generation after fresh datapath handoff failure: %w", rollbackErr)))
 								break loop
 							}
 							listener = recoveredListener
@@ -1198,7 +1260,7 @@ loop:
 								conf:         handoff.oldConf,
 							}); err != nil {
 								log.WithError(err).Errorln("[Reload] Failed to restore supervisor after fresh datapath rollback")
-								fastExit = true
+								failRun(errors.Join(reloadErr, fmt.Errorf("restore supervisor after fresh datapath rollback: %w", err)))
 								break loop
 							}
 							reloadManager.clearPendingStagedHandoff()
@@ -1206,21 +1268,17 @@ loop:
 								log.WithError(restartErr).Errorln("[Reload] Failed to restart previous listener generation after rollback")
 								// Fresh datapath rollback already detached the old hooks and closed the old listener.
 								// If the recovered generation cannot become ready, continuing would leave traffic state ambiguous.
-								fastExit = true
+								failRun(errors.Join(reloadErr, fmt.Errorf("restart previous generation after fresh datapath rollback: %w", restartErr)))
 								break loop
 							}
 						} else {
-							rollbackStagedReloadHandoff(log, handoff)
-							if republishErr := handoff.oldControlPlane.PublishListenerSockets(handoff.oldListener); republishErr != nil {
-								log.WithError(republishErr).Errorln("[Reload] Failed to republish previous listeners after staged handoff failure")
-							}
-							if rebuildErr := handoff.oldControlPlane.RebuildReloadDatapath(); rebuildErr != nil {
-								log.WithError(rebuildErr).Errorln("[Reload] Failed to rebuild previous datapath after staged handoff failure")
-							}
-							if restartErr := handoff.oldControlPlane.RestartDNSListener(); restartErr != nil {
-								log.WithError(restartErr).Warnln("[Reload] Failed to restart previous DNS listener after staged handoff rollback")
-							}
 							reloadManager.clearPendingStagedHandoff()
+							if restoreErr := restoreStagedReloadHandoff(log, handoff); restoreErr != nil {
+								reloadManager.setReloadError(errors.Join(reloadErr, restoreErr))
+								log.WithError(restoreErr).Errorln("[Reload] Failed to recover previous generation after staged handoff failure")
+								failRun(errors.Join(reloadErr, fmt.Errorf("recover previous generation after staged handoff failure: %w", restoreErr)))
+								break loop
+							}
 							log.Warnln("[Reload] Restored previous listener generation after staged handoff failure")
 						}
 					}
@@ -1239,7 +1297,7 @@ loop:
 							recoveredListener, rollbackErr := rollbackFreshDatapathReloadHandoff(log, handoff)
 							if rollbackErr != nil {
 								log.WithError(rollbackErr).Errorln("[Reload] Failed to recover previous generation after publish error")
-								fastExit = true
+								failRun(errors.Join(reloadErr, fmt.Errorf("recover previous generation after publish error: %w", rollbackErr)))
 								break loop
 							}
 							listener = recoveredListener
@@ -1250,24 +1308,21 @@ loop:
 								conf:         handoff.oldConf,
 							}); err != nil {
 								log.WithError(err).Errorln("[Reload] Failed to restore supervisor after publish error")
-								fastExit = true
+								failRun(errors.Join(reloadErr, fmt.Errorf("restore supervisor after publish error: %w", err)))
 								break loop
 							}
 							if restartErr := restartRecoveredControlPlane(log, sigs, runStateChanges, handoff.oldControlPlane, listener); restartErr != nil {
 								log.WithError(restartErr).Errorln("[Reload] Failed to restart previous listener generation after publish error")
-								fastExit = true
+								failRun(errors.Join(reloadErr, fmt.Errorf("restart previous generation after publish error: %w", restartErr)))
 								break loop
 							}
 						} else {
-							rollbackStagedReloadHandoff(log, handoff)
-							if republishErr := handoff.oldControlPlane.PublishListenerSockets(handoff.oldListener); republishErr != nil {
-								log.WithError(republishErr).Errorln("[Reload] Failed to republish previous listeners after publish error")
-							}
-							if rebuildErr := handoff.oldControlPlane.RebuildReloadDatapath(); rebuildErr != nil {
-								log.WithError(rebuildErr).Errorln("[Reload] Failed to rebuild previous datapath after publish error")
-							}
-							if restartErr := handoff.oldControlPlane.RestartDNSListener(); restartErr != nil {
-								log.WithError(restartErr).Warnln("[Reload] Failed to restart previous DNS listener after publish error")
+							if restoreErr := restoreStagedReloadHandoff(log, handoff); restoreErr != nil {
+								reloadManager.setReloadError(errors.Join(reloadErr, restoreErr))
+								log.WithError(restoreErr).Errorln("[Reload] Failed to recover previous generation after publish error")
+								reloadManager.clearPendingStagedHandoff()
+								failRun(errors.Join(reloadErr, fmt.Errorf("recover previous generation after publish error: %w", restoreErr)))
+								break loop
 							}
 						}
 						reloadManager.clearPendingStagedHandoff()
@@ -1285,11 +1340,26 @@ loop:
 						serveControlPlane.InjectBpf(bpf)
 						serveControlPlane.InheritLpmIndices(oldC.EjectLpmIndices())
 					}
-					if handoff.routingEpochReady {
+					if handoff.sharedBpfHandoff {
 						// The supervisor now owns the candidate as active. Publish its
 						// current health snapshot only after this point; the old
 						// generation remains paused until retirement closes it.
 						serveControlPlane.ResumeOutboundConnectivityUpdates()
+					}
+					if oldC != nil && !handoff.freshDatapath {
+						if detachErr := oldC.DetachBpfHooks(); detachErr != nil {
+							log.WithError(detachErr).Warnln("[Reload] Failed to detach previous datapath hooks after publish; retrying")
+							if retryErr := oldC.DetachBpfHooks(); retryErr != nil {
+								detachFatalErr := errors.Join(
+									fmt.Errorf("detach previous datapath hooks: %w", retryErr),
+									fmt.Errorf("initial detach previous datapath hooks: %w", detachErr),
+								)
+								reloadManager.setReloadError(detachFatalErr)
+								log.WithError(retryErr).Errorln("[Reload] Previous datapath hooks remain attached after publish")
+								failRun(detachFatalErr)
+								break loop
+							}
+						}
 					}
 					c = handoff.preparedGeneration.controlPlane
 					currCancel = handoff.preparedGeneration.cancel
@@ -1345,7 +1415,8 @@ loop:
 		cancel:       currCancel,
 		conf:         conf,
 	}, fastExit)
-	return shutdownAfterSignalWithHandoff(log, listener, c, control.GetDaeNetns(), fastExit, shutdownHandoff)
+	shutdownErr := shutdownAfterSignalWithHandoff(log, listener, c, control.GetDaeNetns(), fastExit, shutdownHandoff)
+	return errors.Join(fatalRunErr, shutdownErr)
 }
 
 // buildRunShutdownHandoff preserves the historical fast-exit path: process
@@ -1543,7 +1614,7 @@ func rollbackFreshDatapathReloadHandoff(log *logrus.Logger, handoff *stagedReloa
 		return nil, errors.Join(rollbackCleanupErrs...)
 	}
 
-	recoveredListener, err := listenControlPlaneFunc(handoff.oldControlPlane, handoff.oldConf.Global.TproxyPort)
+	recoveredListener, err := listenControlPlaneInDaeNetns(handoff.oldControlPlane, handoff.oldConf.Global.TproxyPort)
 	if err != nil {
 		return nil, fmt.Errorf("restore previous listener: %w", err)
 	}
@@ -1597,10 +1668,38 @@ func restartRecoveredControlPlane(
 	return nil
 }
 
-func rollbackStagedReloadHandoff(log *logrus.Logger, handoff *stagedReloadHandoff) {
+func restoreStagedReloadHandoff(log *logrus.Logger, handoff *stagedReloadHandoff) error {
 	if handoff == nil {
-		return
+		return fmt.Errorf("staged reload handoff is nil")
 	}
+
+	var errs []error
+	if err := rollbackStagedReloadHandoff(log, handoff); err != nil {
+		errs = append(errs, err)
+	}
+	if handoff.oldControlPlane == nil {
+		errs = append(errs, fmt.Errorf("previous control plane is nil"))
+		return errors.Join(errs...)
+	}
+	if handoff.oldListener == nil {
+		errs = append(errs, fmt.Errorf("previous listener is nil"))
+	} else if err := restoreListenerSocketsFunc(handoff.oldControlPlane, handoff.oldListener); err != nil {
+		errs = append(errs, fmt.Errorf("republish previous listeners: %w", err))
+	}
+	if err := restoreReloadDatapathFunc(handoff.oldControlPlane); err != nil {
+		errs = append(errs, fmt.Errorf("rebuild previous datapath: %w", err))
+	}
+	if err := restoreDNSListenerFunc(handoff.oldControlPlane); err != nil {
+		errs = append(errs, fmt.Errorf("restart previous DNS listener: %w", err))
+	}
+	return errors.Join(errs...)
+}
+
+func rollbackStagedReloadHandoff(log *logrus.Logger, handoff *stagedReloadHandoff) error {
+	if handoff == nil {
+		return nil
+	}
+	var errs []error
 	defer func() {
 		if handoff.oldConnectivityPaused && handoff.oldControlPlane != nil {
 			handoff.oldControlPlane.ResumeOutboundConnectivityUpdates()
@@ -1617,31 +1716,44 @@ func rollbackStagedReloadHandoff(log *logrus.Logger, handoff *stagedReloadHandof
 	if handoff.newControlPlane != nil {
 		handoff.newControlPlane.ClearReloadDnsCacheSource()
 		if handoff.routingEpochReady {
-			if err := handoff.newControlPlane.RollbackPreparedRoutingEpoch(); err != nil && log != nil {
-				log.WithError(err).Errorln("[Reload] Failed to restore previous routing epoch before closing staged control plane")
+			if err := handoff.newControlPlane.RollbackPreparedRoutingEpoch(); err != nil {
+				errs = append(errs, fmt.Errorf("restore previous routing epoch: %w", err))
+				if log != nil {
+					log.WithError(err).Errorln("[Reload] Failed to restore previous routing epoch before closing staged control plane")
+				}
 			}
 		}
 	}
 
 	if handoff.preparedGeneration != nil {
-		if err := handoff.preparedGeneration.cleanup(); err != nil && log != nil {
-			log.WithError(err).Warnln("[Reload] Failed to clean up staged generation during rollback")
+		if err := handoff.preparedGeneration.cleanup(); err != nil {
+			errs = append(errs, fmt.Errorf("clean up staged generation: %w", err))
+			if log != nil {
+				log.WithError(err).Warnln("[Reload] Failed to clean up staged generation during rollback")
+			}
 		}
 	} else {
 		if handoff.newListener != nil {
-			if err := handoff.newListener.Close(); err != nil && log != nil {
-				log.WithError(err).Warnln("[Reload] Failed to close prepared listener during rollback")
+			if err := handoff.newListener.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("close prepared listener: %w", err))
+				if log != nil {
+					log.WithError(err).Warnln("[Reload] Failed to close prepared listener during rollback")
+				}
 			}
 		}
 		if handoff.newCancel != nil {
 			handoff.newCancel()
 		}
 		if handoff.newControlPlane != nil {
-			if err := handoff.newControlPlane.Close(); err != nil && log != nil {
-				log.WithError(err).Warnln("[Reload] Failed to close staged control plane during rollback")
+			if err := handoff.newControlPlane.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("close staged control plane: %w", err))
+				if log != nil {
+					log.WithError(err).Warnln("[Reload] Failed to close staged control plane during rollback")
+				}
 			}
 		}
 	}
+	return errors.Join(errs...)
 }
 
 func wrapReloadTimeoutError(stage string, err error, timeout time.Duration) error {

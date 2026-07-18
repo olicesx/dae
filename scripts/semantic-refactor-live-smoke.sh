@@ -38,6 +38,12 @@ if [ ! -f "$source_config" ]; then
 	echo "config file does not exist: $source_config" >&2
 	exit 1
 fi
+for command_name in ip mountpoint stat tc; do
+	if ! command -v "$command_name" >/dev/null 2>&1; then
+		echo "required command is missing: $command_name" >&2
+		exit 1
+	fi
+done
 
 binary=$(readlink -f "$binary")
 source_config=$(readlink -f "$source_config")
@@ -131,9 +137,11 @@ wait_for_reload_count() {
 	local expected=$2
 	local attempt
 	local finished
+	local retired
 	for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45; do
 		finished=$(grep -F -c "[Reload] Finished" "$log_file" || true)
-		if [ "$finished" -ge "$expected" ]; then
+		retired=$(grep -F -c "[Reload] Retired old control plane" "$log_file" || true)
+		if [ "$finished" -ge "$expected" ] && [ "$retired" -ge "$expected" ]; then
 			return 0
 		fi
 		if ! kill -0 "$daemon_pid" 2>/dev/null; then
@@ -144,6 +152,18 @@ wait_for_reload_count() {
 	done
 	cat "$log_file" >&2
 	return 1
+}
+
+assert_single_internal_filter() {
+	local host_count
+	local peer_count
+	host_count=$(tc filter show dev dae0 ingress | grep -F -c dae_dae0_ingress || true)
+	peer_count=$(ip netns exec daens tc filter show dev dae0peer ingress | grep -F -c dae_dae0peer_ingress || true)
+	if [ "$host_count" -ne 1 ] || [ "$peer_count" -ne 1 ]; then
+		echo "unexpected internal TC filter counts: dae0=$host_count dae0peer=$peer_count" >&2
+		cat "$tmp_dir/initial.log" >&2
+		return 1
+	fi
 }
 
 start_daemon "$tmp_dir/initial.log"
@@ -157,8 +177,9 @@ fi
 
 round=1
 while [ "$round" -le "$rounds" ]; do
-	kill -USR2 "$daemon_pid"
+	kill -USR1 "$daemon_pid"
 	wait_for_reload_count "$tmp_dir/initial.log" "$round"
+	assert_single_internal_filter
 	observe_rss
 	round=$((round + 1))
 done

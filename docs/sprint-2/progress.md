@@ -70,9 +70,9 @@ Delivered in this continuation:
   retain only a bounded immutable continuation and resume on the terminal
   observation; continuations expire before a reused tuple can force a stale
   comparison, and a known absent domain no longer produces a false divergence.
-- Restricted staged same-port reload handoff to the `routing-epoch` gate so a
-  default-gated reload follows the legacy ownership path instead of attempting
-  to link two slot-zero generations.
+- Restored staged same-port reload handoff as the default ownership path.
+  Listener and shared-BPF cutover no longer depend on the `routing-epoch`
+  feature gate; the gate controls only routing-epoch linking and rollback.
 - Extended kernel routing-epoch tests to exercise both active slots and verify
   slot attribution in conn-state and handoff records.
 - Corrected the `dae_stub_ebpf` port-range ABI helper so compiled-policy
@@ -723,12 +723,14 @@ cross-kernel verification.
 
 ## Staged Connectivity Ownership (delivered)
 
-During a shared-BPF routing-epoch handoff, a prepared candidate does not write
+During every shared-BPF same-port handoff, a prepared candidate does not write
 the outbound connectivity map. The active generation is paused immediately
 before candidate serving; after `runtimeSupervisor.publishPrepared`, the
 candidate writes a serialized current health snapshot and the old generation
-stays paused until retirement. `rollbackStagedReloadHandoff` restores the old
-owner on candidate readiness or publication failure.
+stays paused until retirement. Routing-epoch linking remains optional.
+`rollbackStagedReloadHandoff` restores the old owner on candidate readiness or
+publication failure, and an incomplete rollback is fatal instead of leaving a
+ready but partially restored generation.
 
 `TestPreparedConnectivityHandoffSuppressesStaleWritesAndRestoresRollbackOwner`
 checks the initial candidate suppression, cutover pause, rollback restoration,

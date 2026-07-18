@@ -22,7 +22,6 @@ import (
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component"
 	internal "github.com/daeuniverse/dae/pkg/ebpf_internal"
-	"github.com/mohae/deepcopy"
 	"github.com/safchain/ethtool"
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
@@ -33,6 +32,11 @@ import (
 var coreFlip int32
 
 var configureNetlinkSocketTimeoutOnce sync.Once
+
+var (
+	listTCFilters  = netlink.FilterList
+	deleteTCFilter = netlink.FilterDel
+)
 
 type cgroupAttachment interface {
 	io.Closer
@@ -626,17 +630,19 @@ func (c *controlPlaneCore) _bindLan(ifname string) error {
 		filterIngress.Fd = bpf.TproxyLanIngressL3.FD()
 		filterIngress.Name += "_l3"
 	}
-	// Remove and add.
-	// Best effort to remove old filter; it may not exist.
-	_ = netlink.FilterDel(filterIngress)
-	if !c.isReload {
-		tryDeleteFlippedFilter(filterIngress)
+	if err := deleteTCFiltersByHandle(link, filterIngress.Parent, filterIngress.Handle); err != nil {
+		return fmt.Errorf("cannot remove existing LAN ingress filter: %w", err)
 	}
-	if err := netlink.FilterAdd(filterIngress); err != nil && !errors.Is(err, unix.EEXIST) {
+	if !c.isReload {
+		if err := deleteTCFiltersByHandle(link, filterIngress.Parent, filterIngress.Handle^1); err != nil {
+			return fmt.Errorf("cannot remove flipped LAN ingress filter: %w", err)
+		}
+	}
+	if err := netlink.FilterAdd(filterIngress); err != nil {
 		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
 	}
 	detachFunc := func() error {
-		if err := netlink.FilterDel(filterIngress); err != nil && !os.IsNotExist(err) && !errors.Is(err, unix.ENODEV) {
+		if err := deleteTCFiltersByHandle(link, filterIngress.Parent, filterIngress.Handle); err != nil {
 			return fmt.Errorf("FilterDel(%v:%v): %w", ifname, filterIngress.Name, err)
 		}
 		return nil
@@ -662,17 +668,19 @@ func (c *controlPlaneCore) _bindLan(ifname string) error {
 		filterEgress.Fd = bpf.TproxyLanEgressL3.FD()
 		filterEgress.Name += "_l3"
 	}
-	// Remove and add.
-	// Best effort to remove old filter; it may not exist.
-	_ = netlink.FilterDel(filterEgress)
-	if !c.isReload {
-		tryDeleteFlippedFilter(filterEgress)
+	if err := deleteTCFiltersByHandle(link, filterEgress.Parent, filterEgress.Handle); err != nil {
+		return fmt.Errorf("cannot remove existing LAN egress filter: %w", err)
 	}
-	if err := netlink.FilterAdd(filterEgress); err != nil && !errors.Is(err, unix.EEXIST) {
+	if !c.isReload {
+		if err := deleteTCFiltersByHandle(link, filterEgress.Parent, filterEgress.Handle^1); err != nil {
+			return fmt.Errorf("cannot remove flipped LAN egress filter: %w", err)
+		}
+	}
+	if err := netlink.FilterAdd(filterEgress); err != nil {
 		return fmt.Errorf("cannot attach ebpf object to filter egress: %w", err)
 	}
 	egressDetachFunc := func() error {
-		if err := netlink.FilterDel(filterEgress); err != nil && !os.IsNotExist(err) && !errors.Is(err, unix.ENODEV) {
+		if err := deleteTCFiltersByHandle(link, filterEgress.Parent, filterEgress.Handle); err != nil {
 			return fmt.Errorf("FilterDel(%v:%v): %w", ifname, filterEgress.Name, err)
 		}
 		return nil
@@ -898,16 +906,19 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 		filterEgress.Fd = bpf.TproxyWanEgressL3.FD()
 		filterEgress.Name += "_l3"
 	}
-	// Best effort to remove old filter; it may not exist.
-	_ = netlink.FilterDel(filterEgress)
-	if !c.isReload {
-		tryDeleteFlippedFilter(filterEgress)
+	if err := deleteTCFiltersByHandle(link, filterEgress.Parent, filterEgress.Handle); err != nil {
+		return fmt.Errorf("cannot remove existing WAN egress filter: %w", err)
 	}
-	if err := netlink.FilterAdd(filterEgress); err != nil && !errors.Is(err, unix.EEXIST) {
+	if !c.isReload {
+		if err := deleteTCFiltersByHandle(link, filterEgress.Parent, filterEgress.Handle^1); err != nil {
+			return fmt.Errorf("cannot remove flipped WAN egress filter: %w", err)
+		}
+	}
+	if err := netlink.FilterAdd(filterEgress); err != nil {
 		return fmt.Errorf("cannot attach ebpf object to filter egress: %w", err)
 	}
 	egressDetachFunc := func() error {
-		if err := netlink.FilterDel(filterEgress); err != nil && !os.IsNotExist(err) && !errors.Is(err, unix.ENODEV) {
+		if err := deleteTCFiltersByHandle(link, filterEgress.Parent, filterEgress.Handle); err != nil {
 			return fmt.Errorf("FilterDel(%v:%v): %w", ifname, filterEgress.Name, err)
 		}
 		return nil
@@ -932,16 +943,19 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 		filterIngress.Fd = bpf.TproxyWanIngressL3.FD()
 		filterIngress.Name += "_l3"
 	}
-	// Best effort to remove old filter; it may not exist.
-	_ = netlink.FilterDel(filterIngress)
-	if !c.isReload {
-		tryDeleteFlippedFilter(filterIngress)
+	if err := deleteTCFiltersByHandle(link, filterIngress.Parent, filterIngress.Handle); err != nil {
+		return fmt.Errorf("cannot remove existing WAN ingress filter: %w", err)
 	}
-	if err := netlink.FilterAdd(filterIngress); err != nil && !errors.Is(err, unix.EEXIST) {
+	if !c.isReload {
+		if err := deleteTCFiltersByHandle(link, filterIngress.Parent, filterIngress.Handle^1); err != nil {
+			return fmt.Errorf("cannot remove flipped WAN ingress filter: %w", err)
+		}
+	}
+	if err := netlink.FilterAdd(filterIngress); err != nil {
 		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
 	}
 	ingressDetachFunc := func() error {
-		if err := netlink.FilterDel(filterIngress); err != nil && !os.IsNotExist(err) && !errors.Is(err, unix.ENODEV) {
+		if err := deleteTCFiltersByHandle(link, filterIngress.Parent, filterIngress.Handle); err != nil {
 			return fmt.Errorf("FilterDel(%v:%v): %w", ifname, filterIngress.Name, err)
 		}
 		return nil
@@ -970,44 +984,46 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 			Parent:    netlink.HANDLE_MIN_INGRESS,
 			Handle:    netlink.MakeHandle(0x2022, 0b010+uint16(c.flip)),
 			Protocol:  unix.ETH_P_ALL,
-			Priority:  0,
+			Priority:  1,
 		},
 		Fd:           bpf.TproxyDae0peerIngress.FD(),
 		Name:         consts.AppName + "_dae0peer_ingress",
 		DirectAction: true,
 	}
-	// Best effort to remove old filter; it may not exist.
-	daens.WithBestEffort("delete old dae0peer ingress filter", func() error {
-		err := netlink.FilterDel(filterDae0peerIngress)
-		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESRCH) {
-			return nil
-		}
-		return err
-	})
+	if err = daens.WithRequired("delete old dae0peer ingress filter", func() error {
+		return deleteTCFiltersByHandle(
+			daens.Dae0Peer(),
+			filterDae0peerIngress.Parent,
+			filterDae0peerIngress.Handle,
+		)
+	}); err != nil {
+		return fmt.Errorf("cannot remove existing dae0peer ingress filter: %w", err)
+	}
 	// Remove and add.
 	if !c.isReload {
 		// Clean up thoroughly: delete the filter with the flipped handle.
-		filterIngressFlipped := deepcopy.Copy(filterDae0peerIngress).(*netlink.BpfFilter)
-		filterIngressFlipped.Handle ^= 1
-		daens.WithBestEffort("delete flipped dae0peer ingress filter", func() error {
-			err := netlink.FilterDel(filterIngressFlipped)
-			if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESRCH) {
-				return nil
-			}
-			return err
-		})
+		if err = daens.WithRequired("delete flipped dae0peer ingress filter", func() error {
+			return deleteTCFiltersByHandle(
+				daens.Dae0Peer(),
+				filterDae0peerIngress.Parent,
+				filterDae0peerIngress.Handle^1,
+			)
+		}); err != nil {
+			return fmt.Errorf("cannot remove flipped dae0peer ingress filter: %w", err)
+		}
 	}
 	if err = daens.WithRequired("add dae0peer ingress filter", func() error {
-		if err := netlink.FilterAdd(filterDae0peerIngress); err != nil && !errors.Is(err, unix.EEXIST) {
-			return err
-		}
-		return nil
+		return netlink.FilterAdd(filterDae0peerIngress)
 	}); err != nil {
 		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
 	}
 	detachFunc := func() error {
 		return daens.WithRequired("delete dae0peer ingress filter", func() error {
-			if err := netlink.FilterDel(filterDae0peerIngress); err != nil && !os.IsNotExist(err) && !errors.Is(err, unix.ENODEV) {
+			if err := deleteTCFiltersByHandle(
+				daens.Dae0Peer(),
+				filterDae0peerIngress.Parent,
+				filterDae0peerIngress.Handle,
+			); err != nil {
 				return fmt.Errorf("FilterDel(%v:%v): %w", daens.Dae0Peer().Attrs().Name, filterDae0peerIngress.Name, err)
 			}
 			return nil
@@ -1024,23 +1040,26 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 			Parent:    netlink.HANDLE_MIN_INGRESS,
 			Handle:    netlink.MakeHandle(0x2022, 0b010+uint16(c.flip)),
 			Protocol:  unix.ETH_P_ALL,
-			Priority:  0,
+			Priority:  1,
 		},
 		Fd:           bpf.TproxyDae0Ingress.FD(),
 		Name:         consts.AppName + "_dae0_ingress",
 		DirectAction: true,
 	}
-	// Best effort to remove old filter; it may not exist.
-	_ = netlink.FilterDel(filterDae0Ingress)
+	if err := deleteTCFiltersByHandle(daens.Dae0(), filterDae0Ingress.Parent, filterDae0Ingress.Handle); err != nil {
+		return fmt.Errorf("cannot remove existing dae0 ingress filter: %w", err)
+	}
 	// Remove and add.
 	if !c.isReload {
-		tryDeleteFlippedFilter(filterDae0Ingress)
+		if err := deleteTCFiltersByHandle(daens.Dae0(), filterDae0Ingress.Parent, filterDae0Ingress.Handle^1); err != nil {
+			return fmt.Errorf("cannot remove flipped dae0 ingress filter: %w", err)
+		}
 	}
-	if err := netlink.FilterAdd(filterDae0Ingress); err != nil && !errors.Is(err, unix.EEXIST) {
+	if err := netlink.FilterAdd(filterDae0Ingress); err != nil {
 		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
 	}
 	dae0DetachFunc := func() error {
-		if err := netlink.FilterDel(filterDae0Ingress); err != nil && !os.IsNotExist(err) && !errors.Is(err, unix.ENODEV) {
+		if err := deleteTCFiltersByHandle(daens.Dae0(), filterDae0Ingress.Parent, filterDae0Ingress.Handle); err != nil {
 			return fmt.Errorf("FilterDel(%v:%v): %w", daens.Dae0().Attrs().Name, filterDae0Ingress.Name, err)
 		}
 		return nil
@@ -1049,13 +1068,36 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 	return
 }
 
-// tryDeleteFlippedFilter deletes the TC filter obtained by flipping the
-// low bit of the handle. Used during non-reload startup to remove any
-// stale filter from a previous run that used the opposite flip value.
-func tryDeleteFlippedFilter(f *netlink.BpfFilter) {
-	flipped := deepcopy.Copy(f).(*netlink.BpfFilter)
-	flipped.Handle ^= 1
-	_ = netlink.FilterDel(flipped)
+// deleteTCFiltersByHandle removes every filter with the exact handle regardless
+// of its priority. Older dae versions left priority unset on dae0 hooks, so the
+// kernel assigned a different priority on each reload and template deletion
+// with priority zero could not find the stale filter.
+func deleteTCFiltersByHandle(link netlink.Link, parent, handle uint32) error {
+	if link == nil {
+		return fmt.Errorf("delete TC filter %#x: nil link", handle)
+	}
+	filters, err := listTCFilters(link, parent)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ESRCH) || errors.Is(err, unix.ENODEV) {
+			return nil
+		}
+		return err
+	}
+	var errs []error
+	for _, filter := range filters {
+		attrs := filter.Attrs()
+		if attrs == nil || attrs.Handle != handle {
+			continue
+		}
+		if err := deleteTCFilter(filter); err != nil &&
+			!os.IsNotExist(err) &&
+			!errors.Is(err, unix.ENOENT) &&
+			!errors.Is(err, unix.ESRCH) &&
+			!errors.Is(err, unix.ENODEV) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // extractIpsFromDnsCache returns the unique, valid non-unspecified IP addresses

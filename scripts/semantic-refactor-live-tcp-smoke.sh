@@ -143,9 +143,11 @@ wait_for_reload_count() {
 	local expected=$2
 	local attempt
 	local finished
+	local retired
 	for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45; do
 		finished=$(grep -F -c "[Reload] Finished" "$log_file" || true)
-		if [ "$finished" -ge "$expected" ]; then
+		retired=$(grep -F -c "[Reload] Retired old control plane" "$log_file" || true)
+		if [ "$finished" -ge "$expected" ] && [ "$retired" -ge "$expected" ]; then
 			return 0
 		fi
 		if ! kill -0 "$daemon_pid" 2>/dev/null; then
@@ -176,7 +178,7 @@ while [ "$round" -le "$rounds" ]; do
 	) &
 	request_pid=$!
 	sleep 0.1
-	kill -USR2 "$daemon_pid"
+	kill -USR1 "$daemon_pid"
 	wait_for_reload_count "$tmp_dir/daemon.log" "$round"
 	current_fd_count=$(find "/proc/$daemon_pid/fd" -mindepth 1 -maxdepth 1 -type l | wc -l)
 	if [ "$current_fd_count" -gt "$max_fd_count" ]; then

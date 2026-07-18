@@ -140,6 +140,8 @@ type ControlPlane struct {
 // prepared-generation boundaries in Serve. The production path leaves every
 // hook nil and calls the normal ControlPlane implementation directly.
 type ServeLifecycleHooks struct {
+	// ValidateListener replaces listener validation when non-nil.
+	ValidateListener func(*Listener) error
 	// CommitPreparedDatapath replaces the prepared BPF commit when non-nil.
 	CommitPreparedDatapath func() error
 	// PublishListenerSockets replaces listener FD publication when non-nil.
@@ -689,7 +691,7 @@ func newControlPlaneWithContextOptions(
 	// active generation's health map while it is still only a candidate. The
 	// runtime supervisor resumes its writes after publish, or leaves it paused
 	// while rollback restores the old generation.
-	if buildOpts.delayDatapathCommit && sharedBpfReload && refactorFeatures.RoutingEpoch {
+	if buildOpts.delayDatapathCommit && sharedBpfReload {
 		core.pauseOutboundConnectivityUpdates()
 	}
 	if ephemeralPinPath {
@@ -1670,6 +1672,10 @@ func (c *ControlPlane) publishListenerSockets(listener *Listener) error {
 	if c == nil || c.core == nil || listener == nil {
 		return fmt.Errorf("publishListenerSockets: nil control plane or listener")
 	}
+	bpf := c.core.bpf.Load()
+	if bpf == nil || bpf.ListenSocketMap == nil {
+		return fmt.Errorf("publishListenerSockets: listen socket map is unavailable")
+	}
 
 	var (
 		newFiles []*os.File
@@ -1689,7 +1695,7 @@ func (c *ControlPlane) publishListenerSockets(listener *Listener) error {
 			return fmt.Errorf("failed to retrieve copy of the underlying TCP IPv4 listener file")
 		}
 		newFiles = append(newFiles, tcp4File)
-		if err = c.core.bpf.Load().ListenSocketMap.Update(consts.ZeroKey, uint64(tcp4File.Fd()), ebpf.UpdateAny); err != nil {
+		if err = bpf.ListenSocketMap.Update(consts.ZeroKey, uint64(tcp4File.Fd()), ebpf.UpdateAny); err != nil {
 			closeNewFiles()
 			return err
 		}
@@ -1701,7 +1707,7 @@ func (c *ControlPlane) publishListenerSockets(listener *Listener) error {
 			return fmt.Errorf("failed to retrieve copy of the underlying TCP IPv6 listener file")
 		}
 		newFiles = append(newFiles, tcp6File)
-		if err = c.core.bpf.Load().ListenSocketMap.Update(consts.TwoKey, uint64(tcp6File.Fd()), ebpf.UpdateAny); err != nil {
+		if err = bpf.ListenSocketMap.Update(consts.TwoKey, uint64(tcp6File.Fd()), ebpf.UpdateAny); err != nil {
 			closeNewFiles()
 			return err
 		}
@@ -1713,7 +1719,7 @@ func (c *ControlPlane) publishListenerSockets(listener *Listener) error {
 			return fmt.Errorf("failed to retrieve copy of the underlying UDP connection file")
 		}
 		newFiles = append(newFiles, udpFile)
-		if err = c.core.bpf.Load().ListenSocketMap.Update(consts.OneKey, uint64(udpFile.Fd()), ebpf.UpdateAny); err != nil {
+		if err = bpf.ListenSocketMap.Update(consts.OneKey, uint64(udpFile.Fd()), ebpf.UpdateAny); err != nil {
 			closeNewFiles()
 			return err
 		}
@@ -3231,6 +3237,76 @@ type Listener struct {
 	port         uint16
 }
 
+func currentNetnsCookie() (uint64, error) {
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = unix.Close(fd) }()
+	return unix.GetsockoptUint64(fd, unix.SOL_SOCKET, unix.SO_NETNS_COOKIE)
+}
+
+func socketNetnsCookie(conn any) (uint64, error) {
+	syscallConn, ok := conn.(syscall.Conn)
+	if !ok {
+		return 0, fmt.Errorf("socket type %T does not expose SyscallConn", conn)
+	}
+	rawConn, err := syscallConn.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var (
+		cookie    uint64
+		cookieErr error
+	)
+	if err := rawConn.Control(func(fd uintptr) {
+		cookie, cookieErr = unix.GetsockoptUint64(int(fd), unix.SOL_SOCKET, unix.SO_NETNS_COOKIE)
+	}); err != nil {
+		return 0, err
+	}
+	return cookie, cookieErr
+}
+
+// ValidateCurrentNetns verifies that every listener socket belongs to the
+// caller's current network namespace. BPF socket assignment rejects sockets
+// from another namespace, so publishing one would silently black-hole proxy
+// traffic even though the listener itself was otherwise healthy.
+func (l *Listener) ValidateCurrentNetns() error {
+	if l == nil {
+		return fmt.Errorf("validate listener netns: nil listener")
+	}
+	expected, err := currentNetnsCookie()
+	if err != nil {
+		return fmt.Errorf("read current network namespace cookie: %w", err)
+	}
+	sockets := []struct {
+		name string
+		conn any
+	}{
+		{name: "tcp4", conn: l.tcp4Listener},
+		{name: "tcp6", conn: l.tcp6Listener},
+		{name: "udp", conn: l.packetConn},
+	}
+	validated := 0
+	for _, socket := range sockets {
+		if socket.conn == nil {
+			continue
+		}
+		cookie, err := socketNetnsCookie(socket.conn)
+		if err != nil {
+			return fmt.Errorf("read %s listener network namespace cookie: %w", socket.name, err)
+		}
+		if cookie != expected {
+			return fmt.Errorf("%s listener belongs to network namespace cookie %d, want %d", socket.name, cookie, expected)
+		}
+		validated++
+	}
+	if validated == 0 {
+		return fmt.Errorf("validate listener netns: listener has no sockets")
+	}
+	return nil
+}
+
 const udpDualStackListenIP = "::"
 
 func udpDualStackListenAddr(port uint16) string {
@@ -3475,8 +3551,29 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			}
 		}
 	}()
-	var udpConn *net.UDPConn
 	hooks := c.serveLifecycleHooks()
+	validateListener := func(listener *Listener) error {
+		if listener == nil {
+			return fmt.Errorf("nil listener")
+		}
+		if tcp4, ok := listener.tcp4Listener.(*net.TCPListener); !ok || tcp4 == nil {
+			return fmt.Errorf("listener TCP IPv4 socket is not TCP")
+		}
+		if tcp6, ok := listener.tcp6Listener.(*net.TCPListener); !ok || tcp6 == nil {
+			return fmt.Errorf("listener TCP IPv6 socket is not TCP")
+		}
+		udpConn, ok := listener.packetConn.(*net.UDPConn)
+		if !ok || udpConn == nil {
+			return fmt.Errorf("listener packet connection is not UDP")
+		}
+		return nil
+	}
+	if hooks.ValidateListener != nil {
+		validateListener = hooks.ValidateListener
+	}
+	if err := validateListener(listener); err != nil {
+		return err
+	}
 	commitPreparedDatapath := c.CommitPreparedDatapath
 	if hooks.CommitPreparedDatapath != nil {
 		commitPreparedDatapath = hooks.CommitPreparedDatapath
@@ -3498,14 +3595,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 	if err := activatePreparedRuntime(); err != nil {
 		return err
 	}
-	if listener == nil {
-		return fmt.Errorf("nil listener")
-	}
-	var ok bool
-	udpConn, ok = listener.packetConn.(*net.UDPConn)
-	if !ok || udpConn == nil {
-		return fmt.Errorf("listener packet connection is not UDP")
-	}
+	udpConn, _ := listener.packetConn.(*net.UDPConn)
 
 	c.markReady()
 	sentReady = true

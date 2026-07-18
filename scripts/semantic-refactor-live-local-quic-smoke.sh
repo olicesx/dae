@@ -119,7 +119,8 @@ wait_log() {
 wait_reload() {
 	local expected=$1
 	for attempt in {1..45}; do
-		if [ "$(grep -F -c '[Reload] Finished' "$tmp_dir/daemon.log" || true)" -ge "$expected" ]; then return 0; fi
+		if [ "$(grep -F -c '[Reload] Finished' "$tmp_dir/daemon.log" || true)" -ge "$expected" ] &&
+			[ "$(grep -F -c '[Reload] Retired old control plane' "$tmp_dir/daemon.log" || true)" -ge "$expected" ]; then return 0; fi
 		if ! kill -0 "$daemon_pid" 2>/dev/null; then cat "$tmp_dir/daemon.log" >&2; return 1; fi
 		sleep 1
 	done
@@ -137,7 +138,7 @@ while [ "$round" -le "$rounds" ]; do
 	"$tmp_dir/quic-helper" client "$server_ip" "$server_port" "$round" >"$status_file" 2>&1 &
 	request_pid=$!
 	sleep 0.1
-	kill -USR2 "$daemon_pid"
+	kill -USR1 "$daemon_pid"
 	wait_reload "$round"
 	current_fd_count=$(find "/proc/$daemon_pid/fd" -mindepth 1 -maxdepth 1 -type l | wc -l)
 	if [ "$current_fd_count" -gt "$max_fd_count" ]; then max_fd_count=$current_fd_count; fi

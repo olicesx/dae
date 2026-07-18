@@ -37,8 +37,9 @@ func ptrToUint32(v uint32) *uint32 {
 }
 
 var (
-	daeNetns *DaeNetns
-	once     sync.Once
+	daeNetns     *DaeNetns
+	once         sync.Once
+	setNetnsFunc = netns.Set
 )
 
 type DaeNetns struct {
@@ -167,23 +168,129 @@ func (ns *DaeNetns) Close() (err error) {
 	return stderrors.Join(errs...)
 }
 
-func (ns *DaeNetns) With(f func() error) (err error) {
-	if err = ns.Setup(); err != nil {
-		return fmt.Errorf("failed to setup dae netns: %v", err)
+func duplicateNetnsHandle(handle netns.NsHandle) (netns.NsHandle, error) {
+	if !handle.IsOpen() {
+		return netns.None(), fmt.Errorf("network namespace handle is closed")
+	}
+	fd, err := unix.FcntlInt(uintptr(handle), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		return netns.None(), err
+	}
+	return netns.NsHandle(fd), nil
+}
+
+func (ns *DaeNetns) snapshotHandles() (hostNs, daeNs netns.NsHandle, err error) {
+	ns.mu.Lock()
+	defer ns.mu.Unlock()
+	if !ns.setupDone.Load() || !ns.handlesInitialized {
+		return netns.None(), netns.None(), fmt.Errorf("dae netns is not initialized")
+	}
+	hostNs, err = duplicateNetnsHandle(ns.hostNs)
+	if err != nil {
+		return netns.None(), netns.None(), fmt.Errorf("duplicate host netns handle: %w", err)
+	}
+	daeNs, err = duplicateNetnsHandle(ns.daeNs)
+	if err != nil {
+		_ = hostNs.Close()
+		return netns.None(), netns.None(), fmt.Errorf("duplicate dae netns handle: %w", err)
+	}
+	return hostNs, daeNs, nil
+}
+
+// With runs f synchronously on a dedicated OS thread in dae netns and restores
+// the host namespace before returning.
+func (ns *DaeNetns) With(f func() error) error {
+	if f == nil {
+		return fmt.Errorf("dae netns callback is nil")
+	}
+	if err := ns.Setup(); err != nil {
+		return fmt.Errorf("failed to setup dae netns: %w", err)
+	}
+	hostNs, daeNs, err := ns.snapshotHandles()
+	if err != nil {
+		return fmt.Errorf("snapshot dae netns handles: %w", err)
 	}
 
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	if err = netns.Set(ns.daeNs); err != nil {
-		return fmt.Errorf("failed to switch to daens: %v", err)
+	type result struct {
+		err        error
+		panicValue any
 	}
-	defer func() { _ = netns.Set(ns.hostNs) }()
+	resultCh := make(chan result, 1)
+	go func() {
+		runtime.LockOSThread()
+		var (
+			switchErr        error
+			callbackErr      error
+			switched         bool
+			callbackStarted  bool
+			callbackReturned bool
+		)
+		defer func() {
+			panicValue := recover()
+			if callbackStarted && !callbackReturned && panicValue == nil {
+				callbackErr = stderrors.New("dae netns callback exited without returning")
+			}
+			var restoreErr error
+			if switched {
+				restoreErr = setNetnsFunc(hostNs)
+			}
+			closeErr := stderrors.Join(
+				closeNetnsSnapshot("dae", daeNs),
+				closeNetnsSnapshot("host", hostNs),
+			)
+			if !switched || restoreErr == nil {
+				runtime.UnlockOSThread()
+			}
+			// A goroutine that exits while locked causes the runtime to discard its
+			// OS thread. This prevents a failed restore from returning a daens-bound
+			// thread to the scheduler.
+			resultCh <- result{
+				err: stderrors.Join(
+					switchErr,
+					wrapDaeNetnsCallbackError(callbackErr),
+					wrapDaeNetnsRestoreError(restoreErr),
+					closeErr,
+				),
+				panicValue: panicValue,
+			}
+		}()
 
-	if err = f(); err != nil {
-		return fmt.Errorf("failed to run func in dae netns: %v", err)
+		if err := setNetnsFunc(daeNs); err != nil {
+			switchErr = fmt.Errorf("failed to switch to daens: %w", err)
+			return
+		}
+		switched = true
+		callbackStarted = true
+		callbackErr = f()
+		callbackReturned = true
+	}()
+
+	callResult := <-resultCh
+	if callResult.panicValue != nil {
+		panic(callResult.panicValue)
 	}
-	return
+	return callResult.err
+}
+
+func closeNetnsSnapshot(name string, handle netns.NsHandle) error {
+	if err := handle.Close(); err != nil {
+		return fmt.Errorf("close %s netns snapshot: %w", name, err)
+	}
+	return nil
+}
+
+func wrapDaeNetnsCallbackError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("failed to run func in dae netns: %w", err)
+}
+
+func wrapDaeNetnsRestoreError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("failed to restore host netns: %w", err)
 }
 
 // WithRequired runs f in dae netns and wraps the error with operation context.

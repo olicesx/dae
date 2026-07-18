@@ -17,3 +17,6 @@ venv
 CLAUDE.md
 AGENTS.md
 .sisyphus
+.claude
+tmp/
+control.test

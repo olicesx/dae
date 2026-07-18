@@ -1,6 +1,7 @@
 package control
 
 import (
+	stderrors "errors"
 	"fmt"
 	"io"
 	"sync"
@@ -132,6 +133,70 @@ func TestControlPlaneCore_ReloadFlipIsCommittedTransactionally(t *testing.T) {
 	next := newControlPlaneCore(logger, nil, nil, nil, true, false)
 	if next.flip != 0 {
 		t.Fatalf("next reload reserved flip %d, want 0", next.flip)
+	}
+}
+
+func TestDeleteTCFiltersByHandleRemovesLegacyAutoPriorityFilters(t *testing.T) {
+	previousList := listTCFilters
+	previousDelete := deleteTCFilter
+	t.Cleanup(func() {
+		listTCFilters = previousList
+		deleteTCFilter = previousDelete
+	})
+
+	const (
+		parent = uint32(netlink.HANDLE_MIN_INGRESS)
+		handle = uint32(0x20220002)
+	)
+	matchingA := &netlink.BpfFilter{FilterAttrs: netlink.FilterAttrs{Handle: handle, Priority: 49152}}
+	matchingB := &netlink.BpfFilter{FilterAttrs: netlink.FilterAttrs{Handle: handle, Priority: 1}}
+	other := &netlink.BpfFilter{FilterAttrs: netlink.FilterAttrs{Handle: handle ^ 1, Priority: 49151}}
+	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "dae0", Index: 42}}
+
+	listTCFilters = func(gotLink netlink.Link, gotParent uint32) ([]netlink.Filter, error) {
+		if gotLink != link || gotParent != parent {
+			t.Fatalf("FilterList(%v, %#x), want (%v, %#x)", gotLink, gotParent, link, parent)
+		}
+		return []netlink.Filter{matchingA, other, matchingB}, nil
+	}
+	var deleted []netlink.Filter
+	deleteTCFilter = func(filter netlink.Filter) error {
+		deleted = append(deleted, filter)
+		return nil
+	}
+
+	if err := deleteTCFiltersByHandle(link, parent, handle); err != nil {
+		t.Fatalf("deleteTCFiltersByHandle() error = %v", err)
+	}
+	if len(deleted) != 2 || deleted[0] != matchingA || deleted[1] != matchingB {
+		t.Fatalf("deleted filters = %#v, want both matching priorities", deleted)
+	}
+}
+
+func TestDeleteTCFiltersByHandlePropagatesNetlinkFailures(t *testing.T) {
+	previousList := listTCFilters
+	previousDelete := deleteTCFilter
+	t.Cleanup(func() {
+		listTCFilters = previousList
+		deleteTCFilter = previousDelete
+	})
+
+	wantErr := stderrors.New("netlink failed")
+	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "dae0", Index: 42}}
+	listTCFilters = func(netlink.Link, uint32) ([]netlink.Filter, error) {
+		return nil, wantErr
+	}
+	if err := deleteTCFiltersByHandle(link, netlink.HANDLE_MIN_INGRESS, 0x20220002); !stderrors.Is(err, wantErr) {
+		t.Fatalf("list failure error = %v, want %v", err, wantErr)
+	}
+
+	filter := &netlink.BpfFilter{FilterAttrs: netlink.FilterAttrs{Handle: 0x20220002}}
+	listTCFilters = func(netlink.Link, uint32) ([]netlink.Filter, error) {
+		return []netlink.Filter{filter}, nil
+	}
+	deleteTCFilter = func(netlink.Filter) error { return wantErr }
+	if err := deleteTCFiltersByHandle(link, netlink.HANDLE_MIN_INGRESS, filter.Handle); !stderrors.Is(err, wantErr) {
+		t.Fatalf("delete failure error = %v, want %v", err, wantErr)
 	}
 }
 

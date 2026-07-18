@@ -51,25 +51,23 @@ func TestSemanticRefactorFeaturesFromValue(t *testing.T) {
 	}
 }
 
-func TestShouldUseStagedRoutingEpochHandoff(t *testing.T) {
+func TestShouldUseStagedHotHandoff(t *testing.T) {
 	tests := []struct {
 		name                string
-		routingEpochEnabled bool
 		freshDatapathReload bool
 		listenerPresent     bool
 		want                bool
 	}{
-		{name: "default gate disabled", listenerPresent: true},
-		{name: "fresh datapath reload", routingEpochEnabled: true, freshDatapathReload: true, listenerPresent: true},
-		{name: "no listener", routingEpochEnabled: true},
-		{name: "epoch staged handoff", routingEpochEnabled: true, listenerPresent: true, want: true},
+		{name: "same port reload", listenerPresent: true, want: true},
+		{name: "fresh datapath reload", freshDatapathReload: true, listenerPresent: true},
+		{name: "no listener"},
 	}
 	for _, tc := range tests {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			got := shouldUseStagedRoutingEpochHandoff(tc.routingEpochEnabled, tc.freshDatapathReload, tc.listenerPresent)
+			got := shouldUseStagedHotHandoff(tc.freshDatapathReload, tc.listenerPresent)
 			if got != tc.want {
-				t.Fatalf("shouldUseStagedRoutingEpochHandoff(%v, %v, %v) = %v, want %v", tc.routingEpochEnabled, tc.freshDatapathReload, tc.listenerPresent, got, tc.want)
+				t.Fatalf("shouldUseStagedHotHandoff(%v, %v) = %v, want %v", tc.freshDatapathReload, tc.listenerPresent, got, tc.want)
 			}
 		})
 	}

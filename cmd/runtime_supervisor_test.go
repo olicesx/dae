@@ -128,11 +128,54 @@ func TestRollbackStagedHandoffCleansPreparedGenerationOnce(t *testing.T) {
 		newCancel:          generation.cancel,
 	}
 
-	rollbackStagedReloadHandoff(nil, handoff)
-	rollbackStagedReloadHandoff(nil, handoff)
+	if err := rollbackStagedReloadHandoff(nil, handoff); err != nil {
+		t.Fatalf("first rollback error = %v", err)
+	}
+	if err := rollbackStagedReloadHandoff(nil, handoff); err != nil {
+		t.Fatalf("second rollback error = %v", err)
+	}
 
 	if got := cancelCalls.Load(); got != 1 {
 		t.Fatalf("rollback cancel calls = %d, want 1", got)
+	}
+}
+
+func TestRestoreStagedHandoffAggregatesEveryRestoreFailure(t *testing.T) {
+	previousRestoreListenerSockets := restoreListenerSocketsFunc
+	previousRestoreReloadDatapath := restoreReloadDatapathFunc
+	previousRestoreDNSListener := restoreDNSListenerFunc
+	t.Cleanup(func() {
+		restoreListenerSocketsFunc = previousRestoreListenerSockets
+		restoreReloadDatapathFunc = previousRestoreReloadDatapath
+		restoreDNSListenerFunc = previousRestoreDNSListener
+	})
+
+	listenerErr := errors.New("listener restore failed")
+	datapathErr := errors.New("datapath restore failed")
+	dnsErr := errors.New("DNS restore failed")
+	var calls []string
+	restoreListenerSocketsFunc = func(*control.ControlPlane, *control.Listener) error {
+		calls = append(calls, "listener")
+		return listenerErr
+	}
+	restoreReloadDatapathFunc = func(*control.ControlPlane) error {
+		calls = append(calls, "datapath")
+		return datapathErr
+	}
+	restoreDNSListenerFunc = func(*control.ControlPlane) error {
+		calls = append(calls, "dns")
+		return dnsErr
+	}
+
+	err := restoreStagedReloadHandoff(nil, &stagedReloadHandoff{
+		oldControlPlane: &control.ControlPlane{},
+		oldListener:     &control.Listener{},
+	})
+	if !errors.Is(err, listenerErr) || !errors.Is(err, datapathErr) || !errors.Is(err, dnsErr) {
+		t.Fatalf("restore error = %v, want all restore failures", err)
+	}
+	if got, want := fmt.Sprint(calls), "[listener datapath dns]"; got != want {
+		t.Fatalf("restore calls = %s, want %s", got, want)
 	}
 }
 

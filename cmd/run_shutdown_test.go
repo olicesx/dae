@@ -1219,6 +1219,23 @@ func TestWaitReloadReadyOrSignalReturnsTimeout(t *testing.T) {
 	}
 }
 
+func TestCanRecoverReloadReadinessFailureOnlyAfterServeReturns(t *testing.T) {
+	tests := []struct {
+		result reloadReadyWaitResult
+		want   bool
+	}{
+		{result: reloadReadyWaitReady},
+		{result: reloadReadyWaitFailed, want: true},
+		{result: reloadReadyWaitSignal},
+		{result: reloadReadyWaitTimeout},
+	}
+	for _, test := range tests {
+		if got := canRecoverReloadReadinessFailure(test.result); got != test.want {
+			t.Fatalf("canRecoverReloadReadinessFailure(%d) = %t, want %t", test.result, got, test.want)
+		}
+	}
+}
+
 func TestWaitForControlPlaneDrainReturnsIdleImmediately(t *testing.T) {
 	result := waitForControlPlaneDrain(newDiscardLogger(), context.Background(), newFakeRetirementControlPlane(0), time.Second, 0)
 	if result != controlPlaneDrainIdle {

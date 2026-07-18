@@ -621,6 +621,9 @@ func TestRunnerStagedWarmupFailureProcessHelper(t *testing.T) {
 	previousCloneControlListener := cloneControlListenerFunc
 	previousLinkRoutingEpochPeer := linkRoutingEpochPeerFunc
 	previousServeControlPlane := serveControlPlaneFunc
+	previousRestoreListenerSockets := restoreListenerSocketsFunc
+	previousRestoreReloadDatapath := restoreReloadDatapathFunc
+	previousRestoreDNSListener := restoreDNSListenerFunc
 	previousWithDaeNetnsRequired := withDaeNetnsRequiredFunc
 	cfgFile = filepath.Join(t.TempDir(), "dae.conf")
 	disablePidFile = true
@@ -642,6 +645,9 @@ func TestRunnerStagedWarmupFailureProcessHelper(t *testing.T) {
 		cloneControlListenerFunc = previousCloneControlListener
 		linkRoutingEpochPeerFunc = previousLinkRoutingEpochPeer
 		serveControlPlaneFunc = previousServeControlPlane
+		restoreListenerSocketsFunc = previousRestoreListenerSockets
+		restoreReloadDatapathFunc = previousRestoreReloadDatapath
+		restoreDNSListenerFunc = previousRestoreDNSListener
 		withDaeNetnsRequiredFunc = previousWithDaeNetnsRequired
 	})
 	t.Setenv(semanticRefactorFeaturesEnv, string(control.SemanticRefactorFeatureRoutingEpoch))
@@ -681,6 +687,9 @@ func TestRunnerStagedWarmupFailureProcessHelper(t *testing.T) {
 		linkCalls.Add(1)
 		return nil
 	}
+	restoreListenerSocketsFunc = func(*control.ControlPlane, *control.Listener) error { return nil }
+	restoreReloadDatapathFunc = func(*control.ControlPlane) error { return nil }
+	restoreDNSListenerFunc = func(*control.ControlPlane) error { return nil }
 	withDaeNetnsRequiredFunc = func(_ string, f func() error) error { return f() }
 
 	initialReady := make(chan struct{})
@@ -758,7 +767,7 @@ func TestRunnerStagedWarmupFailureProcessHelper(t *testing.T) {
 const runnerLiveStageFailureProcessHelperEnv = "DAE_RUNNER_LIVE_STAGE_FAILURE_PROCESS_HELPER"
 
 func TestRunnerLiveStageFailureProcessBoundary(t *testing.T) {
-	for _, kind := range []string{"bpf", "dns"} {
+	for _, kind := range []string{"bpf", "dns", "restore"} {
 		t.Run(kind, func(t *testing.T) {
 			command := exec.Command(os.Args[0], "-test.run=^TestRunnerLiveStageFailureProcessHelper$")
 			command.Env = append(os.Environ(),
@@ -781,7 +790,7 @@ func TestRunnerLiveStageFailureProcessHelper(t *testing.T) {
 		t.Skip("child-process live stage failure helper")
 	}
 	kind := os.Getenv("DAE_RUNNER_LIVE_STAGE_FAILURE_KIND")
-	if kind != "bpf" && kind != "dns" {
+	if kind != "bpf" && kind != "dns" && kind != "restore" {
 		t.Fatalf("unknown live stage failure kind %q", kind)
 	}
 
@@ -793,6 +802,9 @@ func TestRunnerLiveStageFailureProcessHelper(t *testing.T) {
 	previousCloneControlListener := cloneControlListenerFunc
 	previousLinkRoutingEpochPeer := linkRoutingEpochPeerFunc
 	previousServeControlPlane := serveControlPlaneFunc
+	previousRestoreListenerSockets := restoreListenerSocketsFunc
+	previousRestoreReloadDatapath := restoreReloadDatapathFunc
+	previousRestoreDNSListener := restoreDNSListenerFunc
 	previousWithDaeNetnsRequired := withDaeNetnsRequiredFunc
 	previousReloadFailureCompletionHook := reloadFailureCompletionHook
 	cfgFile = filepath.Join(t.TempDir(), "dae.conf")
@@ -815,12 +827,16 @@ func TestRunnerLiveStageFailureProcessHelper(t *testing.T) {
 		cloneControlListenerFunc = previousCloneControlListener
 		linkRoutingEpochPeerFunc = previousLinkRoutingEpochPeer
 		serveControlPlaneFunc = previousServeControlPlane
+		restoreListenerSocketsFunc = previousRestoreListenerSockets
+		restoreReloadDatapathFunc = previousRestoreReloadDatapath
+		restoreDNSListenerFunc = previousRestoreDNSListener
 		withDaeNetnsRequiredFunc = previousWithDaeNetnsRequired
 		reloadFailureCompletionHook = previousReloadFailureCompletionHook
 	})
 	t.Setenv(semanticRefactorFeaturesEnv, string(control.SemanticRefactorFeatureRoutingEpoch))
 
 	var buildCalls atomic.Int32
+	restoreErr := stderrors.New("injected restore failure")
 	installControlPlaneRuntimeBuilderForTest(t, func(
 		context.Context,
 		*logrus.Logger,
@@ -842,8 +858,9 @@ func TestRunnerLiveStageFailureProcessHelper(t *testing.T) {
 		candidate := &control.ControlPlane{}
 		wantErr := fmt.Errorf("injected %s stage failure", kind)
 		candidate.SetServeLifecycleHooks(control.ServeLifecycleHooks{
+			ValidateListener: func(*control.Listener) error { return nil },
 			CommitPreparedDatapath: func() error {
-				if kind == "bpf" {
+				if kind == "bpf" || kind == "restore" {
 					return wantErr
 				}
 				return nil
@@ -874,6 +891,14 @@ func TestRunnerLiveStageFailureProcessHelper(t *testing.T) {
 		linkCalls.Add(1)
 		return nil
 	}
+	restoreListenerSocketsFunc = func(*control.ControlPlane, *control.Listener) error {
+		if kind == "restore" {
+			return restoreErr
+		}
+		return nil
+	}
+	restoreReloadDatapathFunc = func(*control.ControlPlane) error { return nil }
+	restoreDNSListenerFunc = func(*control.ControlPlane) error { return nil }
 	withDaeNetnsRequiredFunc = func(_ string, f func() error) error { return f() }
 
 	initialReady := make(chan struct{})
@@ -924,19 +949,30 @@ func TestRunnerLiveStageFailureProcessHelper(t *testing.T) {
 		t.Fatalf("send live-stage reload signal: %v", err)
 	}
 	wait(candidateFailed, kind+" stage failure")
-	wait(reloadFailureCompleted, kind+" rollback completion")
-	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
-		t.Fatalf("send live-stage termination signal: %v", err)
-	}
-	stopOnce.Do(func() { close(serveStop) })
-
-	select {
-	case err := <-runDone:
-		if err != nil {
-			t.Fatalf("Runner.Run() error = %v, want clean shutdown", err)
+	if kind == "restore" {
+		select {
+		case err := <-runDone:
+			if !stderrors.Is(err, restoreErr) {
+				t.Fatalf("Runner.Run() error = %v, want fatal restore error %v", err, restoreErr)
+			}
+		case <-time.After(runnerProcessBoundaryTimeout):
+			t.Fatal("Runner.Run() did not fail after unrecoverable staged restore")
 		}
-	case <-time.After(runnerProcessBoundaryTimeout):
-		t.Fatalf("Runner.Run() did not terminate after %s stage rollback", kind)
+		stopOnce.Do(func() { close(serveStop) })
+	} else {
+		wait(reloadFailureCompleted, kind+" rollback completion")
+		if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+			t.Fatalf("send live-stage termination signal: %v", err)
+		}
+		stopOnce.Do(func() { close(serveStop) })
+		select {
+		case err := <-runDone:
+			if err != nil {
+				t.Fatalf("Runner.Run() error = %v, want clean shutdown", err)
+			}
+		case <-time.After(runnerProcessBoundaryTimeout):
+			t.Fatalf("Runner.Run() did not terminate after %s stage rollback", kind)
+		}
 	}
 	wait(readyNotificationDone, "initial live-stage readiness notification")
 	wait(initialServeDone, "initial live-stage Serve shutdown")

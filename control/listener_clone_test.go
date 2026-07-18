@@ -183,6 +183,30 @@ func TestListenerCloneCloseOriginalKeepsCloneServing(t *testing.T) {
 	}
 }
 
+func TestListenerValidateCurrentNetnsAcceptsCurrentNamespaceSockets(t *testing.T) {
+	tcp4Listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp4: %v", err)
+	}
+	udpConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		_ = tcp4Listener.Close()
+		t.Fatalf("listen udp4: %v", err)
+	}
+	listener := &Listener{tcp4Listener: tcp4Listener, packetConn: udpConn}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	if err := listener.ValidateCurrentNetns(); err != nil {
+		t.Fatalf("ValidateCurrentNetns() error = %v", err)
+	}
+}
+
+func TestListenerValidateCurrentNetnsRejectsEmptyListener(t *testing.T) {
+	if err := (&Listener{}).ValidateCurrentNetns(); err == nil {
+		t.Fatal("ValidateCurrentNetns() error = nil, want empty listener failure")
+	}
+}
+
 func TestListenerCloneCloseOriginalKeepsTCP6CloneServing(t *testing.T) {
 	tcp6Listener, err := net.Listen("tcp6", "[::1]:0")
 	if err != nil {

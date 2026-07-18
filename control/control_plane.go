@@ -505,12 +505,21 @@ func newControlPlaneWithContextOptions(
 	buildOpts controlPlaneBuildOptions,
 ) (plane *ControlPlane, err error) {
 	// The ctx parameter may carry a preparation timeout from the caller (e.g.
-	// context.WithTimeout in cmd/run.go).  All long-lived objects owned by the
+	// context.WithTimeout in cmd/run.go). All long-lived objects owned by the
 	// ControlPlane — its lifecycle context, dialer contexts, goroutines — MUST
 	// derive from a background context so they are not cancelled when the
-	// preparation deadline expires.  The caller's ctx is NOT used as a parent
-	// for any perennnial context below.
-	_ = ctx
+	// preparation deadline expires. The caller's ctx is only consulted at
+	// cooperative checkpoints between slow build stages so a stalled build can
+	// be aborted; it is never used as a parent for any perennial context below.
+	checkCtx := func(stage string) error {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("control plane build canceled at %s: %w", stage, err)
+		}
+		return nil
+	}
+	if err := checkCtx("prepare"); err != nil {
+		return nil, err
+	}
 	refactorFeatures := semanticRefactorFeatureGateSnapshot()
 
 	// Clear failed QUIC DCID cache on reload/startup.
@@ -631,6 +640,9 @@ func newControlPlaneWithContextOptions(
 		if !ephemeralPinPath {
 			cleanupEphemeralBpfPinDirs(log, pinPath)
 			cleanupPinnedConnStateMapFiles(log, pinPath)
+		}
+		if err := checkCtx("load eBPF objects"); err != nil {
+			return nil, err
 		}
 		log.Infof("Loading eBPF programs and maps into the kernel...")
 		log.Infof("The loading process takes about 120MB free memory, which will be released after loading. Insufficient memory will cause loading failure.")
@@ -754,6 +766,9 @@ func newControlPlaneWithContextOptions(
 	}
 
 	// Filter out groups.
+	if err := checkCtx("resolve subscription links"); err != nil {
+		return nil, err
+	}
 	dialerSet := outbound.NewDialerSetFromLinksContext(context.Background(), option, tagToNodeList)
 	deferFuncs = append(deferFuncs, dialerSet.Close)
 	deferFuncs = append(deferFuncs, func() error {
@@ -827,6 +842,9 @@ func newControlPlaneWithContextOptions(
 	}
 	// Apply rules optimizers.
 	log.Infoln("Optimizing and loading routing rules (this may take a while for large rule sets)...")
+	if err := checkCtx("optimize routing rules"); err != nil {
+		return nil, err
+	}
 	routingProgram, err := routing.NewNormalizedProgram(routingA.Rules, routingA.Fallback,
 		&routing.AliasOptimizer{},
 		&routing.DatReaderOptimizer{Logger: log, LocationFinder: locationFinder},

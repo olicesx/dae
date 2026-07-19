@@ -501,11 +501,9 @@ func TestSessionManagerMixedFlowsSurviveSixtyFiveRoutingEpochReloads(t *testing.
 			if previous.resourceCleanup.Load() != 0 || previous.underlay.closeCalls.Load() != 0 {
 				t.Fatal("initial egress resources closed while long flows were active")
 			}
-		} else {
-			if previous.resourceCleanup.Load() != 1 || previous.underlay.closeCalls.Load() != 1 {
-				t.Fatalf("generation %d cleanup = (runtime=%d, dialer=%d), want (1, 1)",
-					previous.epoch, previous.resourceCleanup.Load(), previous.underlay.closeCalls.Load())
-			}
+		} else if previous.resourceCleanup.Load() != 1 || previous.underlay.closeCalls.Load() != 1 {
+			t.Fatalf("generation %d cleanup = (runtime=%d, dialer=%d), want (1, 1)",
+				previous.epoch, previous.resourceCleanup.Load(), previous.underlay.closeCalls.Load())
 		}
 
 		candidate.plane.RunReloadRetirementCleanup(0)

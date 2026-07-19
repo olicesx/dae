@@ -14,6 +14,7 @@ import (
 // every network interface. Called at initial startup to ensure no filters from a
 // previous process remain active before the new BPF programs are loaded.
 func PurgeStaleTCFilters(log *logrus.Logger) {
+	log.Infof("purging stale TC filters before startup")
 	links, err := netlink.LinkList()
 	if err != nil {
 		log.Errorf("failed to list links for TC filter purge: %v", err)

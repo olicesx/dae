@@ -211,13 +211,14 @@ func (h *canonicalPolicyHasher) writePrefix(prefix netip.Prefix) {
 	h.writeBool(address.IsValid())
 	h.writeBool(address.Is4())
 	h.writeString(address.Zone())
-	if address.Is4() {
+	switch {
+	case address.Is4():
 		bytes := address.As4()
 		h.writeBytes(bytes[:])
-	} else if address.IsValid() {
+	case address.IsValid():
 		bytes := address.As16()
 		h.writeBytes(bytes[:])
-	} else {
+	default:
 		h.writeBytes(nil)
 	}
 	h.writeInt(prefix.Bits())

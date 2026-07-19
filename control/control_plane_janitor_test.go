@@ -489,8 +489,8 @@ func TestReloadCleanupPreservesProcessOwnedTCPStateUntilFlowEnds(t *testing.T) {
 	}
 
 	plane.connStateCleanupMu.Lock()
-	redirectDeleted := plane.cleanupRedirectTrackMapBeforeLocked(uint64(now + 1))
-	_, tcpStats := plane.cleanupConnStateMapBeforeLocked(true, uint64(now+1))
+	redirectDeleted := plane.cleanupRedirectTrackMapBeforeLocked(now + 1)
+	_, tcpStats := plane.cleanupConnStateMapBeforeLocked(true, now+1)
 	plane.connStateCleanupMu.Unlock()
 	if redirectDeleted != 0 || tcpStats.deleted != 0 {
 		t.Fatalf("pinned cleanup deleted redirect=%d tcp=%d, want 0", redirectDeleted, tcpStats.deleted)
@@ -511,8 +511,8 @@ func TestReloadCleanupPreservesProcessOwnedTCPStateUntilFlowEnds(t *testing.T) {
 		t.Fatalf("update closing conn_state: %v", err)
 	}
 	plane.connStateCleanupMu.Lock()
-	redirectDeleted = plane.cleanupRedirectTrackMapBeforeLocked(uint64(now + 1))
-	_, tcpStats = plane.cleanupConnStateMapBeforeLocked(true, uint64(now+1))
+	redirectDeleted = plane.cleanupRedirectTrackMapBeforeLocked(now + 1)
+	_, tcpStats = plane.cleanupConnStateMapBeforeLocked(true, now+1)
 	plane.connStateCleanupMu.Unlock()
 	if redirectDeleted != 1 || tcpStats.deleted != 1 {
 		t.Fatalf("unpinned cleanup deleted redirect=%d tcp=%d, want 1 each", redirectDeleted, tcpStats.deleted)
@@ -553,7 +553,7 @@ func TestReloadCleanupPreservesProcessOwnedUDPStateUntilEndpointEnds(t *testing.
 	plane.core.bpf.Store(bpf)
 
 	plane.connStateCleanupMu.Lock()
-	udpStats, _ := plane.cleanupConnStateMapBeforeLocked(true, uint64(now+1))
+	udpStats, _ := plane.cleanupConnStateMapBeforeLocked(true, now+1)
 	plane.connStateCleanupMu.Unlock()
 	if udpStats.deleted != 0 {
 		t.Fatalf("pinned cleanup deleted %d UDP entries, want 0", udpStats.deleted)

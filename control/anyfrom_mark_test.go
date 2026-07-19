@@ -218,7 +218,9 @@ func TestUdpEndpointReplyKeepsImmutableBindingMark(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListenUDP(client) error = %v", err)
 	}
-	defer clientConn.Close()
+	defer func() {
+		_ = clientConn.Close()
+	}()
 	clientAddr := clientConn.LocalAddr().(*net.UDPAddr).AddrPort()
 
 	replyConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})

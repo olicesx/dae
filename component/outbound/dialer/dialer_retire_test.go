@@ -62,7 +62,9 @@ func TestRetireForEstablishedFlowsDropsDNSMetadataAndKeepsConnection(t *testing.
 	if err != nil {
 		t.Fatalf("DialContext() error = %v", err)
 	}
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	d.RetireForEstablishedFlows()
 	if option.DaeDNS != nil {

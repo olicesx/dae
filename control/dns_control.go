@@ -776,7 +776,7 @@ func (c *DnsController) updateRuntime(option *DnsControllerOption, routing *dns.
 		fixedDomainTtl:            option.FixedDomainTtl,
 	}
 	c.runtimeMu.Lock()
-	c.dnsControllerStore.runtimeState.Store(runtimeState)
+	c.runtimeState.Store(runtimeState)
 	c.runtimeMu.Unlock()
 	if maxCacheSize > 0 && c.dnsCacheSize.Load() > int64(maxCacheSize) {
 		c.cacheProjectionMu.Lock()
@@ -790,7 +790,7 @@ func (c *DnsController) runtime() *dnsControllerRuntimeState {
 	if c == nil || c.dnsControllerStore == nil {
 		return nil
 	}
-	return c.dnsControllerStore.runtimeState.Load()
+	return c.runtimeState.Load()
 }
 
 func (c *DnsController) useResolvePipeline() bool {
@@ -1217,11 +1217,12 @@ func (c *DnsController) rememberDnsKnowledge(baseKey string, originalDeadline ti
 
 	current, loaded := c.dnsKnowledge.Load(baseKey)
 	entry, valid := parseDnsKnowledgeEntry(current)
-	if !loaded || !valid {
+	switch {
+	case !loaded || !valid:
 		entry = dnsKnowledgeEntry{cacheCount: 1}
-	} else if newCacheEntry {
+	case newCacheEntry:
 		entry.cacheCount++
-	} else if entry.cacheCount == 0 {
+	case entry.cacheCount == 0:
 		entry.cacheCount = 1
 	}
 	if entry.expiresAt < expiresAt {

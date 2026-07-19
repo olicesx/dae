@@ -335,7 +335,7 @@ func (d *Dialer) RetireForEstablishedFlows() {
 	}
 	d.retireOnce.Do(func() {
 		d.cancel()
-		d.GlobalOption.retireForEstablishedFlows()
+		d.retireForEstablishedFlows()
 		if d.metadataRetirer != nil {
 			d.metadataRetirer.RetireForEstablishedFlows()
 		}

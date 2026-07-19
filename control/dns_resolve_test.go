@@ -27,7 +27,7 @@ func setSnapshotBestDialerChooser(ctrl *DnsController, chooser func(context.Cont
 	updated := *runtime
 	updated.bestDialerSnapshotChooser = chooser
 	updated.bestDialerChooser = nil
-	ctrl.dnsControllerStore.runtimeState.Store(&updated)
+	ctrl.runtimeState.Store(&updated)
 }
 
 func TestDnsResultCachedResponseSharesImmutableWire(t *testing.T) {

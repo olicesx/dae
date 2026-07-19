@@ -44,6 +44,6 @@ func setTestDnsControllerRuntime(ctrl *DnsController, apply func(*dnsControllerR
 	if rt.lifecycleCtx == nil {
 		rt.lifecycleCtx = context.Background()
 	}
-	ctrl.dnsControllerStore.runtimeState.Store(&rt)
+	ctrl.runtimeState.Store(&rt)
 	return ctrl
 }

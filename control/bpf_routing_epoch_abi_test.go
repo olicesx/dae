@@ -32,6 +32,9 @@ func TestRoutingEpochBPFABI(t *testing.T) {
 	if got, want := unsafe.Offsetof(bpfRoutingResult{}.RoutingEpochSlot), uintptr(33); got != want {
 		t.Fatalf("bpfRoutingResult.RoutingEpochSlot offset = %d, want %d", got, want)
 	}
+	if got, want := unsafe.Offsetof(bpfRoutingResult{}.DatapathGeneration), uintptr(34); got != want {
+		t.Fatalf("bpfRoutingResult.DatapathGeneration offset = %d, want %d", got, want)
+	}
 
 	if got, want := unsafe.Sizeof(bpfRoutingHandoffEntry{}), uintptr(48); got != want {
 		t.Fatalf("sizeof(bpfRoutingHandoffEntry) = %d, want %d", got, want)
@@ -45,6 +48,13 @@ func TestRoutingEpochBPFABI(t *testing.T) {
 	}
 	if got, want := unsafe.Offsetof(bpfConnState{}.RoutingEpochSlot), uintptr(52); got != want {
 		t.Fatalf("bpfConnState.RoutingEpochSlot offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(bpfConnState{}.DatapathGeneration), uintptr(54); got != want {
+		t.Fatalf("bpfConnState.DatapathGeneration offset = %d, want %d", got, want)
+	}
+
+	if got, want := unsafe.Offsetof(bpfDaeParam{}.DatapathGeneration), uintptr(26); got != want {
+		t.Fatalf("bpfDaeParam.DatapathGeneration offset = %d, want %d", got, want)
 	}
 
 	if got, want := unsafe.Sizeof(bpfRoutingEpochIp{}), uintptr(20); got != want {

@@ -135,10 +135,7 @@ func setScopedBestDialerChooser(ctrl *DnsController, chooser func(ctx context.Co
 	}
 	updated := *rt
 	updated.bestDialerChooser = chooser
-	ctrl.runtimeState.Store(&updated)
-	if ctrl.dnsControllerStore != nil {
-		ctrl.dnsControllerStore.runtimeState.Store(&updated)
-	}
+	ctrl.dnsControllerStore.runtimeState.Store(&updated)
 }
 
 func TestDnsController_AsIsCacheIsScopedByResolver(t *testing.T) {
@@ -303,7 +300,7 @@ func TestDnsController_Handle_LoopbackReplyInjectionDeliversMissAndCacheHit(t *t
 
 	shard := DefaultAnyfromPool.shardFor(replyAddr)
 	shard.mu.Lock()
-	shard.pool[replyAddr] = af
+	shard.pool[anyfromPoolKey{lAddr: replyAddr}] = af
 	shard.mu.Unlock()
 
 	req := &udpRequest{

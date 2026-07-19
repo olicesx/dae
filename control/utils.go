@@ -209,6 +209,7 @@ func (c *controlPlaneCore) retrieveEmbeddedRoutingResult(tuples *bpfTuplesKey, l
 			connState.Pname,
 			connState.Pid,
 			connState.RoutingEpochSlot,
+			connState.DatapathGeneration,
 		)
 	case unix.IPPROTO_UDP:
 		if bpf.ConnStateMap == nil {
@@ -233,6 +234,7 @@ func (c *controlPlaneCore) retrieveEmbeddedRoutingResult(tuples *bpfTuplesKey, l
 			connState.Pname,
 			connState.Pid,
 			connState.RoutingEpochSlot,
+			connState.DatapathGeneration,
 		)
 	default:
 		return nil, ebpf.ErrKeyNotExist
@@ -241,7 +243,7 @@ func (c *controlPlaneCore) retrieveEmbeddedRoutingResult(tuples *bpfTuplesKey, l
 	return &routingResult, nil
 }
 
-func routingResultFromConnState(mark uint32, must uint8, outbound uint8, mac [6]uint8, dscp uint8, pname [16]uint8, pid uint32, routingEpochSlot uint8) bpfRoutingResult {
+func routingResultFromConnState(mark uint32, must uint8, outbound uint8, mac [6]uint8, dscp uint8, pname [16]uint8, pid uint32, routingEpochSlot uint8, datapathGeneration uint16) bpfRoutingResult {
 	var routingResult bpfRoutingResult
 	routingResult.Mark = mark
 	routingResult.Must = must
@@ -251,6 +253,7 @@ func routingResultFromConnState(mark uint32, must uint8, outbound uint8, mac [6]
 	routingResult.Pname = pname
 	routingResult.Pid = pid
 	routingResult.RoutingEpochSlot = canonicalBpfRoutingEpochSlot(routingEpochSlot)
+	routingResult.DatapathGeneration = datapathGeneration
 	return routingResult
 }
 
@@ -292,6 +295,7 @@ func (c *controlPlaneCore) retrieveRoutingHandoffResult(tuples *bpfTuplesKey) (*
 		entry.Result.Pname,
 		entry.Result.Pid,
 		entry.Result.RoutingEpochSlot,
+		entry.Result.DatapathGeneration,
 	)
 	return &routingResult, nil
 }

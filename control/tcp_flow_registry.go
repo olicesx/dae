@@ -8,14 +8,13 @@ package control
 import (
 	"net"
 	"net/netip"
-	"sync"
 
 	"github.com/daeuniverse/outbound/netproxy"
 )
 
 // TcpFlowKey identifies one transparent TCP flow by its converged ingress tuple.
-// TCP has no full-cone or symmetric endpoint reuse: one live connection owns one
-// tuple and its binding for the lifetime of that connection.
+// It remains available to diagnostics without being duplicated for every live
+// connection; the ingress connection is the runtime lifecycle identity.
 type TcpFlowKey struct {
 	Src netip.AddrPort
 	Dst netip.AddrPort
@@ -26,100 +25,47 @@ func NewTcpFlowKey(src, dst netip.AddrPort) TcpFlowKey {
 	return TcpFlowKey{Src: src, Dst: dst}
 }
 
-// tcpFlowEntry retains the fixed route and egress choice for one live relay.
-// The entry is immutable after registration; the registry only manages its
-// lifetime and does not participate in relay copy loops.
-type tcpFlowEntry struct {
-	Key     TcpFlowKey
-	Binding TcpFlowBinding
-	Ingress net.Conn
-	Egress  netproxy.Conn
-}
-
-// tcpFlowRegistry indexes a live TCP relay by both its tuple and the accepted
-// connection. The latter keeps abort and drain cleanup aligned with the
-// existing incoming-connection lifecycle.
-type tcpFlowRegistry struct {
-	byKey     sync.Map // map[TcpFlowKey]*tcpFlowEntry
-	byIngress sync.Map // map[net.Conn]*tcpFlowEntry
-}
-
-func (r *tcpFlowRegistry) register(entry *tcpFlowEntry) {
-	if r == nil || entry == nil || entry.Ingress == nil {
-		return
-	}
-	r.byKey.Store(entry.Key, entry)
-	r.byIngress.Store(entry.Ingress, entry)
-}
-
-func (r *tcpFlowRegistry) lookup(key TcpFlowKey) (*tcpFlowEntry, bool) {
-	if r == nil {
-		return nil, false
-	}
-	value, ok := r.byKey.Load(key)
-	if !ok {
-		return nil, false
-	}
-	entry, ok := value.(*tcpFlowEntry)
-	return entry, ok
-}
-
-func (r *tcpFlowRegistry) lookupIngress(conn net.Conn) (*tcpFlowEntry, bool) {
-	if r == nil || conn == nil {
-		return nil, false
-	}
-	value, ok := r.byIngress.Load(conn)
-	if !ok {
-		return nil, false
-	}
-	entry, ok := value.(*tcpFlowEntry)
-	return entry, ok
-}
-
-func (r *tcpFlowRegistry) remove(entry *tcpFlowEntry) {
-	if r == nil || entry == nil {
-		return
-	}
-	r.byKey.CompareAndDelete(entry.Key, entry)
-	if entry.Ingress != nil {
-		r.byIngress.CompareAndDelete(entry.Ingress, entry)
-	}
-}
-
-func (r *tcpFlowRegistry) removeIngress(conn net.Conn) *tcpFlowEntry {
-	entry, ok := r.lookupIngress(conn)
-	if !ok {
-		return nil
-	}
-	r.remove(entry)
-	return entry
-}
-
-// registerTCPFlow records a successful transparent TCP dial. It shares the
-// incoming-connection ownership lock with AbortConnections so a forced abort
-// cannot leave a newly registered flow behind after its connection is closed.
-func (c *ControlPlane) registerTCPFlow(src, dst netip.AddrPort, ingress net.Conn, egress netproxy.Conn, binding TcpFlowBinding) (*tcpFlowEntry, bool) {
+// registerTCPFlow upgrades the existing incoming-connection entry with its
+// egress. AbortConnections can then close both sides without a second registry
+// or per-flow wrapper allocation.
+func (c *ControlPlane) registerTCPFlow(ingress net.Conn, egress netproxy.Conn) bool {
 	if c == nil || ingress == nil || egress == nil {
-		return nil, false
+		return false
 	}
 	incomingConnectionOwnershipMu.Lock()
 	defer incomingConnectionOwnershipMu.Unlock()
-	if c.rejectNewConnections.Load() {
-		return nil, false
+	if !c.acceptsRoutingEpochExecutionLocked() {
+		return false
 	}
-	entry := &tcpFlowEntry{
-		Key:     NewTcpFlowKey(src, dst),
-		Binding: binding,
-		Ingress: ingress,
-		Egress:  egress,
-	}
-	c.tcpFlows.register(entry)
-	return entry, true
+	c.inConnections.Store(ingress, egress)
+	return true
 }
 
-func (c *ControlPlane) unregisterTCPFlow(entry *tcpFlowEntry) {
-	if c == nil {
+func (c *ControlPlane) unregisterTCPFlow(ingress net.Conn) {
+	if c == nil || ingress == nil {
 		return
 	}
-	c.tcpFlows.remove(entry)
+	incomingConnectionOwnershipMu.Lock()
+	c.inConnections.Delete(ingress)
+	incomingConnectionOwnershipMu.Unlock()
+}
+
+// tcpFlowEgress returns the egress attached to an accepted connection. This is
+// intentionally ingress-indexed: tuple diagnostics are already emitted when
+// the flow is established and do not require another live-flow map.
+func (c *ControlPlane) tcpFlowEgress(ingress net.Conn) (netproxy.Conn, bool) {
+	if c == nil || ingress == nil {
+		return nil, false
+	}
+	if manager, _ := c.controlPlaneSessionManager(); manager != nil {
+		if flow, ok := manager.flowForIngress(ingress); ok {
+			return flow.Egress(), true
+		}
+	}
+	value, ok := c.inConnections.Load(ingress)
+	if !ok {
+		return nil, false
+	}
+	egress, ok := value.(netproxy.Conn)
+	return egress, ok && egress != nil
 }

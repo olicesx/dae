@@ -13,28 +13,28 @@ func (c *ControlPlane) submitOrderedUDPIngress(key UdpFlowKey, run, discard UdpT
 }
 
 func (c *ControlPlane) closeUDPOrderedDispatcher() {
-	if c == nil || c.udpOrderedDispatcher == nil {
+	if c == nil || c.udpOrderedDispatcher == nil || c.udpOrderedDispatcherShared {
 		return
 	}
 	c.udpOrderedDispatcher.close()
 }
 
 func (c *ControlPlane) waitUDPOrderedDispatcher() {
-	if c == nil || c.udpOrderedDispatcher == nil {
+	if c == nil || c.udpOrderedDispatcher == nil || c.udpOrderedDispatcherShared {
 		return
 	}
 	c.udpOrderedDispatcher.wait()
 }
 
 func (c *ControlPlane) closeUDPReplyDispatcher() {
-	if c == nil || c.udpReplyDispatcher == nil {
+	if c == nil || c.udpReplyDispatcher == nil || c.udpReplyDispatcherShared {
 		return
 	}
 	c.udpReplyDispatcher.close()
 }
 
 func (c *ControlPlane) waitUDPReplyDispatcher() {
-	if c == nil || c.udpReplyDispatcher == nil {
+	if c == nil || c.udpReplyDispatcher == nil || c.udpReplyDispatcherShared {
 		return
 	}
 	c.udpReplyDispatcher.wait()

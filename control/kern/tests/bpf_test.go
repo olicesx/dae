@@ -68,6 +68,23 @@ func collectPrograms(t *testing.T) (obj *bpftestObjects, progset []programSet, e
 	if err = disableAllPinnedMapsForTests(spec); err != nil {
 		return nil, nil, err
 	}
+	param := struct {
+		tproxyPort           uint32
+		controlPlanePid      uint32
+		dae0Ifindex          uint32
+		daeNetnsId           uint32
+		dae0peerMac          [6]byte
+		paddingAfterMac      [2]uint8
+		useRedirectPeer      uint8
+		hasBpfGetCurrentTask uint8
+		datapathGeneration   uint16
+		daeSocketMark        uint32
+	}{
+		datapathGeneration: 41,
+	}
+	if err = spec.Variables["PARAM"].Set(param); err != nil {
+		return nil, nil, err
+	}
 
 	if err = spec.LoadAndAssign(obj,
 		&ebpf.CollectionOptions{

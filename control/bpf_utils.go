@@ -55,15 +55,15 @@ import (
 // ============================================================================
 
 type bpfRoutingResult struct {
-	Mark             uint32
-	Must             uint8
-	Mac              [6]uint8
-	Outbound         uint8
-	Pname            [16]uint8
-	Pid              uint32
-	Dscp             uint8
-	RoutingEpochSlot uint8
-	Padding          [2]uint8
+	Mark               uint32
+	Must               uint8
+	Mac                [6]uint8
+	Outbound           uint8
+	Pname              [16]uint8
+	Pid                uint32
+	Dscp               uint8
+	RoutingEpochSlot   uint8
+	DatapathGeneration uint16
 }
 
 type _bpfLpmKey struct {
@@ -375,6 +375,7 @@ type loadBpfOptions struct {
 	BigEndianTproxyPort    uint32
 	CollectionOptions      *ebpf.CollectionOptions
 	ConnStateMapMaxEntries uint32
+	DatapathGeneration     uint16
 }
 
 const (
@@ -575,7 +576,7 @@ retryLoadBpf:
 			paddingAfterMac      [2]uint8
 			useRedirectPeer      uint8
 			hasBpfGetCurrentTask uint8
-			padding2             uint16
+			datapathGeneration   uint16
 			daeSocketMark        uint32
 		}{
 			tproxyPort:           opts.BigEndianTproxyPort,
@@ -586,7 +587,7 @@ retryLoadBpf:
 			paddingAfterMac:      [2]uint8{0, 0},
 			useRedirectPeer:      useRedirectPeer,
 			hasBpfGetCurrentTask: hasBpfGetCurrentTask,
-			padding2:             0,
+			datapathGeneration:   opts.DatapathGeneration,
 			daeSocketMark:        soMarkFromDae,
 		},
 	}

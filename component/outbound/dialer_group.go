@@ -87,6 +87,29 @@ func (g *DialerGroup) Close() error {
 	return nil
 }
 
+// SnapshotForEstablishedFlow returns a compact immutable view of the group
+// decision retained by an established flow. It deliberately omits health sets
+// and every unselected dialer so a long-lived flow cannot retain the full
+// retired generation.
+func (g *DialerGroup) SnapshotForEstablishedFlow(selected *dialer.Dialer) *DialerGroup {
+	if g == nil {
+		return nil
+	}
+	view := &DialerGroup{
+		log:                    g.log,
+		Name:                   g.Name,
+		cachedMinCheckInterval: g.cachedMinCheckInterval,
+	}
+	if selected != nil {
+		view.Dialer = selected
+		view.Dialers = []*dialer.Dialer{selected}
+	}
+	view.selectionState.Store(&dialerGroupSelectionState{
+		policy: g.currentSelectionState().policy,
+	})
+	return view
+}
+
 func (g *DialerGroup) SetSelectionPolicy(policy DialerSelectionPolicy) {
 	g.selectionStateMu.Lock()
 	defer g.selectionStateMu.Unlock()

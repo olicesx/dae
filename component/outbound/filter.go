@@ -38,6 +38,14 @@ type DialerSet struct {
 	nodeToTagMap map[*dialer.Dialer]string
 }
 
+// AllDialers returns a snapshot of every dialer owned by the set.
+func (s *DialerSet) AllDialers() []*dialer.Dialer {
+	if s == nil {
+		return nil
+	}
+	return append([]*dialer.Dialer(nil), s.dialers...)
+}
+
 func NewDialerSetFromLinks(option *dialer.GlobalOption, tagToNodeList map[string][]string) *DialerSet {
 	return NewDialerSetFromLinksContext(context.Background(), option, tagToNodeList)
 }

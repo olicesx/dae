@@ -1966,7 +1966,7 @@ func TestUdpEndpointReplySenderReleasesRemainingBatchOnError(t *testing.T) {
 		released[string(data)]++
 	}
 
-	replyCh := make(chan udpEndpointReply, 3)
+	replyCh := make(chan *udpEndpointReply, 3)
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	ue := &UdpEndpoint{
@@ -1979,9 +1979,10 @@ func TestUdpEndpointReplySenderReleasesRemainingBatchOnError(t *testing.T) {
 	}
 
 	go ue.replySender(replyCh, stop, done)
-	replyCh <- udpEndpointReply{data: pool.PB([]byte("first")), from: netip.MustParseAddrPort("203.0.113.10:3478")}
-	replyCh <- udpEndpointReply{data: pool.PB([]byte("second")), from: netip.MustParseAddrPort("203.0.113.10:3478")}
-	replyCh <- udpEndpointReply{data: pool.PB([]byte("third")), from: netip.MustParseAddrPort("203.0.113.10:3478")}
+	from := netip.MustParseAddrPort("203.0.113.10:3478")
+	replyCh <- takeUdpEndpointReply(pool.PB([]byte("first")), from)
+	replyCh <- takeUdpEndpointReply(pool.PB([]byte("second")), from)
+	replyCh <- takeUdpEndpointReply(pool.PB([]byte("third")), from)
 	close(replyCh)
 	<-done
 
@@ -1989,6 +1990,20 @@ func TestUdpEndpointReplySenderReleasesRemainingBatchOnError(t *testing.T) {
 		if got := released[key]; got != 1 {
 			t.Fatalf("released[%q] = %d, want 1", key, got)
 		}
+	}
+}
+
+func BenchmarkUdpEndpointLegacyReplyQueueReuse(b *testing.B) {
+	replyCh := make(chan *udpEndpointReply, 1)
+	data := pool.PB(make([]byte, 1))
+	from := netip.MustParseAddrPort("203.0.113.10:3478")
+	warm := takeUdpEndpointReply(data, from)
+	recycleUdpEndpointReply(warm, false)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		replyCh <- takeUdpEndpointReply(data, from)
+		recycleUdpEndpointReply(<-replyCh, false)
 	}
 }
 
@@ -2088,12 +2103,10 @@ func TestUdpEndpointStart_UsesGenerationReplyDispatcher(t *testing.T) {
 
 	handled := make(chan string, 2)
 	ue := &UdpEndpoint{
-		conn:            conn,
-		NatTimeout:      QuicNatTimeout,
-		Dialer:          newTestProxyEndpointDialer("hysteria2", "proxy.example:443"),
-		replyDispatcher: dispatcher,
-		replySlots:      make(chan struct{}, udpEndpointReplyQueueSize),
-		replyStop:       make(chan struct{}),
+		conn:         conn,
+		NatTimeout:   QuicNatTimeout,
+		Dialer:       newTestProxyEndpointDialer("hysteria2", "proxy.example:443"),
+		replyRuntime: newUdpEndpointReplyRuntime(dispatcher, nil, udpEndpointReplyQueueSize),
 		handler: func(_ *UdpEndpoint, data []byte, _ netip.AddrPort) error {
 			handled <- string(data)
 			return nil
@@ -2145,14 +2158,11 @@ func TestUdpEndpointStart_UsesTransportOwnedPacketReceiver(t *testing.T) {
 	handled := make(chan string, 1)
 	var releases atomic.Int32
 	ue := &UdpEndpoint{
-		conn:              conn,
-		NatTimeout:        QuicNatTimeout,
-		Dialer:            newTestProxyEndpointDialer("hysteria2", "proxy.example:443"),
-		replyDispatcher:   dispatcher,
-		replySlots:        make(chan struct{}, udpEndpointReplyQueueSize),
-		replyStop:         make(chan struct{}),
-		replyDrainTracker: newControlPlaneDrainTracker(),
-		hasReply:          atomic.Bool{},
+		conn:         conn,
+		NatTimeout:   QuicNatTimeout,
+		Dialer:       newTestProxyEndpointDialer("hysteria2", "proxy.example:443"),
+		replyRuntime: newUdpEndpointReplyRuntime(dispatcher, newControlPlaneDrainTracker(), udpEndpointReplyQueueSize),
+		hasReply:     atomic.Bool{},
 		handler: func(_ *UdpEndpoint, data []byte, _ netip.AddrPort) error {
 			handled <- string(data)
 			return nil
@@ -2216,9 +2226,7 @@ func TestUdpEndpointCloseDrainsAcceptedRepliesWithGenerationDispatcher(t *testin
 	release := make(chan struct{})
 	handled := make(chan string, 2)
 	ue := &UdpEndpoint{
-		replyDispatcher: dispatcher,
-		replySlots:      make(chan struct{}, udpEndpointReplyQueueSize),
-		replyStop:       make(chan struct{}),
+		replyRuntime: newUdpEndpointReplyRuntime(dispatcher, nil, udpEndpointReplyQueueSize),
 		handler: func(_ *UdpEndpoint, data []byte, _ netip.AddrPort) error {
 			handled <- string(data)
 			if string(data) == "first" {
@@ -2246,7 +2254,7 @@ func TestUdpEndpointCloseDrainsAcceptedRepliesWithGenerationDispatcher(t *testin
 	}
 	close(release)
 	dispatcher.closeInputAndWait(ue)
-	ue.replyTasks.Wait()
+	ue.replyRuntime.tasks.Wait()
 
 	for _, want := range []string{"first", "second"} {
 		select {
@@ -2274,10 +2282,7 @@ func TestUdpEndpointSubmitReplyRejectedReleasesBufferOnce(t *testing.T) {
 	dispatcher := newUDPReplyDispatcher(1, 1, 1)
 	dispatcher.close()
 	ue := &UdpEndpoint{
-		replyDispatcher:   dispatcher,
-		replySlots:        make(chan struct{}, 1),
-		replyStop:         make(chan struct{}),
-		replyDrainTracker: newControlPlaneDrainTracker(),
+		replyRuntime: newUdpEndpointReplyRuntime(dispatcher, newControlPlaneDrainTracker(), 1),
 	}
 
 	if ue.submitReply(udpEndpointReply{data: pool.PB([]byte("rejected"))}) {
@@ -2301,10 +2306,7 @@ func TestUdpEndpointTransportReplyBackpressureKeepsReceiverAlive(t *testing.T) {
 	releaseFirst := make(chan struct{})
 	var secondReleased atomic.Int32
 	ue := &UdpEndpoint{
-		replyDispatcher:   dispatcher,
-		replySlots:        make(chan struct{}, 1),
-		replyStop:         make(chan struct{}),
-		replyDrainTracker: newControlPlaneDrainTracker(),
+		replyRuntime: newUdpEndpointReplyRuntime(dispatcher, newControlPlaneDrainTracker(), 1),
 		handler: func(_ *UdpEndpoint, data []byte, _ netip.AddrPort) error {
 			if string(data) == "first" {
 				close(started)
@@ -2317,7 +2319,7 @@ func TestUdpEndpointTransportReplyBackpressureKeepsReceiverAlive(t *testing.T) {
 	accepted, keepReceiver := ue.submitReplyFromReceiver(udpEndpointReply{
 		data: pool.PB([]byte("first")),
 		from: from,
-	})
+	}, nil)
 	if !accepted || !keepReceiver {
 		t.Fatalf("first transport reply = accepted:%v keep:%v, want true/true", accepted, keepReceiver)
 	}
@@ -2330,9 +2332,8 @@ func TestUdpEndpointTransportReplyBackpressureKeepsReceiverAlive(t *testing.T) {
 	accepted, keepReceiver = ue.submitReplyFromReceiver(udpEndpointReply{
 		data: pool.PB([]byte("second")),
 		from: from,
-		release: func() {
-			secondReleased.Add(1)
-		},
+	}, func() {
+		secondReleased.Add(1)
 	})
 	if accepted || !keepReceiver {
 		t.Fatalf("full transport reply = accepted:%v keep:%v, want false/true", accepted, keepReceiver)
@@ -2342,7 +2343,7 @@ func TestUdpEndpointTransportReplyBackpressureKeepsReceiverAlive(t *testing.T) {
 	}
 
 	close(releaseFirst)
-	ue.replyTasks.Wait()
+	ue.replyRuntime.tasks.Wait()
 }
 
 func TestEffectiveUdpEndpointNatTimeout_LongLivedProtocolsUseQuicFloor(t *testing.T) {
@@ -2568,7 +2569,7 @@ func TestUdpEndpointPoolGetOrCreate_FullConeEndpointPrewarmsCachedResponseConn(t
 	af.RefreshTtl()
 	shard := DefaultAnyfromPool.shardFor(bindAddr)
 	shard.mu.Lock()
-	shard.pool[bindAddr] = af
+	shard.pool[anyfromPoolKey{lAddr: bindAddr}] = af
 	shard.mu.Unlock()
 
 	conn := &scriptedPacketConn{
@@ -2632,7 +2633,7 @@ func TestUdpEndpointPoolGetOrCreate_NoReplyTimeoutReleasesPrewarmedAnyfrom(t *te
 	af.RefreshTtl()
 	shard := DefaultAnyfromPool.shardFor(bindAddr)
 	shard.mu.Lock()
-	shard.pool[bindAddr] = af
+	shard.pool[anyfromPoolKey{lAddr: bindAddr}] = af
 	shard.mu.Unlock()
 
 	conn := &scriptedPacketConn{

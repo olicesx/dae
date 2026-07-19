@@ -163,7 +163,7 @@ type Dns struct {
 	Bind               string          `mapstructure:"bind"`
 	OptimisticCache    bool            `mapstructure:"optimistic_cache" default:"true"`
 	OptimisticCacheTtl int             `mapstructure:"optimistic_cache_ttl" default:"60"`
-	MaxCacheSize       int             `mapstructure:"max_cache_size" default:"0"`
+	MaxCacheSize       int             `mapstructure:"max_cache_size" default:"65536"`
 }
 
 type Routing struct {

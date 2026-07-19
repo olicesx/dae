@@ -503,9 +503,8 @@ func TestRunnerFreshReloadFailureProcessHelper(t *testing.T) {
 	baselineFDs := countProcessFileDescriptors(t)
 	initialReady := make(chan struct{})
 	candidateFailed := make(chan struct{}, cycles)
-	recoveredReady := make(chan struct{}, cycles)
 	reloadFailureCompleted := make(chan struct{}, cycles)
-	serveDone := make(chan struct{}, 1+cycles*2)
+	serveDone := make(chan struct{}, 1+cycles)
 	reloadFailureCompletionHook = func() {
 		reloadFailureCompleted <- struct{}{}
 	}
@@ -515,25 +514,17 @@ func TestRunnerFreshReloadFailureProcessHelper(t *testing.T) {
 	var serveCalls atomic.Int32
 	serveControlPlaneFunc = func(_ *control.ControlPlane, readyChan chan<- bool, _ *control.Listener) error {
 		call := serveCalls.Add(1)
-		switch {
-		case call == 1:
+		if call == 1 {
 			defer func() { serveDone <- struct{}{} }()
 			readyChan <- true
 			close(initialReady)
 			<-serveStop
 			return nil
-		case call%2 == 0:
-			defer func() { serveDone <- struct{}{} }()
-			readyChan <- false
-			candidateFailed <- struct{}{}
-			return stderrors.New("injected fresh candidate readiness failure")
-		default:
-			defer func() { serveDone <- struct{}{} }()
-			readyChan <- true
-			recoveredReady <- struct{}{}
-			<-serveStop
-			return nil
 		}
+		defer func() { serveDone <- struct{}{} }()
+		readyChan <- false
+		candidateFailed <- struct{}{}
+		return stderrors.New("injected fresh candidate readiness failure")
 	}
 
 	conf := newControlPlaneBoundaryConfig(t)
@@ -556,20 +547,19 @@ func TestRunnerFreshReloadFailureProcessHelper(t *testing.T) {
 			t.Fatalf("cycle %d send suspend/reload signal: %v", cycle, err)
 		}
 		wait(candidateFailed, fmt.Sprintf("cycle %d fresh candidate readiness failure", cycle))
-		wait(recoveredReady, fmt.Sprintf("cycle %d recovered generation readiness", cycle))
 		wait(reloadFailureCompleted, fmt.Sprintf("cycle %d reload failure completion", cycle))
 	}
 	if got := listenCalls.Load(); got != 1+cycles {
 		t.Fatalf("listener operation calls = %d, want %d", got, 1+cycles)
 	}
-	if got := cloneCalls.Load(); got != cycles {
-		t.Fatalf("listener clone calls = %d, want %d", got, cycles)
+	if got := cloneCalls.Load(); got != 0 {
+		t.Fatalf("listener clone calls = %d, want 0", got)
 	}
 	if got := buildCalls.Load(); got != 1+cycles {
 		t.Fatalf("control plane build calls = %d, want %d", got, 1+cycles)
 	}
-	if got := serveCalls.Load(); got != 1+2*cycles {
-		t.Fatalf("serve calls = %d, want %d", got, 1+2*cycles)
+	if got := serveCalls.Load(); got != 1+cycles {
+		t.Fatalf("serve calls = %d, want %d", got, 1+cycles)
 	}
 	if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
 		t.Fatalf("send termination signal: %v", err)
@@ -585,7 +575,7 @@ func TestRunnerFreshReloadFailureProcessHelper(t *testing.T) {
 		t.Fatal("Runner.Run() did not terminate after fresh reload rollback")
 	}
 	wait(readyNotificationDone, "initial readiness notification")
-	for call := 0; call < 1+2*cycles; call++ {
+	for call := 0; call < 1+cycles; call++ {
 		wait(serveDone, fmt.Sprintf("serve call %d shutdown", call))
 	}
 	if got := countProcessFileDescriptors(t); got > baselineFDs {

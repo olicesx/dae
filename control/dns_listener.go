@@ -372,24 +372,15 @@ func (h *dnsHandler) ServeDNS(w dnsmessage.ResponseWriter, r *dnsmessage.Msg) {
 		downloadRecord: downloadRecord,
 	}
 
-	ctx := context.Background()
-	if controller != nil && controller.ctx != nil {
-		ctx = controller.ctx
-	}
 	if controller == nil {
 		m := new(dnsmessage.Msg)
 		m.SetRcode(r, dnsmessage.RcodeServerFailure)
 		_ = w.WriteMsg(m)
 		return
 	}
-	dnsController := controller.ActiveDnsController()
-	if dnsController == nil {
-		m := new(dnsmessage.Msg)
-		m.SetRcode(r, dnsmessage.RcodeServerFailure)
-		_ = w.WriteMsg(m)
-		return
-	}
-	err = dnsController.HandleWithResponseWriter_(controller.dnsRequestContext(ctx, dnsController), r, udpReq, w)
+	err = withActiveDNSController(controller, nil, func(queryCtx context.Context, dnsController *DnsController) error {
+		return dnsController.HandleWithResponseWriter_(queryCtx, r, udpReq, w)
+	})
 	if err != nil {
 		if errors.Is(err, ErrDNSQueryConcurrencyLimitExceeded) {
 			// REFUSED response has been written by DNS controller.

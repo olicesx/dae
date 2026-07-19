@@ -140,7 +140,7 @@ struct routing_result {
 	__u8 dscp;
 	// 0 is unknown; active routing slots 0 and 1 are encoded as 1 and 2.
 	__u8 routing_epoch_slot;
-	__u8 padding[2];
+	__u16 datapath_generation;
 };
 
 static __always_inline __u8 routing_epoch_slot_encode(__u32 slot)
@@ -191,7 +191,7 @@ struct dae_param {
 	__u8 padding_after_mac[2]; // pad to align use_redirect_peer
 	__u8 use_redirect_peer;
 	__u8 has_bpf_get_current_task;
-	__u16 padding2;
+	__u16 datapath_generation;
 	// dae_socket_mark is set on dae's own sockets (Anyfrom pool) to identify them.
 	// When bpf_sk_lookup_* finds a socket, we check this mark to skip dae's own sockets.
 	// This prevents false positives in NAT loopback detection for transparent proxying.
@@ -430,7 +430,8 @@ struct conn_state {
 	__u32 pid;                 // Process ID (for WAN egress; 0 for LAN)
 	// 0 is unknown; active routing slots 0 and 1 are encoded as 1 and 2.
 	__u8 routing_epoch_slot;
-	__u8 padding_after_pid[3];
+	__u8 padding_after_pid;
+	__u16 datapath_generation;
 };
 
 struct {
@@ -1031,6 +1032,7 @@ struct parsed_packet {
 	struct udphdr udph;
 	__u8 l4proto;
 	__u8 listener_l4proto;
+	__u16 datapath_generation;
 };
 
 struct {
@@ -1652,7 +1654,7 @@ fill_routing_result(struct routing_result *dst,
 		    __u32 mark, __u8 must, __u8 outbound,
 		    const __u8 mac[6], __u8 dscp,
 		    const char *pname, __u32 pid,
-		    __u8 routing_epoch_slot)
+		    __u8 routing_epoch_slot, __u16 datapath_generation)
 {
 	__builtin_memset(dst, 0, sizeof(*dst));
 	dst->mark = mark;
@@ -1662,6 +1664,7 @@ fill_routing_result(struct routing_result *dst,
 	dst->dscp = dscp;
 	dst->routing_epoch_slot =
 		routing_epoch_slot_sanitize(routing_epoch_slot);
+	dst->datapath_generation = datapath_generation;
 	if (mac)
 		__builtin_memcpy(dst->mac, mac, sizeof(dst->mac));
 	if (pname)
@@ -1856,6 +1859,7 @@ __mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 						 TASK_COMM_LEN);
 			state->pid = args->pid;
 			state->routing_epoch_slot = args->routing_epoch_slot;
+			state->datapath_generation = PARAM.datapath_generation;
 			publish_routing_meta(&state->meta, meta);
 		}
 		return state;
@@ -1879,6 +1883,7 @@ __mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 			__builtin_memcpy(new_state.pname, args->pname,
 					 TASK_COMM_LEN);
 		new_state.routing_epoch_slot = args->routing_epoch_slot;
+		new_state.datapath_generation = PARAM.datapath_generation;
 	}
 
 	int ret = bpf_map_update_elem(&conn_state_map, key,
@@ -1923,20 +1928,18 @@ mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 
 // mark_tcp_seen: update/create TCP conn state with optional routing metadata.
 // SYN starts new lifecycle; FIN/RST transitions to CLOSING.
-#define TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS 120000000000ULL  // 120 seconds
 #define TCP_CONN_STATE_CLOSING_TIMEOUT_NS 10000000000ULL       // 10 seconds
 #define TCP_CONN_STATE_UPDATE_INTERVAL_NS 1000000000ULL  // 1 second
 
 static __always_inline bool
 tcp_conn_state_expired(const struct conn_state *state, __u64 now)
 {
-	__u64 timeout = TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS;
-
-	if (!state)
+	/* ACTIVE entries may belong to process-owned sessions across reloads.
+	 * Userspace owns their idle expiry because it can distinguish a live,
+	 * pinned session from stale kernel state. */
+	if (!state || state->state != TCP_STATE_CLOSING)
 		return false;
-	if (state->state == TCP_STATE_CLOSING)
-		timeout = TCP_CONN_STATE_CLOSING_TIMEOUT_NS;
-	return now - state->last_seen_ns > timeout;
+	return now - state->last_seen_ns > TCP_CONN_STATE_CLOSING_TIMEOUT_NS;
 }
 
 // __mark_tcp_seen: noinline core. tcp_flags: bit 0 = SYN && !ACK (new
@@ -1990,6 +1993,7 @@ __mark_tcp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 						 TASK_COMM_LEN);
 			state->pid = args->pid;
 			state->routing_epoch_slot = args->routing_epoch_slot;
+			state->datapath_generation = PARAM.datapath_generation;
 			publish_routing_meta(&state->meta, meta);
 		}
 
@@ -2018,6 +2022,7 @@ __mark_tcp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 				__builtin_memcpy(new_state.pname, args->pname,
 						 TASK_COMM_LEN);
 			new_state.routing_epoch_slot = args->routing_epoch_slot;
+			new_state.datapath_generation = PARAM.datapath_generation;
 		}
 
 		int ret = bpf_map_update_elem(&conn_state_map, key,
@@ -2178,6 +2183,7 @@ redirect_lan_packet_to_control_plane(struct __sk_buff *skb, __u32 link_h_len,
 	handoff.result.dscp = routing_meta.data.dscp;
 	handoff.result.routing_epoch_slot =
 		routing_epoch_slot_sanitize(routing_epoch_slot);
+	handoff.result.datapath_generation = pkt->datapath_generation;
 	__builtin_memcpy(handoff.result.mac, pkt->ethh.h_source, 6);
 	bpf_map_update_elem(&routing_handoff_map, &pkt->tuples.five,
 			    &handoff, BPF_ANY);
@@ -2255,9 +2261,7 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 		}
 		if (unlikely(outbound == OUTBOUND_BLOCK))
 			return TC_ACT_SHOT;
-		if (!wan_outbound_is_alive(skb, outbound, pkt->l4proto,
-					   pkt->tuples.five.dport))
-			return TC_ACT_SHOT;
+		pkt->datapath_generation = tcp_state->datapath_generation;
 		return redirect_lan_packet_to_control_plane(
 			skb, link_h_len, pkt, tcp_state->meta.raw,
 			tcp_state->routing_epoch_slot);
@@ -2302,12 +2306,9 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 					goto block;
 				}
 
-				if (!wan_outbound_is_alive(skb, outbound, pkt->l4proto,
-							   pkt->tuples.five.dport))
-					goto block;
-
 				// Update conn state timestamp for this fast path packet
 				udp_state->last_seen_ns = bpf_ktime_get_ns();
+				pkt->datapath_generation = udp_state->datapath_generation;
 				return redirect_lan_packet_to_control_plane(
 					skb, link_h_len, pkt, udp_state->meta.raw,
 					udp_state->routing_epoch_slot);
@@ -2414,6 +2415,7 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 		// Directly update the TCP conn state we already looked up
 		__builtin_memcpy(tcp_state->mac, pkt->ethh.h_source, 6);
 		tcp_state->routing_epoch_slot = routing_epoch_slot;
+		tcp_state->datapath_generation = PARAM.datapath_generation;
 		union routing_meta _m = build_routing_meta(outbound, mark, must,
 						    pkt->tuples.dscp);
 		publish_routing_meta(&tcp_state->meta, _m);
@@ -2421,6 +2423,7 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 		// Directly update the UDP conn state we already looked up
 		__builtin_memcpy(udp_state->mac, pkt->ethh.h_source, 6);
 		udp_state->routing_epoch_slot = routing_epoch_slot;
+		udp_state->datapath_generation = PARAM.datapath_generation;
 		union routing_meta _m = build_routing_meta(outbound, mark, must,
 							    pkt->tuples.dscp);
 		publish_routing_meta(&udp_state->meta, _m);
@@ -2476,6 +2479,7 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 	if (!wan_outbound_is_alive(skb, outbound, pkt->l4proto,
 				   pkt->tuples.five.dport))
 		goto block;
+	pkt->datapath_generation = PARAM.datapath_generation;
 	return redirect_lan_packet_to_control_plane(
 		skb, link_h_len, pkt,
 		build_routing_meta(outbound, mark, must, pkt->tuples.dscp).raw,
@@ -2639,6 +2643,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 	__u32 handoff_pid = 0;
 	__u8 handoff_mac[6] = {};
 	__u8 routing_epoch_slot = ROUTING_EPOCH_SLOT_UNKNOWN;
+	__u16 datapath_generation = PARAM.datapath_generation;
 	__u32 scratch_key = 0;
 	struct wan_egress_route_scratch *scratch =
 		bpf_map_lookup_elem(&wan_egress_route_scratch_map, &scratch_key);
@@ -2748,6 +2753,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 		handoff_pid = tcp_conn->pid;
 		routing_epoch_slot =
 			routing_epoch_slot_sanitize(tcp_conn->routing_epoch_slot);
+		datapath_generation = tcp_conn->datapath_generation;
 	}
 
 	if (!wan_egress_needs_control_plane(outbound, mark)) {
@@ -2763,7 +2769,8 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 		return TC_ACT_SHOT;
 	}
 
-	if (!wan_outbound_is_alive(skb, outbound, IPPROTO_TCP,
+	if (tcp_state_syn &&
+	    !wan_outbound_is_alive(skb, outbound, IPPROTO_TCP,
 				   tuples->five.dport))
 		return TC_ACT_SHOT;
 
@@ -2771,7 +2778,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 
 	fill_routing_result(&routing_result, mark, must, outbound, handoff_mac,
 			    tuples->dscp, handoff_pname, handoff_pid,
-			    routing_epoch_slot);
+			    routing_epoch_slot, datapath_generation);
 	/* TCP has embedded conn-state routing metadata; handoff is best-effort. */
 	publish_routing_handoff(&tuples->five, &routing_result);
 
@@ -2800,6 +2807,8 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 	const char *handoff_pname = NULL;
 	__u32 handoff_pid = 0;
 	__u8 routing_epoch_slot = ROUTING_EPOCH_SLOT_UNKNOWN;
+	__u16 datapath_generation = PARAM.datapath_generation;
+	bool cached_routing = false;
 
 	__u32 scratch_key = 0;
 	struct wan_egress_route_scratch *scratch =
@@ -2834,6 +2843,8 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 			handoff_pid = udp_conn_state->pid;
 			routing_epoch_slot = routing_epoch_slot_sanitize(
 				udp_conn_state->routing_epoch_slot);
+			datapath_generation = udp_conn_state->datapath_generation;
+			cached_routing = true;
 			goto fast_path_skip_routing;
 		}
 	}
@@ -2882,6 +2893,7 @@ fast_path_skip_routing:
 					udp_conn_state->pid = pid_pname->pid;
 				}
 				udp_conn_state->routing_epoch_slot = routing_epoch_slot;
+				udp_conn_state->datapath_generation = datapath_generation;
 				union routing_meta _m = build_routing_meta(outbound,
 								   mark,
 								   must,
@@ -2905,7 +2917,8 @@ fast_path_skip_routing:
 	else if (unlikely(outbound == OUTBOUND_BLOCK))
 		return TC_ACT_SHOT;
 
-	if (!wan_outbound_is_alive(skb, outbound, IPPROTO_UDP,
+	if (!cached_routing &&
+	    !wan_outbound_is_alive(skb, outbound, IPPROTO_UDP,
 				   tuples->five.dport))
 		return TC_ACT_SHOT;
 
@@ -2915,7 +2928,7 @@ fast_path_skip_routing:
 
 	fill_routing_result(&routing_result, mark, must, outbound, mac,
 			    tuples->dscp, handoff_pname, handoff_pid,
-			    routing_epoch_slot);
+			    routing_epoch_slot, datapath_generation);
 	if (publish_routing_handoff(&tuples->five, &routing_result) &&
 	    handoff_mandatory)
 		return TC_ACT_SHOT;

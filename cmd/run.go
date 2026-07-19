@@ -138,6 +138,8 @@ type reloadRetirementControlPlane interface {
 type retirementDrainPlane interface {
 	reloadRetirementControlPlane
 	AbortConnections() error
+	AbortPendingConnections() error
+	StopRoutingEpochExecution()
 }
 
 type controlPlaneDrainWaitResult uint8
@@ -179,6 +181,13 @@ type stagedReloadHandoff struct {
 	routingEpochReady     bool
 	oldConnectivityPaused bool
 	freshCutoverStarted   bool
+	flowDatapathAdopted   bool
+	oldRuntimeStopped     bool
+	dnsControllerMoved    bool
+	dnsListenerMoved      bool
+	oldDNSListenerActive  bool
+	hookFlipCommitted     bool
+	provisionalOwner      bool
 }
 
 func tryQueueReloadRequest(
@@ -248,6 +257,15 @@ func clearReloadPending(flag *atomic.Bool) {
 
 func shouldUseStagedHotHandoff(freshDatapathReload, listenerPresent bool) bool {
 	return !freshDatapathReload && listenerPresent
+}
+
+func shouldStreamStagedDnsCache(
+	stagedHotHandoff,
+	routingEpochEnabled,
+	dnsConfigUnchanged,
+	ipVersionPreferenceUnchanged bool,
+) bool {
+	return stagedHotHandoff && routingEpochEnabled && dnsConfigUnchanged && ipVersionPreferenceUnchanged
 }
 
 func listenControlPlaneInDaeNetns(c *control.ControlPlane, port uint16) (*control.Listener, error) {
@@ -388,6 +406,10 @@ func (r *Runner) Run() (err error) {
 	log := r.log
 	conf := r.conf
 	externGeoDataDirs := r.externGeoDataDirs
+	processSessions := control.NewSessionManager(context.Background())
+	defer func() {
+		err = errors.Join(err, processSessions.Close())
+	}()
 
 	phase1Observability, err := enablePhase1ObservabilityFromEnvironment()
 	if err != nil {
@@ -427,6 +449,11 @@ func (r *Runner) Run() (err error) {
 		cancel()
 		return err
 	}
+	if err = c.AttachSessionManager(processSessions); err != nil {
+		cancel()
+		_ = c.Close()
+		return fmt.Errorf("attach process session manager: %w", err)
+	}
 	runtimeSupervisor := newRuntimeSupervisor(&runtimeGeneration{
 		controlPlane: c,
 		cancel:       currCancel,
@@ -453,6 +480,7 @@ func (r *Runner) Run() (err error) {
 	}
 	var pprofServer *http.Server
 	if conf.Global.PprofPort != 0 {
+		registerDaeDebugHandlers()
 		pprofAddr := fmt.Sprintf("localhost:%d", conf.Global.PprofPort)
 		pprofServer = &http.Server{Addr: pprofAddr, Handler: nil}
 		go func() { _ = pprofServer.ListenAndServe() }()
@@ -563,6 +591,11 @@ func (r *Runner) Run() (err error) {
 			logger.SetLogger(logrus.StandardLogger(), newConf.Global.LogLevel, disableTimestamp, nil)
 			log.SetOutput(oldLogOutput) // NOTE: Restore log output after creating new logger during reload.
 			logrus.SetOutput(oldLogOutput)
+			if !req.isSuspend {
+				if deferred := preserveReloadInterfaceBindings(conf, newConf); len(deferred) > 0 {
+					log.WithField("bindings", strings.Join(deferred, ",")).Warnln("[Reload] Deferring interface removal or role change until cold start to preserve established flows")
+				}
+			}
 
 			portChanged := conf.Global.TproxyPort != newConf.Global.TproxyPort
 			datapathChanged := bpfDatapathChanged(conf, newConf)
@@ -602,8 +635,16 @@ func (r *Runner) Run() (err error) {
 				log.Warnln("[Reload] Kernel datapath input changed (interface/somark/map-size); will perform a fresh datapath handoff")
 			}
 
+			dnsConfigUnchanged := dnsConfigEqual(conf, newConf)
+			ipVersionPreferenceUnchanged := conf.Dns.IpVersionPrefer == newConf.Dns.IpVersionPrefer
+			streamStagedDnsCache := shouldStreamStagedDnsCache(
+				stagedHotHandoff,
+				routingEpochHandoffEnabled,
+				dnsConfigUnchanged,
+				ipVersionPreferenceUnchanged,
+			)
 			var dnsCache map[string]*control.DnsCache
-			if conf.Dns.IpVersionPrefer == newConf.Dns.IpVersionPrefer {
+			if ipVersionPreferenceUnchanged && !streamStagedDnsCache {
 				// Only keep dns cache when ip version preference not change.
 				dnsCache = c.CloneDnsCache()
 			}
@@ -613,8 +654,14 @@ func (r *Runner) Run() (err error) {
 			if stagedHotHandoff {
 				log.Warnln("[Reload] Prepare staged same-port handoff")
 				ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
-				newC, prepareErr := newPreparedControlPlane(ctx, log, reloadBpf, dnsCache, newConf, externGeoDataDirs, dnsConfigEqual(conf, newConf), true)
+				newC, prepareErr := newPreparedControlPlane(ctx, log, reloadBpf, dnsCache, newConf, externGeoDataDirs, dnsConfigUnchanged, true)
 				dnsCache = nil
+				if prepareErr == nil {
+					prepareErr = newC.AttachSessionManager(processSessions)
+					if prepareErr != nil {
+						_ = newC.Close()
+					}
+				}
 				if prepareErr != nil {
 					reloadErr := wrapReloadTimeoutError("prepare staged reload", prepareErr, reloadPrepareTimeout)
 					reloadManager.setReloadError(reloadErr)
@@ -668,8 +715,12 @@ func (r *Runner) Run() (err error) {
 					}
 				}
 
-				if routingEpochHandoffEnabled && conf.Dns.IpVersionPrefer == newConf.Dns.IpVersionPrefer {
-					newC.SetReloadDnsCacheSource(oldC.CloneDnsCache)
+				if routingEpochHandoffEnabled && ipVersionPreferenceUnchanged {
+					if streamStagedDnsCache {
+						newC.SetReloadDnsCacheStreamSource(oldC.StreamDnsCacheForReload, oldC.PolicyIdentity().Hash())
+					} else {
+						newC.SetReloadDnsCacheSource(oldC.CloneDnsCache)
+					}
 				}
 				hasOverlap := newC.InheritDialerHealthFrom(oldC)
 				configureTransparentHugePages(log, newConf.Global.DisableTHP)
@@ -737,8 +788,18 @@ func (r *Runner) Run() (err error) {
 			if freshDatapathHandoff {
 				log.Warnln("[Reload] Prepare fresh datapath handoff")
 				ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
-				newC, prepareErr := newPreparedControlPlane(ctx, log, nil, dnsCache, newConf, externGeoDataDirs, false, true)
+				freshState, prepareErr := c.SnapshotFreshDatapathState()
+				var newC *control.ControlPlane
+				if prepareErr == nil {
+					newC, prepareErr = newPreparedControlPlane(ctx, log, freshState, dnsCache, newConf, externGeoDataDirs, false, true)
+				}
 				dnsCache = nil
+				if prepareErr == nil {
+					prepareErr = newC.AttachSessionManager(processSessions)
+					if prepareErr != nil {
+						_ = newC.Close()
+					}
+				}
 				if prepareErr != nil {
 					reloadErr := wrapReloadTimeoutError("prepare fresh datapath reload", prepareErr, reloadPrepareTimeout)
 					reloadManager.setReloadError(reloadErr)
@@ -752,11 +813,7 @@ func (r *Runner) Run() (err error) {
 					continue
 				}
 
-				if portChanged {
-					stagedListener, err = listenControlPlaneInDaeNetns(newC, newConf.Global.TproxyPort)
-				} else {
-					stagedListener, err = cloneControlListenerFunc(listener)
-				}
+				stagedListener, err = listenControlPlaneInDaeNetns(newC, newConf.Global.TproxyPort)
 				if err != nil {
 					reloadErr := fmt.Errorf("prepare fresh datapath listener: %w", err)
 					reloadManager.setReloadError(reloadErr)
@@ -845,7 +902,13 @@ func (r *Runner) Run() (err error) {
 
 			log.Warnln("[Reload] Load new control plane")
 			ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
-			newC, err := newControlPlane(ctx, log, reloadBpf, dnsCache, newConf, externGeoDataDirs, dnsConfigEqual(conf, newConf), true)
+			newC, err := newControlPlane(ctx, log, reloadBpf, dnsCache, newConf, externGeoDataDirs, dnsConfigUnchanged, true)
+			if err == nil {
+				err = newC.AttachSessionManager(processSessions)
+				if err != nil {
+					_ = newC.Close()
+				}
+			}
 			dnsCache = nil // Allow previous generation's clone to be GC'd.
 
 			var newCancel context.CancelFunc
@@ -864,6 +927,12 @@ func (r *Runner) Run() (err error) {
 				}
 				ctx, cancel = context.WithTimeout(context.Background(), reloadPrepareTimeout)
 				newC, err = newControlPlane(ctx, log, reloadBpf, rollbackDNSCache, conf, externGeoDataDirs, false, true)
+				if err == nil {
+					err = newC.AttachSessionManager(processSessions)
+					if err != nil {
+						_ = newC.Close()
+					}
+				}
 				err = wrapReloadTimeoutError("rollback control plane", err, reloadPrepareTimeout)
 				if err != nil {
 					_ = sdnotify.Stopping()
@@ -1138,10 +1207,12 @@ loop:
 								failRun(errors.Join(reloadErr, fmt.Errorf("restore supervisor from malformed fresh handoff: %w", err)))
 								break loop
 							}
-							if restartErr := restartRecoveredControlPlane(log, sigs, runStateChanges, handoff.oldControlPlane, listener); restartErr != nil {
-								log.WithError(restartErr).Errorln("[Reload] Failed to restart previous generation from malformed fresh handoff")
-								failRun(errors.Join(reloadErr, fmt.Errorf("restart previous generation from malformed fresh handoff: %w", restartErr)))
-								break loop
+							if handoff.oldRuntimeStopped {
+								if restartErr := restartRecoveredControlPlane(log, sigs, runStateChanges, handoff.oldControlPlane, listener); restartErr != nil {
+									log.WithError(restartErr).Errorln("[Reload] Failed to restart previous generation from malformed fresh handoff")
+									failRun(errors.Join(reloadErr, fmt.Errorf("restart previous generation from malformed fresh handoff: %w", restartErr)))
+									break loop
+								}
 							}
 						} else {
 							if restoreErr := restoreStagedReloadHandoff(log, handoff); restoreErr != nil {
@@ -1187,10 +1258,12 @@ loop:
 							break loop
 						}
 						reloadManager.clearPendingStagedHandoff()
-						if restartErr := restartRecoveredControlPlane(log, sigs, runStateChanges, handoff.oldControlPlane, listener); restartErr != nil {
-							log.WithError(restartErr).Errorln("[Reload] Failed to restart previous listener generation after cutover rollback")
-							failRun(errors.Join(reloadErr, fmt.Errorf("restart previous generation after cutover rollback: %w", restartErr)))
-							break loop
+						if handoff.oldRuntimeStopped {
+							if restartErr := restartRecoveredControlPlane(log, sigs, runStateChanges, handoff.oldControlPlane, listener); restartErr != nil {
+								log.WithError(restartErr).Errorln("[Reload] Failed to restart previous listener generation after cutover rollback")
+								failRun(errors.Join(reloadErr, fmt.Errorf("restart previous generation after cutover rollback: %w", restartErr)))
+								break loop
+							}
 						}
 						reloadManager.finishReloadFailure()
 						continue
@@ -1264,12 +1337,12 @@ loop:
 								break loop
 							}
 							reloadManager.clearPendingStagedHandoff()
-							if restartErr := restartRecoveredControlPlane(log, sigs, runStateChanges, handoff.oldControlPlane, listener); restartErr != nil {
-								log.WithError(restartErr).Errorln("[Reload] Failed to restart previous listener generation after rollback")
-								// Fresh datapath rollback already detached the old hooks and closed the old listener.
-								// If the recovered generation cannot become ready, continuing would leave traffic state ambiguous.
-								failRun(errors.Join(reloadErr, fmt.Errorf("restart previous generation after fresh datapath rollback: %w", restartErr)))
-								break loop
+							if handoff.oldRuntimeStopped {
+								if restartErr := restartRecoveredControlPlane(log, sigs, runStateChanges, handoff.oldControlPlane, listener); restartErr != nil {
+									log.WithError(restartErr).Errorln("[Reload] Failed to restart previous listener generation after rollback")
+									failRun(errors.Join(reloadErr, fmt.Errorf("restart previous generation after fresh datapath rollback: %w", restartErr)))
+									break loop
+								}
 							}
 						} else {
 							reloadManager.clearPendingStagedHandoff()
@@ -1287,7 +1360,37 @@ loop:
 				}
 				dnsHandoffActive := reloadManager.pendingDNSHandoffActive(serveControlPlane)
 				if handoff := reloadManager.currentPendingStagedHandoff(); handoff != nil {
-					retiringGeneration, publishErr := runtimeSupervisor.publishPrepared(handoff.preparedGeneration)
+					var publishErr error
+					if handoff.freshDatapath && !handoff.provisionalOwner {
+						publishErr = handoff.newControlPlane.RegisterProvisionalRoutingEpochExecutionOwner()
+						if publishErr == nil {
+							handoff.provisionalOwner = true
+						}
+					}
+					if handoff.freshDatapath && !handoff.hookFlipCommitted {
+						if publishErr == nil {
+							publishErr = handoff.newControlPlane.CommitPreparedBpfHookFlip()
+						}
+						if publishErr == nil {
+							handoff.hookFlipCommitted = true
+						}
+					}
+					if handoff.freshDatapath && !handoff.flowDatapathAdopted {
+						if publishErr == nil {
+							publishErr = handoff.newControlPlane.AdoptProcessFlowDatapath(handoff.oldControlPlane)
+						}
+						if publishErr == nil {
+							handoff.flowDatapathAdopted = true
+						}
+					}
+					var retiringGeneration *runtimeGeneration
+					if publishErr == nil {
+						retiringGeneration, publishErr = runtimeSupervisor.publishPrepared(handoff.preparedGeneration)
+					}
+					if publishErr == nil && handoff.provisionalOwner {
+						handoff.newControlPlane.UnregisterProvisionalRoutingEpochExecutionOwner()
+						handoff.provisionalOwner = false
+					}
 					if publishErr != nil {
 						reloadErr := fmt.Errorf("publish staged reload candidate: %w", publishErr)
 						reloadManager.setReloadError(reloadErr)
@@ -1311,10 +1414,12 @@ loop:
 								failRun(errors.Join(reloadErr, fmt.Errorf("restore supervisor after publish error: %w", err)))
 								break loop
 							}
-							if restartErr := restartRecoveredControlPlane(log, sigs, runStateChanges, handoff.oldControlPlane, listener); restartErr != nil {
-								log.WithError(restartErr).Errorln("[Reload] Failed to restart previous listener generation after publish error")
-								failRun(errors.Join(reloadErr, fmt.Errorf("restart previous generation after publish error: %w", restartErr)))
-								break loop
+							if handoff.oldRuntimeStopped {
+								if restartErr := restartRecoveredControlPlane(log, sigs, runStateChanges, handoff.oldControlPlane, listener); restartErr != nil {
+									log.WithError(restartErr).Errorln("[Reload] Failed to restart previous listener generation after publish error")
+									failRun(errors.Join(reloadErr, fmt.Errorf("restart previous generation after publish error: %w", restartErr)))
+									break loop
+								}
 							}
 						} else {
 							if restoreErr := restoreStagedReloadHandoff(log, handoff); restoreErr != nil {
@@ -1346,7 +1451,7 @@ loop:
 						// generation remains paused until retirement closes it.
 						serveControlPlane.ResumeOutboundConnectivityUpdates()
 					}
-					if oldC != nil && !handoff.freshDatapath {
+					if oldC != nil {
 						if detachErr := oldC.DetachBpfHooks(); detachErr != nil {
 							log.WithError(detachErr).Warnln("[Reload] Failed to detach previous datapath hooks after publish; retrying")
 							if retryErr := oldC.DetachBpfHooks(); retryErr != nil {
@@ -1367,11 +1472,12 @@ loop:
 					listener = handoff.preparedGeneration.listener
 					reloadManager.clearPendingStagedHandoff()
 
-					if oldListener != nil && !handoff.freshDatapath {
+					if oldListener != nil {
 						if err := oldListener.Close(); err != nil {
 							log.WithError(err).Warnln("[Reload] Failed to close previous listener generation")
 						}
 					}
+					handoff.oldRuntimeStopped = true
 
 					if oldC != nil {
 						reloadManager.startControlPlaneRetirement(log, oldC, c, oldCancel, abortConnections, hasOverlap, runtimeSupervisor, retiringGeneration)
@@ -1503,6 +1609,7 @@ func retireControlPlaneConnections(
 	hasOverlap bool,
 	maxDrain time.Duration,
 ) {
+	_ = hasOverlap
 	observation := control.BeginPhase1ReloadDrainObservation()
 	outcome := control.Phase1ReloadDrainCompleted
 	defer func() {
@@ -1515,73 +1622,48 @@ func retireControlPlaneConnections(
 		if err := c.AbortConnections(); err != nil {
 			outcome = control.Phase1ReloadDrainFailed
 		}
-	case !hasOverlap:
-		log.Infoln("[Reload] No dialer overlap between generations; aborting stale connections")
-		if err := c.AbortConnections(); err != nil {
-			outcome = control.Phase1ReloadDrainFailed
-		}
 	default:
 		switch waitForControlPlaneDrain(log, ctx, c, maxDrain, controlPlaneRetirementLogEvery) {
 		case controlPlaneDrainIdle:
 			log.Infoln("[Reload] Old control plane drained active sessions; retiring immediately")
 		case controlPlaneDrainCanceled:
 			outcome = control.Phase1ReloadDrainCanceled
-			log.Warnln("[Reload] New generation ready; accelerating old generation retirement")
-			if err := c.AbortConnections(); err != nil {
+			log.Warnln("[Reload] Retirement canceled; aborting generation-owned pending work")
+			if err := c.AbortPendingConnections(); err != nil {
 				outcome = control.Phase1ReloadDrainFailed
 			}
 		case controlPlaneDrainTimeout:
 			outcome = control.Phase1ReloadDrainTimedOut
 			log.WithField("active_sessions", c.ActiveSessionCount()).
-				Warnln("[Reload] Old control plane drain timed out; forcing retirement")
-			if err := c.AbortConnections(); err != nil {
+				Warnln("[Reload] Old control plane drain timed out; aborting pending generation work")
+			if err := c.AbortPendingConnections(); err != nil {
 				outcome = control.Phase1ReloadDrainFailed
 			}
 		default:
 			outcome = control.Phase1ReloadDrainFailed
 		}
 	}
+	// Seal generation admission on every retirement path and wait for any lease
+	// acquired before abort/drain committed to closing the owner.
+	c.StopRoutingEpochExecution()
 }
 
 func prepareFreshDatapathCutover(log *logrus.Logger, handoff *stagedReloadHandoff) error {
 	if handoff == nil || !handoff.freshDatapath {
 		return fmt.Errorf("missing fresh datapath handoff")
 	}
-	handoff.freshCutoverStarted = true
-	if handoff.oldListener != nil {
-		if err := handoff.oldListener.Close(); err != nil {
-			return fmt.Errorf("close previous listener: %w", err)
-		}
-		handoff.oldListener = nil
-	}
 	if handoff.oldControlPlane == nil || handoff.newControlPlane == nil {
 		return fmt.Errorf("missing control plane for fresh datapath cutover")
 	}
+	if handoff.oldListener == nil {
+		return fmt.Errorf("missing previous listener for fresh datapath cutover")
+	}
+	handoff.freshCutoverStarted = true
 	if err := handoff.oldControlPlane.StopDNSListener(); err != nil {
 		return fmt.Errorf("stop previous DNS listener: %w", err)
 	}
-	// A fresh datapath owns isolated maps and replaces multiple TC/cgroup hooks.
-	// Classic TC cannot atomically swap that set across all interfaces, so active
-	// flows cannot be preserved without a packet bypass or mixed-policy window.
-	// Abort them explicitly before detaching hooks instead of claiming a graceful
-	// handoff that the supported kernel range cannot guarantee.
-	if log != nil {
-		log.Warnln("[Reload] Fresh datapath reload requires aborting previous connections before cutover")
-	}
-	if err := handoff.oldControlPlane.AbortConnections(); err != nil {
-		return fmt.Errorf("abort previous connections for fresh datapath: %w", err)
-	}
-	// The fresh datapath loads isolated flow-state maps (conn_state_map,
-	// redirect_track, etc.). Stale UDP endpoints, anyfrom connections and
-	// sniffer sessions in the shared global pools still reference the retiring
-	// generation's dialer, outbound group and cached routing result; reusing
-	// them would apply the old policy to the new datapath. Evict them now —
-	// at this point the old listener is closed and the new generation has not
-	// started serving, so no in-flight traffic is disrupted. Janitor goroutines
-	// are left running for the successor to reuse.
-	control.ResetGlobalUdpFlowState()
-	if err := handoff.oldControlPlane.DetachBpfHooks(); err != nil {
-		return fmt.Errorf("detach previous BPF hooks: %w", err)
+	if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
+		log.Debugln("[Reload] Previous datapath remains active until the fresh candidate is ready")
 	}
 	return nil
 }
@@ -1591,6 +1673,24 @@ func rollbackFreshDatapathReloadHandoff(log *logrus.Logger, handoff *stagedReloa
 		return nil, fmt.Errorf("missing previous generation for fresh datapath rollback")
 	}
 	var rollbackCleanupErrs []error
+	if handoff.provisionalOwner && handoff.newControlPlane != nil {
+		handoff.newControlPlane.UnregisterProvisionalRoutingEpochExecutionOwner()
+		handoff.provisionalOwner = false
+	}
+	if handoff.flowDatapathAdopted && handoff.newControlPlane != nil {
+		if err := handoff.oldControlPlane.AdoptProcessFlowDatapath(handoff.newControlPlane); err != nil {
+			rollbackCleanupErrs = append(rollbackCleanupErrs, fmt.Errorf("restore process flow datapath: %w", err))
+		} else {
+			handoff.flowDatapathAdopted = false
+		}
+	}
+	if handoff.hookFlipCommitted && handoff.newControlPlane != nil {
+		if err := handoff.newControlPlane.RollbackPreparedBpfHookFlip(); err != nil {
+			rollbackCleanupErrs = append(rollbackCleanupErrs, fmt.Errorf("restore previous BPF hook flip: %w", err))
+		} else {
+			handoff.hookFlipCommitted = false
+		}
+	}
 	if handoff.newControlPlane != nil {
 		if err := handoff.newControlPlane.DetachBpfHooks(); err != nil {
 			rollbackCleanupErrs = append(rollbackCleanupErrs, fmt.Errorf("detach fresh datapath hooks: %w", err))
@@ -1612,6 +1712,15 @@ func rollbackFreshDatapathReloadHandoff(log *logrus.Logger, handoff *stagedReloa
 	}
 	if len(rollbackCleanupErrs) > 0 {
 		return nil, errors.Join(rollbackCleanupErrs...)
+	}
+	if !handoff.oldRuntimeStopped {
+		if err := handoff.oldControlPlane.RestartDNSListener(); err != nil {
+			return nil, fmt.Errorf("restart previous DNS listener: %w", err)
+		}
+		if log != nil {
+			log.Warnln("[Reload] Discarded fresh datapath candidate; previous generation remained active")
+		}
+		return handoff.oldListener, nil
 	}
 
 	recoveredListener, err := listenControlPlaneInDaeNetns(handoff.oldControlPlane, handoff.oldConf.Global.TproxyPort)
@@ -1689,8 +1798,10 @@ func restoreStagedReloadHandoff(log *logrus.Logger, handoff *stagedReloadHandoff
 	if err := restoreReloadDatapathFunc(handoff.oldControlPlane); err != nil {
 		errs = append(errs, fmt.Errorf("rebuild previous datapath: %w", err))
 	}
-	if err := restoreDNSListenerFunc(handoff.oldControlPlane); err != nil {
-		errs = append(errs, fmt.Errorf("restart previous DNS listener: %w", err))
+	if !handoff.oldDNSListenerActive {
+		if err := restoreDNSListenerFunc(handoff.oldControlPlane); err != nil {
+			errs = append(errs, fmt.Errorf("restart previous DNS listener: %w", err))
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -1706,6 +1817,21 @@ func rollbackStagedReloadHandoff(log *logrus.Logger, handoff *stagedReloadHandof
 			handoff.oldConnectivityPaused = false
 		}
 	}()
+
+	if handoff.newControlPlane != nil && (handoff.dnsControllerMoved || handoff.dnsListenerMoved) {
+		listenerActive, err := handoff.newControlPlane.RestorePreparedDNSRuntimeForRollback(
+			handoff.oldControlPlane,
+			handoff.dnsControllerMoved,
+			handoff.dnsListenerMoved,
+		)
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			handoff.dnsControllerMoved = false
+			handoff.dnsListenerMoved = false
+			handoff.oldDNSListenerActive = listenerActive
+		}
+	}
 
 	if handoff.bpfTransferred && handoff.oldControlPlane != nil && handoff.newControlPlane != nil {
 		handoff.oldControlPlane.InjectBpf(handoff.newControlPlane.EjectBpf())
@@ -2020,18 +2146,26 @@ func configureTransparentHugePages(log *logrus.Logger, disable bool) {
 	}
 }
 
-// configureGcMemoryLimit auto-detects the cgroup v2 memory limit for the
+// configureGcMemoryLimit auto-detects the cgroup v2 memory ceiling for the
 // current process and sets GOMEMLIMIT to 90% of it. This lets the Go runtime
 // GC proactively release memory before hitting the container/system limit,
 // which is critical for containerized deployments where GOGC's default
 // (100% heap growth) can overshoot the cgroup limit and trigger OOM kills.
 //
-// No-op when no cgroup memory limit is detected (bare metal without cgroup).
+// An explicit GOMEMLIMIT always wins. Otherwise memory.high participates in
+// the detected ceiling so systemd MemoryHigh works even without MemoryMax.
+// The function is a no-op when no finite cgroup ceiling is configured.
 func configureGcMemoryLimit(log *logrus.Logger) {
+	if value, ok := os.LookupEnv("GOMEMLIMIT"); ok {
+		if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
+			log.Debugf("GOMEMLIMIT: using explicit environment value %q", value)
+		}
+		return
+	}
 	limit := detectCgroupMemLimit()
 	if limit <= 0 {
 		if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
-			log.Debug("GOMEMLIMIT: no cgroup memory limit detected, skipping")
+			log.Debug("GOMEMLIMIT: no finite cgroup memory ceiling detected, skipping")
 		}
 		return
 	}
@@ -2039,20 +2173,25 @@ func configureGcMemoryLimit(log *logrus.Logger) {
 	softLimit := limit * 9 / 10
 	debug.SetMemoryLimit(softLimit)
 	if log != nil {
-		log.Infof("Configured GOMEMLIMIT=%d MiB (cgroup memory.max=%d MiB)",
+		log.Infof("Configured GOMEMLIMIT=%d MiB (cgroup memory ceiling=%d MiB)",
 			softLimit/1024/1024, limit/1024/1024)
 	}
 }
 
-// detectCgroupMemLimit reads the cgroup v2 memory.max for the current process.
-// It walks from the process's own cgroup up to the root, returning the first
-// concrete limit found. Returns 0 if no limit is set (value is "max").
+// detectCgroupMemLimit returns the smallest finite memory.max or memory.high
+// applying to the current cgroup. Parent ceilings still constrain children, so
+// the complete path is inspected instead of stopping at the first value.
 func detectCgroupMemLimit() int64 {
 	data, err := os.ReadFile("/proc/self/cgroup")
 	if err != nil {
 		// Not in cgroup v2 or can't read; try root-level (container case).
-		return readMemMax("/sys/fs/cgroup")
+		return readCgroupMemoryCeiling("/sys/fs/cgroup")
 	}
+	return detectCgroupMemLimitFrom(data, "/sys/fs/cgroup")
+}
+
+func detectCgroupMemLimitFrom(data []byte, root string) int64 {
+	var limit int64
 	for _, line := range strings.Split(string(data), "\n") {
 		// cgroup v2 unified hierarchy format: "0::/path"
 		if !strings.HasPrefix(line, "0::") {
@@ -2060,9 +2199,7 @@ func detectCgroupMemLimit() int64 {
 		}
 		cgPath := strings.TrimSpace(strings.TrimPrefix(line, "0::"))
 		for {
-			if v := readMemMax(filepath.Join("/sys/fs/cgroup", cgPath)); v > 0 {
-				return v
-			}
+			limit = minPositive(limit, readCgroupMemoryCeiling(filepath.Join(root, cgPath)))
 			if cgPath == "/" || cgPath == "." || cgPath == "" {
 				break
 			}
@@ -2073,14 +2210,26 @@ func detectCgroupMemLimit() int64 {
 				cgPath = cgPath[:idx]
 			}
 		}
+		return limit
 	}
-	return readMemMax("/sys/fs/cgroup")
+	return readCgroupMemoryCeiling(root)
 }
 
 // readMemMax reads memory.max from a cgroup v2 directory.
 // Returns 0 if the file is missing, set to "max", or unparseable.
 func readMemMax(dir string) int64 {
-	b, err := os.ReadFile(filepath.Join(dir, "memory.max"))
+	return readCgroupMemoryValue(dir, "memory.max")
+}
+
+func readCgroupMemoryCeiling(dir string) int64 {
+	return minPositive(
+		readMemMax(dir),
+		readCgroupMemoryValue(dir, "memory.high"),
+	)
+}
+
+func readCgroupMemoryValue(dir, name string) int64 {
+	b, err := os.ReadFile(filepath.Join(dir, name))
 	if err != nil {
 		return 0
 	}
@@ -2093,6 +2242,16 @@ func readMemMax(dir string) int64 {
 		return 0
 	}
 	return v
+}
+
+func minPositive(values ...int64) int64 {
+	var minimum int64
+	for _, value := range values {
+		if value > 0 && (minimum == 0 || value < minimum) {
+			minimum = value
+		}
+	}
+	return minimum
 }
 
 func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {

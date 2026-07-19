@@ -45,7 +45,7 @@ func TestTcpFlowBindingCapturesFinalRouteAndEgress(t *testing.T) {
 		SelectionNetworkTypeObj: &networkType,
 	}
 
-	binding := newTcpFlowBinding(snapshot, result)
+	binding := newTcpFlowBinding(snapshot.Epoch(), result)
 	if binding.Route.PolicyEpoch != snapshot.Epoch() || binding.Route.Outbound != result.OutboundIndex || binding.Route.Mark != result.Mark || !binding.Route.Must {
 		t.Fatalf("route binding = %+v", binding.Route)
 	}
@@ -61,7 +61,7 @@ func TestTcpFlowBindingCapturesFinalRouteAndEgress(t *testing.T) {
 	}
 }
 
-func TestRouteDialDoesNotBindFailedTcpDial(t *testing.T) {
+func TestRouteDialReturnsFailedTcpSelection(t *testing.T) {
 	d, _ := newTestEndpointErrorDialer("hysteria2", "proxy.example:443", io.ErrUnexpectedEOF)
 	cp := newTestDialControlPlane(newTestFixedOutboundGroup(d))
 
@@ -79,8 +79,5 @@ func TestRouteDialDoesNotBindFailedTcpDial(t *testing.T) {
 	}
 	if result == nil {
 		t.Fatal("routeDial() result = nil, want failed selection result")
-	}
-	if result.Binding != (TcpFlowBinding{}) {
-		t.Fatalf("failed dial binding = %+v, want zero value", result.Binding)
 	}
 }

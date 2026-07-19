@@ -130,15 +130,16 @@ func (r *controlPlaneDNSRuntime) reuseDNSControllerFrom(previous *controlPlaneDN
 	}
 
 	oldController := previous.dnsController
-	if r.dnsController != nil {
-		_ = r.dnsController.Close()
-	}
+	replacementController := r.dnsController
 	reusedController, err := oldController.ReuseForReload(option, routing)
 	if err != nil {
 		if log != nil {
 			log.WithError(err).Warn("failed to reuse DNS controller for reload")
 		}
 		return false
+	}
+	if replacementController != nil && replacementController != oldController {
+		_ = replacementController.Close()
 	}
 	if publishHandoff != nil {
 		publishHandoff(reusedController)
@@ -272,4 +273,60 @@ func (r *controlPlaneDNSRuntime) releaseRetainedState() {
 	r.dnsUpstreamsReady = nil
 	r.dnsUpstreamAvailable = nil
 	r.dnsUpstreamAvailableOnce = sync.Once{}
+}
+
+// RestorePreparedDNSRuntimeForRollback returns DNS resources transferred to a
+// prepared candidate back to the still-active previous generation.
+func (c *ControlPlane) RestorePreparedDNSRuntimeForRollback(
+	previous *ControlPlane,
+	restoreController bool,
+	restoreListener bool,
+) (listenerRestoredActive bool, err error) {
+	if c == nil || previous == nil {
+		return false, fmt.Errorf("restore prepared DNS runtime: both control planes are required")
+	}
+	activeControlPlanePublication.mu.Lock()
+	defer activeControlPlanePublication.mu.Unlock()
+
+	if restoreController {
+		if c.dnsController == nil {
+			return false, fmt.Errorf("restore prepared DNS runtime: candidate controller is unavailable")
+		}
+		if previous.dnsController != nil {
+			return false, fmt.Errorf("restore prepared DNS runtime: previous controller still owns a controller")
+		}
+	}
+	if restoreListener {
+		if c.dnsListener == nil {
+			return false, fmt.Errorf("restore prepared DNS runtime: candidate listener is unavailable")
+		}
+		if previous.dnsListener != nil {
+			return false, fmt.Errorf("restore prepared DNS runtime: previous listener still owns a listener")
+		}
+	}
+
+	if restoreController {
+		transferred := c.dnsController
+		restored, restoreErr := transferred.ReuseForReload(previous.dnsControllerOption(), previous.dnsRouting)
+		if restoreErr != nil {
+			return false, fmt.Errorf("restore prepared DNS controller: %w", restoreErr)
+		}
+		if restored == nil {
+			return false, fmt.Errorf("restore prepared DNS controller: restored controller is nil")
+		}
+		c.dnsController = nil
+		previous.dnsController = restored
+		previous.clearDNSHandoffControllerIfMatch(transferred)
+	}
+
+	if restoreListener {
+		listener := c.dnsListener
+		c.dnsListener = nil
+		c.dnsListenerStopRegistered = false
+		previous.dnsListener = listener
+		listener.SwapController(previous)
+		listenerRestoredActive = true
+	}
+
+	return listenerRestoredActive, nil
 }

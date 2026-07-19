@@ -85,6 +85,34 @@ routing {
 	require.EqualValues(t, 262144, conf.Global.BpfConnStateMapSize)
 }
 
+func TestDnsMemoryDefaultsAndExplicitUnlimited(t *testing.T) {
+	sections, err := config_parser.Parse(`
+global {}
+dns {}
+routing {
+  fallback: direct
+}
+`)
+	require.NoError(t, err)
+	conf, err := New(sections)
+	require.NoError(t, err)
+	require.Equal(t, 65536, conf.Dns.MaxCacheSize)
+
+	sections, err = config_parser.Parse(`
+global {}
+dns {
+  max_cache_size: 0
+}
+routing {
+  fallback: direct
+}
+`)
+	require.NoError(t, err)
+	conf, err = New(sections)
+	require.NoError(t, err)
+	require.Zero(t, conf.Dns.MaxCacheSize)
+}
+
 func TestDecodeConfigSectionRejectsUnknownSection(t *testing.T) {
 	conf := &Config{}
 	err := decodeConfigSection(conf, "unknown", &config_parser.Section{Name: "unknown"})

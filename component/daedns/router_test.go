@@ -45,6 +45,27 @@ func TestRouterMatchSubscriptionUpstream(t *testing.T) {
 	}
 }
 
+func TestResolvingDialerRetirementDropsRouterMetadata(t *testing.T) {
+	router := &Router{}
+	base := &stubDialer{}
+	d := newResolvingDialer(base, router, "request", "control", "proxy.example.com")
+
+	if got := d.router.Load(); got != router {
+		t.Fatalf("router before retirement = %p, want %p", got, router)
+	}
+	if got := d.UnwrapDialer(); got != base {
+		t.Fatalf("UnwrapDialer() = %T %p, want base %p", got, got, base)
+	}
+
+	d.RetireForEstablishedFlows()
+	if got := d.router.Load(); got != nil {
+		t.Fatalf("router after retirement = %p, want nil", got)
+	}
+	if _, err := d.LookupIPAddr(context.Background(), "tcp", "proxy.example.com"); !errors.Is(err, errResolvingDialerRetired) {
+		t.Fatalf("LookupIPAddr() error = %v, want %v", err, errResolvingDialerRetired)
+	}
+}
+
 func TestRouterDoesNotInheritSubscriptionSelectorToNodes(t *testing.T) {
 	router := mustNewTestRouter(t,
 		testInternalRule("subdns", testInternalFunction("sub", testInternalParam("", "my_sub"))),

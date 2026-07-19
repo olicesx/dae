@@ -7,7 +7,24 @@ package control
 
 import "github.com/daeuniverse/dae/component/routing"
 
-// PolicySnapshot returns the immutable routing policy for this control-plane generation.
+// PolicyIdentity returns routing metadata without retaining the normalized rule tree.
+func (c *ControlPlane) PolicyIdentity() routing.PolicyIdentity {
+	if c == nil {
+		return routing.PolicyIdentity{}
+	}
+	if c.policyIdentity == (routing.PolicyIdentity{}) && c.policySnapshot != nil {
+		return c.policySnapshot.Identity()
+	}
+	return c.policyIdentity
+}
+
+// PolicyEpoch returns the immutable routing generation identifier.
+func (c *ControlPlane) PolicyEpoch() routing.PolicyEpoch {
+	return c.PolicyIdentity().Epoch()
+}
+
+// PolicySnapshot returns the retained routing policy used by decision shadowing.
+// Other execution paths retain only PolicyIdentity to avoid keeping the rule tree alive.
 func (c *ControlPlane) PolicySnapshot() *routing.PolicySnapshot {
 	if c == nil {
 		return nil

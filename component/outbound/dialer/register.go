@@ -46,6 +46,7 @@ func NewFromLinkWithProxyCacheContext(ctx context.Context, gOption *GlobalOption
 		SubscriptionTag: subscriptionTag,
 	}
 	proxyHost := controlPlaneAddressHost(p.Address)
+	var metadataRetirer establishedFlowMetadataRetirer
 
 	if gOption.DaeDNS != nil {
 		baseDialer, err = gOption.DaeDNS.WrapNodeDialer(baseDialer, daedns.NodeMeta{
@@ -57,6 +58,7 @@ func NewFromLinkWithProxyCacheContext(ctx context.Context, gOption *GlobalOption
 		if err != nil {
 			return nil, err
 		}
+		metadataRetirer, _ = baseDialer.(establishedFlowMetadataRetirer)
 		scopedBaseDialer = scopeTransportCacheDialer(baseDialer, gOption.TransportCacheNamespace)
 		d, _p, err = D.NewNetproxyDialerFromLink(scopedBaseDialer, &gOption.ExtraOption, normalizedLink)
 		if err != nil {
@@ -106,6 +108,7 @@ func NewFromLinkWithProxyCacheContext(ctx context.Context, gOption *GlobalOption
 	}
 
 	daeDialer := NewDialerContext(ctx, d, gOption, iOption, &p)
+	daeDialer.metadataRetirer = metadataRetirer
 
 	// Store reference to sticky wrapper for health check cycle management
 	if stickyWrapper != nil {

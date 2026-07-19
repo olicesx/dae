@@ -55,7 +55,10 @@ func TestPhase5DnsProjectionLifecycleCorpusTTLRetrySharedIPAcrossEpoch(t *testin
 	if !controller.processBpfUpdateTask(phase5ProjectionTask(cacheA, oldRuntime), false) {
 		t.Fatal("failed projection was not processed")
 	}
-	retries := controller.takeBpfProjectionRetryIntents()
+	retries, overflow := controller.takeBpfProjectionRetryIntents()
+	if overflow {
+		t.Fatal("unexpected retry overflow")
+	}
 	if len(retries) != 1 {
 		t.Fatalf("retry intents = %d, want 1", len(retries))
 	}
@@ -131,8 +134,6 @@ func TestPhase5DnsProjectionLifecycleCorpusTTLRetrySharedIPAcrossEpoch(t *testin
 func phase5ProjectionTask(cache *DnsCache, runtime *dnsControllerRuntimeState) *bpfUpdateTask {
 	return &bpfUpdateTask{
 		cache:                cache,
-		cacheKey:             cache.RouteOwnerKey,
-		runtime:              runtime,
 		routeProjectionEpoch: runtime.routeProjectionEpoch,
 	}
 }

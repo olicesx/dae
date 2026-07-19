@@ -374,6 +374,12 @@ func TestCommitPreparedDatapathStartsConnStateJanitor(t *testing.T) {
 			connStateJanitorStop: make(chan struct{}),
 			connStateJanitorDone: make(chan struct{}),
 		},
+		pendingDnsReloadCache: map[string]*DnsCache{
+			"reload.example.1": {RouteOwnerKey: "reload.example.1"},
+		},
+		dnsReloadCacheSource: func() map[string]*DnsCache {
+			return map[string]*DnsCache{"source.example.1": {RouteOwnerKey: "source.example.1"}}
+		},
 	}
 
 	if cp.connStateJanitorStarted.Load() {
@@ -388,6 +394,15 @@ func TestCommitPreparedDatapathStartsConnStateJanitor(t *testing.T) {
 	}
 	if cp.preparedDatapathCommit {
 		t.Fatal("expected preparedDatapathCommit to be cleared after commit")
+	}
+	if cp.pendingDnsReloadCache != nil {
+		t.Fatal("expected committed DNS reload snapshot to be released")
+	}
+	cp.dnsReloadCacheSourceMu.Lock()
+	hasReloadSource := cp.dnsReloadCacheSource != nil
+	cp.dnsReloadCacheSourceMu.Unlock()
+	if hasReloadSource {
+		t.Fatal("expected committed DNS reload source to be released")
 	}
 
 	cp.stopConnStateJanitor()
@@ -743,6 +758,88 @@ func TestReuseDNSControllerFromUpdatesRuntime(t *testing.T) {
 	oldRT := oldController.runtime()
 	if oldRT == nil || oldRT.lifecycleCtx != newCtx {
 		t.Fatal("expected original DNS controller facade runtime to be refreshed before handoff")
+	}
+}
+
+func TestRestorePreparedDNSRuntimeForRollbackReturnsControllerAndListener(t *testing.T) {
+	resetActiveControlPlanePublicationForTest(t)
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	oldCtx, oldCancel := context.WithCancel(context.Background())
+	defer oldCancel()
+	newCtx, newCancel := context.WithCancel(context.Background())
+	defer newCancel()
+	oldRouting := &dns.Dns{}
+	newRouting := &dns.Dns{}
+	oldController := &DnsController{}
+	oldListener := &DNSListener{log: logger, endpoint: Endpoint{TCP: true, UDP: true, Addr: "0.0.0.0:53"}}
+	oldCP := &ControlPlane{
+		log: logger,
+		ctx: oldCtx,
+		controlPlaneDNSRuntime: controlPlaneDNSRuntime{
+			dnsController: oldController,
+			dnsRouting:    oldRouting,
+			dnsFixedDomainTtl: map[string]int{
+				"old.example": 10,
+			},
+			dnsListener:               oldListener,
+			dnsListenerStopRegistered: true,
+		},
+	}
+	newCP := &ControlPlane{
+		log: logger,
+		ctx: newCtx,
+		controlPlaneDNSRuntime: controlPlaneDNSRuntime{
+			dnsController: &DnsController{},
+			dnsRouting:    newRouting,
+			dnsFixedDomainTtl: map[string]int{
+				"new.example": 20,
+			},
+			dnsListener: &DNSListener{log: logger, endpoint: oldListener.endpoint},
+		},
+	}
+	oldCP.publishActiveControlPlane()
+	if !newCP.ReuseDNSControllerFrom(oldCP) {
+		t.Fatal("ReuseDNSControllerFrom() = false, want true")
+	}
+	if !newCP.ReuseDNSListenerFrom(oldCP) {
+		t.Fatal("ReuseDNSListenerFrom() = false, want true")
+	}
+	transferred := newCP.dnsController
+
+	listenerActive, err := newCP.RestorePreparedDNSRuntimeForRollback(oldCP, true, true)
+	if err != nil {
+		t.Fatalf("RestorePreparedDNSRuntimeForRollback() error = %v", err)
+	}
+	if !listenerActive {
+		t.Fatal("RestorePreparedDNSRuntimeForRollback() did not report the transferred listener active")
+	}
+	if newCP.dnsController != nil || newCP.dnsListener != nil {
+		t.Fatal("candidate retained transferred DNS resources after rollback")
+	}
+	if oldCP.dnsController == nil || oldCP.dnsController == transferred {
+		t.Fatal("previous generation did not receive a fresh restored DNS facade")
+	}
+	if oldCP.ActiveDnsController() != oldCP.dnsController {
+		t.Fatal("previous generation still resolves through the candidate handoff facade")
+	}
+	if oldCP.dnsController.dnsControllerStore != oldController.dnsControllerStore {
+		t.Fatal("rollback did not preserve the shared DNS store")
+	}
+	if rt := oldCP.dnsController.runtime(); rt == nil || rt.lifecycleCtx != oldCtx || rt.routing != oldRouting || rt.fixedDomainTtl["old.example"] != 10 {
+		t.Fatalf("restored DNS runtime = %+v, want previous generation settings", rt)
+	}
+	if oldCP.dnsListener != oldListener || oldListener.Controller() != oldCP {
+		t.Fatal("previous generation did not regain DNS listener ownership")
+	}
+	if err := newCP.Close(); err != nil {
+		t.Fatalf("candidate Close() error = %v", err)
+	}
+	if oldCP.dnsController.bpfUpdateClosed.Load() {
+		t.Fatal("candidate cleanup closed the restored DNS store")
+	}
+	if err := oldCP.dnsController.Close(); err != nil {
+		t.Fatalf("restored DNS controller Close() error = %v", err)
 	}
 }
 

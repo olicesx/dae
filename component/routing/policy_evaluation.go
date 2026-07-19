@@ -106,14 +106,14 @@ func (s *PolicySnapshot) Evaluate(resolve PredicateResult) (PolicyEvaluation, er
 				continue
 			}
 			return PolicyEvaluation{
-				Epoch:         s.epoch,
+				Epoch:         s.Epoch(),
 				State:         DecisionResolved,
 				RuleIndex:     ruleIndex,
 				inheritedMust: inheritedMust,
 			}, nil
 		case TruthUnknown:
 			return PolicyEvaluation{
-				Epoch:         s.epoch,
+				Epoch:         s.Epoch(),
 				State:         DecisionDeferred,
 				RuleIndex:     ruleIndex,
 				inheritedMust: inheritedMust,
@@ -123,7 +123,7 @@ func (s *PolicySnapshot) Evaluate(resolve PredicateResult) (PolicyEvaluation, er
 	}
 
 	return PolicyEvaluation{
-		Epoch:         s.epoch,
+		Epoch:         s.Epoch(),
 		State:         DecisionResolved,
 		RuleIndex:     len(s.program.Rules),
 		inheritedMust: inheritedMust,
@@ -183,10 +183,10 @@ func (s *PolicySnapshot) ValidateContinuation(continuation Continuation) error {
 	if s == nil || s.program == nil {
 		return fmt.Errorf("nil policy snapshot")
 	}
-	if continuation.Epoch != s.epoch {
-		return fmt.Errorf("continuation epoch %d does not match snapshot epoch %d", continuation.Epoch, s.epoch)
+	if continuation.Epoch != s.Epoch() {
+		return fmt.Errorf("continuation epoch %d does not match snapshot epoch %d", continuation.Epoch, s.Epoch())
 	}
-	if continuation.SnapshotHash != s.hash {
+	if continuation.SnapshotHash != s.Hash() {
 		return fmt.Errorf("continuation snapshot hash does not match policy snapshot")
 	}
 	if continuation.RuleIndex < 0 || continuation.RuleIndex >= len(s.program.Rules) {
@@ -267,14 +267,14 @@ func (s *PolicySnapshot) evaluateGroups(resolve PredicateGroupResult) (PolicyEva
 				continue
 			}
 			return PolicyEvaluation{
-				Epoch:         s.epoch,
+				Epoch:         s.Epoch(),
 				State:         DecisionResolved,
 				RuleIndex:     ruleIndex,
 				inheritedMust: inheritedMust,
 			}, nil
 		case TruthUnknown:
 			return PolicyEvaluation{
-				Epoch:         s.epoch,
+				Epoch:         s.Epoch(),
 				State:         DecisionDeferred,
 				RuleIndex:     ruleIndex,
 				inheritedMust: inheritedMust,
@@ -284,7 +284,7 @@ func (s *PolicySnapshot) evaluateGroups(resolve PredicateGroupResult) (PolicyEva
 	}
 
 	return PolicyEvaluation{
-		Epoch:         s.epoch,
+		Epoch:         s.Epoch(),
 		State:         DecisionResolved,
 		RuleIndex:     len(s.program.Rules),
 		inheritedMust: inheritedMust,
@@ -293,8 +293,8 @@ func (s *PolicySnapshot) evaluateGroups(resolve PredicateGroupResult) (PolicyEva
 
 func (s *PolicySnapshot) newContinuation(ruleIndex, instructionID int) Continuation {
 	return Continuation{
-		Epoch:         s.epoch,
-		SnapshotHash:  s.hash,
+		Epoch:         s.Epoch(),
+		SnapshotHash:  s.Hash(),
 		RuleIndex:     ruleIndex,
 		InstructionID: instructionID,
 	}
@@ -364,8 +364,8 @@ func (s *PolicySnapshot) OutboundFor(evaluation PolicyEvaluation) (*config_parse
 	if s == nil || s.program == nil {
 		return nil, fmt.Errorf("nil policy snapshot")
 	}
-	if evaluation.Epoch != s.epoch {
-		return nil, fmt.Errorf("evaluation epoch %d does not match snapshot epoch %d", evaluation.Epoch, s.epoch)
+	if evaluation.Epoch != s.Epoch() {
+		return nil, fmt.Errorf("evaluation epoch %d does not match snapshot epoch %d", evaluation.Epoch, s.Epoch())
 	}
 	if evaluation.State != DecisionResolved {
 		return nil, fmt.Errorf("deferred evaluation has no outbound")

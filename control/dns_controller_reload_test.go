@@ -158,6 +158,26 @@ func TestDnsController_ReuseForReloadReturnsFreshFacadeSharingStore(t *testing.T
 	require.Nil(t, reusedRT.routing)
 }
 
+func TestDnsRuntimeReuseFailurePreservesReplacementController(t *testing.T) {
+	oldController := newTestDnsController()
+	replacementController := newTestDnsController()
+	previous := &controlPlaneDNSRuntime{dnsController: oldController}
+	current := &controlPlaneDNSRuntime{dnsController: replacementController}
+
+	if current.reuseDNSControllerFrom(previous, &DnsControllerOption{IpVersionPrefer: 99}, nil, nil, nil) {
+		t.Fatal("reuseDNSControllerFrom() = true for invalid runtime option")
+	}
+	if current.dnsController != replacementController {
+		t.Fatal("failed reuse replaced the current DNS controller")
+	}
+	if replacementController.bpfUpdateClosed.Load() {
+		t.Fatal("failed reuse closed the replacement DNS controller")
+	}
+	if previous.dnsController != oldController {
+		t.Fatal("failed reuse detached the previous DNS controller")
+	}
+}
+
 func TestDnsController_ReuseForReloadReprojectsCachedRoutes(t *testing.T) {
 	controller, err := NewDnsController(nil, &DnsControllerOption{
 		Log:                  logrus.New(),
@@ -193,6 +213,94 @@ func TestDnsController_ReuseForReloadReprojectsCachedRoutes(t *testing.T) {
 	require.NotSame(t, original, remapped)
 	require.Equal(t, uint64(2), remapped.RouteProjectionEpoch)
 	require.Equal(t, []uint32{2}, remapped.DomainBitmap)
+}
+
+func TestDnsController_ReuseForReloadSkipsUnchangedProjection(t *testing.T) {
+	projectionHash := [32]byte{1}
+	var projectionCalls atomic.Int64
+	controller, err := NewDnsController(nil, &DnsControllerOption{
+		Log:                  logrus.New(),
+		RouteProjectionEpoch: 11,
+		RouteProjectionHash:  projectionHash,
+		ProjectCacheRoute: func(*DnsCache) []uint32 {
+			projectionCalls.Add(1)
+			return []uint32{1}
+		},
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, controller.Close()) }()
+
+	original := &DnsCache{
+		RouteOwnerKey:        "unchanged.example.1",
+		RouteProjectionEpoch: 11,
+		DomainBitmap:         []uint32{1},
+		Deadline:             time.Now().Add(time.Minute),
+	}
+	controller.dnsCache.Store(original.RouteOwnerKey, original)
+
+	reused, err := controller.ReuseForReload(&DnsControllerOption{
+		Log:                  logrus.New(),
+		RouteProjectionEpoch: 12,
+		RouteProjectionHash:  projectionHash,
+		ProjectCacheRoute: func(*DnsCache) []uint32 {
+			projectionCalls.Add(1)
+			return []uint32{2}
+		},
+	}, nil)
+	require.NoError(t, err)
+	require.Equal(t, int64(0), projectionCalls.Load())
+	require.Equal(t, uint64(11), reused.runtime().routeProjectionEpoch)
+
+	value, ok := reused.dnsCache.Load(original.RouteOwnerKey)
+	require.True(t, ok)
+	require.Same(t, original, value, "unchanged projection must not replace cache wrappers")
+}
+
+func TestDnsController_ReuseForReloadReprojectionSharesImmutablePayload(t *testing.T) {
+	controller, err := NewDnsController(nil, &DnsControllerOption{
+		Log:                  logrus.New(),
+		RouteProjectionEpoch: 21,
+		RouteProjectionHash:  [32]byte{1},
+		ProjectCacheRoute: func(*DnsCache) []uint32 {
+			return []uint32{1}
+		},
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, controller.Close()) }()
+
+	original := &DnsCache{
+		RouteOwnerKey:        "changed.example.1",
+		RouteProjectionEpoch: 21,
+		DomainBitmap:         []uint32{1},
+		Answer: []dnsmessage.RR{&dnsmessage.A{
+			Hdr: dnsmessage.RR_Header{Name: "changed.example.", Rrtype: dnsmessage.TypeA, Class: dnsmessage.ClassINET, Ttl: 60},
+			A:   net.IPv4(192, 0, 2, 1),
+		}},
+		Deadline:         time.Now().Add(time.Minute),
+		OriginalDeadline: time.Now().Add(time.Minute),
+	}
+	require.NoError(t, original.PrepackResponse("changed.example.", dnsmessage.TypeA))
+	controller.dnsCache.Store(original.RouteOwnerKey, original)
+
+	reused, err := controller.ReuseForReload(&DnsControllerOption{
+		Log:                  logrus.New(),
+		RouteProjectionEpoch: 22,
+		RouteProjectionHash:  [32]byte{2},
+		ProjectCacheRoute: func(*DnsCache) []uint32 {
+			return []uint32{2}
+		},
+	}, nil)
+	require.NoError(t, err)
+
+	value, ok := reused.dnsCache.Load(original.RouteOwnerKey)
+	require.True(t, ok)
+	remapped, ok := value.(*DnsCache)
+	require.True(t, ok)
+	require.NotSame(t, original, remapped)
+	require.Equal(t, []uint32{2}, remapped.DomainBitmap)
+	require.Equal(t, []uint32{1}, original.DomainBitmap)
+	require.Same(t, original.Answer[0], remapped.Answer[0])
+	require.Same(t, original.packedResponse.Load(), remapped.packedResponse.Load())
 }
 
 func TestDnsController_ReprojectCachedRoutesSkipsProjectionAfterRuntimeSwap(t *testing.T) {
@@ -278,7 +386,6 @@ func TestDnsController_ProcessBpfUpdateTaskSkipsStaleRouteProjection(t *testing.
 	cache := &DnsCache{RouteProjectionEpoch: 1}
 	require.True(t, controller.processBpfUpdateTask(&bpfUpdateTask{
 		cache:                cache,
-		now:                  time.Now(),
 		routeProjectionEpoch: 1,
 	}, false))
 	require.False(t, callbackCalled)
@@ -288,7 +395,6 @@ func TestDnsController_ProcessBpfUpdateTaskSkipsStaleRouteProjection(t *testing.
 	cache.RouteProjectionEpoch = 2
 	require.True(t, controller.processBpfUpdateTask(&bpfUpdateTask{
 		cache:                cache,
-		now:                  time.Now(),
 		routeProjectionEpoch: 2,
 	}, false))
 	require.True(t, callbackCalled)
@@ -326,6 +432,26 @@ func TestDnsController_ReuseForReloadUpdatesBehaviorConfig(t *testing.T) {
 	require.Equal(t, enabled, ctrlEnabled)
 	require.Equal(t, ttl, ctrlTTL)
 	require.Equal(t, maxCacheSize, ctrlMaxCacheSize)
+
+	third, err := reused.ReuseForReload(&DnsControllerOption{
+		Log:                logrus.New(),
+		IpVersionPrefer:    int(IpVersionPrefer_4),
+		OptimisticCache:    false,
+		OptimisticCacheTtl: 15,
+		MaxCacheSize:       7,
+	}, nil)
+	require.NoError(t, err)
+	for name, facade := range map[string]*DnsController{
+		"original": controller,
+		"second":   reused,
+		"third":    third,
+	} {
+		require.Equal(t, dnsmessage.TypeA, facade.currentQtypePrefer(), name)
+		enabled, ttl, maxCacheSize := facade.currentOptimisticCacheConfig()
+		require.False(t, enabled, name)
+		require.Equal(t, 15, ttl, name)
+		require.Equal(t, 7, maxCacheSize, name)
+	}
 }
 
 func TestDnsController_UpdateRuntimeRejectsInvalidIpVersionPreference(t *testing.T) {

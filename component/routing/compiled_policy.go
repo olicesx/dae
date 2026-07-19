@@ -7,7 +7,6 @@ package routing
 
 import (
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"net/netip"
 	"sort"
@@ -89,7 +88,7 @@ func (s *PolicySnapshot) Compile(log *logrus.Logger, outboundName2ID map[string]
 	}
 
 	collector := newCompiledPolicyCollector(outboundName2ID)
-	if err := s.Lower(log, collector.registerParsers, collector.addFallback); err != nil {
+	if err := s.program.Lower(log, collector.registerParsers, collector.addFallback); err != nil {
 		return nil, err
 	}
 	if len(collector.matches) > consts.MaxMatchSetLen {
@@ -101,21 +100,12 @@ func (s *PolicySnapshot) Compile(log *logrus.Logger, outboundName2ID map[string]
 
 	plan := collector.plan()
 	outboundIDs := copiedOutboundIDs(collector.outboundName2ID)
-	encoded, err := json.Marshal(struct {
-		OutboundIDs []OutboundID
-		Plan        CompiledPolicyPlan
-	}{
-		OutboundIDs: outboundIDs,
-		Plan:        plan,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("marshal compiled routing policy for hash: %w", err)
-	}
+	compiledHash := hashCompiledPolicy(outboundIDs, plan)
 
 	return &CompiledPolicy{
-		epoch:       s.epoch,
-		sourceHash:  s.hash,
-		hash:        sha256.Sum256(encoded),
+		epoch:       s.Epoch(),
+		sourceHash:  s.Hash(),
+		hash:        compiledHash,
 		outboundIDs: outboundIDs,
 		plan:        plan,
 	}, nil
@@ -167,6 +157,15 @@ func (p *CompiledPolicy) UserspacePlan() CompiledPolicyPlan {
 		return CompiledPolicyPlan{}
 	}
 	return cloneCompiledPolicyPlan(p.plan)
+}
+
+// PlanView returns a borrowed read-only view of the compiled plan.
+// Callers must not mutate the returned slices or any nested slice.
+func (p *CompiledPolicy) PlanView() CompiledPolicyPlan {
+	if p == nil {
+		return CompiledPolicyPlan{}
+	}
+	return p.plan
 }
 
 type compiledPolicyCollector struct {
@@ -446,14 +445,14 @@ func (c *compiledPolicyCollector) plan() CompiledPolicyPlan {
 		referenced = append(referenced, name)
 	}
 	sort.Strings(referenced)
-	return cloneCompiledPolicyPlan(CompiledPolicyPlan{
+	return CompiledPolicyPlan{
 		Matches:                    c.matches,
 		PredicateGroups:            c.predicateGroups,
 		PrefixSets:                 c.prefixSets,
 		DeduplicatedPrefixSetCount: len(c.lpmDedup),
 		ReferencedOutbounds:        referenced,
 		PacketMetadataSensitive:    c.metadata,
-	})
+	}
 }
 
 func copiedOutboundIDs(bindings map[string]uint8) []OutboundID {

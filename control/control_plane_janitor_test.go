@@ -6,7 +6,9 @@
 package control
 
 import (
+	"context"
 	stderrors "errors"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -268,7 +270,7 @@ func TestCleanupUdpConnStateMapRemovesExpiredRoutingResult(t *testing.T) {
 	}
 }
 
-func TestCleanupTcpConnStateMapRemovesExpiredRoutingResult(t *testing.T) {
+func TestCleanupTcpConnStateMapRetainsIdleActiveRoutingResult(t *testing.T) {
 	tcpMap := newJanitorTestMap(t, "conn_state_map")
 	now := monotonicNowNs(t)
 
@@ -289,7 +291,7 @@ func TestCleanupTcpConnStateMapRemovesExpiredRoutingResult(t *testing.T) {
 	freshState.Meta.Data.HasRouting = 1
 
 	staleState := freshState
-	staleState.LastSeenNs = staleTimestampNs(now, tcpConnStateTimeoutEstablished+time.Second)
+	staleState.LastSeenNs = staleTimestampNs(now, 24*time.Hour)
 	staleState.Meta.Data.Mark = 404
 	staleState.Meta.Data.Outbound = 13
 
@@ -313,8 +315,8 @@ func TestCleanupTcpConnStateMapRemovesExpiredRoutingResult(t *testing.T) {
 	if tcpStats.entries != 2 {
 		t.Fatalf("cleanupConnStateMap TCP entries = %d, want 2", tcpStats.entries)
 	}
-	if tcpStats.deleted != 1 {
-		t.Fatalf("cleanupConnStateMap TCP deleted = %d, want 1", tcpStats.deleted)
+	if tcpStats.deleted != 0 {
+		t.Fatalf("cleanupConnStateMap TCP deleted = %d, want 0", tcpStats.deleted)
 	}
 
 	freshResult, err := core.RetrieveRoutingResult(freshSrc, freshDst, unix.IPPROTO_TCP)
@@ -326,11 +328,11 @@ func TestCleanupTcpConnStateMapRemovesExpiredRoutingResult(t *testing.T) {
 	}
 
 	staleResult, err := core.RetrieveRoutingResult(staleSrc, staleDst, unix.IPPROTO_TCP)
-	if !stderrors.Is(err, ebpf.ErrKeyNotExist) {
-		t.Fatalf("RetrieveRoutingResult stale tcp err = %v, want %v", err, ebpf.ErrKeyNotExist)
+	if err != nil {
+		t.Fatalf("RetrieveRoutingResult idle active tcp: %v", err)
 	}
-	if staleResult != nil {
-		t.Fatalf("stale tcp routing result = %+v, want nil", staleResult)
+	if staleResult.Mark != staleState.Meta.Data.Mark || staleResult.Outbound != staleState.Meta.Data.Outbound {
+		t.Fatalf("idle active tcp routing result = %+v, want mark=%d outbound=%d", staleResult, staleState.Meta.Data.Mark, staleState.Meta.Data.Outbound)
 	}
 }
 
@@ -429,6 +431,143 @@ func TestCleanupRedirectTrackMapUsesIndependentTTL(t *testing.T) {
 	var gotStale bpfRedirectEntry
 	if err := redirectMap.Lookup(staleKey, &gotStale); !stderrors.Is(err, ebpf.ErrKeyNotExist) {
 		t.Fatalf("stale redirect_track lookup err = %v, want %v", err, ebpf.ErrKeyNotExist)
+	}
+}
+
+func TestReloadCleanupPreservesProcessOwnedTCPStateUntilFlowEnds(t *testing.T) {
+	redirectMap := newJanitorTestMap(t, "redirect_track")
+	connMap := newJanitorTestMap(t, "conn_state_map")
+	now := monotonicNowNs(t)
+	src := common.ConvergeAddrPort(netip.MustParseAddrPort("192.0.2.40:43000"))
+	dst := common.ConvergeAddrPort(netip.MustParseAddrPort("198.51.100.50:443"))
+	connKey := tuplesKeyFromAddrPorts(src, dst, unix.IPPROTO_TCP)
+	redirectKey := redirectTupleFromAddrs(src.Addr(), dst.Addr())
+
+	connState := bpfConnState{
+		LastSeenNs: staleTimestampNs(now, 24*time.Hour),
+	}
+	connState.Meta.Data.HasRouting = 1
+	if err := connMap.Update(connKey, &connState, ebpf.UpdateAny); err != nil {
+		t.Fatalf("update conn_state: %v", err)
+	}
+	redirectState := bpfRedirectEntry{
+		LastSeenNs: staleTimestampNs(now, redirectTrackTimeout+time.Second),
+	}
+	if err := redirectMap.Update(redirectKey, &redirectState, ebpf.UpdateAny); err != nil {
+		t.Fatalf("update redirect_track: %v", err)
+	}
+
+	manager := NewSessionManager(context.Background())
+	defer func() { _ = manager.Close() }()
+	ingress, ingressPeer := net.Pipe()
+	egress, egressPeer := net.Pipe()
+	defer func() { _ = ingressPeer.Close() }()
+	defer func() { _ = egressPeer.Close() }()
+	flow, err := manager.adoptTCP(
+		ingress,
+		egress,
+		TcpFlowBinding{},
+		nil,
+		[]bpfTuplesKey{*connKey},
+	)
+	if err != nil {
+		t.Fatalf("adoptTCP() error = %v", err)
+	}
+
+	core := &controlPlaneCore{}
+	core.bpf.Store(&bpfObjects{bpfMaps: bpfMaps{
+		RedirectTrack: redirectMap,
+		ConnStateMap:  connMap,
+	}})
+	plane := &ControlPlane{
+		log:            logrus.New(),
+		core:           core,
+		sessionManager: manager,
+		controlPlaneDatapathJanitor: controlPlaneDatapathJanitor{
+			connStateJanitorStop: make(chan struct{}),
+		},
+	}
+
+	plane.connStateCleanupMu.Lock()
+	redirectDeleted := plane.cleanupRedirectTrackMapBeforeLocked(uint64(now + 1))
+	_, tcpStats := plane.cleanupConnStateMapBeforeLocked(true, uint64(now+1))
+	plane.connStateCleanupMu.Unlock()
+	if redirectDeleted != 0 || tcpStats.deleted != 0 {
+		t.Fatalf("pinned cleanup deleted redirect=%d tcp=%d, want 0", redirectDeleted, tcpStats.deleted)
+	}
+	var gotRedirect bpfRedirectEntry
+	if err := redirectMap.Lookup(redirectKey, &gotRedirect); err != nil {
+		t.Fatalf("pinned redirect_track lookup: %v", err)
+	}
+	var gotConn bpfConnState
+	if err := connMap.Lookup(connKey, &gotConn); err != nil {
+		t.Fatalf("pinned conn_state lookup: %v", err)
+	}
+
+	flow.finish()
+	connState.State = 1
+	connState.LastSeenNs = staleTimestampNs(now, tcpConnStateTimeoutClosing+time.Second)
+	if err := connMap.Update(connKey, &connState, ebpf.UpdateAny); err != nil {
+		t.Fatalf("update closing conn_state: %v", err)
+	}
+	plane.connStateCleanupMu.Lock()
+	redirectDeleted = plane.cleanupRedirectTrackMapBeforeLocked(uint64(now + 1))
+	_, tcpStats = plane.cleanupConnStateMapBeforeLocked(true, uint64(now+1))
+	plane.connStateCleanupMu.Unlock()
+	if redirectDeleted != 1 || tcpStats.deleted != 1 {
+		t.Fatalf("unpinned cleanup deleted redirect=%d tcp=%d, want 1 each", redirectDeleted, tcpStats.deleted)
+	}
+	if err := redirectMap.Lookup(redirectKey, &gotRedirect); !stderrors.Is(err, ebpf.ErrKeyNotExist) {
+		t.Fatalf("redirect_track after unpin error = %v, want %v", err, ebpf.ErrKeyNotExist)
+	}
+	if err := connMap.Lookup(connKey, &gotConn); !stderrors.Is(err, ebpf.ErrKeyNotExist) {
+		t.Fatalf("conn_state after unpin error = %v, want %v", err, ebpf.ErrKeyNotExist)
+	}
+}
+
+func TestReloadCleanupPreservesProcessOwnedUDPStateUntilEndpointEnds(t *testing.T) {
+	connMap := newJanitorTestMap(t, "conn_state_map")
+	now := monotonicNowNs(t)
+	src := common.ConvergeAddrPort(netip.MustParseAddrPort("192.0.2.60:44000"))
+	dst := common.ConvergeAddrPort(netip.MustParseAddrPort("198.51.100.70:443"))
+	connKey := tuplesKeyFromAddrPorts(src, dst, unix.IPPROTO_UDP)
+	connState := bpfConnState{LastSeenNs: 1}
+	connState.Meta.Data.HasRouting = 1
+	if err := connMap.Update(connKey, &connState, ebpf.UpdateAny); err != nil {
+		t.Fatalf("update conn_state: %v", err)
+	}
+
+	bpf := &bpfObjects{bpfMaps: bpfMaps{ConnStateMap: connMap}}
+	manager := NewSessionManager(context.Background())
+	defer func() { _ = manager.Close() }()
+	manager.udpBPF.Store(bpf)
+	manager.RetainUdpConnStateTuples([]bpfTuplesKey{*connKey})
+	plane := &ControlPlane{
+		log:            logrus.New(),
+		sessionManager: manager,
+		core:           &controlPlaneCore{},
+		controlPlaneDatapathJanitor: controlPlaneDatapathJanitor{
+			connStateJanitorStop: make(chan struct{}),
+		},
+	}
+	plane.core.bpf.Store(bpf)
+
+	plane.connStateCleanupMu.Lock()
+	udpStats, _ := plane.cleanupConnStateMapBeforeLocked(true, uint64(now+1))
+	plane.connStateCleanupMu.Unlock()
+	if udpStats.deleted != 0 {
+		t.Fatalf("pinned cleanup deleted %d UDP entries, want 0", udpStats.deleted)
+	}
+	var got bpfConnState
+	if err := connMap.Lookup(connKey, &got); err != nil {
+		t.Fatalf("pinned conn_state lookup: %v", err)
+	}
+
+	if err := manager.ReleaseUdpConnStateTuples([]bpfTuplesKey{*connKey}); err != nil {
+		t.Fatalf("ReleaseUdpConnStateTuples() error = %v", err)
+	}
+	if err := connMap.Lookup(connKey, &got); !stderrors.Is(err, ebpf.ErrKeyNotExist) {
+		t.Fatalf("conn_state after endpoint release error = %v, want %v", err, ebpf.ErrKeyNotExist)
 	}
 }
 
@@ -646,7 +785,7 @@ func TestCleanupRoutingHandoffMapRemovesExpiredEntries(t *testing.T) {
 	}
 }
 
-func TestRunReloadRetirementCleanupRemovesOnlyEntriesUntouchedSinceCutover(t *testing.T) {
+func TestRunReloadRetirementCleanupPreservesUnexpiredEntriesAcrossCutover(t *testing.T) {
 	now := monotonicNowNs(t)
 	cutoff := now - uint64((2 * time.Second).Nanoseconds())
 	staleNs := cutoff - 1
@@ -689,12 +828,18 @@ func TestRunReloadRetirementCleanupRemovesOnlyEntriesUntouchedSinceCutover(t *te
 		netip.MustParseAddrPort("9.9.9.9:443"),
 		unix.IPPROTO_UDP,
 	)
-	staleUDP := bpfConnState{LastSeenNs: staleNs}
+	staleUDP := bpfConnState{
+		LastSeenNs:         staleNs,
+		RoutingEpochSlot:   bpfRoutingEpochSlot0Encoded,
+		DatapathGeneration: 1,
+	}
 	staleUDP.Meta.Data.HasRouting = 1
-	staleUDP.Meta.Data.Outbound = 3
-	freshUDP := bpfConnState{LastSeenNs: freshNs}
+	freshUDP := bpfConnState{
+		LastSeenNs:         freshNs,
+		RoutingEpochSlot:   bpfRoutingEpochSlot0Encoded,
+		DatapathGeneration: 2,
+	}
 	freshUDP.Meta.Data.HasRouting = 1
-	freshUDP.Meta.Data.Outbound = 4
 	if err := connMap.Update(staleUDPKey, &staleUDP, ebpf.UpdateAny); err != nil {
 		t.Fatalf("update stale conn_state_map: %v", err)
 	}
@@ -712,12 +857,18 @@ func TestRunReloadRetirementCleanupRemovesOnlyEntriesUntouchedSinceCutover(t *te
 		netip.MustParseAddrPort("8.8.8.8:443"),
 		unix.IPPROTO_TCP,
 	)
-	staleTCP := bpfConnState{LastSeenNs: staleNs}
+	staleTCP := bpfConnState{
+		LastSeenNs:         staleNs,
+		RoutingEpochSlot:   bpfRoutingEpochSlot0Encoded,
+		DatapathGeneration: 1,
+	}
 	staleTCP.Meta.Data.HasRouting = 1
-	staleTCP.Meta.Data.Outbound = 5
-	freshTCP := bpfConnState{LastSeenNs: freshNs}
+	freshTCP := bpfConnState{
+		LastSeenNs:         freshNs,
+		RoutingEpochSlot:   bpfRoutingEpochSlot0Encoded,
+		DatapathGeneration: 2,
+	}
 	freshTCP.Meta.Data.HasRouting = 1
-	freshTCP.Meta.Data.Outbound = 6
 	if err := connMap.Update(staleTCPKey, &staleTCP, ebpf.UpdateAny); err != nil {
 		t.Fatalf("update stale conn_state_map: %v", err)
 	}
@@ -745,6 +896,7 @@ func TestRunReloadRetirementCleanupRemovesOnlyEntriesUntouchedSinceCutover(t *te
 	}
 
 	core := &controlPlaneCore{}
+	core.datapathGeneration.Store(2)
 	core.bpf.Store(&bpfObjects{bpfMaps: bpfMaps{
 		RedirectTrack:     redirectMap,
 		CookiePidMap:      cookieMap,
@@ -762,40 +914,40 @@ func TestRunReloadRetirementCleanupRemovesOnlyEntriesUntouchedSinceCutover(t *te
 	plane.RunReloadRetirementCleanup(cutoff)
 
 	var gotRedirect bpfRedirectEntry
-	if err := redirectMap.Lookup(staleRedirectKey, &gotRedirect); !stderrors.Is(err, ebpf.ErrKeyNotExist) {
-		t.Fatalf("stale redirect_track lookup err = %v, want %v", err, ebpf.ErrKeyNotExist)
+	if err := redirectMap.Lookup(staleRedirectKey, &gotRedirect); err != nil {
+		t.Fatalf("pre-cutover redirect_track lookup failed: %v", err)
 	}
 	if err := redirectMap.Lookup(freshRedirectKey, &gotRedirect); err != nil {
 		t.Fatalf("fresh redirect_track lookup failed: %v", err)
 	}
 
 	var gotCookie bpfPidPname
-	if err := cookieMap.Lookup(staleCookieKey, &gotCookie); !stderrors.Is(err, ebpf.ErrKeyNotExist) {
-		t.Fatalf("stale cookie_pid_map lookup err = %v, want %v", err, ebpf.ErrKeyNotExist)
+	if err := cookieMap.Lookup(staleCookieKey, &gotCookie); err != nil {
+		t.Fatalf("pre-cutover cookie_pid_map lookup failed: %v", err)
 	}
 	if err := cookieMap.Lookup(freshCookieKey, &gotCookie); err != nil {
 		t.Fatalf("fresh cookie_pid_map lookup failed: %v", err)
 	}
 
 	var gotUDP bpfConnState
-	if err := connMap.Lookup(staleUDPKey, &gotUDP); !stderrors.Is(err, ebpf.ErrKeyNotExist) {
-		t.Fatalf("stale conn_state_map lookup err = %v, want %v", err, ebpf.ErrKeyNotExist)
+	if err := connMap.Lookup(staleUDPKey, &gotUDP); err != nil {
+		t.Fatalf("pre-cutover UDP conn_state_map lookup failed: %v", err)
 	}
 	if err := connMap.Lookup(freshUDPKey, &gotUDP); err != nil {
 		t.Fatalf("fresh conn_state_map lookup failed: %v", err)
 	}
 
 	var gotTCP bpfConnState
-	if err := connMap.Lookup(staleTCPKey, &gotTCP); !stderrors.Is(err, ebpf.ErrKeyNotExist) {
-		t.Fatalf("stale conn_state_map lookup err = %v, want %v", err, ebpf.ErrKeyNotExist)
+	if err := connMap.Lookup(staleTCPKey, &gotTCP); err != nil {
+		t.Fatalf("pre-cutover TCP conn_state_map lookup failed: %v", err)
 	}
 	if err := connMap.Lookup(freshTCPKey, &gotTCP); err != nil {
 		t.Fatalf("fresh conn_state_map lookup failed: %v", err)
 	}
 
 	var gotHandoff bpfRoutingHandoffEntry
-	if err := handoffMap.Lookup(staleHandoffKey, &gotHandoff); !stderrors.Is(err, ebpf.ErrKeyNotExist) {
-		t.Fatalf("stale routing_handoff_map lookup err = %v, want %v", err, ebpf.ErrKeyNotExist)
+	if err := handoffMap.Lookup(staleHandoffKey, &gotHandoff); err != nil {
+		t.Fatalf("pre-cutover routing_handoff_map lookup failed: %v", err)
 	}
 	if err := handoffMap.Lookup(freshHandoffKey, &gotHandoff); err != nil {
 		t.Fatalf("fresh routing_handoff_map lookup failed: %v", err)

@@ -45,13 +45,14 @@ func TestRouteDial_RetriesAlternateFamilyAfterLocalNetworkFailure(t *testing.T) 
 	if got := res.SelectionNetworkTypeObj.IpVersion; got != consts.IpVersionStr_4 {
 		t.Fatalf("selection ip version = %v, want %v", got, consts.IpVersionStr_4)
 	}
-	if res.Binding.Route.Outbound != res.OutboundIndex || res.Binding.Route.Mark != res.Mark || res.Binding.Route.Must != res.Must {
-		t.Fatalf("route binding = %+v, want final result %+v", res.Binding.Route, res)
+	binding := newTcpFlowBinding(cp.PolicyEpoch(), res)
+	if binding.Route.Outbound != res.OutboundIndex || binding.Route.Mark != res.Mark || binding.Route.Must != res.Must {
+		t.Fatalf("route binding = %+v, want final result %+v", binding.Route, res)
 	}
-	if res.Binding.Egress.Dialer != res.Dialer || res.Binding.Egress.Outbound != res.Outbound || res.Binding.Egress.Target != res.DialTarget || res.Binding.Egress.Network != res.Network || res.Binding.Egress.NetworkType != *res.SelectionNetworkTypeObj {
-		t.Fatalf("egress binding = %+v, want final result %+v", res.Binding.Egress, res)
+	if binding.Egress.Dialer != res.Dialer || binding.Egress.Outbound != res.Outbound || binding.Egress.Target != res.DialTarget || binding.Egress.Network != res.Network || binding.Egress.NetworkType != *res.SelectionNetworkTypeObj {
+		t.Fatalf("egress binding = %+v, want final result %+v", binding.Egress, res)
 	}
-	if got := res.Binding.Egress.NetworkType.IpVersion; got != consts.IpVersionStr_4 {
+	if got := binding.Egress.NetworkType.IpVersion; got != consts.IpVersionStr_4 {
 		t.Fatalf("bound selection ip version = %v, want %v", got, consts.IpVersionStr_4)
 	}
 }

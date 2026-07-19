@@ -6,6 +6,7 @@
 package control
 
 import (
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -253,7 +254,7 @@ func TestDnsController_EvictExpiredDnsCache_RemovesKnowledgeForLastScopedEntry(t
 
 func TestDnsController_EvictLRUIfFull_RemovesKnowledgeForEvictedBaseKey(t *testing.T) {
 	ctrl := newScopedDnsController(t)
-	ctrl.maxCacheSize.Store(1)
+	ctrl.maxCacheSize.Store(2)
 
 	baseKey1 := ctrl.cacheKey("knowledge-lru-old.test.", dnsmessage.TypeA)
 	req1 := &udpRequest{realDst: netip.MustParseAddrPort("8.8.4.4:53")}
@@ -277,12 +278,33 @@ func TestDnsController_EvictLRUIfFull_RemovesKnowledgeForEvictedBaseKey(t *testi
 	require.True(t, ok)
 	newCache.lastAccessNano.Store(time.Now().UnixNano())
 
-	ctrl.evictLRUIfFull()
+	ctrl.maxCacheSize.Store(1)
+	ctrl.evictLRUIfFull(1)
 
 	require.False(t, ctrl.HasDnsKnowledge(baseKey1), "knowledge should be cleared for the base key evicted by LRU")
 	require.True(t, ctrl.HasDnsKnowledge(baseKey2), "knowledge for the surviving cache entry should remain")
 	_, ok = ctrl.dnsCache.Load(cacheKey1)
 	require.False(t, ok, "oldest cache entry should be evicted by LRU")
+}
+
+func TestDnsController_EvictLRUUsesCapturedLimitAndUnlimitedIsNoop(t *testing.T) {
+	ctrl := newTestDnsController()
+	for i := range 3 {
+		key := fmt.Sprintf("captured-limit-%d", i)
+		cache := &DnsCache{RouteOwnerKey: key}
+		cache.lastAccessNano.Store(int64(i + 1))
+		ctrl.dnsCache.Store(key, cache)
+	}
+
+	// A concurrent reload may publish unlimited after the janitor captured the
+	// previous positive limit. The captured limit must not be re-read as zero.
+	ctrl.maxCacheSize.Store(0)
+	ctrl.evictLRUIfFull(2)
+	require.Equal(t, 2, countDnsCacheEntries(ctrl))
+
+	ctrl.dnsCache.Store("unlimited", &DnsCache{RouteOwnerKey: "unlimited"})
+	ctrl.evictLRUIfFull(0)
+	require.Equal(t, 3, countDnsCacheEntries(ctrl))
 }
 
 func TestDnsController_CloseNoPanicDuringBpfUpdate(t *testing.T) {

@@ -72,3 +72,40 @@ func TestShouldUseStagedHotHandoff(t *testing.T) {
 		})
 	}
 }
+
+func TestShouldStreamStagedDnsCache(t *testing.T) {
+	tests := []struct {
+		name                         string
+		stagedHotHandoff             bool
+		routingEpochEnabled          bool
+		dnsConfigUnchanged           bool
+		ipVersionPreferenceUnchanged bool
+		want                         bool
+	}{
+		{
+			name:                         "reusable routing epoch handoff",
+			stagedHotHandoff:             true,
+			routingEpochEnabled:          true,
+			dnsConfigUnchanged:           true,
+			ipVersionPreferenceUnchanged: true,
+			want:                         true,
+		},
+		{name: "legacy handoff", stagedHotHandoff: true, dnsConfigUnchanged: true, ipVersionPreferenceUnchanged: true},
+		{name: "fresh datapath", routingEpochEnabled: true, dnsConfigUnchanged: true, ipVersionPreferenceUnchanged: true},
+		{name: "changed DNS config", stagedHotHandoff: true, routingEpochEnabled: true, ipVersionPreferenceUnchanged: true},
+		{name: "changed IP preference", stagedHotHandoff: true, routingEpochEnabled: true, dnsConfigUnchanged: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shouldStreamStagedDnsCache(
+				tc.stagedHotHandoff,
+				tc.routingEpochEnabled,
+				tc.dnsConfigUnchanged,
+				tc.ipVersionPreferenceUnchanged,
+			)
+			if got != tc.want {
+				t.Fatalf("shouldStreamStagedDnsCache() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

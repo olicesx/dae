@@ -38,6 +38,9 @@ func shouldTryRawUDPFallback(err error, from, realTo netip.AddrPort) bool {
 	if from.Port() != 53 {
 		return false
 	}
+	if stderrors.Is(err, ErrAnyfromBindFailed) {
+		return true
+	}
 	if stderrors.Is(err, unix.EADDRINUSE) || stderrors.Is(err, unix.EADDRNOTAVAIL) {
 		return true
 	}
@@ -48,15 +51,15 @@ func shouldTryRawUDPFallback(err error, from, realTo netip.AddrPort) bool {
 		strings.Contains(errStr, "cannot assign requested address")
 }
 
-func tryRawUDPFallback(log *logrus.Logger, data []byte, from, realTo netip.AddrPort, debugEnabled, errorEnabled bool, reason string, err error) bool {
+func tryRawUDPFallback(log *logrus.Logger, data []byte, from, realTo netip.AddrPort, soMark uint32, debugEnabled, errorEnabled bool, reason string, err error) bool {
 	if !shouldTryRawUDPFallback(err, from, realTo) {
 		return false
 	}
 	var fallbackErr error
 	if from.Addr().Is4() || from.Addr().Is4In6() {
-		fallbackErr = sendUDPv4RawInDaeNetns(data, from, realTo)
+		fallbackErr = sendUDPv4RawInDaeNetns(data, from, realTo, soMark)
 	} else {
-		fallbackErr = sendUDPv6RawInDaeNetns(data, from, realTo)
+		fallbackErr = sendUDPv6RawInDaeNetns(data, from, realTo, soMark)
 	}
 	if fallbackErr == nil {
 		if debugEnabled {
@@ -290,6 +293,14 @@ func (s anyfromPtrSlot) Swap(next *Anyfrom) {
 	swapPinnedAnyfrom(s.ptr, next)
 }
 
+func (s anyfromPtrSlot) CompareAndSwap(old, next *Anyfrom) bool {
+	if s.ptr == nil || *s.ptr != old {
+		return false
+	}
+	swapPinnedAnyfrom(s.ptr, next)
+	return true
+}
+
 func swapPinnedAnyfrom(slot **Anyfrom, next *Anyfrom) {
 	if slot == nil {
 		return
@@ -307,7 +318,7 @@ func swapPinnedAnyfrom(slot **Anyfrom, next *Anyfrom) {
 	}
 }
 
-func sendPktWithResponseConnSlot(log *logrus.Logger, data []byte, from netip.AddrPort, realTo netip.AddrPort, slot udpEndpointResponseConnSlot, cache udpEndpointResponseConnCache) (err error) {
+func sendPktWithResponseConnSlot(log *logrus.Logger, data []byte, from netip.AddrPort, realTo netip.AddrPort, soMark uint32, slot udpEndpointResponseConnSlot, cache udpEndpointResponseConnCache) (err error) {
 	// Proxy chain support: Use original 'from' address as bindAddr to ensure
 	// each server response gets its own UDP socket. This prevents response mixing
 	// when multiple IPv6 servers would otherwise share [::]:port (wildcard binding).
@@ -333,53 +344,74 @@ func sendPktWithResponseConnSlot(log *logrus.Logger, data []byte, from netip.Add
 	// Try cached socket first (for Symmetric NAT sessions)
 	if slot != nil {
 		if cached := slot.Load(); cached != nil {
-			if _, err = cached.WriteToUDPAddrPort(data, writeAddr); err == nil {
-				if traceEnabled {
+			if cached.soMark != soMark {
+				slot.CompareAndSwap(cached, nil)
+				if debugEnabled {
 					log.WithFields(logrus.Fields{
-						"to":         realTo.String(),
-						"write_addr": writeAddr.String(),
-						"cached":     true,
-					}).Trace("sendPkt: sent via cached socket")
+						"cached_mark": cached.soMark,
+						"reply_mark":  soMark,
+					}).Debug("sendPkt: discarded cached socket with mismatched mark")
 				}
-				return nil
-			}
-			// Cached socket is stale or broken; clear the cache slot immediately
-			// so the next call doesn't waste time retrying a dead socket.
-			slot.Swap(nil)
-			if debugEnabled {
-				log.WithFields(logrus.Fields{
-					"error": err.Error(),
-				}).Debug("sendPkt: cached socket failed, getting new socket from pool")
+			} else {
+				if _, err = cached.WriteToUDPAddrPort(data, writeAddr); err == nil {
+					if traceEnabled {
+						log.WithFields(logrus.Fields{
+							"to":         realTo.String(),
+							"write_addr": writeAddr.String(),
+							"cached":     true,
+						}).Trace("sendPkt: sent via cached socket")
+					}
+					return nil
+				}
+				// Cached socket is stale or broken; clear the cache slot immediately
+				// so the next call doesn't waste time retrying a dead socket.
+				slot.CompareAndSwap(cached, nil)
+				if debugEnabled {
+					log.WithFields(logrus.Fields{
+						"error": err.Error(),
+					}).Debug("sendPkt: cached socket failed, getting new socket from pool")
+				}
 			}
 		}
 	}
 
 	if cache != nil {
 		if cached := cache.CachedResponseConn(bindAddr); cached != nil {
-			if _, err = cached.WriteToUDPAddrPort(data, writeAddr); err == nil {
-				if traceEnabled {
+			if cached.soMark != soMark {
+				cache.ClearCachedResponseConn(bindAddr, cached)
+				if debugEnabled {
 					log.WithFields(logrus.Fields{
-						"to":         realTo.String(),
-						"write_addr": writeAddr.String(),
-						"cached":     true,
-						"cache_kind": "bind_addr",
-					}).Trace("sendPkt: sent via bind-address cached socket")
+						"bind_addr":   bindAddr.String(),
+						"cached_mark": cached.soMark,
+						"reply_mark":  soMark,
+					}).Debug("sendPkt: discarded bind-address cached socket with mismatched mark")
 				}
-				return nil
-			}
-			cache.ClearCachedResponseConn(bindAddr, cached)
-			if debugEnabled {
-				log.WithFields(logrus.Fields{
-					"bind_addr": bindAddr.String(),
-					"error":     err.Error(),
-				}).Debug("sendPkt: bind-address cached socket failed, getting new socket from pool")
+			} else {
+				if _, err = cached.WriteToUDPAddrPort(data, writeAddr); err == nil {
+					if traceEnabled {
+						log.WithFields(logrus.Fields{
+							"to":         realTo.String(),
+							"write_addr": writeAddr.String(),
+							"cached":     true,
+							"cache_kind": "bind_addr",
+						}).Trace("sendPkt: sent via bind-address cached socket")
+					}
+					return nil
+				}
+				cache.ClearCachedResponseConn(bindAddr, cached)
+				if debugEnabled {
+					log.WithFields(logrus.Fields{
+						"bind_addr": bindAddr.String(),
+						"error":     err.Error(),
+					}).Debug("sendPkt: bind-address cached socket failed, getting new socket from pool")
+				}
 			}
 		}
 	}
 
-	uConn, isNew, err := DefaultAnyfromPool.GetOrCreate(bindAddr, AnyfromTimeout)
+	uConn, isNew, err := DefaultAnyfromPool.getOrCreateWithMark(bindAddr, soMark, AnyfromTimeout)
 	if err != nil {
-		if tryRawUDPFallback(log, data, from, realTo, debugEnabled, errorEnabled, "get-or-create", err) {
+		if tryRawUDPFallback(log, data, from, realTo, soMark, debugEnabled, errorEnabled, "get-or-create", err) {
 			return nil
 		}
 		if stderrors.Is(err, ErrAnyfromBindFailed) {
@@ -404,7 +436,7 @@ func sendPktWithResponseConnSlot(log *logrus.Logger, data []byte, from netip.Add
 
 	_, err = uConn.WriteToUDPAddrPort(data, writeAddr)
 	if err != nil {
-		if tryRawUDPFallback(log, data, from, realTo, debugEnabled, errorEnabled, "write-to-udp", err) {
+		if tryRawUDPFallback(log, data, from, realTo, soMark, debugEnabled, errorEnabled, "write-to-udp", err) {
 			return nil
 		}
 		if errorEnabled {
@@ -435,12 +467,12 @@ func sendPktWithResponseConnSlot(log *logrus.Logger, data []byte, from netip.Add
 	return err
 }
 
-func sendPktWithCacheProvider(log *logrus.Logger, data []byte, from netip.AddrPort, realTo netip.AddrPort, afp **Anyfrom, cache udpEndpointResponseConnCache) (err error) {
+func sendPktWithCacheProvider(log *logrus.Logger, data []byte, from netip.AddrPort, realTo netip.AddrPort, soMark uint32, afp **Anyfrom, cache udpEndpointResponseConnCache) (err error) {
 	var slot udpEndpointResponseConnSlot
 	if afp != nil {
 		slot = anyfromPtrSlot{ptr: afp}
 	}
-	return sendPktWithResponseConnSlot(log, data, from, realTo, slot, cache)
+	return sendPktWithResponseConnSlot(log, data, from, realTo, soMark, slot, cache)
 }
 
 // sendPkt sends a UDP packet to the destination.
@@ -451,13 +483,14 @@ func sendPktWithCacheProvider(log *logrus.Logger, data []byte, from netip.AddrPo
 //   - realTo: destination address where the packet should be sent
 //   - afp: optional cached Anyfrom socket for Symmetric NAT sessions
 func sendPkt(log *logrus.Logger, data []byte, from netip.AddrPort, realTo netip.AddrPort, afp **Anyfrom) (err error) {
-	return sendPktWithCacheProvider(log, data, from, realTo, afp, nil)
+	return sendPktWithCacheProvider(log, data, from, realTo, soMarkFromDae.Load(), afp, nil)
 }
 
 func forwardUdpEndpointReplyToClient(log *logrus.Logger, ue *UdpEndpoint, data []byte, from netip.AddrPort, clientAddr netip.AddrPort, send udpEndpointReplySender, recordDownload func(int64)) error {
 	recordDownload = normalizeTrafficRecord(recordDownload)
 	var cacheSlot udpEndpointResponseConnSlot
 	var cacheProvider udpEndpointResponseConnCache
+	replySoMark := ue.replySoMark()
 	if ue != nil {
 		cacheSlot = ue.responseConnSlot()
 		cacheProvider = ue
@@ -466,7 +499,7 @@ func forwardUdpEndpointReplyToClient(log *logrus.Logger, ue *UdpEndpoint, data [
 	// broken. Keeping the endpoint alive avoids recreating a fresh UDP session
 	// for every subsequent client packet after a transient local send failure.
 	if send == nil {
-		if err := sendPktWithResponseConnSlot(log, data, from, clientAddr, cacheSlot, cacheProvider); err != nil {
+		if err := sendPktWithResponseConnSlot(log, data, from, clientAddr, replySoMark, cacheSlot, cacheProvider); err != nil {
 			if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
 				log.WithFields(logrus.Fields{
 					"from":      from.String(),
@@ -495,9 +528,93 @@ func forwardUdpEndpointReplyToClient(log *logrus.Logger, ue *UdpEndpoint, data [
 	return nil
 }
 
+func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision) (bool, error) {
+	manager, _ := c.controlPlaneSessionManager()
+	if manager == nil {
+		return false, nil
+	}
+	ue, ok := manager.retainedUDPEndpoint(src, realDst, routingResult, c.PolicyEpoch())
+	if !ok {
+		return false, nil
+	}
+	if !c.checkUdpEndpointHealth(ue, ue.poolKey, true) {
+		ue.retire()
+		return true, nil
+	}
+	if flowDecision.HasConfirmedQuicState() || ue.SniffedDomain != "" {
+		ue.UpdateNatTimeout(QuicNatTimeout)
+	}
+	ue.TrackUdpConnStateTuplePair(src, realDst)
+	_, err := ue.WriteTo(data, realDst.String())
+	if err != nil {
+		if lifecycle, lifecycleOK := newUdpSessionLifecycleContext(ue, ""); lifecycleOK && c.shouldPenalizeUdpEndpointWriteError(err) {
+			lifecycle.reportUnavailable(fmt.Errorf("retained UDP endpoint write failed: %w", err))
+		}
+		ue.retire()
+		if c.log != nil && c.log.IsLevelEnabled(logrus.DebugLevel) {
+			c.log.WithFields(logrus.Fields{
+				"from": src.String(),
+				"to":   realDst.String(),
+			}).WithError(err).Debug("Retired process-owned UDP endpoint after write failure")
+		}
+		return true, nil
+	}
+	RecordUploadTraffic(int64(len(data)))
+	if lifecycle, lifecycleOK := newUdpSessionLifecycleContext(ue, ""); lifecycleOK {
+		lifecycle.reportTrafficSuccess()
+	}
+	return true, nil
+}
+
+func currentPolicyUDPRoutingResult(stale *bpfRoutingResult) *bpfRoutingResult {
+	result := &bpfRoutingResult{
+		Outbound:         uint8(consts.OutboundControlPlaneRouting),
+		RoutingEpochSlot: bpfRoutingEpochSlotUnknown,
+	}
+	if stale == nil {
+		return result
+	}
+	result.Mac = stale.Mac
+	result.Pname = stale.Pname
+	result.Pid = stale.Pid
+	result.Dscp = stale.Dscp
+	return result
+}
+
+func (c *ControlPlane) prepareUnownedUDPCurrentPolicyFallback(src, dst netip.AddrPort, stale *bpfRoutingResult) (*bpfRoutingResult, bool, error) {
+	if c == nil || !c.isPublishedActiveControlPlane() || !c.ownsActiveRoutingEpoch() {
+		return nil, false, nil
+	}
+	manager, _ := c.controlPlaneSessionManager()
+	retired, err := manager.retireUnpinnedUDPConnState(src, dst)
+	if !retired {
+		return nil, false, err
+	}
+	return currentPolicyUDPRoutingResult(stale), true, err
+}
+
 func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision, skipSniffing bool) (err error) {
+	if handled, retainedErr := c.handleRetainedUDPEndpoint(data, src, realDst, routingResult, flowDecision); handled {
+		return retainedErr
+	}
 	owner, release, ownerErr := c.acquireRoutingEpochExecutionOwner(routingResult)
 	if ownerErr != nil {
+		if stderrors.Is(ownerErr, errRoutingEpochOwnerUnavailable) {
+			if fallbackResult, fallback, retireErr := c.prepareUnownedUDPCurrentPolicyFallback(src, realDst, routingResult); fallback {
+				if retireErr != nil && c.log != nil && c.log.IsLevelEnabled(logrus.DebugLevel) {
+					c.log.WithError(retireErr).Debug("Failed to remove unowned stale UDP conn-state before current-policy fallback")
+				}
+				return c.handlePktOwned(
+					lConn,
+					data,
+					src,
+					realDst,
+					fallbackResult,
+					flowDecision,
+					skipSniffing,
+				)
+			}
+		}
 		return fmt.Errorf("select UDP routing epoch owner: %w", ownerErr)
 	}
 	if release != nil {
@@ -974,19 +1091,29 @@ getNew:
 		ue.UpdateNatTimeout(natTimeout)
 		isNew = false
 	} else {
+		connStateOwner := udpConnStateOwner(c.core)
+		endpointDrainTracker := c.drainTracker
+		sessionManager, _ := c.controlPlaneSessionManager()
+		if sessionManager != nil {
+			connStateOwner = sessionManager
+			endpointDrainTracker = nil
+		}
+		replyLog := c.log
 		ue, isNew, err = DefaultUdpEndpointPool.GetOrCreate(ueKey, &UdpEndpointOptions{
 			Ctx: c.ctx,
 			// Handler handles response packets and send it to the client.
 			Handler: func(ue *UdpEndpoint, data []byte, from netip.AddrPort) (err error) {
-				return forwardUdpEndpointReplyToClient(c.log, ue, data, from, realSrc, nil, c.runtimeDownloadRecorder())
+				return forwardUdpEndpointReplyToClient(replyLog, ue, data, from, realSrc, nil, RecordDownloadTraffic)
 			},
 			NatTimeout:      natTimeout,
-			ConnStateOwner:  c.core,
-			DrainTracker:    c.drainTracker,
+			ConnStateOwner:  connStateOwner,
+			DrainTracker:    endpointDrainTracker,
 			admissionGate:   &c.udpEndpointAdmission,
 			Log:             c.log,
 			NowNano:         nowNano,
 			replyDispatcher: c.udpReplyDispatcher,
+			sessionManager:  sessionManager,
+			egressRuntime:   c.egressRuntime,
 			GetDialOption: func(ctx context.Context) (option *DialOption, err error) {
 				dialParam := &proxyDialParam{
 					Outbound:    consts.OutboundIndex(routingResult.Outbound),
@@ -1044,7 +1171,7 @@ getNew:
 					Excluded:      excludedDialer,
 					NowNano:       nowNano,
 				}
-				option.Binding = newUdpFlowBinding(c.PolicySnapshot(), res.OutboundIndex, res.Mark, res.Must, option)
+				option.Binding = newUdpFlowBinding(c.PolicyEpoch(), res.OutboundIndex, res.Mark, res.Must, option)
 				return option, nil
 			},
 		})

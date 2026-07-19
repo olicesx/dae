@@ -7,6 +7,7 @@ package routing
 
 import (
 	"reflect"
+	"strconv"
 	"testing"
 
 	"github.com/daeuniverse/dae/common/consts"
@@ -144,6 +145,48 @@ func TestPolicySnapshotCompileUsesOneOutboundBindingSnapshot(t *testing.T) {
 		t.Fatalf("compiled proxy IDs = (%d, %d), want binding snapshot ID 2", plan.Matches[2].Outbound, plan.Matches[len(plan.Matches)-1].Outbound)
 	}
 }
+
+func BenchmarkCompiledPolicyPlanAccess(b *testing.B) {
+	params := make([]*config_parser.Param, 4096)
+	for index := range params {
+		params[index] = &config_parser.Param{
+			Key: string(consts.RoutingDomainKey_Suffix),
+			Val: "domain-" + strconv.Itoa(index) + ".example",
+		}
+	}
+	program := &NormalizedProgram{
+		Rules: []*config_parser.RoutingRule{{
+			AndFunctions: []*config_parser.Function{{Name: consts.Function_Domain, Params: params}},
+			Outbound:     config_parser.Function{Name: "proxy"},
+		}},
+		Fallback: config.FunctionOrString("direct"),
+	}
+	snapshot, err := NewPolicySnapshotFromOwnedProgram(1, program)
+	if err != nil {
+		b.Fatalf("NewPolicySnapshotFromOwnedProgram() error = %v", err)
+	}
+	compiled, err := snapshot.Compile(logrus.New(), map[string]uint8{"direct": 1, "proxy": 2})
+	if err != nil {
+		b.Fatalf("Compile() error = %v", err)
+	}
+
+	b.Run("copy", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			plan := compiled.KernelPlan()
+			compiledPlanBenchmarkSink = len(plan.Matches) + len(plan.Matches[0].Domains)
+		}
+	})
+	b.Run("view", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			plan := compiled.PlanView()
+			compiledPlanBenchmarkSink = len(plan.Matches) + len(plan.Matches[0].Domains)
+		}
+	})
+}
+
+var compiledPlanBenchmarkSink int
 
 type mutateCompiledPolicyBindingsHook struct {
 	bindings map[string]uint8

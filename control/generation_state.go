@@ -17,6 +17,7 @@ type controlPlaneGenerationState struct {
 	outbounds           []*outbound.DialerGroup
 	referencedOutbounds map[string]struct{}
 	dialMode            consts.DialMode
+	policyIdentity      routing.PolicyIdentity
 	policySnapshot      *routing.PolicySnapshot
 	routingMatcher      *RoutingMatcher
 	decisionShadow      *phase4DecisionShadow
@@ -29,6 +30,7 @@ func (s *controlPlaneGenerationState) releaseRetainedState() {
 	}
 	s.outbounds = nil
 	s.referencedOutbounds = nil
+	s.policyIdentity = routing.PolicyIdentity{}
 	s.policySnapshot = nil
 	s.routingMatcher = nil
 	s.decisionShadow = nil

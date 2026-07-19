@@ -7,6 +7,7 @@ package control
 
 import (
 	stderrors "errors"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -168,8 +169,6 @@ func TestBpfProjectionRetryIntentSurvivesPrimaryQueueSaturation(t *testing.T) {
 	}
 	controller.scheduleBpfProjectionRetry(&bpfUpdateTask{
 		cache:                retryCache,
-		cacheKey:             retryCache.RouteOwnerKey,
-		runtime:              controller.runtime(),
 		routeProjectionEpoch: 7,
 	})
 	close(releasePrimary)
@@ -349,8 +348,6 @@ func TestBpfProjectionCloseDropsDueRetry(t *testing.T) {
 	<-firstStarted
 	controller.scheduleBpfProjectionRetry(&bpfUpdateTask{
 		cache:                retryCache,
-		cacheKey:             retryCache.RouteOwnerKey,
-		runtime:              controller.runtime(),
 		routeProjectionEpoch: 7,
 		retryAttempt:         bpfProjectionRetryLimit - 1,
 	})
@@ -363,7 +360,6 @@ func TestBpfProjectionCloseDropsDueRetry(t *testing.T) {
 
 	if !controller.sendBpfUpdateTask(&bpfUpdateTask{
 		cache:                blocker,
-		runtime:              controller.runtime(),
 		routeProjectionEpoch: 7,
 	}) {
 		t.Fatal("sendBpfUpdateTask() = false, want blocker task queued")
@@ -467,6 +463,239 @@ func TestDnsCachePublicationWaitsForReloadEpoch(t *testing.T) {
 	requireProjectionEventually(t, time.Second, func() bool {
 		return newCalls.Load() == 1
 	})
+}
+
+func TestBpfProjectionRetryIntentSetIsBoundedAndCoalescesReplacement(t *testing.T) {
+	controller := newTestDnsController()
+	controller.bpfRetryWake = make(chan struct{}, 1)
+	controller.bpfRetryPending = make(map[bpfProjectionRetryKey]*bpfUpdateTask)
+
+	for i := 0; i < bpfProjectionRetryCapacity+128; i++ {
+		cacheKey := "bounded-" + strconv.Itoa(i)
+		controller.scheduleBpfProjectionRetry(&bpfUpdateTask{
+			cache:                &DnsCache{RouteOwnerKey: cacheKey, RouteProjectionEpoch: 7},
+			routeProjectionEpoch: 7,
+		})
+	}
+
+	controller.bpfRetryMu.Lock()
+	if got := len(controller.bpfRetryPending); got != bpfProjectionRetryCapacity {
+		controller.bpfRetryMu.Unlock()
+		t.Fatalf("retry intent count = %d, want %d", got, bpfProjectionRetryCapacity)
+	}
+	if !controller.bpfRetryOverflow {
+		controller.bpfRetryMu.Unlock()
+		t.Fatal("retry overflow reconciliation was not requested")
+	}
+	controller.bpfRetryMu.Unlock()
+
+	key := "bounded-0"
+	replacement := &DnsCache{RouteOwnerKey: key, RouteProjectionEpoch: 7}
+	controller.scheduleBpfProjectionRetry(&bpfUpdateTask{
+		cache:                replacement,
+		routeProjectionEpoch: 7,
+	})
+	controller.bpfRetryMu.Lock()
+	got := controller.bpfRetryPending[bpfProjectionRetryKey{cacheKey: key, routeProjectionEpoch: 7}]
+	controller.bpfRetryMu.Unlock()
+	if got == nil || got.cache != replacement {
+		t.Fatal("retry intent retained the replaced cache")
+	}
+}
+
+func TestBpfProjectionRetrySchedulerIsBounded(t *testing.T) {
+	scheduler := newBpfProjectionRetryScheduler()
+	now := time.Now()
+	for i := 0; i < bpfProjectionRetryCapacity; i++ {
+		cacheKey := "scheduled-" + strconv.Itoa(i)
+		if !scheduler.addAt(&bpfUpdateTask{
+			cache:                &DnsCache{RouteOwnerKey: cacheKey},
+			routeProjectionEpoch: 7,
+		}, now) {
+			t.Fatalf("scheduler rejected task %d before reaching capacity", i)
+		}
+	}
+	if scheduler.addAt(&bpfUpdateTask{
+		cache:                &DnsCache{RouteOwnerKey: "overflow"},
+		routeProjectionEpoch: 7,
+	}, now) {
+		t.Fatal("scheduler accepted a task beyond its capacity")
+	}
+	if got := scheduler.queue.Len(); got != bpfProjectionRetryCapacity {
+		t.Fatalf("scheduler queue length = %d, want %d", got, bpfProjectionRetryCapacity)
+	}
+}
+
+func TestBpfProjectionRetrySchedulerCoalescesOwnerReplacement(t *testing.T) {
+	scheduler := newBpfProjectionRetryScheduler()
+	now := time.Now()
+	const ownerKey = "scheduler-replacement.example.:1"
+	original := &DnsCache{RouteOwnerKey: ownerKey, RouteProjectionEpoch: 7}
+	replacement := &DnsCache{RouteOwnerKey: ownerKey, RouteProjectionEpoch: 7}
+
+	if !scheduler.addAt(&bpfUpdateTask{cache: original, routeProjectionEpoch: 7}, now) {
+		t.Fatal("scheduler rejected original owner")
+	}
+	if !scheduler.addAt(&bpfUpdateTask{cache: replacement, routeProjectionEpoch: 7}, now) {
+		t.Fatal("scheduler rejected replacement owner")
+	}
+	if got := scheduler.queue.Len(); got != 1 {
+		t.Fatalf("scheduler queue length = %d, want one coalesced owner", got)
+	}
+	key := bpfProjectionRetryKey{cacheKey: ownerKey, routeProjectionEpoch: 7}
+	if got := scheduler.pending[key]; got == nil || got.task.cache != replacement {
+		t.Fatal("scheduler did not retain the latest cache owner")
+	}
+}
+
+func TestBpfUpdateTaskCurrentUsesCacheRouteOwnerKey(t *testing.T) {
+	controller := newTestDnsController()
+	const ownerKey = "current-owner.example.:1"
+	cache := &DnsCache{RouteOwnerKey: ownerKey, RouteProjectionEpoch: 7}
+	task := &bpfUpdateTask{cache: cache, routeProjectionEpoch: 7}
+	rt := &dnsControllerRuntimeState{
+		routeProjectionEpoch: 7,
+		cacheAccessCallback:  func(*DnsCache) error { return nil },
+	}
+
+	controller.dnsCache.Store(cache.RouteOwnerKey, cache)
+	if !controller.bpfUpdateTaskCurrent(task, rt) {
+		t.Fatal("current owner task was rejected")
+	}
+	controller.dnsCache.Store(cache.RouteOwnerKey, &DnsCache{RouteOwnerKey: ownerKey, RouteProjectionEpoch: 7})
+	if controller.bpfUpdateTaskCurrent(task, rt) {
+		t.Fatal("replaced cache owner remained current")
+	}
+}
+
+func TestReconcileCurrentBpfProjectionsUsesCurrentRuntime(t *testing.T) {
+	controller := newTestDnsController()
+	cache := &DnsCache{
+		RouteOwnerKey:        "reconcile.example.:1",
+		RouteProjectionEpoch: 9,
+		DomainBitmap:         []uint32{1},
+		Answer: []dnsmessage.RR{&dnsmessage.A{
+			Hdr: dnsmessage.RR_Header{Name: "reconcile.example.", Rrtype: dnsmessage.TypeA, Class: dnsmessage.ClassINET, Ttl: 60},
+			A:   []byte{192, 0, 2, 9},
+		}},
+	}
+	controller.dnsCache.Store(cache.RouteOwnerKey, cache)
+	var calls atomic.Int32
+	setTestDnsControllerRuntime(controller, func(rt *dnsControllerRuntimeState) {
+		rt.routeProjectionEpoch = 9
+		rt.cacheAccessCallback = func(got *DnsCache) error {
+			if got != cache {
+				t.Errorf("reconciled cache = %p, want %p", got, cache)
+			}
+			calls.Add(1)
+			return nil
+		}
+	})
+
+	controller.reconcileCurrentBpfProjections()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("reconciliation callback count = %d, want 1", got)
+	}
+	controller.reconcileCurrentBpfProjections()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("unchanged cache was reconciled again: callbacks = %d", got)
+	}
+}
+
+func TestBpfProjectionReconciliationRetriesAfterRuntimeChange(t *testing.T) {
+	controller := newTestDnsController()
+	cache := &DnsCache{
+		RouteOwnerKey:        "runtime-change.example.:1",
+		RouteProjectionEpoch: 10,
+		DomainBitmap:         []uint32{1},
+		Answer: []dnsmessage.RR{&dnsmessage.A{
+			Hdr: dnsmessage.RR_Header{Name: "runtime-change.example.", Rrtype: dnsmessage.TypeA, Class: dnsmessage.ClassINET, Ttl: 60},
+			A:   []byte{192, 0, 2, 10},
+		}},
+	}
+	controller.dnsCache.Store(cache.RouteOwnerKey, cache)
+	var firstCalls atomic.Int32
+	var currentCalls atomic.Int32
+	invalidated := make(chan struct{})
+	setTestDnsControllerRuntime(controller, func(rt *dnsControllerRuntimeState) {
+		rt.routeProjectionEpoch = 10
+		rt.cacheAccessCallback = func(*DnsCache) error {
+			firstCalls.Add(1)
+			setTestDnsControllerRuntime(controller, func(next *dnsControllerRuntimeState) {
+				next.routeProjectionEpoch = 10
+				next.cacheAccessCallback = func(*DnsCache) error {
+					currentCalls.Add(1)
+					return nil
+				}
+			})
+			go func() {
+				for cache.lastBpfDataHash.Load() == 0 {
+					time.Sleep(100 * time.Microsecond)
+				}
+				cache.lastBpfDataHash.Store(0)
+				close(invalidated)
+			}()
+			return nil
+		}
+	})
+	controller.startBpfUpdateWorker()
+	t.Cleanup(func() { _ = controller.Close() })
+
+	controller.bpfRetryMu.Lock()
+	controller.bpfRetryOverflow = true
+	wake := controller.bpfRetryWake
+	controller.bpfRetryMu.Unlock()
+	wake <- struct{}{}
+
+	select {
+	case <-invalidated:
+	case <-time.After(time.Second):
+		t.Fatal("first reconciliation did not finish")
+	}
+	requireProjectionEventually(t, time.Second, func() bool {
+		return currentCalls.Load() == 1
+	})
+	if got := firstCalls.Load(); got != 1 {
+		t.Fatalf("original runtime callback count = %d, want 1", got)
+	}
+}
+
+func TestBpfProjectionOverflowReconciliationHasBoundedRetryBudget(t *testing.T) {
+	controller := newTestDnsController()
+	cache := &DnsCache{
+		RouteOwnerKey:        "persistent-failure.example.:1",
+		RouteProjectionEpoch: 12,
+		DomainBitmap:         []uint32{1},
+		Answer: []dnsmessage.RR{&dnsmessage.A{
+			Hdr: dnsmessage.RR_Header{Name: "persistent-failure.example.", Rrtype: dnsmessage.TypeA, Class: dnsmessage.ClassINET, Ttl: 60},
+			A:   []byte{192, 0, 2, 12},
+		}},
+	}
+	controller.dnsCache.Store(cache.RouteOwnerKey, cache)
+	var calls atomic.Int32
+	setTestDnsControllerRuntime(controller, func(rt *dnsControllerRuntimeState) {
+		rt.routeProjectionEpoch = 12
+		rt.cacheAccessCallback = func(*DnsCache) error {
+			calls.Add(1)
+			return stderrors.New("persistent projection failure")
+		}
+	})
+	controller.startBpfUpdateWorker()
+	t.Cleanup(func() { _ = controller.Close() })
+
+	controller.bpfRetryMu.Lock()
+	controller.bpfRetryOverflow = true
+	wake := controller.bpfRetryWake
+	controller.bpfRetryMu.Unlock()
+	wake <- struct{}{}
+
+	requireProjectionEventually(t, 2*time.Second, func() bool {
+		return calls.Load() == bpfProjectionRetryLimit
+	})
+	time.Sleep(2 * bpfProjectionRetryMaxDelay)
+	if got := calls.Load(); got != bpfProjectionRetryLimit {
+		t.Fatalf("persistent failure callbacks = %d, want bounded at %d", got, bpfProjectionRetryLimit)
+	}
 }
 
 func requireProjectionEventually(t *testing.T, timeout time.Duration, condition func() bool) {

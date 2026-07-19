@@ -49,7 +49,6 @@ type proxyDialResult struct {
 	OrigNetworkTypeObj      *dialer.NetworkType
 	SelectionNetworkTypeObj *dialer.NetworkType
 	AdmissionNetworkTypeObj *dialer.NetworkType
-	Binding                 TcpFlowBinding
 }
 
 func shouldForceMarkUnavailableOnProxyDialError(err error) bool {
@@ -293,7 +292,6 @@ func (c *ControlPlane) routeDial(ctx context.Context, p *proxyDialParam) (netpro
 		cancel()
 		if err == nil {
 			observePhase1Dial(operation, phase1TransportForNetwork(p.Network), phase1DialOutcomeSuccess)
-			res.Binding = newTcpFlowBinding(c.PolicySnapshot(), res)
 			return conn, res, nil
 		}
 		observePhase1Dial(operation, phase1TransportForNetwork(p.Network), phase1DialOutcomeFailure)

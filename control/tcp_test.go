@@ -26,6 +26,18 @@ type mockConn struct {
 	closed     atomic.Bool
 }
 
+type closeOrderConn struct {
+	*mockConn
+	onClose func()
+}
+
+func (c *closeOrderConn) Close() error {
+	if c.onClose != nil {
+		c.onClose()
+	}
+	return c.mockConn.Close()
+}
+
 func newMockConn(block bool, retErr error) *mockConn {
 	m := &mockConn{
 		readBlock:  make(chan struct{}),
@@ -37,6 +49,37 @@ func newMockConn(block bool, retErr error) *mockConn {
 		})
 	}
 	return m
+}
+
+func TestCloseEstablishedTCPFlowClosesConnectionBeforeReleasingEgress(t *testing.T) {
+	var order []string
+	runtime := newEgressRuntime(nil, []func() error{func() error {
+		order = append(order, "lease")
+		return nil
+	}})
+	lease, ok := runtime.acquire()
+	if !ok {
+		t.Fatal("acquire egress lease failed")
+	}
+	if err := runtime.releaseOwner(); err != nil {
+		t.Fatalf("release owner: %v", err)
+	}
+	flow := &FlowRuntime{egressLease: lease}
+	conn := &closeOrderConn{
+		mockConn: newMockConn(false, nil),
+		onClose: func() {
+			order = append(order, "connection")
+		},
+	}
+
+	closeEstablishedTCPFlow(conn, flow)
+
+	if got, want := len(order), 2; got != want {
+		t.Fatalf("close order length = %d, want %d: %v", got, want, order)
+	}
+	if order[0] != "connection" || order[1] != "lease" {
+		t.Fatalf("close order = %v, want [connection lease]", order)
+	}
 }
 
 func (m *mockConn) Read(b []byte) (n int, err error) {

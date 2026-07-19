@@ -139,6 +139,10 @@ type Dialer struct {
 
 	recoveryManagerMu sync.Mutex
 	recoveryManager   *dialerRecoveryManager
+
+	metadataRetirer establishedFlowMetadataRetirer
+	retireOnce      sync.Once
+	closeOnce       sync.Once
 }
 
 type DialerCollectionHealthSnapshot struct {
@@ -186,6 +190,21 @@ type GlobalOption struct {
 	// across reload generations so a replacement control plane never reuses
 	// transports bound to the previous generation's dialer lifecycle.
 	TransportCacheNamespace string
+
+	metadataMu sync.Mutex
+}
+
+type establishedFlowMetadataRetirer interface {
+	RetireForEstablishedFlows()
+}
+
+func (o *GlobalOption) retireForEstablishedFlows() {
+	if o == nil {
+		return
+	}
+	o.metadataMu.Lock()
+	o.DaeDNS = nil
+	o.metadataMu.Unlock()
 }
 
 type InstanceOption struct {
@@ -308,51 +327,75 @@ func (d *Dialer) CloneWithGlobalOptionContext(ctx context.Context, option *Globa
 	return clone
 }
 
-func (d *Dialer) Close() error {
-	d.cancel()
-	if d.property != nil {
-		unregisterProxyCache(d.property.Address, d.proxyIpCache)
+// RetireForEstablishedFlows releases control-plane health state while keeping
+// the underlying transport available to already-established connections.
+func (d *Dialer) RetireForEstablishedFlows() {
+	if d == nil {
+		return
 	}
+	d.retireOnce.Do(func() {
+		d.cancel()
+		d.GlobalOption.retireForEstablishedFlows()
+		if d.metadataRetirer != nil {
+			d.metadataRetirer.RetireForEstablishedFlows()
+		}
+		if d.property != nil {
+			unregisterProxyCache(d.property.Address, d.proxyIpCache)
+		}
 
-	// Cancel any pending recovery confirmation to prevent timer leaks
-	d.cancelPendingRecoveryConfirmation(consts.L4ProtoStr_TCP)
-	d.cancelPendingRecoveryConfirmationForType(&NetworkType{
-		L4Proto:         consts.L4ProtoStr_UDP,
-		IpVersion:       consts.IpVersionStr_4,
-		IsDns:           true,
-		UdpHealthDomain: UdpHealthDomainDns,
-	})
-	d.cancelPendingRecoveryConfirmationForType(&NetworkType{
-		L4Proto:         consts.L4ProtoStr_UDP,
-		IpVersion:       consts.IpVersionStr_4,
-		UdpHealthDomain: UdpHealthDomainData,
-	})
+		// Cancel pending recovery work owned by the retired control plane.
+		d.cancelPendingRecoveryConfirmation(consts.L4ProtoStr_TCP)
+		d.cancelPendingRecoveryConfirmationForType(&NetworkType{
+			L4Proto:         consts.L4ProtoStr_UDP,
+			IpVersion:       consts.IpVersionStr_4,
+			IsDns:           true,
+			UdpHealthDomain: UdpHealthDomainDns,
+		})
+		d.cancelPendingRecoveryConfirmationForType(&NetworkType{
+			L4Proto:         consts.L4ProtoStr_UDP,
+			IpVersion:       consts.IpVersionStr_4,
+			UdpHealthDomain: UdpHealthDomainData,
+		})
 
-	d.tickerMu.Lock()
-	if d.ticker != nil {
-		d.ticker.Stop()
-	}
-	d.tickerMu.Unlock()
+		d.tickerMu.Lock()
+		if d.ticker != nil {
+			d.ticker.Stop()
+			d.ticker = nil
+		}
+		d.tickerMu.Unlock()
 
-	d.httpClientMu.Lock()
-	for k, cli := range d.httpClients {
-		if cli != nil {
-			cli.CloseIdleConnections()
-			// Further help the Go GC by clearing the pool reference.
-			if t, ok := cli.Transport.(*http.Transport); ok {
-				t.CloseIdleConnections()
+		d.httpClientMu.Lock()
+		for k, cli := range d.httpClients {
+			if cli != nil {
+				cli.CloseIdleConnections()
+				if t, ok := cli.Transport.(*http.Transport); ok {
+					t.CloseIdleConnections()
+				}
 			}
 			delete(d.httpClients, k)
 		}
-	}
-	d.httpClientMu.Unlock()
+		d.httpClientMu.Unlock()
 
-	// If the underlying dialer supports explicit closure (common for QUIC/Hysteria2),
-	// call it to retire background workers immediately.
-	if closer, ok := d.Dialer.(interface{ Close() error }); ok {
-		_ = closer.Close()
-	}
+		// Generation callbacks retain the retired control plane and its BPF maps.
+		d.aliveTransitionMu.Lock()
+		d.aliveTransitionCallbacks = nil
+		d.aliveTransitionMu.Unlock()
+	})
+}
 
+func (d *Dialer) Close() error {
+	if d == nil {
+		return nil
+	}
+	d.closeOnce.Do(func() {
+		d.RetireForEstablishedFlows()
+
+		// Multiplexed transports must remain open until the last established flow
+		// releases this concrete dialer.
+		if closer, ok := d.Dialer.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+	})
 	return nil
 }
 

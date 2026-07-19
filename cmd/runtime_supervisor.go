@@ -110,6 +110,9 @@ func (s *runtimeSupervisor) replaceActive(active *runtimeGeneration) error {
 	}
 
 	s.active = active
+	if active.controlPlane != nil {
+		active.controlPlane.PublishActiveDebugState()
+	}
 	return nil
 }
 
@@ -165,6 +168,9 @@ func (s *runtimeSupervisor) publishPrepared(candidate *runtimeGeneration) (*runt
 	s.active = candidate
 	s.prepared = nil
 	s.retiring = retiring
+	if candidate.controlPlane != nil {
+		candidate.controlPlane.PublishActiveDebugState()
+	}
 	return retiring, nil
 }
 

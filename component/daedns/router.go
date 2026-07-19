@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/assets"
@@ -213,13 +214,7 @@ func (r *Router) WrapSubscriptionDialer(base netproxy.Dialer, rawSubscription st
 	if !ok && r.requestMatcher == nil && controlHost == "" {
 		return base, nil
 	}
-	return &resolvingDialer{
-		Dialer:              base,
-		router:              r,
-		upstreamName:        upstream,
-		controlUpstreamName: upstream,
-		controlHost:         controlHost,
-	}, nil
+	return newResolvingDialer(base, r, upstream, upstream, controlHost), nil
 }
 
 func (r *Router) WrapNodeDialer(base netproxy.Dialer, meta NodeMeta) (netproxy.Dialer, error) {
@@ -239,13 +234,7 @@ func (r *Router) WrapNodeDialer(base netproxy.Dialer, meta NodeMeta) (netproxy.D
 	if !ok && r.requestMatcher == nil && meta.AddressHost == "" {
 		return base, nil
 	}
-	return &resolvingDialer{
-		Dialer:              base,
-		router:              r,
-		upstreamName:        upstream,
-		controlUpstreamName: upstream,
-		controlHost:         meta.AddressHost,
-	}, nil
+	return newResolvingDialer(base, r, upstream, upstream, meta.AddressHost), nil
 }
 
 func (r *Router) MatchSubscriptionUpstream(rawSubscription string) (string, bool) {
@@ -642,10 +631,46 @@ func sameDNSHost(a, b string) bool {
 
 type resolvingDialer struct {
 	netproxy.Dialer
-	router              *Router
+	router              atomic.Pointer[Router]
 	upstreamName        string
 	controlUpstreamName string
 	controlHost         string
+}
+
+var errResolvingDialerRetired = errors.New("dns resolving dialer retired")
+
+func newResolvingDialer(
+	base netproxy.Dialer,
+	router *Router,
+	upstreamName string,
+	controlUpstreamName string,
+	controlHost string,
+) *resolvingDialer {
+	d := &resolvingDialer{
+		Dialer:              base,
+		upstreamName:        upstreamName,
+		controlUpstreamName: controlUpstreamName,
+		controlHost:         controlHost,
+	}
+	d.router.Store(router)
+	return d
+}
+
+// UnwrapDialer exposes the transport below the generation-scoped resolver.
+func (d *resolvingDialer) UnwrapDialer() netproxy.Dialer {
+	if d == nil {
+		return nil
+	}
+	return d.Dialer
+}
+
+// RetireForEstablishedFlows drops generation-scoped DNS routing metadata.
+// Connections returned before retirement are independent of this wrapper.
+func (d *resolvingDialer) RetireForEstablishedFlows() {
+	if d == nil {
+		return
+	}
+	d.router.Store(nil)
 }
 
 func (d *resolvingDialer) lookupBaseIPAddr(ctx context.Context, network, host string) ([]net.IPAddr, error) {
@@ -657,28 +682,32 @@ func (d *resolvingDialer) lookupBaseIPAddr(ctx context.Context, network, host st
 	return net.DefaultResolver.LookupIPAddr(ctx, host)
 }
 
-func (d *resolvingDialer) lookupControlIPAddr(ctx context.Context, network, host string) ([]net.IPAddr, error) {
+func (d *resolvingDialer) lookupControlIPAddr(ctx context.Context, router *Router, network, host string) ([]net.IPAddr, error) {
 	if d.controlUpstreamName == "" {
-		return d.router.lookupBootstrapIPAddr(ctx, network, host)
+		return router.lookupBootstrapIPAddr(ctx, network, host)
 	}
-	ips, err := d.router.LookupIPAddr(ctx, d.controlUpstreamName, network, host)
+	ips, err := router.LookupIPAddr(ctx, d.controlUpstreamName, network, host)
 	if errors.Is(err, errPassthroughToBaseResolver) {
-		return d.router.lookupBootstrapIPAddr(ctx, network, host)
+		return router.lookupBootstrapIPAddr(ctx, network, host)
 	}
 	if err != nil {
 		return nil, err
 	}
 	if len(ips) == 0 {
-		return d.router.lookupBootstrapIPAddr(ctx, network, host)
+		return router.lookupBootstrapIPAddr(ctx, network, host)
 	}
 	return ips, nil
 }
 
 func (d *resolvingDialer) lookupIPAddr(ctx context.Context, network, host string) ([]net.IPAddr, error) {
-	if d.controlHost != "" && sameDNSHost(host, d.controlHost) {
-		return d.lookupControlIPAddr(ctx, network, host)
+	router := d.router.Load()
+	if router == nil {
+		return nil, errResolvingDialerRetired
 	}
-	ips, err := d.router.LookupIPAddr(ctx, d.upstreamName, network, host)
+	if d.controlHost != "" && sameDNSHost(host, d.controlHost) {
+		return d.lookupControlIPAddr(ctx, router, network, host)
+	}
+	ips, err := router.LookupIPAddr(ctx, d.upstreamName, network, host)
 	if errors.Is(err, errPassthroughToBaseResolver) {
 		return d.lookupBaseIPAddr(ctx, network, host)
 	}

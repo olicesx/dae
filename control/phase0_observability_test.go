@@ -90,10 +90,8 @@ func TestPhase0ObservabilityRecordsDNSProjectionOutcomes(t *testing.T) {
 	startedAt := time.Now().Add(-2 * time.Second)
 	if !controller.processBpfUpdateTask(&bpfUpdateTask{
 		cache:                &DnsCache{RouteProjectionEpoch: 2},
-		now:                  time.Now(),
 		routeProjectionEpoch: 2,
-		phase0Recorder:       recorder,
-		phase0StartedAt:      startedAt,
+		observation:          newBpfUpdateTaskObservation(recorder, startedAt),
 	}, false) {
 		t.Fatal("processBpfUpdateTask() = false, want true")
 	}
@@ -110,10 +108,8 @@ func TestPhase0ObservabilityRecordsDNSProjectionOutcomes(t *testing.T) {
 	})
 	controller.processBpfUpdateTask(&bpfUpdateTask{
 		cache:                &DnsCache{RouteProjectionEpoch: 2},
-		now:                  time.Now(),
 		routeProjectionEpoch: 2,
-		phase0Recorder:       recorder,
-		phase0StartedAt:      time.Now().Add(-2 * time.Second),
+		observation:          newBpfUpdateTaskObservation(recorder, time.Now().Add(-2*time.Second)),
 	}, false)
 	if got := recorder.dnsProjectionCount(phase0DNSProjectionAsync, phase0DNSProjectionFailed); got != 1 {
 		t.Fatalf("async failed count = %d, want 1", got)
@@ -128,16 +124,15 @@ func TestPhase0ObservabilityRecordsDNSProjectionOutcomes(t *testing.T) {
 	})
 	controller.processBpfUpdateTask(&bpfUpdateTask{
 		cache:                &DnsCache{RouteProjectionEpoch: 2},
-		now:                  time.Now(),
 		routeProjectionEpoch: 2,
-		phase0Recorder:       recorder,
+		observation:          newBpfUpdateTaskObservation(recorder, time.Time{}),
 	}, false)
 	if got := recorder.dnsProjectionCount(phase0DNSProjectionAsync, phase0DNSProjectionStale); got != 1 {
 		t.Fatalf("async stale count = %d, want 1", got)
 	}
 
 	controller.bpfUpdateClosed.Store(true)
-	if controller.sendBpfUpdateTask(&bpfUpdateTask{phase0Recorder: recorder}) {
+	if controller.sendBpfUpdateTask(&bpfUpdateTask{observation: newBpfUpdateTaskObservation(recorder, time.Time{})}) {
 		t.Fatal("sendBpfUpdateTask() = true, want queue rejection")
 	}
 	if got := recorder.dnsProjectionCount(phase0DNSProjectionAsync, phase0DNSProjectionQueueDrop); got != 1 {

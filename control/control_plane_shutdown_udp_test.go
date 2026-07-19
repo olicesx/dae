@@ -99,7 +99,7 @@ func TestControlPlaneClose_DoesNotResetGlobalUdpPools(t *testing.T) {
 	anyfrom.RefreshTtl()
 	anyfromShard := DefaultAnyfromPool.shardFor(anyfromAddr)
 	anyfromShard.mu.Lock()
-	anyfromShard.pool[anyfromAddr] = anyfrom
+	anyfromShard.pool[anyfromPoolKey{lAddr: anyfromAddr}] = anyfrom
 	anyfromShard.mu.Unlock()
 
 	plane := newShutdownTestControlPlane()
@@ -197,7 +197,7 @@ func TestResetGlobalUdpFlowStateClearsFlowPoolsWithoutStoppingJanitors(t *testin
 	anyfrom.RefreshTtl()
 	anyfromShard := DefaultAnyfromPool.shardFor(anyfromAddr)
 	anyfromShard.mu.Lock()
-	anyfromShard.pool[anyfromAddr] = anyfrom
+	anyfromShard.pool[anyfromPoolKey{lAddr: anyfromAddr}] = anyfrom
 	anyfromShard.mu.Unlock()
 
 	// Seed a packet sniffer session.

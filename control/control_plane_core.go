@@ -145,7 +145,9 @@ type controlPlaneCore struct {
 	routingEpochMu            sync.Mutex
 	routingEpochSlot          atomic.Uint32
 	routingEpochPreviousSlot  atomic.Uint32
+	routingEpochRollbackOff   atomic.Bool
 	routingEpochPolicyEpoch   atomic.Uint64
+	datapathGeneration        atomic.Uint32
 	routingEpochStaged        bool
 	routingEpochStagedSlot    uint32
 	routingEpochStagedEpoch   uint64
@@ -206,6 +208,7 @@ func newControlPlaneCore(log *logrus.Logger,
 	core.routingEpochSlot.Store(routingEpochSlotUnset)
 	core.routingEpochPreviousSlot.Store(routingEpochSlotUnset)
 	core.routingEpochStagedSlot = routingEpochSlotUnset
+	core.datapathGeneration.Store(uint32(bpfDatapathGeneration(bpf)))
 	core.bpf.Store(bpf)
 	core.udpConnStateTracker.Store(acquireSharedUdpConnStateTracker(bpf))
 	core.startIfindexWatcher()
@@ -220,6 +223,25 @@ func (c *controlPlaneCore) commitBpfHookFlip() error {
 		return fmt.Errorf("BPF hook flip changed during reload: active=%d expected=%d", atomic.LoadInt32(&coreFlip)&1, c.flipBase)
 	}
 	c.flipPending = false
+	return nil
+}
+
+func (c *controlPlaneCore) rollbackCommittedBpfHookFlip() error {
+	if c == nil || c.flipPending || !c.isReload {
+		return nil
+	}
+	active := atomic.LoadInt32(&coreFlip) & 1
+	if active == c.flipBase {
+		c.flipPending = true
+		return nil
+	}
+	if active != int32(c.flip) {
+		return fmt.Errorf("BPF hook flip changed before rollback: active=%d candidate=%d previous=%d", active, c.flip, c.flipBase)
+	}
+	if !atomic.CompareAndSwapInt32(&coreFlip, int32(c.flip), c.flipBase) {
+		return fmt.Errorf("BPF hook flip changed during rollback: active=%d candidate=%d previous=%d", atomic.LoadInt32(&coreFlip)&1, c.flip, c.flipBase)
+	}
+	c.flipPending = true
 	return nil
 }
 
@@ -434,6 +456,7 @@ func (c *controlPlaneCore) Close() (err error) {
 		if e := bpf.Close(); e != nil {
 			errs = append(errs, e)
 		}
+		unregisterBpfDatapathGeneration(bpf)
 	}
 	if tracker := c.udpConnStateTracker.Swap(nil); tracker != nil {
 		releaseSharedUdpConnStateTracker(bpf, tracker)
@@ -1316,6 +1339,7 @@ func (c *controlPlaneCore) InjectBpf(bpf *bpfObjects) {
 	defer c.mu.Unlock()
 	if bpf != nil {
 		c.bpf.Store(bpf)
+		c.datapathGeneration.Store(uint32(bpfDatapathGeneration(bpf)))
 	}
 	c.bpfEjected = false
 	c.bpfOwned = true

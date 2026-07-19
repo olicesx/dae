@@ -26,7 +26,7 @@ func NewRoutingMatcherBuilderFromCompiledPolicy(log *logrus.Logger, policy *rout
 		log = logrus.New()
 	}
 
-	plan := policy.KernelPlan()
+	plan := policy.PlanView()
 	if len(plan.Matches) == 0 {
 		return nil, fmt.Errorf("compiled routing policy has no matches")
 	}

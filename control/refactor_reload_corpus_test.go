@@ -34,9 +34,10 @@ func phase0ReloadLiveUdpFlowCorpusFixtures() []reloadLiveUdpFlowCorpusFixture {
 // receives a packet with different newly-selected route facts, but the shared
 // endpoint must continue using the original route, dialer, and drain lease.
 //
-// This corpus deliberately covers only reloads that retain the shared
-// datapath and have dialer overlap. Fresh-datapath and no-overlap reloads
-// explicitly interrupt old flows and are not a compatibility regression.
+// This legacy corpus exercises the shared-datapath compatibility path. The
+// process-level SessionManager tests cover fresh-datapath and no-overlap
+// reloads, where established flows retain their immutable bindings while new
+// flows use the newly published generation.
 func TestPhase0ReloadLiveUdpFlowCorpus_LegacyBaseline(t *testing.T) {
 	for _, fixture := range phase0ReloadLiveUdpFlowCorpusFixtures() {
 		fixture := fixture

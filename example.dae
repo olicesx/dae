@@ -213,10 +213,10 @@ dns {
 
     # Maximum number of DNS cache entries.
     # When cache size exceeds this limit, least recently used entries will be evicted.
-    # Set to 0 for unlimited cache size (default, original behavior).
-    # Recommended to set a limit when using optimistic_cache_ttl=0 to prevent memory leaks.
-    # Default: 0
-    #max_cache_size: 0
+    # Set to 0 for unlimited cache size.
+    # The finite default keeps high-cardinality query streams from growing memory without bound.
+    # Default: 65536
+    #max_cache_size: 65536
 
     # Bind to local address to listen for DNS queries
     # bind: '127.0.0.1:5353'

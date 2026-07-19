@@ -11,10 +11,12 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
+	commonerrors "github.com/daeuniverse/dae/common/errors"
 	componentdialer "github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/sirupsen/logrus"
@@ -80,55 +82,28 @@ func tcpFlowRegistryTestKey() TcpFlowKey {
 	)
 }
 
-func tcpFlowRegistryTestBinding() TcpFlowBinding {
-	return TcpFlowBinding{
-		Route: TcpRouteBinding{
-			PolicyEpoch: 7,
-			Outbound:    consts.OutboundUserDefinedMin,
-			Mark:        42,
-			Must:        true,
-		},
-		Egress: TcpEgressBinding{
-			Target:  "198.51.100.20:443",
-			Network: "tcp+0x2a",
-		},
-	}
-}
-
 func TestTCPFlowRegistryRegistersAndCleansUp(t *testing.T) {
 	cp := &ControlPlane{}
-	key := tcpFlowRegistryTestKey()
 	ingress, ingressPeer := net.Pipe()
 	defer func() { _ = ingress.Close() }()
 	defer func() { _ = ingressPeer.Close() }()
 	egress := newMockConn(false, nil)
 
-	entry, ok := cp.registerTCPFlow(key.Src, key.Dst, ingress, egress, tcpFlowRegistryTestBinding())
-	if !ok || entry == nil {
-		t.Fatal("registerTCPFlow() = nil")
+	if !cp.registerTCPFlow(ingress, egress) {
+		t.Fatal("registerTCPFlow() = false")
 	}
-	if got, ok := cp.tcpFlows.lookup(key); !ok || got != entry {
-		t.Fatalf("tuple lookup = (%p, %t), want (%p, true)", got, ok, entry)
-	}
-	if got, ok := cp.tcpFlows.lookupIngress(ingress); !ok || got != entry {
-		t.Fatalf("ingress lookup = (%p, %t), want (%p, true)", got, ok, entry)
-	}
-	if entry.Binding != tcpFlowRegistryTestBinding() {
-		t.Fatalf("flow binding = %+v", entry.Binding)
+	if got, ok := cp.tcpFlowEgress(ingress); !ok || got != egress {
+		t.Fatalf("ingress lookup = (%p, %t), want (%p, true)", got, ok, egress)
 	}
 
-	cp.unregisterTCPFlow(entry)
-	if _, ok := cp.tcpFlows.lookup(key); ok {
-		t.Fatal("tuple binding remained after cleanup")
-	}
-	if _, ok := cp.tcpFlows.lookupIngress(ingress); ok {
+	cp.unregisterTCPFlow(ingress)
+	if _, ok := cp.tcpFlowEgress(ingress); ok {
 		t.Fatal("ingress binding remained after cleanup")
 	}
 }
 
-func TestTCPFlowRegistryCleanupDoesNotDeleteReusedTuple(t *testing.T) {
+func TestTCPFlowRegistryCleanupDoesNotDeleteAnotherIngress(t *testing.T) {
 	cp := &ControlPlane{}
-	key := tcpFlowRegistryTestKey()
 	firstIngress, firstPeer := net.Pipe()
 	secondIngress, secondPeer := net.Pipe()
 	defer func() { _ = firstIngress.Close() }()
@@ -136,45 +111,37 @@ func TestTCPFlowRegistryCleanupDoesNotDeleteReusedTuple(t *testing.T) {
 	defer func() { _ = secondIngress.Close() }()
 	defer func() { _ = secondPeer.Close() }()
 
-	first, firstOK := cp.registerTCPFlow(key.Src, key.Dst, firstIngress, newMockConn(false, nil), tcpFlowRegistryTestBinding())
-	second, secondOK := cp.registerTCPFlow(key.Src, key.Dst, secondIngress, newMockConn(false, nil), tcpFlowRegistryTestBinding())
-	if !firstOK || !secondOK || first == nil || second == nil {
-		t.Fatal("registerTCPFlow() returned nil")
+	firstEgress := newMockConn(false, nil)
+	secondEgress := newMockConn(false, nil)
+	if !cp.registerTCPFlow(firstIngress, firstEgress) || !cp.registerTCPFlow(secondIngress, secondEgress) {
+		t.Fatal("registerTCPFlow() = false")
 	}
 
-	cp.unregisterTCPFlow(first)
-	if got, ok := cp.tcpFlows.lookup(key); !ok || got != second {
-		t.Fatalf("tuple lookup after stale cleanup = (%p, %t), want (%p, true)", got, ok, second)
-	}
-	if _, ok := cp.tcpFlows.lookupIngress(firstIngress); ok {
+	cp.unregisterTCPFlow(firstIngress)
+	if _, ok := cp.tcpFlowEgress(firstIngress); ok {
 		t.Fatal("first ingress binding remained after cleanup")
 	}
-	if got, ok := cp.tcpFlows.lookupIngress(secondIngress); !ok || got != second {
-		t.Fatalf("second ingress lookup = (%p, %t), want (%p, true)", got, ok, second)
+	if got, ok := cp.tcpFlowEgress(secondIngress); !ok || got != secondEgress {
+		t.Fatalf("second ingress lookup = (%p, %t), want (%p, true)", got, ok, secondEgress)
 	}
 }
 
 func TestControlPlaneAbortConnectionsRemovesTCPFlow(t *testing.T) {
 	cp := &ControlPlane{}
-	key := tcpFlowRegistryTestKey()
 	ingress, ingressPeer := net.Pipe()
 	defer func() { _ = ingressPeer.Close() }()
 	if !cp.registerIncomingConnection(ingress) {
 		t.Fatal("registerIncomingConnection() = false")
 	}
 	egress := newMockConn(false, nil)
-	entry, ok := cp.registerTCPFlow(key.Src, key.Dst, ingress, egress, tcpFlowRegistryTestBinding())
-	if !ok || entry == nil {
-		t.Fatal("registerTCPFlow() = nil")
+	if !cp.registerTCPFlow(ingress, egress) {
+		t.Fatal("registerTCPFlow() = false")
 	}
 
 	if err := cp.AbortConnections(); err != nil {
 		t.Fatalf("AbortConnections() error = %v", err)
 	}
-	if _, ok := cp.tcpFlows.lookup(key); ok {
-		t.Fatal("tuple binding remained after abort")
-	}
-	if _, ok := cp.tcpFlows.lookupIngress(ingress); ok {
+	if _, ok := cp.tcpFlowEgress(ingress); ok {
 		t.Fatal("ingress binding remained after abort")
 	}
 	if !egress.closed.Load() {
@@ -184,15 +151,14 @@ func TestControlPlaneAbortConnectionsRemovesTCPFlow(t *testing.T) {
 
 func TestControlPlaneAbortConnectionsIgnoresClosedTCPFlowEgress(t *testing.T) {
 	cp := &ControlPlane{}
-	key := tcpFlowRegistryTestKey()
 	ingress, ingressPeer := net.Pipe()
 	defer func() { _ = ingressPeer.Close() }()
 	if !cp.registerIncomingConnection(ingress) {
 		t.Fatal("registerIncomingConnection() = false")
 	}
 	egress := &tcpFlowRegistryAlreadyClosedConn{mockConn: newMockConn(false, nil)}
-	if entry, ok := cp.registerTCPFlow(key.Src, key.Dst, ingress, egress, tcpFlowRegistryTestBinding()); !ok || entry == nil {
-		t.Fatal("registerTCPFlow() = nil")
+	if !cp.registerTCPFlow(ingress, egress) {
+		t.Fatal("registerTCPFlow() = false")
 	}
 
 	if err := cp.AbortConnections(); err != nil {
@@ -214,17 +180,15 @@ func TestTCPFlowRegistryFollowsIncomingConnectionLeaseOwnership(t *testing.T) {
 		t.Fatal("transfer() = false")
 	}
 
-	key := tcpFlowRegistryTestKey()
 	egress := newMockConn(false, nil)
-	entry, registered := successor.registerTCPFlow(key.Src, key.Dst, ingress, egress, tcpFlowRegistryTestBinding())
-	if !registered || entry == nil {
-		t.Fatal("successor registerTCPFlow() = nil")
+	if !successor.registerTCPFlow(ingress, egress) {
+		t.Fatal("successor registerTCPFlow() = false")
 	}
 
 	if err := previous.AbortConnections(); err != nil {
 		t.Fatalf("previous AbortConnections() error = %v", err)
 	}
-	if _, ok := successor.tcpFlows.lookup(key); !ok {
+	if _, ok := successor.tcpFlowEgress(ingress); !ok {
 		t.Fatal("previous abort removed the successor flow")
 	}
 	if _, ok := successor.inConnections.Load(ingress); !ok {
@@ -237,7 +201,7 @@ func TestTCPFlowRegistryFollowsIncomingConnectionLeaseOwnership(t *testing.T) {
 	if err := successor.AbortConnections(); err != nil {
 		t.Fatalf("successor AbortConnections() error = %v", err)
 	}
-	if _, ok := successor.tcpFlows.lookup(key); ok {
+	if _, ok := successor.tcpFlowEgress(ingress); ok {
 		t.Fatal("successor abort retained its flow")
 	}
 	if !egress.closed.Load() {
@@ -273,12 +237,11 @@ func TestHandleTCPFlowRegistryRegistersAfterDialAndCleansUp(t *testing.T) {
 	}
 	close(releaseDial)
 	waitForCondition(t, time.Second, "TCP flow registry entry", func() bool {
-		_, ok := cp.tcpFlows.lookup(key)
+		_, ok := cp.tcpFlowEgress(ingress)
 		return ok
 	})
-	entry, _ := cp.tcpFlows.lookup(key)
-	if entry.Binding.Route.Outbound != consts.OutboundUserDefinedMin || entry.Binding.Route.Mark != 42 || !entry.Binding.Route.Must || entry.Binding.Egress.Dialer != d {
-		t.Fatalf("registered binding = %+v", entry.Binding)
+	if got, _ := cp.tcpFlowEgress(ingress); got != egress {
+		t.Fatalf("registered egress = %p, want %p", got, egress)
 	}
 
 	cancel()
@@ -287,8 +250,86 @@ func TestHandleTCPFlowRegistryRegistersAfterDialAndCleansUp(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for TCP relay cleanup")
 	}
-	if _, ok := cp.tcpFlows.lookup(key); ok {
-		t.Fatal("tuple binding remained after relay exit")
+	if _, ok := cp.tcpFlowEgress(ingress); ok {
+		t.Fatal("ingress binding remained after relay exit")
+	}
+}
+
+func TestProcessOwnedTCPFlowSurvivesGenerationCancellation(t *testing.T) {
+	releaseDial := make(chan struct{})
+	close(releaseDial)
+	egress, egressPeer := net.Pipe()
+	d, _ := newTCPFlowRegistryBlockingDialer(egress, releaseDial)
+	cp := newTCPFlowRegistryTestPlane(t, d)
+	manager := NewSessionManager(context.Background())
+	defer func() { _ = manager.Close() }()
+	if err := cp.AttachSessionManager(manager); err != nil {
+		t.Fatalf("AttachSessionManager() error = %v", err)
+	}
+	cleanupCalls := atomic.Int32{}
+	cp.egressRuntime = newEgressRuntime(nil, []func() error{func() error {
+		cleanupCalls.Add(1)
+		return nil
+	}})
+	ingress, ingressPeer := net.Pipe()
+	defer func() { _ = ingressPeer.Close() }()
+	defer func() { _ = egressPeer.Close() }()
+
+	generationCtx, cancelGeneration := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	key := tcpFlowRegistryTestKey()
+	go func() {
+		done <- cp.handleConnWithRoutingResult(generationCtx, ingress, key.Src, key.Dst, &bpfRoutingResult{
+			Outbound: uint8(consts.OutboundUserDefinedMin),
+		})
+	}()
+	waitForCondition(t, time.Second, "process-owned TCP flow", func() bool {
+		return manager.ActiveTCPConnections() == 1
+	})
+	cancelGeneration()
+	if err := cp.egressRuntime.releaseOwner(); err != nil {
+		t.Fatalf("releaseOwner() error = %v", err)
+	}
+	if cleanupCalls.Load() != 0 {
+		t.Fatal("egress runtime closed while flow remained active")
+	}
+
+	clientPayload := []byte("client-after-reload")
+	if _, err := ingressPeer.Write(clientPayload); err != nil {
+		t.Fatalf("client write after generation cancellation: %v", err)
+	}
+	gotClient := make([]byte, len(clientPayload))
+	if _, err := io.ReadFull(egressPeer, gotClient); err != nil {
+		t.Fatalf("egress read after generation cancellation: %v", err)
+	}
+	if string(gotClient) != string(clientPayload) {
+		t.Fatalf("egress payload = %q, want %q", gotClient, clientPayload)
+	}
+
+	serverPayload := []byte("server-after-reload")
+	if _, err := egressPeer.Write(serverPayload); err != nil {
+		t.Fatalf("server write after generation cancellation: %v", err)
+	}
+	gotServer := make([]byte, len(serverPayload))
+	if _, err := io.ReadFull(ingressPeer, gotServer); err != nil {
+		t.Fatalf("client read after generation cancellation: %v", err)
+	}
+	if string(gotServer) != string(serverPayload) {
+		t.Fatalf("client payload = %q, want %q", gotServer, serverPayload)
+	}
+
+	_ = ingressPeer.Close()
+	_ = egressPeer.Close()
+	select {
+	case err := <-done:
+		if err != nil && !commonerrors.IsClosedConnection(err) {
+			t.Fatalf("relay error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for process-owned relay cleanup")
+	}
+	if cleanupCalls.Load() != 1 {
+		t.Fatalf("egress cleanup calls = %d, want 1", cleanupCalls.Load())
 	}
 }
 
@@ -303,7 +344,7 @@ func TestHandleTCPFlowRegistryLeavesFailedDialUnregistered(t *testing.T) {
 	_ = cp.handleConnWithRoutingResult(context.Background(), ingress, key.Src, key.Dst, &bpfRoutingResult{
 		Outbound: uint8(consts.OutboundUserDefinedMin),
 	})
-	if _, ok := cp.tcpFlows.lookup(key); ok {
+	if _, ok := cp.tcpFlowEgress(ingress); ok {
 		t.Fatal("failed TCP dial registered a flow")
 	}
 }
@@ -340,7 +381,7 @@ func TestHandleTCPFlowRegistryRejectsPostAbortSuccessfulDial(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for post-abort TCP handler")
 	}
-	if _, ok := cp.tcpFlows.lookup(key); ok {
+	if _, ok := cp.tcpFlowEgress(ingress); ok {
 		t.Fatal("post-abort successful dial registered a stale flow")
 	}
 	if !egress.closed.Load() {

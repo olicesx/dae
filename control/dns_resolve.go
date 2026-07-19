@@ -533,7 +533,7 @@ func (c *DnsController) deliverDNSResult(result *DnsResult, requestID uint16, re
 	if err != nil {
 		return fmt.Errorf("pack DNS response: %w", err)
 	}
-	if err := sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.downloadRecorder()); err != nil {
+	if err := sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.replySoMark(), req.downloadRecorder()); err != nil {
 		return err
 	}
 	return nil

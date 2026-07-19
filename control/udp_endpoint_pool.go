@@ -53,6 +53,35 @@ type udpConnStateOwner interface {
 	ReleaseUdpConnStateTuples(keys []bpfTuplesKey) error
 }
 
+type udpEndpointReplyRuntime struct {
+	receiverMu   sync.Mutex
+	receiverStop func()
+	receiveMu    sync.Mutex
+
+	dispatcher   *udpReplyDispatcher
+	slots        chan struct{}
+	stop         chan struct{}
+	stopOnce     sync.Once
+	failed       atomic.Bool
+	tasks        sync.WaitGroup
+	drainTracker *controlPlaneDrainTracker
+}
+
+func newUdpEndpointReplyRuntime(dispatcher *udpReplyDispatcher, drainTracker *controlPlaneDrainTracker, queueCapacity int) *udpEndpointReplyRuntime {
+	if dispatcher == nil {
+		return nil
+	}
+	if queueCapacity <= 0 {
+		queueCapacity = udpEndpointReplyQueueSize
+	}
+	return &udpEndpointReplyRuntime{
+		dispatcher:   dispatcher,
+		slots:        make(chan struct{}, queueCapacity),
+		stop:         make(chan struct{}),
+		drainTracker: drainTracker,
+	}
+}
+
 // sameUdpConnStateOwner compares owner identities without panicking when an
 // implementation contains a non-comparable value. Such values cannot provide
 // a stable equality identity and are treated as distinct owners.
@@ -76,9 +105,6 @@ type UdpEndpoint struct {
 	natTimeoutMu sync.RWMutex
 	closeOnce    sync.Once
 	closeErr     error
-	receiverMu   sync.Mutex
-	receiverStop func()
-	receiveMu    sync.Mutex
 
 	// lastRefreshNano tracks the last TTL refresh time for throttling.
 	// Reduces atomic store + time.Now() frequency under high QPS from every packet to ~5/sec max.
@@ -108,9 +134,13 @@ type UdpEndpoint struct {
 	pendingReplyPeerCount int
 	pendingReplyPeerNext  int
 
-	Dialer   *dialer.Dialer
-	Outbound *outbound.DialerGroup
-	binding  UdpFlowBinding
+	Dialer             *dialer.Dialer
+	Outbound           *outbound.DialerGroup
+	flowRouteBinding   UdpRouteBinding
+	flowNetwork        string
+	flowEgressOverride *UdpEgressBinding
+	flowBindingSet     bool
+	flowBindingDialIP  bool
 
 	// Non-empty indicates this UDP Endpoint is related with a sniffed domain.
 	SniffedDomain string
@@ -135,6 +165,7 @@ type UdpEndpoint struct {
 	fullConeRespCacheNext int
 	udpConnStateMu        sync.Mutex
 	udpConnStateTuples    map[bpfTuplesKey]struct{}
+	udpConnStateLastPair  atomic.Pointer[udpConnStateTuplePairSnapshot]
 	udpConnStateClosed    bool
 	udpConnStateOwner     udpConnStateOwner
 	drainTracker          *controlPlaneDrainTracker
@@ -157,15 +188,11 @@ type UdpEndpoint struct {
 	dialerGenerationRef *atomic.Uint64
 	endpointNetworkType dialer.NetworkType
 	lifecycleProfile    UdpLifecycleProfile
-	transportMu         sync.RWMutex
-	transportDone       <-chan struct{}
-	replyDispatcher     *udpReplyDispatcher
-	replySlots          chan struct{}
-	replyStop           chan struct{}
-	replyStopOnce       sync.Once
-	replyFailed         atomic.Bool
-	replyTasks          sync.WaitGroup
-	replyDrainTracker   *controlPlaneDrainTracker
+	// transportDone stores a <-chan struct{} once the transport lifecycle is
+	// indexed. atomic.Value avoids carrying a mutex in every endpoint.
+	transportDone  atomic.Value
+	replyRuntime   *udpEndpointReplyRuntime
+	sessionRuntime *UDPFlowRuntime
 }
 
 type udpEndpointResponseCacheEntry struct {
@@ -173,17 +200,63 @@ type udpEndpointResponseCacheEntry struct {
 	conn     *Anyfrom
 }
 
+type udpConnStateTuplePairSnapshot struct {
+	src netip.AddrPort
+	dst netip.AddrPort
+}
+
+func (p *udpConnStateTuplePairSnapshot) matches(src, dst netip.AddrPort) bool {
+	if p == nil {
+		return false
+	}
+	return p.src == src && p.dst == dst || p.src == dst && p.dst == src
+}
+
 // FlowBinding returns the immutable route and egress selections made when the endpoint was created.
 func (ue *UdpEndpoint) FlowBinding() UdpFlowBinding {
-	if ue == nil {
+	if ue == nil || !ue.flowBindingSet {
 		return UdpFlowBinding{}
 	}
-	return ue.binding
+	egress := UdpEgressBinding{
+		Dialer:        ue.Dialer,
+		Outbound:      ue.Outbound,
+		Target:        ue.DialTarget,
+		Network:       ue.flowNetwork,
+		NetworkType:   ue.endpointNetworkType,
+		SniffedDomain: ue.SniffedDomain,
+		IsDialIp:      ue.flowBindingDialIP,
+	}
+	if ue.flowEgressOverride != nil {
+		egress = *ue.flowEgressOverride
+	}
+	return UdpFlowBinding{Route: ue.flowRouteBinding, Egress: egress}
+}
+
+func (ue *UdpEndpoint) replySoMark() uint32 {
+	if ue != nil && ue.flowBindingSet {
+		return ue.flowRouteBinding.Mark
+	}
+	return soMarkFromDae.Load()
+}
+
+func (ue *UdpEndpoint) setFlowBinding(binding UdpFlowBinding) {
+	if ue == nil || binding == (UdpFlowBinding{}) {
+		return
+	}
+	ue.flowRouteBinding = binding.Route
+	ue.flowNetwork = binding.Egress.Network
+	ue.flowBindingDialIP = binding.Egress.IsDialIp
+	ue.flowBindingSet = true
+	if got := ue.FlowBinding().Egress; got != binding.Egress {
+		override := binding.Egress
+		ue.flowEgressOverride = &override
+	}
 }
 
 type udpEndpointResponseConnSlot interface {
 	Load() *Anyfrom
 	Swap(next *Anyfrom)
+	CompareAndSwap(old, next *Anyfrom) bool
 }
 
 type udpEndpointSymmetricResponseConnSlot struct {
@@ -202,6 +275,13 @@ func (s udpEndpointSymmetricResponseConnSlot) Swap(next *Anyfrom) {
 		return
 	}
 	s.endpoint.swapResponseConn(next)
+}
+
+func (s udpEndpointSymmetricResponseConnSlot) CompareAndSwap(old, next *Anyfrom) bool {
+	if s.endpoint == nil {
+		return false
+	}
+	return s.endpoint.compareAndSwapResponseConn(old, next)
 }
 
 func (ue *UdpEndpoint) responseConnSlot() udpEndpointResponseConnSlot {
@@ -295,12 +375,14 @@ func (ue *UdpEndpoint) prewarmResponseConn(target string) {
 	}
 
 	bindAddr, _ := normalizeSendPktAddrFamily(replyPeer, ue.lAddr)
+	replySoMark := ue.replySoMark()
+	key := anyfromPoolKey{lAddr: bindAddr, soMark: replySoMark}
 	var af *Anyfrom
 	if DefaultAnyfromPool != nil {
-		shard := DefaultAnyfromPool.shardFor(bindAddr)
+		shard := DefaultAnyfromPool.shardForKey(key)
 		nowNano := time.Now().UnixNano()
 		shard.mu.RLock()
-		if cached, ok := shard.pool[bindAddr]; ok && cached != nil && !cached.failed.Load() && !cached.IsExpired(nowNano) {
+		if cached, ok := shard.pool[key]; ok && cached != nil && !cached.failed.Load() && !cached.IsExpired(nowNano) {
 			af = cached
 		}
 		shard.mu.RUnlock()
@@ -314,7 +396,7 @@ func (ue *UdpEndpoint) prewarmResponseConn(target string) {
 			return
 		}
 		var err error
-		af, _, err = DefaultAnyfromPool.GetOrCreate(bindAddr, AnyfromTimeout)
+		af, _, err = DefaultAnyfromPool.getOrCreateWithMark(bindAddr, replySoMark, AnyfromTimeout)
 		if err != nil {
 			return
 		}
@@ -363,6 +445,19 @@ func (ue *UdpEndpoint) swapResponseConn(next *Anyfrom) {
 	swapPinnedAnyfrom(&ue.respConn, next)
 }
 
+func (ue *UdpEndpoint) compareAndSwapResponseConn(old, next *Anyfrom) bool {
+	if ue == nil {
+		return false
+	}
+	ue.respConnMu.Lock()
+	defer ue.respConnMu.Unlock()
+	if ue.respConn != old {
+		return false
+	}
+	swapPinnedAnyfrom(&ue.respConn, next)
+	return true
+}
+
 func (ue *UdpEndpoint) refreshCachedResponseConnsWithTime(deadlineNano int64) {
 	if ue == nil {
 		return
@@ -399,6 +494,9 @@ func (ue *UdpEndpoint) TrackUdpConnStateTuplePair(src, dst netip.AddrPort) {
 	if ue == nil || !src.IsValid() || !dst.IsValid() {
 		return
 	}
+	if ue.udpConnStateLastPair.Load().matches(src, dst) {
+		return
+	}
 
 	forward := bpfTuplesKeyFromAddrPorts(src, dst, uint8(syscall.IPPROTO_UDP))
 	reverse := bpfTuplesKeyFromAddrPorts(dst, src, uint8(syscall.IPPROTO_UDP))
@@ -412,23 +510,27 @@ func (ue *UdpEndpoint) TrackUdpConnStateTuplePair(src, dst netip.AddrPort) {
 	if ue.udpConnStateTuples == nil {
 		ue.udpConnStateTuples = make(map[bpfTuplesKey]struct{}, 4)
 	}
-	// Use a stack array to avoid make([]bpfTuplesKey, 0, 2) allocation on
-	// every packet. RetainUdpConnStateTuples copies keys by value, so the
-	// backing array does not need to outlive this call.
-	var newKeys [2]bpfTuplesKey
-	newKeyCount := 0
+	forwardNew := false
 	if _, ok := ue.udpConnStateTuples[forward]; !ok {
 		ue.udpConnStateTuples[forward] = struct{}{}
-		newKeys[newKeyCount] = forward
-		newKeyCount++
+		forwardNew = true
 	}
+	reverseNew := false
 	if _, ok := ue.udpConnStateTuples[reverse]; !ok {
 		ue.udpConnStateTuples[reverse] = struct{}{}
-		newKeys[newKeyCount] = reverse
-		newKeyCount++
+		reverseNew = true
 	}
-	if newKeyCount > 0 {
-		ue.udpConnStateOwner.RetainUdpConnStateTuples(newKeys[:newKeyCount])
+	if forwardNew || reverseNew {
+		switch {
+		case forwardNew && reverseNew:
+			newKeys := [2]bpfTuplesKey{forward, reverse}
+			ue.udpConnStateOwner.RetainUdpConnStateTuples(newKeys[:])
+		case forwardNew:
+			ue.udpConnStateOwner.RetainUdpConnStateTuples([]bpfTuplesKey{forward})
+		default:
+			ue.udpConnStateOwner.RetainUdpConnStateTuples([]bpfTuplesKey{reverse})
+		}
+		ue.udpConnStateLastPair.Store(&udpConnStateTuplePairSnapshot{src: src, dst: dst})
 	}
 }
 
@@ -444,6 +546,7 @@ func (ue *UdpEndpoint) releaseTrackedUdpConnState() {
 		return
 	}
 	ue.udpConnStateClosed = true
+	ue.udpConnStateLastPair.Store(nil)
 	if owner == nil || len(ue.udpConnStateTuples) == 0 {
 		ue.udpConnStateMu.Unlock()
 		return
@@ -618,9 +721,12 @@ func (ue *UdpEndpoint) shouldRetireOnReadError(err error) bool {
 const udpEndpointReplyQueueSize = 256
 
 type udpEndpointReply struct {
-	data    pool.PB
-	from    netip.AddrPort
-	release func()
+	data pool.PB
+	from netip.AddrPort
+}
+
+var udpEndpointReplyObjects = sync.Pool{
+	New: func() any { return new(udpEndpointReply) },
 }
 
 // putUdpEndpointReplyData is a package-local seam for tests that need to observe
@@ -629,15 +735,33 @@ var putUdpEndpointReplyData = func(data pool.PB) {
 	data.Put()
 }
 
-func releaseUdpEndpointReplies(replies []udpEndpointReply) {
+func takeUdpEndpointReply(data pool.PB, from netip.AddrPort) *udpEndpointReply {
+	reply := udpEndpointReplyObjects.Get().(*udpEndpointReply)
+	reply.data = data
+	reply.from = from
+	return reply
+}
+
+func recycleUdpEndpointReply(reply *udpEndpointReply, releaseData bool) {
+	if reply == nil {
+		return
+	}
+	if releaseData {
+		putUdpEndpointReplyData(reply.data)
+	}
+	*reply = udpEndpointReply{}
+	udpEndpointReplyObjects.Put(reply)
+}
+
+func releaseUdpEndpointReplies(replies []*udpEndpointReply) {
 	for i := range replies {
-		releaseUdpEndpointReply(replies[i])
+		recycleUdpEndpointReply(replies[i], true)
 	}
 }
 
-func releaseUdpEndpointReply(reply udpEndpointReply) {
-	if reply.release != nil {
-		reply.release()
+func releaseUdpEndpointReply(reply udpEndpointReply, release func()) {
+	if release != nil {
+		release()
 		return
 	}
 	putUdpEndpointReplyData(reply.data)
@@ -647,53 +771,54 @@ func releaseUdpEndpointReply(reply udpEndpointReply) {
 // transport-owned reader should remain registered. A full bounded queue drops
 // only the current packet and keeps the receiver alive; a closed dispatcher
 // requires the transport reader to unregister.
-func (ue *UdpEndpoint) submitReplyWithMode(reply udpEndpointReply, nonBlocking bool) (accepted, keepReceiver bool) {
-	if ue == nil || ue.replyDispatcher == nil || ue.replySlots == nil || ue.replyStop == nil {
+func (ue *UdpEndpoint) submitReplyWithMode(reply udpEndpointReply, release func(), nonBlocking bool) (accepted, keepReceiver bool) {
+	if ue == nil || ue.replyRuntime == nil {
 		return false, false
 	}
+	runtime := ue.replyRuntime
 	if nonBlocking {
 		select {
-		case ue.replySlots <- struct{}{}:
-		case <-ue.replyStop:
+		case runtime.slots <- struct{}{}:
+		case <-runtime.stop:
 			return false, false
 		default:
-			releaseUdpEndpointReply(reply)
+			releaseUdpEndpointReply(reply, release)
 			return false, true
 		}
 	} else {
 		select {
-		case ue.replySlots <- struct{}{}:
-		case <-ue.replyStop:
+		case runtime.slots <- struct{}{}:
+		case <-runtime.stop:
 			return false, false
 		}
 	}
 
-	drainRelease := ue.replyDrainTracker.Acquire()
-	ue.replyTasks.Add(1)
+	drainRelease := runtime.drainTracker.Acquire()
+	runtime.tasks.Add(1)
 	complete := func() {
-		releaseUdpEndpointReply(reply)
-		<-ue.replySlots
+		releaseUdpEndpointReply(reply, release)
+		<-runtime.slots
 		drainRelease()
-		ue.replyTasks.Done()
+		runtime.tasks.Done()
 	}
 	run := func() {
 		defer complete()
-		if ue.replyFailed.Load() {
+		if runtime.failed.Load() {
 			return
 		}
 		if err := ue.handler(ue, reply.data, reply.from); err != nil {
-			ue.replyFailed.Store(true)
+			runtime.failed.Store(true)
 			ue.retire()
 			ue.stopReplyDispatcher()
-			ue.replyDispatcher.abortInput(ue)
+			runtime.dispatcher.abortInput(ue)
 			ue.logEndpointExit(err, "reply sender")
 		}
 	}
 	var submitted bool
 	if nonBlocking {
-		submitted = ue.replyDispatcher.submitNonBlocking(ue, run, complete)
+		submitted = runtime.dispatcher.submitNonBlocking(ue, run, complete)
 	} else {
-		submitted = ue.replyDispatcher.submit(ue, run, complete)
+		submitted = runtime.dispatcher.submit(ue, run, complete)
 	}
 	if submitted {
 		return true, true
@@ -701,37 +826,39 @@ func (ue *UdpEndpoint) submitReplyWithMode(reply udpEndpointReply, nonBlocking b
 	// udpReplyDispatcher.submit documents that a rejected task leaves
 	// the reply buffer owned by the caller. Release the bookkeeping here,
 	// while the read loop releases the buffer itself.
-	<-ue.replySlots
+	<-runtime.slots
 	drainRelease()
-	ue.replyTasks.Done()
+	runtime.tasks.Done()
 	ue.stopReplyDispatcher()
 	ue.retire()
 	return false, false
 }
 
 func (ue *UdpEndpoint) submitReply(reply udpEndpointReply) bool {
-	accepted, _ := ue.submitReplyWithMode(reply, false)
+	accepted, _ := ue.submitReplyWithMode(reply, nil, false)
 	return accepted
 }
 
-func (ue *UdpEndpoint) submitReplyFromReceiver(reply udpEndpointReply) (accepted, keepReceiver bool) {
-	return ue.submitReplyWithMode(reply, true)
+func (ue *UdpEndpoint) submitReplyFromReceiver(reply udpEndpointReply, release func()) (accepted, keepReceiver bool) {
+	return ue.submitReplyWithMode(reply, release, true)
 }
 
 func (ue *UdpEndpoint) stopReplyDispatcher() {
-	if ue == nil || ue.replyStop == nil {
+	if ue == nil || ue.replyRuntime == nil {
 		return
 	}
-	ue.replyStopOnce.Do(func() { close(ue.replyStop) })
+	runtime := ue.replyRuntime
+	runtime.stopOnce.Do(func() { close(runtime.stop) })
 }
 
 func (ue *UdpEndpoint) startTransportReceiver() bool {
-	if ue.replyDispatcher != nil {
+	if ue != nil && ue.replyRuntime != nil {
+		runtime := ue.replyRuntime
 		if receiver, ok := ue.conn.(netproxy.PacketReceiver); ok {
 			if stop, registered := receiver.RegisterPacketReceiver(ue.handleReceivedPacket); registered {
-				ue.receiverMu.Lock()
-				ue.receiverStop = stop
-				ue.receiverMu.Unlock()
+				runtime.receiverMu.Lock()
+				runtime.receiverStop = stop
+				runtime.receiverMu.Unlock()
 				if ue.log != nil && ue.log.IsLevelEnabled(logrus.DebugLevel) {
 					ue.log.Debug("[UdpEndpoint] Using transport-owned packet receiver")
 				}
@@ -750,10 +877,14 @@ func (ue *UdpEndpoint) start() {
 }
 
 func (ue *UdpEndpoint) stopPacketReceiver() {
-	ue.receiverMu.Lock()
-	stop := ue.receiverStop
-	ue.receiverStop = nil
-	ue.receiverMu.Unlock()
+	if ue == nil || ue.replyRuntime == nil {
+		return
+	}
+	runtime := ue.replyRuntime
+	runtime.receiverMu.Lock()
+	stop := runtime.receiverStop
+	runtime.receiverStop = nil
+	runtime.receiverMu.Unlock()
 	if stop != nil {
 		stop()
 	}
@@ -767,8 +898,13 @@ func (ue *UdpEndpoint) handleReceivedPacket(packet *netproxy.ReceivedPacket) boo
 	// Some transport implementations can deliver packets concurrently from
 	// multiple stream readers. Keep the endpoint's probing/error counters and
 	// initial-peer admission serialized exactly as they are in ReadFrom mode.
-	ue.receiveMu.Lock()
-	defer ue.receiveMu.Unlock()
+	runtime := ue.replyRuntime
+	if runtime == nil {
+		packet.Release()
+		return false
+	}
+	runtime.receiveMu.Lock()
+	defer runtime.receiveMu.Unlock()
 
 	if packet.Err != nil {
 		if errors.IsReplayAttackError(packet.Err) || errors.IsAuthError(packet.Err) {
@@ -806,12 +942,8 @@ func (ue *UdpEndpoint) handleReceivedPacket(packet *netproxy.ReceivedPacket) boo
 		ue.markReplied(time.Now().UnixNano())
 	}
 
-	reply := udpEndpointReply{
-		data:    pool.PB(packet.Data),
-		from:    from,
-		release: packet.Release,
-	}
-	accepted, keepReceiver := ue.submitReplyFromReceiver(reply)
+	reply := udpEndpointReply{data: pool.PB(packet.Data), from: from}
+	accepted, keepReceiver := ue.submitReplyFromReceiver(reply, packet.Release)
 	if accepted || keepReceiver {
 		return true
 	}
@@ -832,26 +964,23 @@ func (ue *UdpEndpoint) startReadLoop() {
 	// Async reply dispatch keeps slow sendPkt operations off the blocking read
 	// loop. The gated dispatcher preserves the legacy bounded backlog and
 	// endpoint FIFO while sharing workers across endpoint generations.
-	var replyCh chan udpEndpointReply
+	var replyCh chan *udpEndpointReply
 	var senderStop chan struct{}
 	var senderDone chan struct{}
-	if ue.replyDispatcher == nil {
-		replyCh = make(chan udpEndpointReply, udpEndpointReplyQueueSize)
-		senderStop = make(chan struct{})
-		senderDone = make(chan struct{})
-		go ue.replySender(replyCh, senderStop, senderDone)
-	}
+	runtime := ue.replyRuntime
 
 	buf := pool.GetFullCap(consts.EthernetMtu)
 	defer func() {
 		pool.Put(buf)
-		if ue.replyDispatcher == nil {
-			close(replyCh)
-			<-senderDone
+		if runtime == nil {
+			if replyCh != nil {
+				close(replyCh)
+				<-senderDone
+			}
 			return
 		}
-		ue.replyDispatcher.closeInputAndWait(ue)
-		ue.replyTasks.Wait()
+		runtime.dispatcher.closeInputAndWait(ue)
+		runtime.tasks.Wait()
 	}()
 	for {
 		n, from, err := ue.conn.ReadFrom(buf[:])
@@ -915,7 +1044,7 @@ func (ue *UdpEndpoint) startReadLoop() {
 		// read buffer to the sender goroutine. This removes one per-packet copy
 		// from the hot reply path while keeping the same backpressure semantics.
 		reply := udpEndpointReply{data: buf[:n], from: from}
-		if ue.replyDispatcher != nil {
+		if runtime != nil {
 			if !ue.submitReply(reply) {
 				// submitReply returns false before transferring ownership when
 				// the dispatcher rejects the task. The read loop still owns the
@@ -926,10 +1055,18 @@ func (ue *UdpEndpoint) startReadLoop() {
 			buf = pool.GetFullCap(consts.EthernetMtu)
 			continue
 		}
+		if replyCh == nil {
+			replyCh = make(chan *udpEndpointReply, udpEndpointReplyQueueSize)
+			senderStop = make(chan struct{})
+			senderDone = make(chan struct{})
+			go ue.replySender(replyCh, senderStop, senderDone)
+		}
+		queued := takeUdpEndpointReply(reply.data, reply.from)
 		select {
-		case replyCh <- reply:
+		case replyCh <- queued:
 			buf = pool.GetFullCap(consts.EthernetMtu)
 		case <-senderStop:
+			recycleUdpEndpointReply(queued, false)
 			return
 		}
 	}
@@ -938,9 +1075,9 @@ func (ue *UdpEndpoint) startReadLoop() {
 // replySender is the dedicated goroutine that drains the reply channel and
 // calls the handler (which invokes sendPkt). Running this off the read loop
 // avoids blocking the upstream protocol layer's ReceiveCh.
-func (ue *UdpEndpoint) replySender(replyCh <-chan udpEndpointReply, stop chan<- struct{}, done chan<- struct{}) {
+func (ue *UdpEndpoint) replySender(replyCh <-chan *udpEndpointReply, stop chan<- struct{}, done chan<- struct{}) {
 	defer close(done)
-	batch := make([]udpEndpointReply, 0, 8)
+	batch := make([]*udpEndpointReply, 0, 8)
 	for reply := range replyCh {
 		batch = append(batch[:0], reply)
 		for len(batch) < cap(batch) {
@@ -972,12 +1109,12 @@ func (ue *UdpEndpoint) replySender(replyCh <-chan udpEndpointReply, stop chan<- 
 				// Drain remaining queued replies to release pool buffers.
 				if replyCh != nil {
 					for r := range replyCh {
-						releaseUdpEndpointReply(r)
+						recycleUdpEndpointReply(r, true)
 					}
 				}
 				return
 			}
-			releaseUdpEndpointReply(queued)
+			recycleUdpEndpointReply(queued, true)
 		}
 		if replyCh == nil {
 			return
@@ -1126,11 +1263,12 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 
 func (ue *UdpEndpoint) Close() error {
 	ue.closeOnce.Do(func() {
+		ue.dead.Store(true)
 		ue.expiresAtNano.Store(0)
 		ue.stopPacketReceiver()
-		if ue.replyDispatcher != nil {
+		if ue.replyRuntime != nil {
 			ue.stopReplyDispatcher()
-			ue.replyDispatcher.closeInput(ue)
+			ue.replyRuntime.dispatcher.closeInput(ue)
 		}
 		ue.releaseCachedResponseConns()
 		if ue.poolRef != nil {
@@ -1154,6 +1292,9 @@ func (ue *UdpEndpoint) Close() error {
 		ue.udpConnStateMu.Unlock()
 		if drainRelease != nil {
 			drainRelease()
+		}
+		if ue.sessionRuntime != nil {
+			ue.sessionRuntime.finish()
 		}
 	})
 	return ue.closeErr
@@ -1498,6 +1639,10 @@ type UdpEndpointOptions struct {
 	// replyDispatcher is an optional generation-owned dispatcher for replies.
 	// It is private so the legacy endpoint pool API remains unchanged.
 	replyDispatcher *udpReplyDispatcher
+	// sessionManager promotes a successfully dialed endpoint into the
+	// process-owned session lifecycle before it is published in the pool.
+	sessionManager *SessionManager
+	egressRuntime  *egressRuntime
 }
 
 var DefaultUdpEndpointPool = NewUdpEndpointPool()
@@ -1579,6 +1724,28 @@ func (p *UdpEndpointPool) currentDialerGeneration(d *dialer.Dialer, networkType 
 	return counter.Load()
 }
 
+func (p *UdpEndpointPool) forgetDialerEpochs(dialers []*dialer.Dialer) {
+	if p == nil || len(dialers) == 0 {
+		return
+	}
+	retired := make(map[*dialer.Dialer]struct{}, len(dialers))
+	for _, d := range dialers {
+		if d != nil {
+			retired[d] = struct{}{}
+		}
+	}
+	p.dialerEpoch.Range(func(rawKey, _ any) bool {
+		key, ok := rawKey.(udpEndpointDialerNetworkKey)
+		if !ok {
+			return true
+		}
+		if _, exists := retired[key.dialer]; exists {
+			p.dialerEpoch.Delete(rawKey)
+		}
+		return true
+	})
+}
+
 func (p *UdpEndpointPool) endpointGenerationCurrent(ue *UdpEndpoint) bool {
 	if ue == nil || ue.Dialer == nil {
 		return true
@@ -1630,11 +1797,8 @@ func endpointTransportDoneChannel(ue *UdpEndpoint) <-chan struct{} {
 	if ue == nil {
 		return nil
 	}
-	ue.transportMu.RLock()
-	transportDone := ue.transportDone
-	ue.transportMu.RUnlock()
-	if transportDone != nil {
-		return transportDone
+	if value := ue.transportDone.Load(); value != nil {
+		return value.(<-chan struct{})
 	}
 	if ue.conn == nil {
 		return nil
@@ -1651,13 +1815,9 @@ func (p *UdpEndpointPool) registerTransportEndpoint(ue *UdpEndpoint) {
 	if transportDone == nil {
 		return
 	}
-	ue.transportMu.Lock()
-	if ue.transportDone != nil {
-		transportDone = ue.transportDone
-	} else {
-		ue.transportDone = transportDone
+	if !ue.transportDone.CompareAndSwap(nil, transportDone) {
+		transportDone = ue.transportDone.Load().(<-chan struct{})
 	}
-	ue.transportMu.Unlock()
 
 	// Reset holds the write side of this lock while stopping all existing
 	// transport watchers. A registration that starts after Reset has completed
@@ -2038,7 +2198,6 @@ dialSuccess:
 		NatTimeout:        effectiveUdpEndpointNatTimeout(dialOption.Dialer, createOption.NatTimeout),
 		Dialer:            dialOption.Dialer,
 		Outbound:          dialOption.Outbound,
-		binding:           dialOption.Binding,
 		SniffedDomain:     dialOption.SniffedDomain,
 		DialTarget:        dialOption.Target,
 		lAddr:             key.Src,
@@ -2048,7 +2207,7 @@ dialSuccess:
 		udpConnStateOwner: createOption.ConnStateOwner,
 		drainTracker:      createOption.DrainTracker,
 		lifecycleProfile:  newDataSessionLifecycleProfile(dialOption.Dialer),
-		endpointNetworkType: normalizeUdpEndpointPoolNetworkType(func() dialer.NetworkType {
+		endpointNetworkType: func() dialer.NetworkType {
 			if dialOption.NetworkType != nil {
 				return *dialOption.NetworkType
 			}
@@ -2058,13 +2217,19 @@ dialSuccess:
 				IsDns:           false,
 				UdpHealthDomain: dialer.UdpHealthDomainData,
 			}
-		}()),
-		replyDispatcher:   createOption.replyDispatcher,
-		replyDrainTracker: createOption.DrainTracker,
+		}(),
+		replyRuntime: newUdpEndpointReplyRuntime(
+			createOption.replyDispatcher,
+			createOption.DrainTracker,
+			udpEndpointReplyQueueSize,
+		),
 	}
-	if ue.replyDispatcher != nil {
-		ue.replySlots = make(chan struct{}, udpEndpointReplyQueueSize)
-		ue.replyStop = make(chan struct{})
+	ue.setFlowBinding(dialOption.Binding)
+	if createOption.sessionManager != nil {
+		if _, err := createOption.sessionManager.adoptUDP(ue, dialOption.Binding, createOption.egressRuntime); err != nil {
+			_ = packetConn.Close()
+			return nil, err
+		}
 	}
 	if createOption.DrainTracker != nil {
 		ue.drainRelease = createOption.DrainTracker.Acquire()

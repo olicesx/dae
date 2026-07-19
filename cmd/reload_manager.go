@@ -221,8 +221,8 @@ func buildPreparedDNSHandoffHooks(log *logrus.Logger, enableReuse bool, callback
 	var hooks preparedDNSHandoffHooks
 	if enableReuse {
 		hooks.reuseHook = func() error {
-			if callbacks.reuseController != nil {
-				_ = callbacks.reuseController()
+			if callbacks.reuseController == nil || !callbacks.reuseController() {
+				return fmt.Errorf("reuse DNS controller for prepared handoff")
 			}
 			if callbacks.reuseListener != nil && callbacks.reuseListener() {
 				return nil
@@ -258,10 +258,14 @@ func (m *reloadManager) installPreparedDNSHandoffHooks(log *logrus.Logger, curre
 	}
 	hooks := buildPreparedDNSHandoffHooks(log, dnsConfigEqual(handoff.oldConf, conf), preparedDNSHandoffHookCallbacks{
 		reuseController: func() bool {
-			return current.ReuseDNSControllerFrom(handoff.oldControlPlane)
+			reused := current.ReuseDNSControllerFrom(handoff.oldControlPlane)
+			handoff.dnsControllerMoved = reused
+			return reused
 		},
 		reuseListener: func() bool {
-			return current.ReuseDNSListenerFrom(handoff.oldControlPlane)
+			reused := current.ReuseDNSListenerFrom(handoff.oldControlPlane)
+			handoff.dnsListenerMoved = reused
+			return reused
 		},
 		stopOldListener: handoff.oldControlPlane.StopDNSListener,
 	})
@@ -461,6 +465,7 @@ func (m *reloadManager) refreshPprofServer(log *logrus.Logger, server **http.Ser
 		*server = nil
 	}
 	if port != 0 {
+		registerDaeDebugHandlers()
 		pprofAddr := "localhost:" + strconv.Itoa(int(port))
 		*server = &http.Server{Addr: pprofAddr, Handler: nil}
 		go func() { _ = (*server).ListenAndServe() }()
@@ -478,15 +483,15 @@ func dnsConfigEqual(oldConf *config.Config, newConf *config.Config) bool {
 // datapath inputs that cannot be applied via the staged-hot-handoff path —
 // namely BPF program constants (so_mark), TC hook attach points (interfaces),
 // or map dimensions (conn_state_map_size). These require a fresh BPF object
-// load and connection abort.
+// load while reusing the process-owned flow-state maps.
 //
 // Policy-level changes — routing rules, fallback, outbound groups, and DNS
 // routing — do NOT require a BPF reload: they are delivered via BPF map
 // updates (routing_map, domain_routing_map) and Go-side dialer rebuilds.
 // The staged-hot-handoff path handles them seamlessly through
 // CommitPreparedDatapath, which atomically applies the new routing_map,
-// clears+replays domain_routing_map, and flips TC hooks while the retiring
-// generation drains established connections on shared conn_state_map.
+// clears+replays domain_routing_map, and flips TC hooks while established
+// connections remain owned by the process-level session manager.
 func bpfDatapathChanged(oldConf, newConf *config.Config) bool {
 	if oldConf == nil || newConf == nil {
 		return true
@@ -508,6 +513,61 @@ func bpfDatapathChanged(oldConf, newConf *config.Config) bool {
 		return true
 	}
 	return false
+}
+
+func preserveReloadInterfaceBindings(oldConf, newConf *config.Config) []string {
+	if oldConf == nil || newConf == nil {
+		return nil
+	}
+	lan := append([]string(nil), newConf.Global.LanInterface...)
+	wan := append([]string(nil), newConf.Global.WanInterface...)
+	contains := func(values []string, target string) bool {
+		for _, value := range values {
+			if value == target {
+				return true
+			}
+		}
+		return false
+	}
+	remove := func(values []string, target string) []string {
+		result := values[:0]
+		for _, value := range values {
+			if value != target {
+				result = append(result, value)
+			}
+		}
+		return result
+	}
+
+	var deferred []string
+	oldLAN := make(map[string]struct{}, len(oldConf.Global.LanInterface))
+	for _, iface := range oldConf.Global.LanInterface {
+		oldLAN[iface] = struct{}{}
+		changed := !contains(lan, iface) || contains(wan, iface)
+		wan = remove(wan, iface)
+		if !contains(lan, iface) {
+			lan = append(lan, iface)
+		}
+		if changed {
+			deferred = append(deferred, "lan:"+iface)
+		}
+	}
+	for _, iface := range oldConf.Global.WanInterface {
+		if _, isLAN := oldLAN[iface]; isLAN {
+			continue
+		}
+		changed := !contains(wan, iface) || contains(lan, iface)
+		lan = remove(lan, iface)
+		if !contains(wan, iface) {
+			wan = append(wan, iface)
+		}
+		if changed {
+			deferred = append(deferred, "wan:"+iface)
+		}
+	}
+	newConf.Global.LanInterface = lan
+	newConf.Global.WanInterface = wan
+	return deferred
 }
 
 // dnsConfigFingerprint captures only the DNS fields that affect BPF datapath

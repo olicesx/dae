@@ -179,6 +179,36 @@ func TestRestoreStagedHandoffAggregatesEveryRestoreFailure(t *testing.T) {
 	}
 }
 
+func TestRestoreStagedHandoffDoesNotRestartTransferredLiveDNSListener(t *testing.T) {
+	previousRestoreListenerSockets := restoreListenerSocketsFunc
+	previousRestoreReloadDatapath := restoreReloadDatapathFunc
+	previousRestoreDNSListener := restoreDNSListenerFunc
+	t.Cleanup(func() {
+		restoreListenerSocketsFunc = previousRestoreListenerSockets
+		restoreReloadDatapathFunc = previousRestoreReloadDatapath
+		restoreDNSListenerFunc = previousRestoreDNSListener
+	})
+
+	var dnsRestartCalls atomic.Int32
+	restoreListenerSocketsFunc = func(*control.ControlPlane, *control.Listener) error { return nil }
+	restoreReloadDatapathFunc = func(*control.ControlPlane) error { return nil }
+	restoreDNSListenerFunc = func(*control.ControlPlane) error {
+		dnsRestartCalls.Add(1)
+		return nil
+	}
+	err := restoreStagedReloadHandoff(nil, &stagedReloadHandoff{
+		oldControlPlane:      &control.ControlPlane{},
+		oldListener:          &control.Listener{},
+		oldDNSListenerActive: true,
+	})
+	if err != nil {
+		t.Fatalf("restoreStagedReloadHandoff() error = %v", err)
+	}
+	if got := dnsRestartCalls.Load(); got != 0 {
+		t.Fatalf("DNS restart calls = %d, want 0", got)
+	}
+}
+
 func TestRuntimeSupervisorRollbackPreservesActiveGeneration(t *testing.T) {
 	active := newTestRuntimeGeneration()
 	candidate := newTestRuntimeGeneration()

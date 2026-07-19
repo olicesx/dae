@@ -77,7 +77,7 @@ func primeQuicRegressionAnyfrom(src, dst netip.AddrPort) {
 
 	shard := DefaultAnyfromPool.shardFor(bindAddr)
 	shard.mu.Lock()
-	shard.pool[bindAddr] = af
+	shard.pool[anyfromPoolKey{lAddr: bindAddr}] = af
 	shard.mu.Unlock()
 }
 

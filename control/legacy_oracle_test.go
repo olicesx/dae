@@ -347,11 +347,12 @@ func replayLegacyOracleTCP(t *testing.T, trace legacyOracleTrace, result legacyO
 	if err != nil {
 		return legacyOracleActionTrace{}, err
 	}
-	if dialResult.Binding.Route.Outbound != dialResult.OutboundIndex ||
-		dialResult.Binding.Route.Mark != dialResult.Mark ||
-		dialResult.Binding.Route.Must != dialResult.Must ||
-		dialResult.Binding.Egress.Target != dialResult.DialTarget ||
-		dialResult.Binding.Egress.NetworkType != *dialResult.SelectionNetworkTypeObj {
+	binding := newTcpFlowBinding(plane.PolicyEpoch(), dialResult)
+	if binding.Route.Outbound != dialResult.OutboundIndex ||
+		binding.Route.Mark != dialResult.Mark ||
+		binding.Route.Must != dialResult.Must ||
+		binding.Egress.Target != dialResult.DialTarget ||
+		binding.Egress.NetworkType != *dialResult.SelectionNetworkTypeObj {
 		return legacyOracleActionTrace{}, fmt.Errorf("routeDial did not retain the selected TCP flow binding")
 	}
 

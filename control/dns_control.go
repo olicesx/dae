@@ -76,7 +76,12 @@ type DnsControllerOption struct {
 	CacheDeleteCallback  func(cacheKey string, cache *DnsCache) (err error)
 	NewCache             func(fqdn string, answers, ns, extra []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
 	RouteProjectionEpoch uint64
-	ProjectCacheRoute    func(cache *DnsCache) []uint32
+	// RouteProjectionHash identifies the semantic policy content used to build
+	// DomainBitmap. A non-zero hash lets reload reuse an existing projection
+	// without walking or cloning the DNS cache when only the generation epoch
+	// changed.
+	RouteProjectionHash [32]byte
+	ProjectCacheRoute   func(cache *DnsCache) []uint32
 	// UseResolvePipeline selects the split Resolve/delivery path for this
 	// runtime generation. It is an internal migration gate, not a DNS config
 	// option exposed to users.
@@ -103,6 +108,7 @@ type dnsControllerRuntimeState struct {
 	cacheDeleteCallback       func(cacheKey string, cache *DnsCache) (err error)
 	newCache                  func(fqdn string, answers, ns, extra []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
 	routeProjectionEpoch      uint64
+	routeProjectionHash       [32]byte
 	projectCacheRoute         func(cache *DnsCache) []uint32
 	useResolvePipeline        bool
 	bestDialerSnapshotChooser func(ctx context.Context, snapshot DnsRequestSnapshot, upstream *dns.Upstream) (*dialArgument, error)
@@ -111,11 +117,33 @@ type dnsControllerRuntimeState struct {
 	fixedDomainTtl            map[string]int
 }
 
+type dnsKnowledgeEntry struct {
+	expiresAt  int64
+	cacheCount int
+}
+
+func parseDnsKnowledgeEntry(value any) (dnsKnowledgeEntry, bool) {
+	switch value := value.(type) {
+	case dnsKnowledgeEntry:
+		return value, true
+	case int64:
+		// Accept legacy/test values written before cache-family counts existed.
+		return dnsKnowledgeEntry{expiresAt: value}, true
+	default:
+		return dnsKnowledgeEntry{}, false
+	}
+}
+
 type dnsControllerStore struct {
 	// dnsCache uses sync.Map for lock-free concurrent access
-	dnsCache       sync.Map // map[string]*DnsCache
-	dnsKnowledge   sync.Map // map[string]int64 (base cache key -> original deadline unix nano)
-	dnsKnowledgeMu sync.Mutex
+	dnsCache               sync.Map // map[string]*DnsCache
+	dnsCacheSize           atomic.Int64
+	dnsKnowledge           sync.Map // map[string]int64 (base cache key -> original deadline unix nano)
+	dnsKnowledgeMu         sync.Mutex
+	qtypePrefer            atomic.Uint32
+	optimisticCacheEnabled atomic.Bool
+	optimisticCacheTtl     atomic.Int64 // seconds, 0 means never expire
+	maxCacheSize           atomic.Int64 // maximum number of cache entries (0 = unlimited)
 	// runtimeState belongs to the shared store so long-lived workers always
 	// observe the latest reload facade instead of the facade that started them.
 	runtimeState      atomic.Pointer[dnsControllerRuntimeState]
@@ -139,15 +167,16 @@ type dnsControllerStore struct {
 	// Async BPF update uses one worker and a durable, deduplicated retry intent
 	// set. A full primary queue must not discard a projection for a cache entry
 	// that has no later reader.
-	bpfUpdateCh     chan *bpfUpdateTask
-	bpfRetryWake    chan struct{}
-	bpfRetryMu      sync.Mutex
-	bpfRetryPending map[bpfProjectionRetryKey]*bpfUpdateTask
-	bpfUpdateStop   chan struct{}
-	bpfUpdateStopMu sync.Mutex // Protects bpfUpdateStop initialization and closing
-	bpfUpdateWg     sync.WaitGroup
-	bpfUpdateOnce   sync.Once
-	bpfUpdateClosed atomic.Bool
+	bpfUpdateCh      chan *bpfUpdateTask
+	bpfRetryWake     chan struct{}
+	bpfRetryMu       sync.Mutex
+	bpfRetryPending  map[bpfProjectionRetryKey]*bpfUpdateTask
+	bpfRetryOverflow bool
+	bpfUpdateStop    chan struct{}
+	bpfUpdateStopMu  sync.Mutex // Protects bpfUpdateStop initialization and closing
+	bpfUpdateWg      sync.WaitGroup
+	bpfUpdateOnce    sync.Once
+	bpfUpdateClosed  atomic.Bool
 
 	// prefWaitRegistry manages waits for preferred DNS response types.
 	// When ip_version_prefer is set, non-preferred responses wait briefly
@@ -164,13 +193,8 @@ type DnsController struct {
 
 	concurrencyLimiter chan struct{}
 
-	qtypePrefer            atomic.Uint32
-	optimisticCacheEnabled atomic.Bool
-	optimisticCacheTtl     atomic.Int64 // seconds, 0 means never expire
-	maxCacheSize           atomic.Int64 // maximum number of cache entries (0 = unlimited)
-	dnsForwarderIdleTTL    time.Duration
-	log                    *logrus.Logger
-	runtimeState           atomic.Pointer[dnsControllerRuntimeState]
+	dnsForwarderIdleTTL time.Duration
+	log                 *logrus.Logger
 }
 
 func newDnsControllerStore() *dnsControllerStore {
@@ -183,6 +207,39 @@ func newDnsControllerStore() *dnsControllerStore {
 		evictorQ:          make(chan *DnsCache, 512),
 		evictorWake:       make(chan struct{}, 1),
 		prefWaitRegistry:  newPreferenceWaitRegistry(),
+	}
+}
+
+func (c *DnsController) storeDnsCache(cacheKey string, cache *DnsCache) (previous any, loaded bool) {
+	previous, loaded = c.dnsCache.Swap(cacheKey, cache)
+	if !loaded {
+		c.dnsCacheSize.Add(1)
+	}
+	return previous, loaded
+}
+
+func (c *DnsController) loadAndDeleteDnsCache(cacheKey string) (value any, loaded bool) {
+	value, loaded = c.dnsCache.LoadAndDelete(cacheKey)
+	if loaded {
+		c.decrementDnsCacheSize()
+	}
+	return value, loaded
+}
+
+func (c *DnsController) compareAndDeleteDnsCache(cacheKey string, cache *DnsCache) bool {
+	if !c.dnsCache.CompareAndDelete(cacheKey, cache) {
+		return false
+	}
+	c.decrementDnsCacheSize()
+	return true
+}
+
+func (c *DnsController) decrementDnsCacheSize() {
+	for {
+		current := c.dnsCacheSize.Load()
+		if current <= 0 || c.dnsCacheSize.CompareAndSwap(current, current-1) {
+			return
+		}
 	}
 }
 
@@ -226,16 +283,6 @@ func (c *DnsController) ensureStoreForReload() *dnsControllerStore {
 	return c.dnsControllerStore
 }
 
-func (c *DnsController) copyBehaviorConfigTo(dst *DnsController) {
-	if c == nil || dst == nil {
-		return
-	}
-	dst.qtypePrefer.Store(c.qtypePrefer.Load())
-	dst.optimisticCacheEnabled.Store(c.optimisticCacheEnabled.Load())
-	dst.optimisticCacheTtl.Store(c.optimisticCacheTtl.Load())
-	dst.maxCacheSize.Store(c.maxCacheSize.Load())
-}
-
 func (c *DnsController) sharedStoreFacade() *DnsController {
 	if c == nil {
 		return nil
@@ -246,10 +293,6 @@ func (c *DnsController) sharedStoreFacade() *DnsController {
 		concurrencyLimiter:  c.concurrencyLimiter,
 		dnsForwarderIdleTTL: c.dnsForwarderIdleTTL,
 		log:                 c.log,
-	}
-	c.copyBehaviorConfigTo(facade)
-	if rt := c.runtime(); rt != nil {
-		facade.runtimeState.Store(rt)
 	}
 	return facade
 }
@@ -270,20 +313,33 @@ func (c *DnsController) currentOptimisticCacheConfig() (enabled bool, ttl int, m
 
 // ReuseForReload updates the current facade to the replacement generation's
 // runtime and returns a fresh facade that shares the same long-lived store.
-// The shared store carries DNS cache, forwarders, janitors, and async BPF
-// update workers across reloads, while each facade owns its generation-local
-// runtime pointer and behavior config. The old control plane publishes the new
-// facade as a handoff bridge so ActiveDnsController observes the replacement
-// runtime without a nil window during reload retirement.
+// The shared store carries DNS cache, forwarders, janitors, async BPF workers,
+// and the current runtime/config across reloads. The old control plane publishes
+// the new facade as a handoff bridge so ActiveDnsController observes the
+// replacement runtime without a nil window during reload retirement.
 func (c *DnsController) ReuseForReload(option *DnsControllerOption, routing *dns.Dns) (*DnsController, error) {
 	if c == nil {
 		return nil, nil
 	}
 	c.ensureStoreForReload()
+	previousRuntime := c.runtime()
+	projectionUnchanged := previousRuntime != nil && option != nil &&
+		option.RouteProjectionHash != ([32]byte{}) &&
+		previousRuntime.routeProjectionHash == option.RouteProjectionHash
+	if projectionUnchanged {
+		// Projection epochs identify bitmap content, not control-plane lifetime.
+		// Keeping the old epoch makes every existing cache wrapper valid for the
+		// replacement runtime, avoiding an O(cache size) reload walk.
+		adjustedOption := *option
+		adjustedOption.RouteProjectionEpoch = previousRuntime.routeProjectionEpoch
+		option = &adjustedOption
+	}
 	if err := c.TryUpdateRuntime(option, routing); err != nil {
 		return nil, err
 	}
-	c.reprojectCachedRoutes(c.runtime())
+	if !projectionUnchanged {
+		c.reprojectCachedRoutes(c.runtime())
+	}
 	if err := c.ResetDnsForwarders(); err != nil && c.log != nil {
 		c.log.WithError(err).Warn("failed to retire stale DNS forwarders during reload reuse")
 	}
@@ -306,7 +362,7 @@ func (c *DnsController) reprojectCachedRoutes(rt *dnsControllerRuntimeState) {
 			return true
 		}
 
-		replacement := cache.Clone()
+		replacement := cache.CloneForReload()
 		ensureDNSCacheRouteOwnerKey(cacheKey, replacement)
 		replacement.RouteProjectionEpoch = rt.routeProjectionEpoch
 		replacement.DomainBitmap = rt.projectCacheRoute(replacement)
@@ -398,8 +454,9 @@ func (c *DnsController) restoreReloadCache(entries map[string]*DnsCache, matchDo
 			}
 
 			c.cacheProjectionMu.Lock()
-			c.dnsCache.Store(k, restored)
-			c.rememberDnsKnowledge(dnsCacheBaseKey(k), restored.OriginalDeadline)
+			c.enforceDnsCacheCapacityLocked(k)
+			_, loaded := c.storeDnsCache(k, restored)
+			c.rememberDnsKnowledge(dnsCacheBaseKey(k), restored.OriginalDeadline, !loaded)
 			if projectSynchronously && rt != nil && rt.cacheAccessCallback != nil {
 				projectionRecorder, projectionStartedAt := beginPhase0DNSProjectionObservation()
 				if err := rt.cacheAccessCallback(restored); err != nil {
@@ -434,25 +491,43 @@ func (c *DnsController) restoreReloadCache(entries map[string]*DnsCache, matchDo
 // bpfUpdateTask represents a BPF map update request.
 type bpfUpdateTask struct {
 	cache                *DnsCache
-	cacheKey             string
-	runtime              *dnsControllerRuntimeState
-	now                  time.Time
 	routeProjectionEpoch uint64
 	retryAttempt         uint8
-	phase0Recorder       *phase0Observability
-	phase0StartedAt      time.Time
+	observation          *bpfUpdateTaskObservation
+}
+
+type bpfUpdateTaskObservation struct {
+	recorder  *phase0Observability
+	startedAt time.Time
+}
+
+func newBpfUpdateTaskObservation(recorder *phase0Observability, startedAt time.Time) *bpfUpdateTaskObservation {
+	if recorder == nil {
+		return nil
+	}
+	return &bpfUpdateTaskObservation{recorder: recorder, startedAt: startedAt}
 }
 
 const (
 	bpfProjectionRetryLimit     = 5
 	bpfProjectionRetryBaseDelay = 25 * time.Millisecond
 	bpfProjectionRetryMaxDelay  = time.Second
+	bpfProjectionRetryCapacity  = 4096
 )
 
 type bpfProjectionRetryKey struct {
-	cache                *DnsCache
 	cacheKey             string
 	routeProjectionEpoch uint64
+}
+
+func (task *bpfUpdateTask) retryKey() (bpfProjectionRetryKey, bool) {
+	if task == nil || task.cache == nil || task.cache.RouteOwnerKey == "" {
+		return bpfProjectionRetryKey{}, false
+	}
+	return bpfProjectionRetryKey{
+		cacheKey:             task.cache.RouteOwnerKey,
+		routeProjectionEpoch: task.routeProjectionEpoch,
+	}, true
 }
 
 type bpfProjectionRetryItem struct {
@@ -505,35 +580,44 @@ func newBpfProjectionRetryScheduler() *bpfProjectionRetryScheduler {
 	}
 }
 
-func (s *bpfProjectionRetryScheduler) add(task *bpfUpdateTask) {
+func (s *bpfProjectionRetryScheduler) add(task *bpfUpdateTask) bool {
 	if s == nil || task == nil {
-		return
+		return false
 	}
-	s.addAt(task, time.Now())
+	return s.addAt(task, time.Now())
 }
 
-func (s *bpfProjectionRetryScheduler) addAt(task *bpfUpdateTask, now time.Time) {
+func (s *bpfProjectionRetryScheduler) addAt(task *bpfUpdateTask, now time.Time) bool {
 	if s == nil || task == nil {
-		return
+		return false
 	}
-	key := bpfProjectionRetryKey{
-		cache:                task.cache,
-		cacheKey:             task.cacheKey,
-		routeProjectionEpoch: task.routeProjectionEpoch,
+	key, ok := task.retryKey()
+	if !ok {
+		return false
 	}
 	due := now.Add(bpfProjectionRetryDelay(task.retryAttempt))
 	if pending := s.pending[key]; pending != nil {
+		if pending.task.cache != task.cache {
+			pending.task = task
+			pending.due = due
+			heap.Fix(&s.queue, pending.index)
+			return true
+		}
 		if !due.Before(pending.due) && task.retryAttempt >= pending.task.retryAttempt {
-			return
+			return true
 		}
 		pending.task = task
 		pending.due = due
 		heap.Fix(&s.queue, pending.index)
-		return
+		return true
+	}
+	if len(s.pending) >= bpfProjectionRetryCapacity {
+		return false
 	}
 	item := &bpfProjectionRetryItem{task: task, due: due, key: key}
 	heap.Push(&s.queue, item)
 	s.pending[key] = item
+	return true
 }
 
 func (s *bpfProjectionRetryScheduler) nextDue() (time.Time, bool) {
@@ -568,8 +652,8 @@ func bpfProjectionRetryDelay(attempt uint8) time.Duration {
 }
 
 func (task *bpfUpdateTask) observePhase0DNSProjection(outcome phase0DNSProjectionOutcome) {
-	if task != nil {
-		task.phase0Recorder.recordDNSProjection(phase0DNSProjectionAsync, outcome, task.phase0StartedAt)
+	if task != nil && task.observation != nil {
+		task.observation.recorder.recordDNSProjection(phase0DNSProjectionAsync, outcome, task.observation.startedAt)
 	}
 }
 
@@ -683,6 +767,7 @@ func (c *DnsController) updateRuntime(option *DnsControllerOption, routing *dns.
 		cacheDeleteCallback:       option.CacheDeleteCallback,
 		newCache:                  option.NewCache,
 		routeProjectionEpoch:      option.RouteProjectionEpoch,
+		routeProjectionHash:       option.RouteProjectionHash,
 		projectCacheRoute:         option.ProjectCacheRoute,
 		useResolvePipeline:        option.UseResolvePipeline,
 		bestDialerSnapshotChooser: option.BestDialerSnapshotChooser,
@@ -691,24 +776,21 @@ func (c *DnsController) updateRuntime(option *DnsControllerOption, routing *dns.
 		fixedDomainTtl:            option.FixedDomainTtl,
 	}
 	c.runtimeMu.Lock()
-	c.runtimeState.Store(runtimeState)
-	if c.dnsControllerStore != nil {
-		c.dnsControllerStore.runtimeState.Store(runtimeState)
-	}
+	c.dnsControllerStore.runtimeState.Store(runtimeState)
 	c.runtimeMu.Unlock()
+	if maxCacheSize > 0 && c.dnsCacheSize.Load() > int64(maxCacheSize) {
+		c.cacheProjectionMu.Lock()
+		c.trimDnsCacheToSizeLocked(maxCacheSize)
+		c.cacheProjectionMu.Unlock()
+	}
 	return nil
 }
 
 func (c *DnsController) runtime() *dnsControllerRuntimeState {
-	if c == nil {
+	if c == nil || c.dnsControllerStore == nil {
 		return nil
 	}
-	if c.dnsControllerStore != nil {
-		if runtimeState := c.dnsControllerStore.runtimeState.Load(); runtimeState != nil {
-			return runtimeState
-		}
-	}
-	return c.runtimeState.Load()
+	return c.dnsControllerStore.runtimeState.Load()
 }
 
 func (c *DnsController) useResolvePipeline() bool {
@@ -832,6 +914,7 @@ func (c *DnsController) Close() error {
 		c.dnsCache.Delete(key)
 		return true
 	})
+	c.dnsCacheSize.Store(0)
 	c.cacheProjectionMu.Unlock()
 	c.dnsKnowledge.Range(func(key, value any) bool {
 		c.dnsKnowledge.Delete(key)
@@ -1021,6 +1104,12 @@ func (c *DnsController) orphanedDnsSideEffects(baseKey string, candidate *DnsCac
 	if baseKey == "" {
 		return candidate
 	}
+	// Cache deletion updates dnsKnowledge before reaching this function. A
+	// missing family proves that no sibling cache can still own these IPs and
+	// avoids an O(total cache size) scan for normal unique-domain eviction.
+	if _, familyStillCached := c.dnsKnowledge.Load(baseKey); !familyStillCached {
+		return candidate
+	}
 
 	liveIPs := make(map[netip.Addr]struct{})
 	c.dnsCache.Range(func(key, value any) bool {
@@ -1030,7 +1119,7 @@ func (c *DnsController) orphanedDnsSideEffects(baseKey string, candidate *DnsCac
 		}
 		cache, ok := value.(*DnsCache)
 		if !ok {
-			c.dnsCache.Delete(cacheKey)
+			c.loadAndDeleteDnsCache(cacheKey)
 			return true
 		}
 		for _, ans := range cache.Answer {
@@ -1080,7 +1169,7 @@ func (c *DnsController) RemoveDnsRespCache(cacheKey string) {
 	c.requireStore()
 	c.cacheProjectionMu.Lock()
 	defer c.cacheProjectionMu.Unlock()
-	if removed, ok := c.dnsCache.LoadAndDelete(cacheKey); ok {
+	if removed, ok := c.loadAndDeleteDnsCache(cacheKey); ok {
 		if cache, ok := removed.(*DnsCache); ok {
 			baseKey := dnsCacheBaseKey(cacheKey)
 			c.forgetDnsKnowledge(cacheKey, cache)
@@ -1105,10 +1194,10 @@ func (c *DnsController) RemoveDnsRespCacheFamily(baseKey string) {
 		}
 		cache, ok := value.(*DnsCache)
 		if !ok {
-			c.dnsCache.Delete(cacheKey)
+			c.loadAndDeleteDnsCache(cacheKey)
 			return true
 		}
-		if c.dnsCache.CompareAndDelete(cacheKey, cache) {
+		if c.compareAndDeleteDnsCache(cacheKey, cache) {
 			c.invokeCacheDeleteCallback(cacheKey, cache)
 			removedCaches = append(removedCaches, cache)
 		}
@@ -1118,23 +1207,27 @@ func (c *DnsController) RemoveDnsRespCacheFamily(baseKey string) {
 	c.onBaseKeySideEffectsEvicted(baseKey, aggregateDNSRemovalCandidate(removedCaches))
 }
 
-func (c *DnsController) rememberDnsKnowledge(baseKey string, originalDeadline time.Time) {
-	if baseKey == "" || originalDeadline.IsZero() {
+func (c *DnsController) rememberDnsKnowledge(baseKey string, originalDeadline time.Time, newCacheEntry bool) {
+	if baseKey == "" {
 		return
 	}
 	expiresAt := originalDeadline.UnixNano()
 	c.dnsKnowledgeMu.Lock()
 	defer c.dnsKnowledgeMu.Unlock()
 
-	current, ok := c.dnsKnowledge.Load(baseKey)
-	if !ok {
-		c.dnsKnowledge.Store(baseKey, expiresAt)
-		return
+	current, loaded := c.dnsKnowledge.Load(baseKey)
+	entry, valid := parseDnsKnowledgeEntry(current)
+	if !loaded || !valid {
+		entry = dnsKnowledgeEntry{cacheCount: 1}
+	} else if newCacheEntry {
+		entry.cacheCount++
+	} else if entry.cacheCount == 0 {
+		entry.cacheCount = 1
 	}
-	currentExpiresAt, ok := current.(int64)
-	if !ok || currentExpiresAt < expiresAt {
-		c.dnsKnowledge.Store(baseKey, expiresAt)
+	if entry.expiresAt < expiresAt {
+		entry.expiresAt = expiresAt
 	}
+	c.dnsKnowledge.Store(baseKey, entry)
 }
 
 func (c *DnsController) forgetDnsKnowledge(cacheKey string, cache *DnsCache) {
@@ -1152,12 +1245,18 @@ func (c *DnsController) forgetDnsKnowledge(cacheKey string, cache *DnsCache) {
 	if !ok {
 		return
 	}
-	currentExpiresAt, ok := current.(int64)
-	if !ok {
+	entry, ok := parseDnsKnowledgeEntry(current)
+	if !ok || entry.cacheCount <= 0 {
 		c.syncDnsKnowledgeLocked(baseKey)
 		return
 	}
-	if deletedExpiresAt < currentExpiresAt {
+	if entry.cacheCount == 1 {
+		c.dnsKnowledge.Delete(baseKey)
+		return
+	}
+	entry.cacheCount--
+	if deletedExpiresAt < entry.expiresAt {
+		c.dnsKnowledge.Store(baseKey, entry)
 		return
 	}
 	c.syncDnsKnowledgeLocked(baseKey)
@@ -1173,8 +1272,7 @@ func (c *DnsController) syncDnsKnowledge(baseKey string) {
 }
 
 func (c *DnsController) syncDnsKnowledgeLocked(baseKey string) {
-	nowNano := time.Now().UnixNano()
-	var maxExpiresAt int64
+	entry := dnsKnowledgeEntry{}
 
 	c.dnsCache.Range(func(key, value any) bool {
 		cacheKey, ok := key.(string)
@@ -1183,22 +1281,23 @@ func (c *DnsController) syncDnsKnowledgeLocked(baseKey string) {
 		}
 		cache, ok := value.(*DnsCache)
 		if !ok {
-			c.dnsCache.Delete(cacheKey)
+			c.loadAndDeleteDnsCache(cacheKey)
 			return true
 		}
 
 		expiresAt := cache.OriginalDeadline.UnixNano()
-		if expiresAt > nowNano && expiresAt > maxExpiresAt {
-			maxExpiresAt = expiresAt
+		entry.cacheCount++
+		if expiresAt > entry.expiresAt {
+			entry.expiresAt = expiresAt
 		}
 		return true
 	})
 
-	if maxExpiresAt == 0 {
+	if entry.cacheCount == 0 {
 		c.dnsKnowledge.Delete(baseKey)
 		return
 	}
-	c.dnsKnowledge.Store(baseKey, maxExpiresAt)
+	c.dnsKnowledge.Store(baseKey, entry)
 }
 
 func (c *DnsController) HasDnsKnowledge(baseKey string) bool {
@@ -1210,13 +1309,12 @@ func (c *DnsController) HasDnsKnowledge(baseKey string) bool {
 	if !ok {
 		return false
 	}
-	expiresAt, ok := value.(int64)
+	entry, ok := parseDnsKnowledgeEntry(value)
 	if !ok {
 		c.dnsKnowledge.Delete(baseKey)
 		return false
 	}
-	if expiresAt <= time.Now().UnixNano() {
-		c.dnsKnowledge.CompareAndDelete(baseKey, value)
+	if entry.expiresAt <= time.Now().UnixNano() {
 		return false
 	}
 	return true
@@ -1248,12 +1346,17 @@ func (c *DnsController) startBpfUpdateWorker() {
 // processBpfUpdateTask executes a single BPF map update task.
 // Returns true if the task was processed, false if it was nil/empty.
 func (c *DnsController) processBpfUpdateTask(task *bpfUpdateTask, draining bool) bool {
+	processed, _ := c.processBpfUpdateTaskInternal(task, draining, !draining)
+	return processed
+}
+
+func (c *DnsController) processBpfUpdateTaskInternal(task *bpfUpdateTask, draining, scheduleRetry bool) (processed, failed bool) {
 	if task == nil || task.cache == nil {
-		return false
+		return false, false
 	}
 	if c.bpfUpdateClosed.Load() {
 		task.observePhase0DNSProjection(phase0DNSProjectionStale)
-		return true
+		return true, false
 	}
 	c.runtimeMu.RLock()
 	defer c.runtimeMu.RUnlock()
@@ -1261,12 +1364,12 @@ func (c *DnsController) processBpfUpdateTask(task *bpfUpdateTask, draining bool)
 	defer c.cacheProjectionMu.RUnlock()
 	if c.bpfUpdateClosed.Load() {
 		task.observePhase0DNSProjection(phase0DNSProjectionStale)
-		return true
+		return true, false
 	}
 	rt := c.runtime()
 	if !c.bpfUpdateTaskCurrent(task, rt) {
 		task.observePhase0DNSProjection(phase0DNSProjectionStale)
-		return true
+		return true, false
 	}
 	if err := rt.cacheAccessCallback(task.cache); err != nil {
 		task.observePhase0DNSProjection(phase0DNSProjectionFailed)
@@ -1277,14 +1380,15 @@ func (c *DnsController) processBpfUpdateTask(task *bpfUpdateTask, draining bool)
 			}
 			c.log.WithError(err).Warnf("async BPF map update failed%s", suffix)
 		}
-		if !draining {
+		if scheduleRetry {
 			c.scheduleBpfProjectionRetry(task)
 		}
+		failed = true
 	} else {
 		task.cache.MarkBpfUpdated(time.Now())
 		task.observePhase0DNSProjection(phase0DNSProjectionApplied)
 	}
-	return true
+	return true, failed
 }
 
 func (c *DnsController) bpfUpdateTaskCurrent(task *bpfUpdateTask, rt *dnsControllerRuntimeState) bool {
@@ -1292,38 +1396,39 @@ func (c *DnsController) bpfUpdateTaskCurrent(task *bpfUpdateTask, rt *dnsControl
 		task.routeProjectionEpoch != rt.routeProjectionEpoch {
 		return false
 	}
-	if task.runtime != nil && task.runtime != rt {
-		return false
-	}
 	if task.cache.RouteProjectionEpoch != task.routeProjectionEpoch {
 		return false
 	}
-	if task.cacheKey == "" {
+	cacheKey := task.cache.RouteOwnerKey
+	if cacheKey == "" {
 		return task.retryAttempt == 0
 	}
-	value, ok := c.dnsCache.Load(task.cacheKey)
+	value, ok := c.dnsCache.Load(cacheKey)
 	return ok && value == task.cache
 }
 
 func (c *DnsController) scheduleBpfProjectionRetry(task *bpfUpdateTask) {
-	if task == nil || task.cache == nil || task.cacheKey == "" ||
-		task.retryAttempt >= bpfProjectionRetryLimit || c.bpfUpdateClosed.Load() {
+	key, ok := task.retryKey()
+	if !ok || task.retryAttempt >= bpfProjectionRetryLimit || c.bpfUpdateClosed.Load() {
 		return
 	}
 	retry := *task
 	retry.retryAttempt++
-	key := bpfProjectionRetryKey{
-		cache:                retry.cache,
-		cacheKey:             retry.cacheKey,
-		routeProjectionEpoch: retry.routeProjectionEpoch,
-	}
 	c.bpfRetryMu.Lock()
 	if c.bpfUpdateClosed.Load() || c.bpfRetryWake == nil || c.bpfRetryPending == nil {
 		c.bpfRetryMu.Unlock()
 		return
 	}
-	if pending := c.bpfRetryPending[key]; pending == nil || retry.retryAttempt < pending.retryAttempt {
+	if pending := c.bpfRetryPending[key]; pending != nil {
+		if retry.retryAttempt < pending.retryAttempt || pending.cache != retry.cache {
+			c.bpfRetryPending[key] = &retry
+		}
+	} else if len(c.bpfRetryPending) < bpfProjectionRetryCapacity {
 		c.bpfRetryPending[key] = &retry
+	} else {
+		// Preserve a bounded retry set. The worker will reconcile current cache
+		// ownership without retaining one task per cache entry.
+		c.bpfRetryOverflow = true
 	}
 	wake := c.bpfRetryWake
 	c.bpfRetryMu.Unlock()
@@ -1335,18 +1440,66 @@ func (c *DnsController) scheduleBpfProjectionRetry(task *bpfUpdateTask) {
 	}
 }
 
-func (c *DnsController) takeBpfProjectionRetryIntents() []*bpfUpdateTask {
+func (c *DnsController) takeBpfProjectionRetryIntents() (tasks []*bpfUpdateTask, overflow bool) {
 	c.bpfRetryMu.Lock()
 	defer c.bpfRetryMu.Unlock()
+	overflow = c.bpfRetryOverflow
+	c.bpfRetryOverflow = false
 	if len(c.bpfRetryPending) == 0 {
-		return nil
+		return nil, overflow
 	}
-	tasks := make([]*bpfUpdateTask, 0, len(c.bpfRetryPending))
+	tasks = make([]*bpfUpdateTask, 0, len(c.bpfRetryPending))
 	for _, task := range c.bpfRetryPending {
 		tasks = append(tasks, task)
 	}
-	c.bpfRetryPending = make(map[bpfProjectionRetryKey]*bpfUpdateTask)
-	return tasks
+	clear(c.bpfRetryPending)
+	return tasks, overflow
+}
+
+// reconcileCurrentBpfProjections recovers work coalesced by the bounded retry
+// queue. It walks the authoritative cache in place and never builds an
+// O(cache-size) task slice.
+func (c *DnsController) reconcileCurrentBpfProjections() (failed bool) {
+	if c == nil || c.bpfUpdateClosed.Load() {
+		return false
+	}
+	rt := c.runtime()
+	if rt == nil || rt.cacheAccessCallback == nil {
+		return false
+	}
+	c.dnsCache.Range(func(key, value any) bool {
+		if c.bpfUpdateClosed.Load() {
+			return false
+		}
+		if c.runtime() != rt {
+			failed = true
+			return false
+		}
+		cacheKey, keyOK := key.(string)
+		cache, cacheOK := value.(*DnsCache)
+		if !keyOK || !cacheOK || cache == nil || cache.RouteOwnerKey != cacheKey ||
+			cache.RouteProjectionEpoch != rt.routeProjectionEpoch {
+			return true
+		}
+		currentHash := cache.ComputeBpfDataHash()
+		if currentHash == 0 || currentHash == cache.lastBpfDataHash.Load() {
+			return true
+		}
+		_, taskFailed := c.processBpfUpdateTaskInternal(&bpfUpdateTask{
+			cache:                cache,
+			routeProjectionEpoch: rt.routeProjectionEpoch,
+		}, false, false)
+		failed = failed || taskFailed
+		if c.runtime() != rt {
+			failed = true
+			return false
+		}
+		return true
+	})
+	if !c.bpfUpdateClosed.Load() && c.runtime() != rt {
+		failed = true
+	}
+	return failed
 }
 
 // bpfUpdateWorker processes BPF map updates asynchronously.
@@ -1372,8 +1525,24 @@ func (c *DnsController) bpfUpdateWorker() {
 	}
 	defer retryTimer.Stop()
 	var retryTimerCh <-chan time.Time
+	var (
+		reconcilePending bool
+		reconcileAttempt uint8
+		reconcileDue     time.Time
+	)
+	scheduleReconcile := func(now time.Time) {
+		if reconcilePending {
+			return
+		}
+		reconcilePending = true
+		reconcileAttempt = 1
+		reconcileDue = now.Add(bpfProjectionRetryDelay(reconcileAttempt))
+	}
 	resetRetryTimer := func() {
 		due, ok := retries.nextDue()
+		if reconcilePending && (!ok || reconcileDue.Before(due)) {
+			due, ok = reconcileDue, true
+		}
 		if !ok {
 			if retryTimerCh != nil && !retryTimer.Stop() {
 				select {
@@ -1404,14 +1573,35 @@ func (c *DnsController) bpfUpdateWorker() {
 			c.processBpfUpdateTask(task, false)
 			c.drainBpfUpdateTasks(false)
 		case <-c.bpfRetryWake:
-			for _, task := range c.takeBpfProjectionRetryIntents() {
-				retries.add(task)
+			tasks, overflow := c.takeBpfProjectionRetryIntents()
+			if overflow {
+				scheduleReconcile(time.Now())
+			}
+			for _, task := range tasks {
+				if !retries.add(task) {
+					scheduleReconcile(time.Now())
+				}
 			}
 			resetRetryTimer()
 		case <-retryTimerCh:
 			retryTimerCh = nil
-			for _, task := range retries.popDue(time.Now()) {
+			now := time.Now()
+			for _, task := range retries.popDue(now) {
 				c.processBpfUpdateTask(task, false)
+			}
+			if reconcilePending && !reconcileDue.After(now) {
+				failed := c.reconcileCurrentBpfProjections()
+				if failed && reconcileAttempt < bpfProjectionRetryLimit {
+					reconcileAttempt++
+					reconcileDue = now.Add(bpfProjectionRetryDelay(reconcileAttempt))
+				} else {
+					if failed && c.log != nil {
+						c.log.Warn("BPF projection reconciliation exhausted its retry budget")
+					}
+					reconcilePending = false
+					reconcileAttempt = 0
+					reconcileDue = time.Time{}
+				}
 			}
 			resetRetryTimer()
 		case <-c.bpfUpdateStop:
@@ -1466,12 +1656,8 @@ func (c *DnsController) triggerBpfUpdateIfNeededForRuntime(cache *DnsCache, now 
 	projectionRecorder, projectionStartedAt := beginPhase0DNSProjectionObservation()
 	task := &bpfUpdateTask{
 		cache:                cache,
-		cacheKey:             cache.RouteOwnerKey,
-		runtime:              rt,
-		now:                  now,
 		routeProjectionEpoch: rt.routeProjectionEpoch,
-		phase0Recorder:       projectionRecorder,
-		phase0StartedAt:      projectionStartedAt,
+		observation:          newBpfUpdateTaskObservation(projectionRecorder, projectionStartedAt),
 	}
 	if !c.sendBpfUpdateTask(task) {
 		c.scheduleBpfProjectionRetry(task)
@@ -1556,7 +1742,15 @@ func (c *DnsController) enqueueEvictorSpill(cache *DnsCache) {
 		return
 	}
 
+	const maxEvictorSpillEntries = 4096
 	c.evictorMu.Lock()
+	if len(c.evictorBuf) >= maxEvictorSpillEntries {
+		c.evictorMu.Unlock()
+		// Sustained callback overload must not create an unbounded retention
+		// queue. Preserve cleanup correctness with synchronous backpressure.
+		c.invokeCacheRemoveCallback(cache)
+		return
+	}
 	c.evictorBuf = append(c.evictorBuf, cache)
 	c.evictorMu.Unlock()
 
@@ -1613,18 +1807,94 @@ func (c *DnsController) invokeCacheDeleteCallback(cacheKey string, cache *DnsCac
 	}
 }
 
+// evictDnsCacheLocked removes one cache entry while cacheProjectionMu is held.
+func (c *DnsController) evictDnsCacheLocked(cacheKey string, cache *DnsCache) bool {
+	if cache == nil || !c.compareAndDeleteDnsCache(cacheKey, cache) {
+		return false
+	}
+	baseKey := dnsCacheBaseKey(cacheKey)
+	c.forgetDnsKnowledge(cacheKey, cache)
+	c.invokeCacheDeleteCallback(cacheKey, cache)
+	c.onBaseKeySideEffectsEvicted(baseKey, cache)
+	return true
+}
+
+// enforceDnsCacheCapacityLocked keeps a configured maximum as an admission
+// bound rather than waiting for the periodic janitor. The normal at-capacity
+// case selects the oldest entry from a fixed sample so admission work does not
+// grow with cache cardinality.
+func (c *DnsController) enforceDnsCacheCapacityLocked(incomingKey string) {
+	_, _, maxCacheSize := c.currentOptimisticCacheConfig()
+	if maxCacheSize <= 0 {
+		return
+	}
+	if _, exists := c.dnsCache.Load(incomingKey); exists {
+		return
+	}
+	c.trimDnsCacheToSizeLocked(maxCacheSize - 1)
+}
+
+func (c *DnsController) trimDnsCacheToSizeLocked(targetSize int) {
+	if targetSize < 0 {
+		targetSize = 0
+	}
+	count := int(c.dnsCacheSize.Load())
+	if count <= targetSize {
+		return
+	}
+
+	excess := count - targetSize
+	if excess == 1 {
+		const admissionEvictionSampleSize = 16
+		var victimKey string
+		var victim *DnsCache
+		var oldestAccess int64
+		sampled := 0
+		c.dnsCache.Range(func(key, value any) bool {
+			sampled++
+			cacheKey, keyOK := key.(string)
+			cache, cacheOK := value.(*DnsCache)
+			if !keyOK || !cacheOK || cache == nil {
+				return sampled < admissionEvictionSampleSize
+			}
+			access := cache.lastAccessNano.Load()
+			if victim == nil || access < oldestAccess {
+				victimKey, victim, oldestAccess = cacheKey, cache, access
+			}
+			return sampled < admissionEvictionSampleSize
+		})
+		if victim != nil {
+			c.evictDnsCacheLocked(victimKey, victim)
+		}
+		return
+	}
+
+	// A runtime limit reduction can require a bulk trim. Prefer bounded memory
+	// over allocating and retaining an O(cache-size) LRU scratch slice here; the
+	// janitor continues to provide precise LRU ordering during normal operation.
+	c.dnsCache.Range(func(key, value any) bool {
+		if excess == 0 {
+			return false
+		}
+		cacheKey, keyOK := key.(string)
+		cache, cacheOK := value.(*DnsCache)
+		if !keyOK || !cacheOK || cache == nil {
+			return true
+		}
+		if c.evictDnsCacheLocked(cacheKey, cache) {
+			excess--
+		}
+		return true
+	})
+}
+
 func (c *DnsController) evictDnsRespCacheIfSame(cacheKey string, cache *DnsCache) {
 	if cache == nil {
 		return
 	}
 	c.cacheProjectionMu.Lock()
 	defer c.cacheProjectionMu.Unlock()
-	if c.dnsCache.CompareAndDelete(cacheKey, cache) {
-		baseKey := dnsCacheBaseKey(cacheKey)
-		c.forgetDnsKnowledge(cacheKey, cache)
-		c.invokeCacheDeleteCallback(cacheKey, cache)
-		c.onBaseKeySideEffectsEvicted(baseKey, cache)
-	}
+	c.evictDnsCacheLocked(cacheKey, cache)
 }
 
 func (c *DnsController) evictExpiredDnsCache(now time.Time) {
@@ -1639,12 +1909,14 @@ func (c *DnsController) evictExpiredDnsCache(now time.Time) {
 		c.dnsCache.Range(func(key, value any) bool {
 			cacheKey, ok := key.(string)
 			if !ok {
-				c.dnsCache.Delete(key)
+				if _, loaded := c.dnsCache.LoadAndDelete(key); loaded {
+					c.decrementDnsCacheSize()
+				}
 				return true
 			}
 			cache, ok := value.(*DnsCache)
 			if !ok {
-				c.dnsCache.Delete(cacheKey)
+				c.loadAndDeleteDnsCache(cacheKey)
 				return true
 			}
 
@@ -1669,7 +1941,7 @@ func (c *DnsController) evictExpiredDnsCache(now time.Time) {
 	// Step 2: LRU eviction if cache size exceeds limit
 	// This is important when optimistic_cache_ttl=0 (never expire)
 	if maxCacheSize > 0 {
-		c.evictLRUIfFull()
+		c.evictLRUIfFull(maxCacheSize)
 	}
 }
 
@@ -1693,6 +1965,10 @@ func (c *DnsController) putLRUScratch(entries []cacheEntry) {
 	}
 
 	clear(entries)
+	const maxRetainedLRUScratchEntries = 4096
+	if cap(entries) > maxRetainedLRUScratchEntries {
+		return
+	}
 
 	c.lruScratchMu.Lock()
 	if cap(entries) > cap(c.lruScratch) {
@@ -1706,8 +1982,10 @@ func (c *DnsController) putLRUScratch(entries []cacheEntry) {
 // full sort (O(n log n)) or insertion sort (O(n²)) for better performance
 // with large caches. For typical cache sizes (<1000), the overhead is negligible.
 // For large caches (>5000), this is 10-100x faster than insertion sort.
-func (c *DnsController) evictLRUIfFull() {
-	_, _, maxCacheSize := c.currentOptimisticCacheConfig()
+func (c *DnsController) evictLRUIfFull(maxCacheSize int) {
+	if maxCacheSize <= 0 {
+		return
+	}
 	// Count current cache size
 	var count int
 	c.dnsCache.Range(func(_, _ any) bool {
@@ -2120,8 +2398,9 @@ func (c *DnsController) __updateDnsCacheDeadline(cacheKey string, host string, d
 			}
 		}
 		newCache.RouteOwnerKey = cacheKey
-		c.dnsCache.Store(cacheKey, newCache)
-		c.rememberDnsKnowledge(baseKey, originalDeadline)
+		c.enforceDnsCacheCapacityLocked(cacheKey)
+		_, loaded := c.storeDnsCache(cacheKey, newCache)
+		c.rememberDnsKnowledge(baseKey, originalDeadline, !loaded)
 
 		projectionErr := error(nil)
 		if rt.cacheAccessCallback != nil {
@@ -2137,9 +2416,6 @@ func (c *DnsController) __updateDnsCacheDeadline(cacheKey string, host string, d
 			c.startBpfUpdateWorker()
 			c.scheduleBpfProjectionRetry(&bpfUpdateTask{
 				cache:                newCache,
-				cacheKey:             cacheKey,
-				runtime:              rt,
-				now:                  now,
 				routeProjectionEpoch: rt.routeProjectionEpoch,
 			})
 			return projectionErr
@@ -2768,7 +3044,7 @@ func (c *DnsController) handleWithResponseWriterLegacy(ctx context.Context, dnsM
 		if req == nil || req.lConn == nil {
 			return fmt.Errorf("dns request connection is nil for singleflight response")
 		}
-		if err = sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.downloadRecorder()); err != nil {
+		if err = sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.replySoMark(), req.downloadRecorder()); err != nil {
 			return err
 		}
 		return nil
@@ -2987,7 +3263,7 @@ func (c *DnsController) writeCachedResponse(resp []byte, reqId uint16, req *udpR
 		// Transparent DNS replies must preserve the original DNS server tuple.
 		// sendPkt also carries the DNS port-conflict raw fallback for host-local
 		// clients where binding the source address may fail transiently.
-		if err := sendRuntimeTrackedPkt(c.log, patchedResp, req.realDst, req.realSrc, req.downloadRecorder()); err != nil {
+		if err := sendRuntimeTrackedPkt(c.log, patchedResp, req.realDst, req.realSrc, req.replySoMark(), req.downloadRecorder()); err != nil {
 			return fmt.Errorf("failed to write cached DNS resp: %w", err)
 		}
 		return nil
@@ -3000,7 +3276,7 @@ func (c *DnsController) writeCachedResponse(resp []byte, reqId uint16, req *udpR
 		binary.BigEndian.PutUint16(patchedResp[0:2], reqId)
 	}
 
-	if err := sendRuntimeTrackedPkt(c.log, patchedResp, req.realDst, req.realSrc, req.downloadRecorder()); err != nil {
+	if err := sendRuntimeTrackedPkt(c.log, patchedResp, req.realDst, req.realSrc, req.replySoMark(), req.downloadRecorder()); err != nil {
 		return fmt.Errorf("failed to write oversized cached DNS resp: %w", err)
 	}
 	return nil
@@ -3037,7 +3313,7 @@ func (c *DnsController) sendDnsErrorResponse_(
 	if err != nil {
 		return fmt.Errorf("pack DNS packet: %w", err)
 	}
-	if err = sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.downloadRecorder()); err != nil {
+	if err = sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.replySoMark(), req.downloadRecorder()); err != nil {
 		return err
 	}
 	return nil
@@ -3070,7 +3346,7 @@ func (c *DnsController) sendDnsTruncatedResponse_(dnsMessage *dnsmessage.Msg, re
 	if err != nil {
 		return fmt.Errorf("pack DNS packet: %w", err)
 	}
-	if err = sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.downloadRecorder()); err != nil {
+	if err = sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.replySoMark(), req.downloadRecorder()); err != nil {
 		return err
 	}
 	return nil
@@ -3348,7 +3624,7 @@ func (c *DnsController) dialSend(
 		if err != nil {
 			return err
 		}
-		if err = sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.downloadRecorder()); err != nil {
+		if err = sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.replySoMark(), req.downloadRecorder()); err != nil {
 			return err
 		}
 

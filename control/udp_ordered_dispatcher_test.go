@@ -6,7 +6,10 @@
 package control
 
 import (
+	"context"
+	"net"
 	"net/netip"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -378,6 +381,343 @@ func TestUDPOrderedDispatcherCloseDoesNotAffectPeerGeneration(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("new generation dispatcher did not run its task")
+	}
+}
+
+func TestSessionManagerSharesUDPOrderedDispatcherAcrossGenerations(t *testing.T) {
+	manager := NewSessionManager(context.Background())
+	oldPlane := newShutdownTestControlPlane()
+	oldPlane.semanticRefactorFeatures.UDPOrderedDispatcher = true
+	oldPlane.udpOrderedDispatcher = newDefaultUDPOrderedDispatcher()
+	successor := newShutdownTestControlPlane()
+	successor.semanticRefactorFeatures.UDPOrderedDispatcher = true
+	successor.udpOrderedDispatcher = newDefaultUDPOrderedDispatcher()
+	t.Cleanup(func() {
+		_ = oldPlane.Close()
+		_ = successor.Close()
+		_ = manager.Close()
+	})
+
+	if err := oldPlane.AttachSessionManager(manager); err != nil {
+		t.Fatalf("AttachSessionManager(old) error = %v", err)
+	}
+	if err := successor.AttachSessionManager(manager); err != nil {
+		t.Fatalf("AttachSessionManager(successor) error = %v", err)
+	}
+	if oldPlane.udpOrderedDispatcher == nil || oldPlane.udpOrderedDispatcher != successor.udpOrderedDispatcher {
+		t.Fatal("reload generations did not share the process UDP ordered dispatcher")
+	}
+	if !oldPlane.udpOrderedDispatcherShared || !successor.udpOrderedDispatcherShared {
+		t.Fatal("process UDP ordered dispatcher was not marked shared")
+	}
+
+	key := udpOrderedDispatcherTestKey(41)
+	oldStarted := make(chan struct{})
+	releaseOld := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseOld) }) })
+	var orderMu sync.Mutex
+	order := make([]string, 0, 3)
+	appendOrder := func(value string) {
+		orderMu.Lock()
+		order = append(order, value)
+		orderMu.Unlock()
+	}
+
+	if !oldPlane.udpIngressAdmission.tryAcquire() {
+		t.Fatal("old generation ingress admission rejected initial task")
+	}
+	if !oldPlane.submitOrderedUDPIngress(key, func() {
+		close(oldStarted)
+		<-releaseOld
+		appendOrder("old")
+		oldPlane.udpIngressAdmission.release()
+	}, func() {
+		oldPlane.udpIngressAdmission.release()
+	}) {
+		t.Fatal("old generation ordered submit returned false")
+	}
+	select {
+	case <-oldStarted:
+	case <-time.After(time.Second):
+		t.Fatal("old generation ordered task did not start")
+	}
+
+	if !successor.udpIngressAdmission.tryAcquire() {
+		t.Fatal("successor ingress admission rejected task")
+	}
+	successorDone := make(chan struct{})
+	if !successor.submitOrderedUDPIngress(key, func() {
+		appendOrder("successor")
+		successor.udpIngressAdmission.release()
+		close(successorDone)
+	}, func() {
+		successor.udpIngressAdmission.release()
+	}) {
+		t.Fatal("successor ordered submit returned false")
+	}
+
+	retired := make(chan struct{})
+	go func() {
+		oldPlane.StopRoutingEpochExecution()
+		close(retired)
+	}()
+	select {
+	case <-retired:
+		t.Fatal("old generation retired before its accepted task settled")
+	default:
+	}
+	select {
+	case <-successorDone:
+		t.Fatal("same-flow successor task overtook the old generation task")
+	default:
+	}
+
+	releaseOnce.Do(func() { close(releaseOld) })
+	select {
+	case <-retired:
+	case <-time.After(time.Second):
+		t.Fatal("old generation retirement did not settle")
+	}
+	select {
+	case <-successorDone:
+	case <-time.After(time.Second):
+		t.Fatal("successor task did not run after old generation retirement")
+	}
+
+	if !successor.udpIngressAdmission.tryAcquire() {
+		t.Fatal("successor admission closed with old generation")
+	}
+	lastDone := make(chan struct{})
+	if !successor.submitOrderedUDPIngress(key, func() {
+		appendOrder("last")
+		successor.udpIngressAdmission.release()
+		close(lastDone)
+	}, func() {
+		successor.udpIngressAdmission.release()
+	}) {
+		t.Fatal("shared dispatcher closed with retired generation")
+	}
+	select {
+	case <-lastDone:
+	case <-time.After(time.Second):
+		t.Fatal("shared dispatcher stopped after old generation retirement")
+	}
+
+	orderMu.Lock()
+	defer orderMu.Unlock()
+	want := []string{"old", "successor", "last"}
+	if len(order) != len(want) {
+		t.Fatalf("ordered execution = %v, want %v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("ordered execution = %v, want %v", order, want)
+		}
+	}
+}
+
+func TestFailedCandidateDoesNotCloseProcessUDPOrderedDispatcher(t *testing.T) {
+	manager := NewSessionManager(context.Background())
+	active := newShutdownTestControlPlane()
+	active.semanticRefactorFeatures.UDPOrderedDispatcher = true
+	candidate := newShutdownTestControlPlane()
+	candidate.semanticRefactorFeatures.UDPOrderedDispatcher = true
+	t.Cleanup(func() {
+		_ = active.Close()
+		_ = candidate.Close()
+		_ = manager.Close()
+	})
+	if err := active.AttachSessionManager(manager); err != nil {
+		t.Fatalf("AttachSessionManager(active) error = %v", err)
+	}
+	if err := candidate.AttachSessionManager(manager); err != nil {
+		t.Fatalf("AttachSessionManager(candidate) error = %v", err)
+	}
+	shared := active.udpOrderedDispatcher
+	if shared == nil || candidate.udpOrderedDispatcher != shared {
+		t.Fatal("candidate did not attach to active process dispatcher")
+	}
+
+	if err := candidate.Close(); err != nil {
+		t.Fatalf("candidate Close() error = %v", err)
+	}
+	if shared.isClosed() {
+		t.Fatal("failed candidate closed the active process dispatcher")
+	}
+
+	done := make(chan struct{})
+	if !active.udpIngressAdmission.tryAcquire() {
+		t.Fatal("active admission closed with failed candidate")
+	}
+	if !active.submitOrderedUDPIngress(udpOrderedDispatcherTestKey(42), func() {
+		active.udpIngressAdmission.release()
+		close(done)
+	}, func() {
+		active.udpIngressAdmission.release()
+	}) {
+		t.Fatal("active generation submit failed after candidate cleanup")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("active process dispatcher did not execute after candidate cleanup")
+	}
+}
+
+func TestSessionManagerCloseStopsProcessUDPOrderedDispatcher(t *testing.T) {
+	manager := NewSessionManager(context.Background())
+	plane := &ControlPlane{
+		semanticRefactorFeatures: SemanticRefactorFeatureSet{UDPOrderedDispatcher: true},
+	}
+	if err := plane.AttachSessionManager(manager); err != nil {
+		t.Fatalf("AttachSessionManager() error = %v", err)
+	}
+	dispatcher := plane.udpOrderedDispatcher
+	if dispatcher == nil || !plane.udpOrderedDispatcherShared {
+		t.Fatal("control plane did not receive a process ordered dispatcher")
+	}
+
+	key := udpOrderedDispatcherTestKey(43)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		_ = manager.Close()
+	})
+	if !dispatcher.submit(key, func() {
+		close(started)
+		<-release
+	}, nil) {
+		t.Fatal("process dispatcher rejected active task")
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("process dispatcher did not start active task")
+	}
+	discarded := make(chan struct{})
+	if !dispatcher.submit(key, func() {
+		t.Error("queued task ran during process shutdown")
+	}, func() {
+		close(discarded)
+	}) {
+		t.Fatal("process dispatcher rejected queued task")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- manager.Close() }()
+	select {
+	case <-discarded:
+	case <-time.After(time.Second):
+		t.Fatal("SessionManager.Close did not discard queued process work")
+	}
+	select {
+	case err := <-closed:
+		t.Fatalf("SessionManager.Close returned before active work settled: %v", err)
+	default:
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("SessionManager.Close() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SessionManager.Close did not wait for active process work")
+	}
+	if dispatcher.submit(key, func() {}, nil) {
+		t.Fatal("process dispatcher accepted work after SessionManager.Close")
+	}
+}
+
+func TestSessionManagerCloseQuiescesOrderedIngressBeforeFlows(t *testing.T) {
+	manager := NewSessionManager(context.Background())
+	plane := &ControlPlane{
+		semanticRefactorFeatures: SemanticRefactorFeatureSet{UDPOrderedDispatcher: true},
+	}
+	if err := plane.AttachSessionManager(manager); err != nil {
+		t.Fatalf("AttachSessionManager() error = %v", err)
+	}
+
+	ingress, ingressPeer := net.Pipe()
+	egress, egressPeer := net.Pipe()
+	defer func() { _ = ingressPeer.Close() }()
+	defer func() { _ = egressPeer.Close() }()
+	flow, err := manager.adoptTCP(ingress, egress, TcpFlowBinding{}, nil, nil)
+	if err != nil {
+		t.Fatalf("adoptTCP() error = %v", err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	if !plane.udpOrderedDispatcher.submit(udpOrderedDispatcherTestKey(44), func() {
+		close(started)
+		<-release
+	}, nil) {
+		t.Fatal("process dispatcher rejected active task")
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("ordered ingress task did not start")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- manager.Close() }()
+	deadline := time.Now().Add(time.Second)
+	for !plane.udpOrderedDispatcher.isClosed() && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if !plane.udpOrderedDispatcher.isClosed() {
+		t.Fatal("SessionManager.Close did not close ordered ingress admission")
+	}
+	select {
+	case <-flow.Context().Done():
+		t.Fatal("flow was canceled while ordered ingress was still running")
+	default:
+	}
+	select {
+	case err := <-closed:
+		t.Fatalf("SessionManager.Close returned before ordered ingress settled: %v", err)
+	default:
+	}
+
+	close(release)
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("SessionManager.Close() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SessionManager.Close did not finish after ordered ingress settled")
+	}
+	select {
+	case <-flow.Context().Done():
+	default:
+		t.Fatal("flow remained active after SessionManager.Close")
+	}
+}
+
+func TestSessionManagerPreservesLegacyUDPOrderedFeatureGate(t *testing.T) {
+	manager := NewSessionManager(context.Background())
+	enabled := &ControlPlane{
+		semanticRefactorFeatures: SemanticRefactorFeatureSet{UDPOrderedDispatcher: true},
+	}
+	legacy := &ControlPlane{}
+	t.Cleanup(func() { _ = manager.Close() })
+	if err := enabled.AttachSessionManager(manager); err != nil {
+		t.Fatalf("AttachSessionManager(enabled) error = %v", err)
+	}
+	if enabled.udpOrderedDispatcher == nil || !enabled.udpOrderedDispatcherShared {
+		t.Fatal("enabled generation did not receive process ordered dispatcher")
+	}
+	if err := legacy.AttachSessionManager(manager); err != nil {
+		t.Fatalf("AttachSessionManager(legacy) error = %v", err)
+	}
+	if legacy.udpOrderedDispatcher != nil || legacy.udpOrderedDispatcherShared {
+		t.Fatal("legacy generation enabled the ordered dispatcher through a shared manager")
 	}
 }
 

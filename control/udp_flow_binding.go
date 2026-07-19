@@ -39,16 +39,14 @@ type UdpFlowBinding struct {
 	Egress UdpEgressBinding
 }
 
-func newUdpFlowBinding(snapshot *routing.PolicySnapshot, outboundIndex consts.OutboundIndex, mark uint32, must bool, option *DialOption) UdpFlowBinding {
+func newUdpFlowBinding(policyEpoch routing.PolicyEpoch, outboundIndex consts.OutboundIndex, mark uint32, must bool, option *DialOption) UdpFlowBinding {
 	binding := UdpFlowBinding{
 		Route: UdpRouteBinding{
-			Outbound: outboundIndex,
-			Mark:     mark,
-			Must:     must,
+			PolicyEpoch: policyEpoch,
+			Outbound:    outboundIndex,
+			Mark:        mark,
+			Must:        must,
 		},
-	}
-	if snapshot != nil {
-		binding.Route.PolicyEpoch = snapshot.Epoch()
 	}
 	if option == nil {
 		return binding

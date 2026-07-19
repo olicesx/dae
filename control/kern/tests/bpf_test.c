@@ -47,9 +47,10 @@ struct {
 } test_routing_cache_ctx_map SEC(".maps");
 
 static __always_inline int
-setup_cached_routing_result(__u32 saddr, __u32 daddr,
-			    __u16 sport, __u16 dport,
-			    __u8 outbound, __u32 mark)
+setup_cached_routing_result_for_proto(__u32 saddr, __u32 daddr,
+				      __u16 sport, __u16 dport,
+				      __u8 l4proto, __u8 outbound,
+				      __u32 mark)
 {
 	struct test_routing_cache_ctx *ctx =
 		bpf_map_lookup_elem(&test_routing_cache_ctx_map, &zero_key);
@@ -64,7 +65,7 @@ setup_cached_routing_result(__u32 saddr, __u32 daddr,
 	ctx->key.dip.u6_addr32[3] = bpf_htonl(daddr);
 	ctx->key.sport = bpf_htons(sport);
 	ctx->key.dport = bpf_htons(dport);
-	ctx->key.l4proto = IPPROTO_TCP;
+	ctx->key.l4proto = l4proto;
 	ctx->result.outbound = outbound;
 	ctx->result.mark = mark;
 
@@ -72,7 +73,7 @@ setup_cached_routing_result(__u32 saddr, __u32 daddr,
 	struct conn_state conn_state = {};
 
 	conn_state.is_wan_ingress_direction = false;
-	conn_state.state = 0; // TCP_STATE_ACTIVE
+	conn_state.state = TCP_STATE_ACTIVE;
 	conn_state.last_seen_ns = bpf_ktime_get_ns();
 	conn_state.meta.data.has_routing = 1;
 	conn_state.meta.data.outbound = outbound;
@@ -80,6 +81,25 @@ setup_cached_routing_result(__u32 saddr, __u32 daddr,
 	conn_state.meta.data.must = 0;
 
 	return bpf_map_update_elem(&conn_state_map, &ctx->key, &conn_state, BPF_ANY);
+}
+
+static __always_inline int
+setup_cached_routing_result(__u32 saddr, __u32 daddr,
+			    __u16 sport, __u16 dport,
+			    __u8 outbound, __u32 mark)
+{
+	return setup_cached_routing_result_for_proto(saddr, daddr, sport, dport,
+					     IPPROTO_TCP, outbound, mark);
+}
+
+static __always_inline int
+set_test_outbound_connectivity(__u8 outbound, __u8 l4proto, __u32 alive)
+{
+	__u32 domain_idx = l4proto == IPPROTO_UDP ? 2 : 0;
+	__u32 key = ((__u32)outbound * 6) + (domain_idx * 2);
+
+	return bpf_map_update_elem(&outbound_connectivity_map, &key, &alive,
+				   BPF_ANY);
 }
 
 static __always_inline int
@@ -220,14 +240,16 @@ check_routing_epoch_lan_ingress(struct __sk_buff *skb,
 	key.l4proto = IPPROTO_TCP;
 
 	conn_state = bpf_map_lookup_elem(&conn_state_map, &key);
-	if (!conn_state || conn_state->routing_epoch_slot != expected_epoch_slot) {
+	if (!conn_state || conn_state->routing_epoch_slot != expected_epoch_slot ||
+	    conn_state->datapath_generation != PARAM.datapath_generation) {
 		bpf_printk("conn_state routing epoch slot mismatch\n");
 		return TC_ACT_SHOT;
 	}
 
 	handoff = bpf_map_lookup_elem(&routing_handoff_map, &key);
 	if (!handoff || handoff->result.outbound != expected_outbound ||
-	    handoff->result.routing_epoch_slot != expected_epoch_slot) {
+	    handoff->result.routing_epoch_slot != expected_epoch_slot ||
+	    handoff->result.datapath_generation != PARAM.datapath_generation) {
 		bpf_printk("routing handoff epoch attribution mismatch\n");
 		return TC_ACT_SHOT;
 	}
@@ -758,6 +780,297 @@ int testcheck_wan_egress_udp_redirect_track(struct __sk_buff *skb)
 	return check_redirect_with_listener_l4proto_and_track_ipv4(skb,
 								   IPPROTO_UDP,
 								   1);
+}
+
+SEC("tc/pktgen/tcp_active_idle_state_retained")
+int testpktgen_tcp_active_idle_state_retained(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb,
+			    IPV4(192,168,20,1), IPV4(10,20,0,1),
+			    41000, 443);
+}
+
+SEC("tc/setup/tcp_active_idle_state_retained")
+int testsetup_tcp_active_idle_state_retained(struct __sk_buff *skb)
+{
+	struct conn_state state = {};
+	(void)skb;
+
+	state.state = TCP_STATE_ACTIVE;
+	state.last_seen_ns = 1;
+	if (tcp_conn_state_expired(&state, 120000000002ULL))
+		return TC_ACT_SHOT;
+
+	state.state = TCP_STATE_CLOSING;
+	if (tcp_conn_state_expired(
+		    &state, state.last_seen_ns + TCP_CONN_STATE_CLOSING_TIMEOUT_NS))
+		return TC_ACT_SHOT;
+	if (!tcp_conn_state_expired(
+		    &state,
+		    state.last_seen_ns + TCP_CONN_STATE_CLOSING_TIMEOUT_NS + 1))
+		return TC_ACT_SHOT;
+
+	return TC_ACT_OK;
+}
+
+SEC("tc/check/tcp_active_idle_state_retained")
+int testcheck_tcp_active_idle_state_retained(struct __sk_buff *skb)
+{
+	return check_status_and_mark(skb, TC_ACT_OK, 0);
+}
+
+SEC("tc/pktgen/tcp_pure_syn_replaces_stale_state")
+int testpktgen_tcp_pure_syn_replaces_stale_state(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb,
+			    IPV4(192,168,20,2), IPV4(10,20,0,2),
+			    41001, 443);
+}
+
+SEC("tc/setup/tcp_pure_syn_replaces_stale_state")
+int testsetup_tcp_pure_syn_replaces_stale_state(struct __sk_buff *skb)
+{
+	struct tuples_key key = {};
+	struct conn_state stale_state = {};
+	struct tcphdr tcph = {};
+	struct conn_state *new_state;
+	(void)skb;
+
+	key.sip.u6_addr32[2] = bpf_htonl(0xffff);
+	key.sip.u6_addr32[3] = bpf_htonl(IPV4(192,168,20,2));
+	key.dip.u6_addr32[2] = bpf_htonl(0xffff);
+	key.dip.u6_addr32[3] = bpf_htonl(IPV4(10,20,0,2));
+	key.sport = bpf_htons(41001);
+	key.dport = bpf_htons(443);
+	key.l4proto = IPPROTO_TCP;
+	stale_state.state = TCP_STATE_ACTIVE;
+	stale_state.last_seen_ns = 1;
+	stale_state.meta.data.has_routing = 1;
+	stale_state.meta.data.outbound = OUTBOUND_USER_DEFINED_MIN;
+	if (bpf_map_update_elem(&conn_state_map, &key, &stale_state, BPF_ANY))
+		return TC_ACT_SHOT;
+
+	tcph.syn = 1;
+	new_state = mark_tcp_seen(&key, &tcph, false,
+				  NULL, NULL, NULL, NULL,
+				  0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
+	if (!new_state || new_state->meta.data.has_routing ||
+	    new_state->state != TCP_STATE_ACTIVE)
+		return TC_ACT_SHOT;
+
+	return TC_ACT_OK;
+}
+
+SEC("tc/check/tcp_pure_syn_replaces_stale_state")
+int testcheck_tcp_pure_syn_replaces_stale_state(struct __sk_buff *skb)
+{
+	return check_status_and_mark(skb, TC_ACT_OK, 0);
+}
+
+SEC("tc/pktgen/lan_tcp_cached_outbound_survives_connectivity_change")
+int testpktgen_lan_tcp_cached_outbound_survives_connectivity_change(
+	struct __sk_buff *skb)
+{
+	return set_ipv4_tcp_with_flags(skb,
+				       IPV4(192,168,20,3), IPV4(10,20,0,3),
+				       41002, 443,
+				       false, true, false);
+}
+
+SEC("tc/setup/lan_tcp_cached_outbound_survives_connectivity_change")
+int testsetup_lan_tcp_cached_outbound_survives_connectivity_change(
+	struct __sk_buff *skb)
+{
+	__u8 outbound = OUTBOUND_USER_DEFINED_MIN;
+	int ret;
+
+	ret = setup_cached_routing_result(IPV4(192,168,20,3),
+					  IPV4(10,20,0,3), 41002, 443,
+					  outbound, TPROXY_MARK);
+	if (ret || set_test_outbound_connectivity(outbound, IPPROTO_TCP, 0))
+		return TC_ACT_SHOT;
+
+	ret = do_tproxy_lan_ingress(skb, ETH_HLEN);
+	if (set_test_outbound_connectivity(outbound, IPPROTO_TCP, 1))
+		return TC_ACT_SHOT;
+	return ret;
+}
+
+SEC("tc/check/lan_tcp_cached_outbound_survives_connectivity_change")
+int testcheck_lan_tcp_cached_outbound_survives_connectivity_change(
+	struct __sk_buff *skb)
+{
+	return check_redirect_non_syn_tcp(skb);
+}
+
+SEC("tc/pktgen/wan_tcp_cached_outbound_survives_connectivity_change")
+int testpktgen_wan_tcp_cached_outbound_survives_connectivity_change(
+	struct __sk_buff *skb)
+{
+	return set_ipv4_tcp_with_flags(skb,
+				       IPV4(192,168,20,4), IPV4(10,20,0,4),
+				       41003, 443,
+				       false, true, false);
+}
+
+SEC("tc/setup/wan_tcp_cached_outbound_survives_connectivity_change")
+int testsetup_wan_tcp_cached_outbound_survives_connectivity_change(
+	struct __sk_buff *skb)
+{
+	__u8 outbound = OUTBOUND_USER_DEFINED_MIN;
+	int ret;
+
+	ret = setup_cached_routing_result(IPV4(192,168,20,4),
+					  IPV4(10,20,0,4), 41003, 443,
+					  outbound, TPROXY_MARK);
+	if (ret || set_test_outbound_connectivity(outbound, IPPROTO_TCP, 0))
+		return TC_ACT_SHOT;
+
+	ret = do_tproxy_wan_egress(skb, ETH_HLEN);
+	if (set_test_outbound_connectivity(outbound, IPPROTO_TCP, 1))
+		return TC_ACT_SHOT;
+	return ret;
+}
+
+SEC("tc/check/wan_tcp_cached_outbound_survives_connectivity_change")
+int testcheck_wan_tcp_cached_outbound_survives_connectivity_change(
+	struct __sk_buff *skb)
+{
+	return check_redirect_non_syn_tcp(skb);
+}
+
+SEC("tc/pktgen/lan_udp_cached_outbound_survives_connectivity_change")
+int testpktgen_lan_udp_cached_outbound_survives_connectivity_change(
+	struct __sk_buff *skb)
+{
+	return set_ipv4_udp_fastpath_with_dscp(
+		skb, IPV4(192,168,20,5), IPV4(10,20,0,5), 41004, 8443, 0);
+}
+
+SEC("tc/setup/lan_udp_cached_outbound_survives_connectivity_change")
+int testsetup_lan_udp_cached_outbound_survives_connectivity_change(
+	struct __sk_buff *skb)
+{
+	__u8 outbound = OUTBOUND_USER_DEFINED_MIN;
+	int ret;
+
+	ret = setup_cached_routing_result_for_proto(
+		IPV4(192,168,20,5), IPV4(10,20,0,5), 41004, 8443,
+		IPPROTO_UDP, outbound, TPROXY_MARK);
+	if (ret || set_test_outbound_connectivity(outbound, IPPROTO_UDP, 0))
+		return TC_ACT_SHOT;
+
+	ret = do_tproxy_lan_ingress(skb, ETH_HLEN);
+	if (set_test_outbound_connectivity(outbound, IPPROTO_UDP, 1))
+		return TC_ACT_SHOT;
+	return ret;
+}
+
+SEC("tc/check/lan_udp_cached_outbound_survives_connectivity_change")
+int testcheck_lan_udp_cached_outbound_survives_connectivity_change(
+	struct __sk_buff *skb)
+{
+	return check_redirect_with_listener_l4proto(skb, IPPROTO_UDP);
+}
+
+SEC("tc/pktgen/wan_udp_cached_outbound_survives_connectivity_change")
+int testpktgen_wan_udp_cached_outbound_survives_connectivity_change(
+	struct __sk_buff *skb)
+{
+	return set_ipv4_udp_fastpath_with_dscp(
+		skb, IPV4(192,168,20,6), IPV4(10,20,0,6), 41005, 8443, 0);
+}
+
+SEC("tc/setup/wan_udp_cached_outbound_survives_connectivity_change")
+int testsetup_wan_udp_cached_outbound_survives_connectivity_change(
+	struct __sk_buff *skb)
+{
+	__u8 outbound = OUTBOUND_USER_DEFINED_MIN;
+	int ret;
+
+	ret = setup_cached_routing_result_for_proto(
+		IPV4(192,168,20,6), IPV4(10,20,0,6), 41005, 8443,
+		IPPROTO_UDP, outbound, TPROXY_MARK);
+	if (ret || set_test_outbound_connectivity(outbound, IPPROTO_UDP, 0))
+		return TC_ACT_SHOT;
+
+	ret = do_tproxy_wan_egress(skb, ETH_HLEN);
+	if (set_test_outbound_connectivity(outbound, IPPROTO_UDP, 1))
+		return TC_ACT_SHOT;
+	return ret;
+}
+
+SEC("tc/check/wan_udp_cached_outbound_survives_connectivity_change")
+int testcheck_wan_udp_cached_outbound_survives_connectivity_change(
+	struct __sk_buff *skb)
+{
+	return check_redirect_with_listener_l4proto_and_track_ipv4(
+		skb, IPPROTO_UDP, 1);
+}
+
+SEC("tc/pktgen/wan_tcp_new_outbound_obeys_connectivity_change")
+int testpktgen_wan_tcp_new_outbound_obeys_connectivity_change(
+	struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb,
+			    IPV4(192,168,20,7), IPV4(10,20,0,7),
+			    41006, 443);
+}
+
+SEC("tc/setup/wan_tcp_new_outbound_obeys_connectivity_change")
+int testsetup_wan_tcp_new_outbound_obeys_connectivity_change(
+	struct __sk_buff *skb)
+{
+	__u8 outbound = OUTBOUND_USER_DEFINED_MIN;
+	int ret;
+
+	set_routing_fallback(outbound, false);
+	if (set_test_outbound_connectivity(outbound, IPPROTO_TCP, 0))
+		return TC_ACT_SHOT;
+
+	ret = do_tproxy_wan_egress(skb, ETH_HLEN);
+	if (set_test_outbound_connectivity(outbound, IPPROTO_TCP, 1))
+		return TC_ACT_SHOT;
+	return ret;
+}
+
+SEC("tc/check/wan_tcp_new_outbound_obeys_connectivity_change")
+int testcheck_wan_tcp_new_outbound_obeys_connectivity_change(
+	struct __sk_buff *skb)
+{
+	return check_status_and_mark(skb, TC_ACT_SHOT, 0);
+}
+
+SEC("tc/pktgen/wan_udp_new_outbound_obeys_connectivity_change")
+int testpktgen_wan_udp_new_outbound_obeys_connectivity_change(
+	struct __sk_buff *skb)
+{
+	return set_ipv4_udp_fastpath_with_dscp(
+		skb, IPV4(192,168,20,8), IPV4(10,20,0,8), 41007, 8443, 0);
+}
+
+SEC("tc/setup/wan_udp_new_outbound_obeys_connectivity_change")
+int testsetup_wan_udp_new_outbound_obeys_connectivity_change(
+	struct __sk_buff *skb)
+{
+	__u8 outbound = OUTBOUND_USER_DEFINED_MIN;
+	int ret;
+
+	set_routing_fallback(outbound, false);
+	if (set_test_outbound_connectivity(outbound, IPPROTO_UDP, 0))
+		return TC_ACT_SHOT;
+
+	ret = do_tproxy_wan_egress(skb, ETH_HLEN);
+	if (set_test_outbound_connectivity(outbound, IPPROTO_UDP, 1))
+		return TC_ACT_SHOT;
+	return ret;
+}
+
+SEC("tc/check/wan_udp_new_outbound_obeys_connectivity_change")
+int testcheck_wan_udp_new_outbound_obeys_connectivity_change(
+	struct __sk_buff *skb)
+{
+	return check_status_and_mark(skb, TC_ACT_SHOT, 0);
 }
 
 SEC("tc/pktgen/lan_ingress_udp_first_fragment_listener")

@@ -7,6 +7,8 @@ package control
 
 import (
 	"net"
+	"runtime"
+	"strconv"
 	"testing"
 	"time"
 
@@ -148,6 +150,85 @@ func BenchmarkDnsCache_CloneForReload(b *testing.B) {
 	}
 }
 
+func BenchmarkDnsController_ReuseForReloadUnchangedProjection(b *testing.B) {
+	const cacheEntries = 10_000
+	projectionHash := [32]byte{1}
+	controller := newTestDnsController()
+	b.Cleanup(func() { _ = controller.Close() })
+	if err := controller.TryUpdateRuntime(&DnsControllerOption{
+		RouteProjectionEpoch: 1,
+		RouteProjectionHash:  projectionHash,
+	}, nil); err != nil {
+		b.Fatal(err)
+	}
+	for i := 0; i < cacheEntries; i++ {
+		controller.dnsCache.Store(i, &DnsCache{RouteProjectionEpoch: 1})
+	}
+
+	b.ReportAllocs()
+	b.ReportMetric(cacheEntries, "cache_entries")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		reused, err := controller.ReuseForReload(&DnsControllerOption{
+			RouteProjectionEpoch: uint64(i) + 2,
+			RouteProjectionHash:  projectionHash,
+		}, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		controller = reused
+	}
+}
+
+func BenchmarkDnsController_CloneCacheForReload10000(b *testing.B) {
+	const cacheEntries = 10_000
+	controller := newTestDnsController()
+	for i := 0; i < cacheEntries; i++ {
+		key := "clone-" + strconv.Itoa(i)
+		controller.dnsCache.Store(key, &DnsCache{RouteOwnerKey: key})
+	}
+
+	b.ReportAllocs()
+	b.ReportMetric(cacheEntries, "cache_entries")
+	b.ResetTimer()
+	for range b.N {
+		cloned := controller.CloneCacheForReload()
+		if len(cloned) != cacheEntries {
+			b.Fatalf("cloned %d entries, want %d", len(cloned), cacheEntries)
+		}
+		runtime.KeepAlive(cloned)
+	}
+}
+
+func BenchmarkDnsCacheCapacityAdmission(b *testing.B) {
+	for _, cacheEntries := range []int{1024, 65536} {
+		b.Run(strconv.Itoa(cacheEntries), func(b *testing.B) {
+			controller := newTestDnsController()
+			controller.maxCacheSize.Store(int64(cacheEntries))
+			deadline := time.Now().Add(time.Hour)
+			for i := 0; i < cacheEntries; i++ {
+				key := "resident-" + strconv.Itoa(i) + ".:1"
+				cache := &DnsCache{RouteOwnerKey: key, OriginalDeadline: deadline}
+				controller.storeDnsCache(key, cache)
+				controller.rememberDnsKnowledge(dnsCacheBaseKey(key), deadline, true)
+			}
+
+			b.ReportAllocs()
+			b.ReportMetric(float64(cacheEntries), "cache_entries")
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				key := "incoming-" + strconv.Itoa(i) + ".:1"
+				cache := &DnsCache{RouteOwnerKey: key, OriginalDeadline: deadline}
+				controller.cacheProjectionMu.Lock()
+				controller.enforceDnsCacheCapacityLocked(key)
+				controller.storeDnsCache(key, cache)
+				controller.rememberDnsKnowledge(dnsCacheBaseKey(key), deadline, true)
+				controller.cacheProjectionMu.Unlock()
+			}
+		})
+	}
+}
+
 func BenchmarkDnsCache_NeedsBpfUpdate(b *testing.B) {
 	cache := newBenchmarkDnsCache(b)
 	now := time.Now()
@@ -156,6 +237,25 @@ func BenchmarkDnsCache_NeedsBpfUpdate(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		cache.NeedsBpfUpdate(now.Add(time.Duration(i) * time.Second))
+	}
+}
+
+func BenchmarkBpfUpdateTaskCurrentOwnerLookup(b *testing.B) {
+	controller := newTestDnsController()
+	cache := &DnsCache{RouteOwnerKey: "benchmark-owner.example.:1", RouteProjectionEpoch: 7}
+	controller.dnsCache.Store(cache.RouteOwnerKey, cache)
+	task := &bpfUpdateTask{cache: cache, routeProjectionEpoch: 7}
+	rt := &dnsControllerRuntimeState{
+		routeProjectionEpoch: 7,
+		cacheAccessCallback:  func(*DnsCache) error { return nil },
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if !controller.bpfUpdateTaskCurrent(task, rt) {
+			b.Fatal("current owner task was rejected")
+		}
 	}
 }
 

@@ -36,7 +36,7 @@ func TestUdpFlowBindingKeepsRouteAndEgressSeparate(t *testing.T) {
 		SniffedDomain: "example.com",
 		IsDialIp:      true,
 	}
-	binding := newUdpFlowBinding(snapshot, 7, 42, true, option)
+	binding := newUdpFlowBinding(snapshot.Epoch(), 7, 42, true, option)
 
 	if binding.Route.PolicyEpoch != snapshot.Epoch() || binding.Route.Outbound != 7 || binding.Route.Mark != 42 || !binding.Route.Must {
 		t.Fatalf("route binding = %+v", binding.Route)
@@ -45,7 +45,14 @@ func TestUdpFlowBindingKeepsRouteAndEgressSeparate(t *testing.T) {
 		t.Fatalf("egress binding = %+v", binding.Egress)
 	}
 
-	endpoint := &UdpEndpoint{binding: binding}
+	endpoint := &UdpEndpoint{
+		Dialer:              binding.Egress.Dialer,
+		Outbound:            binding.Egress.Outbound,
+		DialTarget:          binding.Egress.Target,
+		endpointNetworkType: binding.Egress.NetworkType,
+		SniffedDomain:       binding.Egress.SniffedDomain,
+	}
+	endpoint.setFlowBinding(binding)
 	if got := endpoint.FlowBinding(); got != binding {
 		t.Fatalf("FlowBinding() = %+v, want %+v", got, binding)
 	}

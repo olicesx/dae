@@ -1,0 +1,1028 @@
+/*
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
+ */
+
+package control
+
+import (
+	"context"
+	stderrors "errors"
+	"fmt"
+	"net"
+	"net/netip"
+	"sync"
+	"sync/atomic"
+
+	commonerrors "github.com/daeuniverse/dae/common/errors"
+	"github.com/daeuniverse/dae/component/routing"
+	"github.com/daeuniverse/outbound/netproxy"
+	"golang.org/x/sys/unix"
+)
+
+var (
+	// ErrSessionManagerClosed is returned when a flow is registered after the
+	// process-level session manager has begun shutdown.
+	ErrSessionManagerClosed = stderrors.New("session manager is closed")
+	// ErrFlowAlreadyRegistered is returned when an ingress connection already
+	// belongs to a live flow runtime.
+	ErrFlowAlreadyRegistered = stderrors.New("flow is already registered")
+)
+
+type sessionGenerationState struct {
+	active int
+	idleCh chan struct{}
+}
+
+type controlPlaneSessionManagerBinding struct {
+	manager *SessionManager
+	owned   bool
+}
+
+type sessionManagerDispatchers struct {
+	ordered *udpOrderedDispatcher
+	reply   *udpReplyDispatcher
+}
+
+type udpFlowSourceSnapshot struct {
+	flows []*UDPFlowRuntime
+}
+
+// SessionManager owns established flow lifecycles independently of any
+// ControlPlane generation. Reload swaps the policy used for new flows while
+// existing runtimes retain their original sockets and immutable bindings.
+type SessionManager struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	mu             sync.RWMutex
+	closed         bool
+	flows          map[net.Conn]*FlowRuntime
+	udpFlows       map[*UdpEndpoint]*UDPFlowRuntime
+	udpBySource    sync.Map // map[netip.AddrPort]*udpFlowSourceSnapshot
+	generations    map[routing.PolicyEpoch]*sessionGenerationState
+	pinnedTCP      map[bpfTuplesKey]int
+	pinnedRedirect map[bpfRedirectTuple]int
+	udpOrdered     *udpOrderedDispatcher
+	udpDispatcher  *udpReplyDispatcher
+
+	udpStateMu sync.RWMutex
+	udpBPF     atomic.Pointer[bpfObjects]
+	pinnedUDP  map[bpfTuplesKey]int
+
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// FlowRuntime is the process-owned lifecycle capsule for one established TCP
+// flow. Its context is independent from the ControlPlane that selected the
+// immutable route and egress binding.
+type FlowRuntime struct {
+	manager *SessionManager
+
+	ingress net.Conn
+	egress  netproxy.Conn
+	binding TcpFlowBinding
+
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	egressLease    *egressRuntimeLease
+	pinKeys        [2]bpfTuplesKey
+	pinKeyCount    uint8
+	redirectKey    bpfRedirectTuple
+	hasRedirectKey bool
+
+	finishOnce sync.Once
+	abortOnce  sync.Once
+}
+
+// UDPFlowRuntime keeps an established UDP endpoint and its immutable route
+// binding alive independently of the ControlPlane that selected it.
+type UDPFlowRuntime struct {
+	manager  *SessionManager
+	endpoint *UdpEndpoint
+	binding  UdpFlowBinding
+
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	egressLease *egressRuntimeLease
+
+	finishOnce sync.Once
+	abortOnce  sync.Once
+}
+
+// NewSessionManager constructs a process-level flow owner. A nil parent uses
+// context.Background.
+func NewSessionManager(parent context.Context) *SessionManager {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	return &SessionManager{
+		ctx:            ctx,
+		cancel:         cancel,
+		flows:          make(map[net.Conn]*FlowRuntime),
+		udpFlows:       make(map[*UdpEndpoint]*UDPFlowRuntime),
+		generations:    make(map[routing.PolicyEpoch]*sessionGenerationState),
+		pinnedTCP:      make(map[bpfTuplesKey]int),
+		pinnedRedirect: make(map[bpfRedirectTuple]int),
+		pinnedUDP:      make(map[bpfTuplesKey]int),
+	}
+}
+
+// AttachSessionManager installs the process-level session owner used by this
+// control plane. It must be called before Serve starts accepting connections.
+// Existing constructors remain compatible by creating a private manager lazily
+// when no process owner is attached.
+func (c *ControlPlane) AttachSessionManager(manager *SessionManager) error {
+	if c == nil || manager == nil {
+		return fmt.Errorf("attach session manager: manager is required")
+	}
+	incomingConnectionOwnershipMu.Lock()
+	defer incomingConnectionOwnershipMu.Unlock()
+	if c.drainTracker != nil && c.drainTracker.Count() != 0 {
+		return fmt.Errorf("attach session manager after connection admission")
+	}
+	if c.udpIngressAdmission.state.Load() != 0 {
+		return fmt.Errorf("attach session manager after UDP ingress admission")
+	}
+	activeIngress := false
+	c.inConnections.Range(func(_, _ any) bool {
+		activeIngress = true
+		return false
+	})
+	if activeIngress {
+		return fmt.Errorf("attach session manager with active ingress")
+	}
+
+	c.sessionManagerMu.Lock()
+	previous := c.sessionManager
+	previousOwned := c.ownsSessionManager
+	if previous != nil && previous != manager && previous.ActiveConnections() != 0 {
+		c.sessionManagerMu.Unlock()
+		return fmt.Errorf("attach session manager with active private flows")
+	}
+	dispatchers, err := manager.prepareControlPlane(c)
+	if err != nil {
+		c.sessionManagerMu.Unlock()
+		return err
+	}
+	oldOrdered := c.udpOrderedDispatcher
+	oldOrderedShared := c.udpOrderedDispatcherShared
+	if dispatchers.ordered != nil && dispatchers.ordered != oldOrdered {
+		c.udpOrderedDispatcher = dispatchers.ordered
+		c.udpOrderedDispatcherShared = true
+	}
+	oldReply := c.udpReplyDispatcher
+	oldReplyShared := c.udpReplyDispatcherShared
+	if dispatchers.reply != nil && dispatchers.reply != oldReply {
+		c.udpReplyDispatcher = dispatchers.reply
+		c.udpReplyDispatcherShared = true
+	}
+	c.sessionManager = manager
+	c.ownsSessionManager = false
+	c.sessionManagerBinding.Store(&controlPlaneSessionManagerBinding{manager: manager})
+	c.sessionManagerMu.Unlock()
+	if oldOrdered != nil && oldOrdered != dispatchers.ordered && !oldOrderedShared {
+		oldOrdered.close()
+		oldOrdered.wait()
+	}
+	if oldReply != nil && oldReply != dispatchers.reply && !oldReplyShared {
+		oldReply.close()
+		oldReply.wait()
+	}
+	if previousOwned && previous != nil && previous != manager {
+		return previous.Close()
+	}
+	return nil
+}
+
+func (m *SessionManager) prepareControlPlane(c *ControlPlane) (sessionManagerDispatchers, error) {
+	if m == nil || c == nil {
+		return sessionManagerDispatchers{}, ErrSessionManagerClosed
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return sessionManagerDispatchers{}, ErrSessionManagerClosed
+	}
+	var dispatchers sessionManagerDispatchers
+	if c.semanticRefactorFeatures.UDPOrderedDispatcher {
+		if m.udpOrdered == nil {
+			m.udpOrdered = newDefaultUDPOrderedDispatcher()
+		}
+		dispatchers.ordered = m.udpOrdered
+	}
+	if c.semanticRefactorFeatures.UDPReplyDispatcher {
+		if m.udpDispatcher == nil {
+			m.udpDispatcher = newDefaultUDPReplyDispatcher()
+		}
+		dispatchers.reply = m.udpDispatcher
+	}
+	m.mu.Unlock()
+
+	if bpf := c.PeekBpf(); bpf != nil {
+		m.udpBPF.CompareAndSwap(nil, bpf)
+	}
+	return dispatchers, nil
+}
+
+func (c *ControlPlane) sessionManagerForFlow(parent context.Context) *SessionManager {
+	if c == nil {
+		return nil
+	}
+	if binding := c.sessionManagerBinding.Load(); binding != nil {
+		return binding.manager
+	}
+	c.sessionManagerMu.Lock()
+	defer c.sessionManagerMu.Unlock()
+	if c.sessionManager == nil {
+		c.sessionManager = NewSessionManager(parent)
+		c.ownsSessionManager = true
+	}
+	c.sessionManagerBinding.Store(&controlPlaneSessionManagerBinding{
+		manager: c.sessionManager,
+		owned:   c.ownsSessionManager,
+	})
+	return c.sessionManager
+}
+
+func (c *ControlPlane) controlPlaneSessionManager() (*SessionManager, bool) {
+	if c == nil {
+		return nil, false
+	}
+	if binding := c.sessionManagerBinding.Load(); binding != nil {
+		return binding.manager, binding.owned
+	}
+	c.sessionManagerMu.Lock()
+	manager := c.sessionManager
+	owned := c.ownsSessionManager
+	if manager != nil {
+		c.sessionManagerBinding.Store(&controlPlaneSessionManagerBinding{
+			manager: manager,
+			owned:   owned,
+		})
+	}
+	c.sessionManagerMu.Unlock()
+	return manager, owned
+}
+
+func (c *ControlPlane) adoptTCPFlow(
+	parent context.Context,
+	ownership *incomingConnectionLease,
+	ingress net.Conn,
+	egress netproxy.Conn,
+	binding TcpFlowBinding,
+	src netip.AddrPort,
+	dst netip.AddrPort,
+) (*FlowRuntime, error) {
+	manager := c.sessionManagerForFlow(parent)
+	if manager == nil {
+		return nil, ErrSessionManagerClosed
+	}
+	keys := []bpfTuplesKey{
+		bpfTuplesKeyFromAddrPorts(src, dst, uint8(unix.IPPROTO_TCP)),
+		bpfTuplesKeyFromAddrPorts(dst, src, uint8(unix.IPPROTO_TCP)),
+	}
+	incomingConnectionOwnershipMu.Lock()
+	if !c.acceptsRoutingEpochExecutionLocked() || (ownership != nil && ownership.owner != c) {
+		incomingConnectionOwnershipMu.Unlock()
+		return nil, errRoutingEpochOwnerUnavailable
+	}
+	var runtime *egressRuntime
+	if egress != nil {
+		runtime = c.egressRuntime
+	}
+	flow, err := manager.adoptTCP(ingress, egress, binding, runtime, keys)
+	var drainRelease func()
+	if err == nil && ownership != nil {
+		drainRelease = ownership.releaseLocked()
+	}
+	incomingConnectionOwnershipMu.Unlock()
+	if drainRelease != nil {
+		drainRelease()
+	}
+	return flow, err
+}
+
+// Context returns the flow-specific lifetime context.
+func (f *FlowRuntime) Context() context.Context {
+	if f == nil || f.ctx == nil {
+		return context.Background()
+	}
+	return f.ctx
+}
+
+// Ingress returns the accepted transparent connection.
+func (f *FlowRuntime) Ingress() net.Conn {
+	if f == nil {
+		return nil
+	}
+	return f.ingress
+}
+
+// Egress returns the concrete outbound connection selected at establishment.
+// It is nil for locally terminated flows such as transparent DNS-over-TCP.
+func (f *FlowRuntime) Egress() netproxy.Conn {
+	if f == nil {
+		return nil
+	}
+	return f.egress
+}
+
+// Binding returns the immutable route and concrete egress decision.
+func (f *FlowRuntime) Binding() TcpFlowBinding {
+	if f == nil {
+		return TcpFlowBinding{}
+	}
+	return f.binding
+}
+
+func (m *SessionManager) adoptTCP(
+	ingress net.Conn,
+	egress netproxy.Conn,
+	binding TcpFlowBinding,
+	runtime *egressRuntime,
+	pinKeys []bpfTuplesKey,
+) (*FlowRuntime, error) {
+	if m == nil {
+		return nil, ErrSessionManagerClosed
+	}
+	if ingress == nil {
+		return nil, fmt.Errorf("adopt TCP flow: ingress is required")
+	}
+	lease, retainedOutbound, ok := runtime.acquireEgress(binding.Egress.Dialer, binding.Egress.Outbound)
+	if !ok {
+		return nil, fmt.Errorf("adopt TCP flow: egress runtime is retiring")
+	}
+	binding.Egress.Outbound = retainedOutbound
+	ctx, cancel := context.WithCancel(m.ctx)
+	flow := &FlowRuntime{
+		manager:     m,
+		ingress:     ingress,
+		egress:      egress,
+		binding:     binding,
+		ctx:         ctx,
+		cancel:      cancel,
+		egressLease: lease,
+	}
+	if len(pinKeys) > len(flow.pinKeys) {
+		pinKeys = pinKeys[:len(flow.pinKeys)]
+	}
+	flow.pinKeyCount = uint8(copy(flow.pinKeys[:], pinKeys))
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		cancel()
+		_ = lease.release()
+		return nil, ErrSessionManagerClosed
+	}
+	if _, exists := m.flows[ingress]; exists {
+		m.mu.Unlock()
+		cancel()
+		_ = lease.release()
+		return nil, ErrFlowAlreadyRegistered
+	}
+	m.flows[ingress] = flow
+	m.retainGenerationLocked(binding.Route.PolicyEpoch)
+	for i := range int(flow.pinKeyCount) {
+		m.pinnedTCP[flow.pinKeys[i]]++
+	}
+	if flow.pinKeyCount > 0 {
+		flow.redirectKey = redirectTupleForFlow(flow.pinKeys[0])
+		flow.hasRedirectKey = true
+		m.pinnedRedirect[flow.redirectKey]++
+	}
+	m.mu.Unlock()
+	return flow, nil
+}
+
+func (f *FlowRuntime) finish() {
+	if f == nil {
+		return
+	}
+	f.finishOnce.Do(func() {
+		if f.manager != nil {
+			f.manager.releaseFlow(f)
+			return
+		}
+		if f.cancel != nil {
+			f.cancel()
+		}
+		_ = f.egressLease.release()
+	})
+}
+
+func (m *SessionManager) releaseFlow(flow *FlowRuntime) {
+	if m == nil || flow == nil {
+		return
+	}
+	deleteKeys := make([]bpfTuplesKey, 0, flow.pinKeyCount)
+	m.mu.Lock()
+	if current := m.flows[flow.ingress]; current == flow {
+		delete(m.flows, flow.ingress)
+		m.releaseGenerationLocked(flow.binding.Route.PolicyEpoch)
+		for i := range int(flow.pinKeyCount) {
+			key := flow.pinKeys[i]
+			if refs := m.pinnedTCP[key]; refs <= 1 {
+				delete(m.pinnedTCP, key)
+				deleteKeys = append(deleteKeys, key)
+			} else {
+				m.pinnedTCP[key] = refs - 1
+			}
+		}
+		if flow.hasRedirectKey {
+			if refs := m.pinnedRedirect[flow.redirectKey]; refs <= 1 {
+				delete(m.pinnedRedirect, flow.redirectKey)
+			} else {
+				m.pinnedRedirect[flow.redirectKey] = refs - 1
+			}
+		}
+	}
+	m.mu.Unlock()
+	if len(deleteKeys) > 0 {
+		m.udpStateMu.RLock()
+		if bpf := m.udpBPF.Load(); bpf != nil && bpf.ConnStateMap != nil {
+			_, _ = BpfMapBatchDelete(bpf.ConnStateMap, deleteKeys)
+		}
+		m.udpStateMu.RUnlock()
+	}
+	if flow.cancel != nil {
+		flow.cancel()
+	}
+	_ = flow.egressLease.release()
+}
+
+func (m *SessionManager) retainGenerationLocked(epoch routing.PolicyEpoch) {
+	state := m.generations[epoch]
+	if state == nil {
+		state = &sessionGenerationState{idleCh: make(chan struct{})}
+		m.generations[epoch] = state
+	}
+	state.active++
+}
+
+func (m *SessionManager) releaseGenerationLocked(epoch routing.PolicyEpoch) {
+	state := m.generations[epoch]
+	if state == nil || state.active == 0 {
+		return
+	}
+	state.active--
+	if state.active == 0 {
+		close(state.idleCh)
+		delete(m.generations, epoch)
+	}
+}
+
+func (m *SessionManager) adoptUDP(endpoint *UdpEndpoint, binding UdpFlowBinding, runtime *egressRuntime) (*UDPFlowRuntime, error) {
+	if m == nil {
+		return nil, ErrSessionManagerClosed
+	}
+	if endpoint == nil {
+		return nil, fmt.Errorf("adopt UDP flow: endpoint is required")
+	}
+	if binding.Egress.Dialer == nil {
+		binding.Egress.Dialer = endpoint.Dialer
+	}
+	if binding.Egress.Outbound == nil {
+		binding.Egress.Outbound = endpoint.Outbound
+	}
+	lease, retainedOutbound, ok := runtime.acquireEgress(binding.Egress.Dialer, binding.Egress.Outbound)
+	if !ok {
+		return nil, fmt.Errorf("adopt UDP flow: egress runtime is retiring")
+	}
+	binding.Egress.Outbound = retainedOutbound
+	endpoint.Outbound = retainedOutbound
+	endpoint.flowEgressOverride = nil
+	endpoint.flowBindingSet = false
+	endpoint.setFlowBinding(binding)
+	ctx, cancel := context.WithCancel(m.ctx)
+	flow := &UDPFlowRuntime{
+		manager:     m,
+		endpoint:    endpoint,
+		binding:     binding,
+		ctx:         ctx,
+		cancel:      cancel,
+		egressLease: lease,
+	}
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		cancel()
+		_ = lease.release()
+		return nil, ErrSessionManagerClosed
+	}
+	if _, exists := m.udpFlows[endpoint]; exists {
+		m.mu.Unlock()
+		cancel()
+		_ = lease.release()
+		return nil, ErrFlowAlreadyRegistered
+	}
+	m.udpFlows[endpoint] = flow
+	m.appendUDPFlowSourceLocked(endpoint.poolKey.Src, flow)
+	m.retainGenerationLocked(binding.Route.PolicyEpoch)
+	endpoint.sessionRuntime = flow
+	m.mu.Unlock()
+	return flow, nil
+}
+
+func (f *UDPFlowRuntime) finish() {
+	if f == nil {
+		return
+	}
+	f.finishOnce.Do(func() {
+		if f.manager != nil {
+			f.manager.releaseUDPFlow(f)
+			return
+		}
+		if f.cancel != nil {
+			f.cancel()
+		}
+		_ = f.egressLease.release()
+	})
+}
+
+func (m *SessionManager) releaseUDPFlow(flow *UDPFlowRuntime) {
+	if m == nil || flow == nil {
+		return
+	}
+	m.mu.Lock()
+	if current := m.udpFlows[flow.endpoint]; current == flow {
+		delete(m.udpFlows, flow.endpoint)
+		m.removeUDPFlowSourceLocked(flow.endpoint.poolKey.Src, flow)
+		m.releaseGenerationLocked(flow.binding.Route.PolicyEpoch)
+	}
+	m.mu.Unlock()
+	if flow.cancel != nil {
+		flow.cancel()
+	}
+	_ = flow.egressLease.release()
+}
+
+func (f *UDPFlowRuntime) abort() error {
+	if f == nil {
+		return nil
+	}
+	var err error
+	f.abortOnce.Do(func() {
+		if f.cancel != nil {
+			f.cancel()
+		}
+		if f.endpoint != nil {
+			f.endpoint.dead.Store(true)
+			f.endpoint.selfRemoveFromPool()
+			err = f.endpoint.Close()
+		}
+		f.finish()
+	})
+	return err
+}
+
+func (m *SessionManager) retainedUDPEndpoint(src, dst netip.AddrPort, result *bpfRoutingResult, currentEpoch routing.PolicyEpoch) (*UdpEndpoint, bool) {
+	if m == nil {
+		return nil, false
+	}
+	desiredScope := newUdpEndpointRouteScope(result)
+	value, ok := m.udpBySource.Load(src)
+	if !ok {
+		return nil, false
+	}
+	snapshot, ok := value.(*udpFlowSourceSnapshot)
+	if !ok || snapshot == nil {
+		return nil, false
+	}
+	var selected *UDPFlowRuntime
+	selectedScore := -1
+	for _, flow := range snapshot.flows {
+		if flow == nil || flow.endpoint == nil || flow.binding.Route.PolicyEpoch == currentEpoch {
+			continue
+		}
+		key := flow.endpoint.poolKey
+		if key.Dst.IsValid() && key.Dst != dst {
+			continue
+		}
+		if key.RouteScope != (udpEndpointRouteScope{}) && key.RouteScope != desiredScope {
+			continue
+		}
+		score := 0
+		if key.Dst.IsValid() {
+			score += 2
+		}
+		if key.RouteScope == desiredScope {
+			score++
+		}
+		if score > selectedScore {
+			selected = flow
+			selectedScore = score
+		}
+	}
+	if selected == nil || selected.endpoint.IsDead() {
+		return nil, false
+	}
+	return selected.endpoint, true
+}
+
+// appendUDPFlowSourceLocked publishes a new immutable per-source index. The
+// caller serializes writers with SessionManager.mu.
+func (m *SessionManager) appendUDPFlowSourceLocked(src netip.AddrPort, flow *UDPFlowRuntime) {
+	if m == nil || flow == nil {
+		return
+	}
+	var current []*UDPFlowRuntime
+	if value, ok := m.udpBySource.Load(src); ok {
+		if snapshot, snapshotOK := value.(*udpFlowSourceSnapshot); snapshotOK && snapshot != nil {
+			current = snapshot.flows
+		}
+	}
+	next := make([]*UDPFlowRuntime, len(current)+1)
+	copy(next, current)
+	next[len(current)] = flow
+	m.udpBySource.Store(src, &udpFlowSourceSnapshot{flows: next})
+}
+
+// removeUDPFlowSourceLocked replaces one immutable per-source index. The
+// caller serializes writers with SessionManager.mu.
+func (m *SessionManager) removeUDPFlowSourceLocked(src netip.AddrPort, flow *UDPFlowRuntime) {
+	if m == nil || flow == nil {
+		return
+	}
+	value, ok := m.udpBySource.Load(src)
+	if !ok {
+		return
+	}
+	snapshot, ok := value.(*udpFlowSourceSnapshot)
+	if !ok || snapshot == nil {
+		return
+	}
+	index := -1
+	for i, candidate := range snapshot.flows {
+		if candidate == flow {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return
+	}
+	if len(snapshot.flows) == 1 {
+		m.udpBySource.Delete(src)
+		return
+	}
+	next := make([]*UDPFlowRuntime, len(snapshot.flows)-1)
+	copy(next, snapshot.flows[:index])
+	copy(next[index:], snapshot.flows[index+1:])
+	m.udpBySource.Store(src, &udpFlowSourceSnapshot{flows: next})
+}
+
+// ActiveUDPConnections returns the number of process-owned UDP endpoints.
+func (m *SessionManager) ActiveUDPConnections() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.RLock()
+	n := len(m.udpFlows)
+	m.mu.RUnlock()
+	return n
+}
+
+// ActiveConnections returns all process-owned TCP and UDP flows.
+func (m *SessionManager) ActiveConnections() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.RLock()
+	n := len(m.flows) + len(m.udpFlows)
+	m.mu.RUnlock()
+	return n
+}
+
+func (f *FlowRuntime) abort() error {
+	if f == nil {
+		return nil
+	}
+	var err error
+	f.abortOnce.Do(func() {
+		if f.cancel != nil {
+			f.cancel()
+		}
+		var errs []error
+		if f.ingress != nil {
+			if closeErr := f.ingress.Close(); closeErr != nil && !commonerrors.IsClosedConnection(closeErr) {
+				errs = append(errs, closeErr)
+			}
+		}
+		if f.egress != nil {
+			if closeErr := f.egress.Close(); closeErr != nil && !commonerrors.IsClosedConnection(closeErr) {
+				errs = append(errs, closeErr)
+			}
+		}
+		err = stderrors.Join(errs...)
+		f.finish()
+	})
+	return err
+}
+
+// ActiveTCPConnections returns the number of process-owned TCP flows.
+func (m *SessionManager) ActiveTCPConnections() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.RLock()
+	n := len(m.flows)
+	m.mu.RUnlock()
+	return n
+}
+
+// ActiveByGeneration returns the number of live flows established under one
+// policy epoch.
+func (m *SessionManager) ActiveByGeneration(epoch routing.PolicyEpoch) int {
+	if m == nil {
+		return 0
+	}
+	m.mu.RLock()
+	state := m.generations[epoch]
+	n := 0
+	if state != nil {
+		n = state.active
+	}
+	m.mu.RUnlock()
+	return n
+}
+
+// GenerationIdle returns a channel closed once the policy epoch owns no live
+// flows. The returned channel is already closed when the epoch is idle.
+func (m *SessionManager) GenerationIdle(epoch routing.PolicyEpoch) <-chan struct{} {
+	if m == nil {
+		return closedDrainIdleCh
+	}
+	m.mu.RLock()
+	state := m.generations[epoch]
+	if state == nil {
+		m.mu.RUnlock()
+		return closedDrainIdleCh
+	}
+	ch := state.idleCh
+	m.mu.RUnlock()
+	return ch
+}
+
+func (m *SessionManager) flowForIngress(ingress net.Conn) (*FlowRuntime, bool) {
+	if m == nil || ingress == nil {
+		return nil, false
+	}
+	m.mu.RLock()
+	flow, ok := m.flows[ingress]
+	m.mu.RUnlock()
+	return flow, ok
+}
+
+func (m *SessionManager) isTCPConnStatePinned(key bpfTuplesKey) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.RLock()
+	refs := m.pinnedTCP[key]
+	m.mu.RUnlock()
+	return refs > 0
+}
+
+func (m *SessionManager) isRedirectTrackPinned(key bpfRedirectTuple) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.RLock()
+	refs := m.pinnedRedirect[key]
+	m.mu.RUnlock()
+	return refs > 0
+}
+
+// RetainUdpConnStateTuples pins established UDP state against reload cleanup.
+func (m *SessionManager) RetainUdpConnStateTuples(keys []bpfTuplesKey) {
+	if m == nil || len(keys) == 0 {
+		return
+	}
+	m.mu.Lock()
+	m.udpStateMu.Lock()
+	for _, key := range keys {
+		m.pinnedUDP[key]++
+		m.pinnedRedirect[redirectTupleForFlow(key)]++
+	}
+	m.udpStateMu.Unlock()
+	m.mu.Unlock()
+}
+
+// TransferRetainedUdpConnStateTuplesFrom moves tuple ownership without
+// deleting the shared BPF entries between owners.
+func (m *SessionManager) TransferRetainedUdpConnStateTuplesFrom(previous udpConnStateOwner, keys []bpfTuplesKey) {
+	if m == nil || previous == nil || sameUdpConnStateOwner(m, previous) || len(keys) == 0 {
+		return
+	}
+	m.RetainUdpConnStateTuples(keys)
+	switch owner := previous.(type) {
+	case *SessionManager:
+		owner.forgetUdpConnStateTuples(keys)
+	case *controlPlaneCore:
+		if tracker := owner.getUdpConnStateTracker(); tracker != nil {
+			tracker.Forget(keys)
+		}
+	}
+}
+
+func (m *SessionManager) forgetUdpConnStateTuples(keys []bpfTuplesKey) {
+	if m == nil || len(keys) == 0 {
+		return
+	}
+	m.mu.Lock()
+	m.udpStateMu.Lock()
+	for _, key := range keys {
+		if refs := m.pinnedUDP[key]; refs <= 1 {
+			delete(m.pinnedUDP, key)
+		} else {
+			m.pinnedUDP[key] = refs - 1
+		}
+		redirectKey := redirectTupleForFlow(key)
+		if refs := m.pinnedRedirect[redirectKey]; refs <= 1 {
+			delete(m.pinnedRedirect, redirectKey)
+		} else {
+			m.pinnedRedirect[redirectKey] = refs - 1
+		}
+	}
+	m.udpStateMu.Unlock()
+	m.mu.Unlock()
+}
+
+// ReleaseUdpConnStateTuples drops tuple references and removes entries after
+// the final process-owned endpoint releases them.
+func (m *SessionManager) ReleaseUdpConnStateTuples(keys []bpfTuplesKey) error {
+	if m == nil || len(keys) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	m.udpStateMu.Lock()
+	deleteKeys := make([]bpfTuplesKey, 0, len(keys))
+	for _, key := range keys {
+		switch refs := m.pinnedUDP[key]; {
+		case refs > 1:
+			m.pinnedUDP[key] = refs - 1
+		case refs == 1:
+			delete(m.pinnedUDP, key)
+			deleteKeys = append(deleteKeys, key)
+		}
+		redirectKey := redirectTupleForFlow(key)
+		if refs := m.pinnedRedirect[redirectKey]; refs <= 1 {
+			delete(m.pinnedRedirect, redirectKey)
+		} else {
+			m.pinnedRedirect[redirectKey] = refs - 1
+		}
+	}
+	var err error
+	if bpf := m.udpBPF.Load(); bpf != nil && bpf.ConnStateMap != nil && len(deleteKeys) > 0 {
+		_, err = BpfMapBatchDelete(bpf.ConnStateMap, deleteKeys)
+	}
+	m.udpStateMu.Unlock()
+	m.mu.Unlock()
+	return err
+}
+
+func (m *SessionManager) isUDPConnStatePinned(key bpfTuplesKey) bool {
+	if m == nil {
+		return false
+	}
+	m.udpStateMu.RLock()
+	refs := m.pinnedUDP[key]
+	m.udpStateMu.RUnlock()
+	return refs > 0
+}
+
+// retireUnpinnedUDPConnState removes stale kernel routing attribution before
+// the active generation treats the packet as a new flow. The pin check and
+// deletion share one lock with endpoint retain/release, so a process-owned UDP
+// runtime can never lose its conn-state entry in this fallback path.
+func (m *SessionManager) retireUnpinnedUDPConnState(src, dst netip.AddrPort) (bool, error) {
+	if m == nil || !src.IsValid() || !dst.IsValid() {
+		return false, nil
+	}
+	keys := [2]bpfTuplesKey{
+		bpfTuplesKeyFromAddrPorts(src, dst, uint8(unix.IPPROTO_UDP)),
+		bpfTuplesKeyFromAddrPorts(dst, src, uint8(unix.IPPROTO_UDP)),
+	}
+
+	m.udpStateMu.Lock()
+	defer m.udpStateMu.Unlock()
+	for _, key := range keys {
+		if m.pinnedUDP[key] > 0 {
+			return false, nil
+		}
+	}
+	bpf := m.udpBPF.Load()
+	if bpf == nil || bpf.ConnStateMap == nil {
+		return true, nil
+	}
+	_, err := BpfMapBatchDelete(bpf.ConnStateMap, keys[:])
+	return true, err
+}
+
+func redirectTupleForFlow(key bpfTuplesKey) bpfRedirectTuple {
+	var redirect bpfRedirectTuple
+	copy(redirect.Sip.U6Addr8[:], key.Sip.U6Addr8[:])
+	copy(redirect.Dip.U6Addr8[:], key.Dip.U6Addr8[:])
+	return redirect
+}
+
+// AbortGeneration closes every flow established under one policy epoch.
+// The manager remains open for flows created by other or future generations.
+func (m *SessionManager) AbortGeneration(epoch routing.PolicyEpoch) error {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	flows := make([]*FlowRuntime, 0)
+	udpFlows := make([]*UDPFlowRuntime, 0)
+	for _, flow := range m.flows {
+		if flow.binding.Route.PolicyEpoch == epoch {
+			flows = append(flows, flow)
+		}
+	}
+	for _, flow := range m.udpFlows {
+		if flow.binding.Route.PolicyEpoch == epoch {
+			udpFlows = append(udpFlows, flow)
+		}
+	}
+	m.mu.RUnlock()
+	var errs []error
+	for _, flow := range flows {
+		if err := flow.abort(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	for _, flow := range udpFlows {
+		if err := flow.abort(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return stderrors.Join(errs...)
+}
+
+// AbortAll closes every established flow without closing the manager.
+func (m *SessionManager) AbortAll() error {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	flows := make([]*FlowRuntime, 0, len(m.flows))
+	udpFlows := make([]*UDPFlowRuntime, 0, len(m.udpFlows))
+	for _, flow := range m.flows {
+		flows = append(flows, flow)
+	}
+	for _, flow := range m.udpFlows {
+		udpFlows = append(udpFlows, flow)
+	}
+	m.mu.RUnlock()
+	var errs []error
+	for _, flow := range flows {
+		if err := flow.abort(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	for _, flow := range udpFlows {
+		if err := flow.abort(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return stderrors.Join(errs...)
+}
+
+// Close prevents new adoption and aborts all process-owned flows.
+func (m *SessionManager) Close() error {
+	if m == nil {
+		return nil
+	}
+	m.closeOnce.Do(func() {
+		m.mu.Lock()
+		m.closed = true
+		ordered := m.udpOrdered
+		m.udpOrdered = nil
+		m.mu.Unlock()
+		// Ordered ingress may still be executing code that touches a live flow.
+		// Quiesce it before canceling contexts or closing endpoint transports.
+		if ordered != nil {
+			ordered.close()
+			ordered.wait()
+		}
+		m.cancel()
+		m.closeErr = m.AbortAll()
+		m.mu.Lock()
+		dispatcher := m.udpDispatcher
+		m.udpDispatcher = nil
+		m.mu.Unlock()
+		if dispatcher != nil {
+			dispatcher.close()
+			dispatcher.wait()
+		}
+	})
+	return m.closeErr
+}

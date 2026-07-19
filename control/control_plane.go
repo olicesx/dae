@@ -57,8 +57,12 @@ type ControlPlane struct {
 
 	controlPlaneGenerationState
 	inConnections         sync.Map
-	tcpFlows              tcpFlowRegistry
 	rejectNewConnections  atomic.Bool
+	sessionManagerMu      sync.Mutex
+	sessionManager        *SessionManager
+	ownsSessionManager    bool
+	sessionManagerBinding atomic.Pointer[controlPlaneSessionManagerBinding]
+	egressRuntime         *egressRuntime
 	udpEndpointAdmission  udpEndpointAdmissionGate
 	udpIngressAdmission   routingEpochIngressGate
 	drainTracker          *controlPlaneDrainTracker
@@ -110,7 +114,9 @@ type ControlPlane struct {
 	udpRouteScopeSensitive         bool
 	udpUnorderedRunner             *udpUnorderedTaskRunner
 	udpOrderedDispatcher           *udpOrderedDispatcher
+	udpOrderedDispatcherShared     bool
 	udpReplyDispatcher             *udpReplyDispatcher
+	udpReplyDispatcherShared       bool
 	failedQuicDcidCache            *failedQuicDcidCache
 	lastConnectionErrorLogTime     atomic.Int64
 	lastDnsFastPathErrorLogTime    atomic.Int64
@@ -123,6 +129,8 @@ type ControlPlane struct {
 	pendingDnsReloadCache          map[string]*DnsCache
 	dnsReloadCacheSourceMu         sync.Mutex
 	dnsReloadCacheSource           func() map[string]*DnsCache
+	dnsReloadCacheStreamSource     func(func(string, *DnsCache) error) error
+	dnsReloadCacheStreamSourceHash [32]byte
 	sharedBpfReload                bool
 	semanticRefactorFeatures       SemanticRefactorFeatureSet
 	// dnsRoutingUnchanged indicates that DNS routing configuration (excluding
@@ -282,12 +290,9 @@ var (
 	routingHandoffSteadyInterval = 5 * time.Second
 	dnsFastPathErrorLogInterval  = 5 * time.Second
 
-	// TCP connection state timeout constants.
-	// TCP connections are longer-lived but we still need to clean up closed connections.
-	// Established connections: 2 minutes timeout (conservative, most connections close sooner)
-	// Closing connections (FIN/RST seen): 10 seconds timeout (quick cleanup)
-	tcpConnStateTimeoutEstablished = 120 * time.Second
-	tcpConnStateTimeoutClosing     = 10 * time.Second
+	// TCP ACTIVE state has no age timeout because an idle socket can remain valid
+	// indefinitely. FIN/RST transitions state to CLOSING for prompt cleanup.
+	tcpConnStateTimeoutClosing = 10 * time.Second
 
 	// Test seams: injected in tests to avoid external DNS dependency.
 	resolveIp46ForBootstrap       = netutils.ResolveIp46
@@ -504,6 +509,11 @@ func newControlPlaneWithContextOptions(
 	externGeoDataDirs []string,
 	buildOpts controlPlaneBuildOptions,
 ) (plane *ControlPlane, err error) {
+	var freshDatapathState *FreshDatapathState
+	if state, ok := _bpf.(*FreshDatapathState); ok {
+		freshDatapathState = state
+		_bpf = nil
+	}
 	// The ctx parameter may carry a preparation timeout from the caller (e.g.
 	// context.WithTimeout in cmd/run.go). All long-lived objects owned by the
 	// ControlPlane — its lifecycle context, dialer contexts, goroutines — MUST
@@ -661,6 +671,13 @@ func newControlPlaneWithContextOptions(
 		},
 		Programs: ProgramOptions,
 	}
+	connStateMapMaxEntries := global.BpfConnStateMapSize
+	if freshDatapathState != nil {
+		connStateMapMaxEntries, err = freshDatapathState.apply(collectionOpts, connStateMapMaxEntries, log)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	var bpf *bpfObjects
 	if _bpf != nil {
@@ -671,16 +688,19 @@ func newControlPlaneWithContextOptions(
 		}
 	} else {
 		bpf = new(bpfObjects)
+		datapathGeneration := nextDatapathGeneration()
 		if err = fullLoadBpfObjects(log, bpf, &loadBpfOptions{
 			PinPath:                pinPath,
 			CollectionOptions:      collectionOpts,
-			ConnStateMapMaxEntries: global.BpfConnStateMapSize,
+			ConnStateMapMaxEntries: connStateMapMaxEntries,
+			DatapathGeneration:     datapathGeneration,
 		}, global.SoMarkFromDae); err != nil {
 			if log.Level == logrus.PanicLevel {
 				log.Panicln(err)
 			}
 			return nil, fmt.Errorf("load eBPF objects: %w", err)
 		}
+		registerBpfDatapathGeneration(bpf, datapathGeneration)
 	}
 	sharedBpfReload := _bpf != nil
 	// Ensure critical maps are always present. DNS fast-path optimizations only
@@ -855,24 +875,39 @@ func newControlPlaneWithContextOptions(
 		return nil, fmt.Errorf("ApplyRulesOptimizers error:\n%w", err)
 	}
 	routingA.Rules = nil // Release.
-	policySnapshot, err := routing.NewPolicySnapshot(
-		routing.PolicyEpoch(policyEpochSequence.Add(1)),
-		routingProgram,
+	policyEpoch := routing.PolicyEpoch(policyEpochSequence.Add(1))
+	decisionShadowSetting := phase4DecisionShadowSettingValue.Load()
+	needsPolicySnapshot := requiresFullPolicySnapshot(refactorFeatures, decisionShadowSetting)
+	var (
+		policyIdentity routing.PolicyIdentity
+		policySnapshot *routing.PolicySnapshot
 	)
-	if err != nil {
-		return nil, fmt.Errorf("create routing policy snapshot: %w", err)
+	if needsPolicySnapshot {
+		policySnapshot, err = routing.NewPolicySnapshotFromOwnedProgram(policyEpoch, routingProgram)
+		if err != nil {
+			return nil, fmt.Errorf("create routing policy snapshot: %w", err)
+		}
+		policyIdentity = policySnapshot.Identity()
+	} else {
+		policyIdentity, err = routing.NewPolicyIdentity(policyEpoch, routingProgram)
+		if err != nil {
+			return nil, fmt.Errorf("create routing policy identity: %w", err)
+		}
 	}
 	if refactorFeatures.RoutingEpoch {
-		if _, err = core.PrepareRoutingEpoch(policySnapshot.Epoch(), sharedBpfReload); err != nil {
+		if _, err = core.PrepareRoutingEpoch(policyIdentity.Epoch(), sharedBpfReload); err != nil {
 			return nil, fmt.Errorf("prepare routing epoch: %w", err)
 		}
 		if err = core.clearDomainRoutingSlot(core.RoutingEpochSlot()); err != nil {
 			return nil, fmt.Errorf("clear inactive domain routing epoch: %w", err)
 		}
 	}
-	compiledPolicy, err := policySnapshot.Compile(log, outboundName2Id)
-	if err != nil {
-		return nil, fmt.Errorf("compile routing policy snapshot: %w", err)
+	var compiledPolicy *routing.CompiledPolicy
+	if needsPolicySnapshot {
+		compiledPolicy, err = policySnapshot.Compile(log, outboundName2Id)
+		if err != nil {
+			return nil, fmt.Errorf("compile routing policy snapshot: %w", err)
+		}
 	}
 	if log.IsLevelEnabled(logrus.DebugLevel) {
 		var debugBuilder strings.Builder
@@ -890,14 +925,16 @@ func newControlPlaneWithContextOptions(
 			return nil, fmt.Errorf("NewRoutingMatcherBuilderFromCompiledPolicy: %w", err)
 		}
 	} else {
-		builderProgram, cloneErr := policySnapshot.CloneProgram()
-		if cloneErr != nil {
-			return nil, fmt.Errorf("clone routing policy snapshot: %w", cloneErr)
-		}
-		builder, err = NewRoutingMatcherBuilderFromProgram(log, builderProgram, outboundName2Id, core.bpf.Load())
+		builder, err = NewRoutingMatcherBuilderFromProgram(log, routingProgram, outboundName2Id, core.bpf.Load())
 		if err != nil {
 			return nil, fmt.Errorf("NewRoutingMatcherBuilder: %w", err)
 		}
+	}
+	if decisionShadowSetting == nil {
+		// The builder owns all data needed below. Drop source/compiler references
+		// before BuildUserspace reaches its routing-build GC checkpoint.
+		policySnapshot = nil
+		compiledPolicy = nil
 	}
 	kernspaceSnapshot := builder.KernspaceSnapshot()
 	if !buildOpts.delayDatapathCommit {
@@ -923,8 +960,8 @@ func newControlPlaneWithContextOptions(
 		return nil, fmt.Errorf("RoutingMatcherBuilder.BuildUserspace: %w", err)
 	}
 	var decisionShadow *phase4DecisionShadow
-	if setting := phase4DecisionShadowSettingValue.Load(); setting != nil {
-		decisionShadow, err = newPhase4DecisionShadowWithProcessState(policySnapshot, compiledPolicy, setting.sampleEvery, setting.state)
+	if decisionShadowSetting != nil {
+		decisionShadow, err = newPhase4DecisionShadowWithProcessState(policySnapshot, compiledPolicy, decisionShadowSetting.sampleEvery, decisionShadowSetting.state)
 		if err != nil {
 			return nil, fmt.Errorf("create phase 4 decision shadow: %w", err)
 		}
@@ -956,18 +993,36 @@ func newControlPlaneWithContextOptions(
 	log.Infof("Memory usage after routing build: Alloc=%vMiB, Sys=%vMiB, HeapObjects=%v",
 		m.Alloc/1024/1024, m.Sys/1024/1024, m.HeapObjects)
 
+	// Transfer every dialer, group health registration and the shared transport
+	// cache namespace into structured runtime ownership. The constructor's
+	// defer stack remains responsible until this point.
+	egressDialers := dialerSet.AllDialers()
+	for _, group := range outbounds {
+		if group != nil {
+			egressDialers = append(egressDialers, group.Dialers...)
+		}
+	}
+	egressRuntime := newEgressRuntime(log, []func() error{func() error {
+		dialer.CleanupTransportCacheNamespace(option.TransportCacheNamespace)
+		return nil
+	}})
+	egressRuntime.configureResources(outbounds, egressDialers, DefaultUdpEndpointPool.forgetDialerEpochs)
+	deferFuncs = nil
+
 	// New control plane.
 	cctx, cancel := context.WithCancel(context.Background())
 	plane = &ControlPlane{
-		log:          log,
-		runtimeStats: newRuntimeStats(),
-		core:         core,
-		deferFuncs:   deferFuncs,
-		listenIp:     "0.0.0.0",
+		log:           log,
+		runtimeStats:  newRuntimeStats(),
+		core:          core,
+		deferFuncs:    nil,
+		listenIp:      "0.0.0.0",
+		egressRuntime: egressRuntime,
 		controlPlaneGenerationState: controlPlaneGenerationState{
 			outbounds:           outbounds,
 			referencedOutbounds: referencedOutbounds,
 			dialMode:            dialMode,
+			policyIdentity:      policyIdentity,
 			policySnapshot:      policySnapshot,
 			routingMatcher:      routingMatcher,
 			decisionShadow:      decisionShadow,
@@ -1105,10 +1160,11 @@ func newControlPlaneWithContextOptions(
 			}
 			return nil, err
 		}
+		plane.releaseCommittedDNSReloadState()
 		plane.markReady()
 	}
-	// UDP listener serving starts only after the control plane is returned, so
-	// the generation-owned dispatcher is complete before first traffic.
+	// Standalone callers retain generation-owned dispatchers. AttachSessionManager
+	// replaces them with process-owned instances before Serve starts.
 	plane.udpOrderedDispatcher = newUDPOrderedDispatcherForFeatures(plane.semanticRefactorFeatures)
 	plane.udpReplyDispatcher = newUDPReplyDispatcherForFeatures(plane.semanticRefactorFeatures)
 	return plane, nil
@@ -1296,6 +1352,33 @@ func (c *ControlPlane) CloneDnsCache() map[string]*DnsCache {
 	return c.cloneDnsCache()
 }
 
+// StreamDnsCacheForReload visits the current cache without building a second
+// map or retaining another set of cache wrappers. Membership is stable for the
+// duration of the visit; cache payloads are immutable after publication.
+func (c *ControlPlane) StreamDnsCacheForReload(visit func(string, *DnsCache) error) error {
+	if c == nil || visit == nil {
+		return nil
+	}
+	controller := c.ActiveDnsController()
+	if controller == nil || controller.dnsControllerStore == nil {
+		return nil
+	}
+	controller.cacheProjectionMu.RLock()
+	defer controller.cacheProjectionMu.RUnlock()
+
+	var visitErr error
+	controller.dnsCache.Range(func(key, value any) bool {
+		cacheKey, keyOK := key.(string)
+		cache, cacheOK := value.(*DnsCache)
+		if !keyOK || !cacheOK || cache == nil {
+			return true
+		}
+		visitErr = visit(cacheKey, cache)
+		return visitErr == nil
+	})
+	return visitErr
+}
+
 // SetReloadDnsCacheSource installs the previous generation's cache snapshot
 // source for a prepared shared-BPF reload. It is consumed at datapath commit.
 func (c *ControlPlane) SetReloadDnsCacheSource(source func() map[string]*DnsCache) {
@@ -1304,12 +1387,37 @@ func (c *ControlPlane) SetReloadDnsCacheSource(source func() map[string]*DnsCach
 	}
 	c.dnsReloadCacheSourceMu.Lock()
 	c.dnsReloadCacheSource = source
+	c.dnsReloadCacheStreamSource = nil
+	c.dnsReloadCacheStreamSourceHash = [32]byte{}
+	c.dnsReloadCacheSourceMu.Unlock()
+}
+
+// SetReloadDnsCacheStreamSource installs a zero-copy cache visitor for a
+// prepared routing-epoch cutover. sourceHash identifies the cached bitmaps.
+func (c *ControlPlane) SetReloadDnsCacheStreamSource(
+	source func(func(string, *DnsCache) error) error,
+	sourceHash [32]byte,
+) {
+	if c == nil {
+		return
+	}
+	c.dnsReloadCacheSourceMu.Lock()
+	c.dnsReloadCacheSource = nil
+	c.dnsReloadCacheStreamSource = source
+	c.dnsReloadCacheStreamSourceHash = sourceHash
 	c.dnsReloadCacheSourceMu.Unlock()
 }
 
 // ClearReloadDnsCacheSource releases the previous generation cache source.
 func (c *ControlPlane) ClearReloadDnsCacheSource() {
-	c.SetReloadDnsCacheSource(nil)
+	if c == nil {
+		return
+	}
+	c.dnsReloadCacheSourceMu.Lock()
+	c.dnsReloadCacheSource = nil
+	c.dnsReloadCacheStreamSource = nil
+	c.dnsReloadCacheStreamSourceHash = [32]byte{}
+	c.dnsReloadCacheSourceMu.Unlock()
 }
 
 func (c *ControlPlane) cloneDnsReloadCacheForCutover() (map[string]*DnsCache, bool) {
@@ -1324,11 +1432,66 @@ func (c *ControlPlane) cloneDnsReloadCacheForCutover() (map[string]*DnsCache, bo
 	return c.dnsReloadCacheSource(), true
 }
 
+func (c *ControlPlane) dnsReloadCacheStreamForCutover() (
+	func(func(string, *DnsCache) error) error,
+	[32]byte,
+	bool,
+) {
+	if c == nil || !c.sharedBpfReload || !c.preparedDatapathCommit {
+		return nil, [32]byte{}, false
+	}
+	c.dnsReloadCacheSourceMu.Lock()
+	defer c.dnsReloadCacheSourceMu.Unlock()
+	if c.dnsReloadCacheStreamSource == nil {
+		return nil, [32]byte{}, false
+	}
+	return c.dnsReloadCacheStreamSource, c.dnsReloadCacheStreamSourceHash, true
+}
+
+func (c *ControlPlane) projectDnsReloadCacheStream(
+	source func(func(string, *DnsCache) error) error,
+	reuseBitmap bool,
+) (int, error) {
+	if c == nil || source == nil || c.core == nil {
+		return 0, nil
+	}
+	count := 0
+	err := source(func(cacheKey string, cache *DnsCache) error {
+		if cache == nil {
+			return nil
+		}
+		bitmap := cache.DomainBitmap
+		if !reuseBitmap || len(bitmap) != len(bpfDomainRouting{}.Bitmap) {
+			if c.routingMatcher == nil || c.routingMatcher.domainMatcher == nil {
+				return fmt.Errorf("project DNS reload cache without domain matcher")
+			}
+			bitmap = c.routingMatcher.domainMatcher.MatchDomainBitmap(cache.GetFqdn())
+		}
+		ownerKey := cache.RouteOwnerKey
+		if ownerKey == "" {
+			ownerKey = cacheKey
+		}
+		projected := DnsCache{
+			RouteOwnerKey:        ownerKey,
+			RouteProjectionEpoch: uint64(c.PolicyEpoch()),
+			DomainBitmap:         bitmap,
+			Answer:               cache.Answer,
+		}
+		if err := c.core.BatchUpdateDomainRouting(&projected); err != nil {
+			return fmt.Errorf("project streamed DNS cache %q: %w", cacheKey, err)
+		}
+		count++
+		return nil
+	})
+	return count, err
+}
+
 // refreshDnsReloadCacheForCutover replaces the early preparation snapshot
 // with one taken immediately before the target routing epoch is published.
 func (c *ControlPlane) refreshDnsReloadCacheForCutover() (bool, error) {
-	cache, ok := c.cloneDnsReloadCacheForCutover()
-	if !ok {
+	streamSource, streamSourceHash, streamOK := c.dnsReloadCacheStreamForCutover()
+	cache, cacheOK := c.cloneDnsReloadCacheForCutover()
+	if !streamOK && !cacheOK {
 		return false, nil
 	}
 	if c.core == nil {
@@ -1336,6 +1499,20 @@ func (c *ControlPlane) refreshDnsReloadCacheForCutover() (bool, error) {
 	}
 	if err := c.core.clearDomainRoutingSlot(c.core.RoutingEpochSlot()); err != nil {
 		return false, fmt.Errorf("clear target domain routing slot: %w", err)
+	}
+	if streamOK {
+		// Release any preparation-time fallback before walking the authoritative
+		// cache. The stream itself retains no map or wrapper copies.
+		c.pendingDnsReloadCache = nil
+		reuseBitmap := streamSourceHash != ([32]byte{}) && streamSourceHash == c.PolicyIdentity().Hash()
+		count, err := c.projectDnsReloadCacheStream(streamSource, reuseBitmap)
+		if err != nil {
+			return false, err
+		}
+		if count > 0 && c.log != nil {
+			c.log.Infof("Projected %d DNS cache entries from previous control plane", count)
+		}
+		return true, nil
 	}
 	c.pendingDnsReloadCache = cache
 	return true, nil
@@ -1603,10 +1780,8 @@ func (c *ControlPlane) dnsControllerOption() *DnsControllerOption {
 	if c == nil {
 		return nil
 	}
-	var routeProjectionEpoch uint64
-	if snapshot := c.PolicySnapshot(); snapshot != nil {
-		routeProjectionEpoch = uint64(snapshot.Epoch())
-	}
+	policyIdentity := c.PolicyIdentity()
+	routeProjectionEpoch := uint64(policyIdentity.Epoch())
 	return &DnsControllerOption{
 		Log:                c.log,
 		LifecycleContext:   c.ctx,
@@ -1626,6 +1801,7 @@ func (c *ControlPlane) dnsControllerOption() *DnsControllerOption {
 			return nil
 		},
 		RouteProjectionEpoch: routeProjectionEpoch,
+		RouteProjectionHash:  policyIdentity.Hash(),
 		ProjectCacheRoute: func(cache *DnsCache) []uint32 {
 			if cache == nil {
 				return nil
@@ -1829,6 +2005,16 @@ func (c *ControlPlane) replayDnsReloadCache() error {
 	return nil
 }
 
+// releaseCommittedDNSReloadState drops rollback-only cache state after the
+// datapath and hook flip have both committed successfully.
+func (c *ControlPlane) releaseCommittedDNSReloadState() {
+	if c == nil {
+		return
+	}
+	c.pendingDnsReloadCache = nil
+	c.ClearReloadDnsCacheSource()
+}
+
 func (c *ControlPlane) registerIncomingConnection(conn net.Conn) bool {
 	if c == nil || conn == nil {
 		return false
@@ -1863,10 +2049,14 @@ func (c *ControlPlane) CommitPreparedDatapath() error {
 	if c == nil || !c.preparedDatapathCommit {
 		return nil
 	}
-	if err := c.commitInterfaceBindings(); err != nil {
-		return err
+	prepareIsolatedDatapath := !c.sharedBpfReload
+	if !prepareIsolatedDatapath {
+		if err := c.commitInterfaceBindings(); err != nil {
+			return err
+		}
 	}
 	if c.core == nil {
+		c.releaseCommittedDNSReloadState()
 		c.startConnStateJanitor()
 		c.preparedDatapathCommit = false
 		return nil
@@ -1923,17 +2113,46 @@ func (c *ControlPlane) CommitPreparedDatapath() error {
 			}
 		}
 	}
-	if err := c.core.commitBpfHookFlip(); err != nil {
-		if c.semanticRefactorFeatures.RoutingEpoch {
-			if rollbackErr := c.core.RollbackRoutingEpoch(); rollbackErr != nil {
-				return stderrors.Join(err, rollbackErr)
-			}
+	if prepareIsolatedDatapath {
+		// Isolated candidates can populate every policy map before their first
+		// hook becomes reachable. The listener map is published by Serve before
+		// entering this method.
+		if err := c.commitInterfaceBindings(); err != nil {
+			return err
 		}
-		return err
 	}
+	if !prepareIsolatedDatapath {
+		if err := c.core.commitBpfHookFlip(); err != nil {
+			if c.semanticRefactorFeatures.RoutingEpoch {
+				if rollbackErr := c.core.RollbackRoutingEpoch(); rollbackErr != nil {
+					return stderrors.Join(err, rollbackErr)
+				}
+			}
+			return err
+		}
+	}
+	c.releaseCommittedDNSReloadState()
 	c.startConnStateJanitor()
 	c.preparedDatapathCommit = false
 	return nil
+}
+
+// CommitPreparedBpfHookFlip publishes the TC handle selected by an isolated
+// prepared datapath after its listener, maps, and hooks are all ready.
+func (c *ControlPlane) CommitPreparedBpfHookFlip() error {
+	if c == nil || c.core == nil {
+		return nil
+	}
+	return c.core.commitBpfHookFlip()
+}
+
+// RollbackPreparedBpfHookFlip restores the previous TC handle after a fresh
+// candidate committed its handle but failed before supervisor publication.
+func (c *ControlPlane) RollbackPreparedBpfHookFlip() error {
+	if c == nil || c.core == nil {
+		return nil
+	}
+	return c.core.rollbackCommittedBpfHookFlip()
 }
 
 // RebuildReloadDatapath restores this generation's datapath after a staged
@@ -2660,15 +2879,24 @@ func (c *ControlPlane) startConnStateJanitor() {
 }
 
 func (c *ControlPlane) RunReloadRetirementCleanup(staleBeforeNs uint64) {
-	if c == nil || staleBeforeNs == 0 {
+	if c == nil {
+		return
+	}
+	if c.core != nil {
+		err := retryPreviousRoutingEpochCleanup(c.ctx, c.core.finalizePreviousRoutingEpoch, nil)
+		if err != nil && c.log != nil {
+			c.log.WithError(err).Warnln("[Reload] Failed to release previous routing epoch projection")
+		}
+	}
+	if staleBeforeNs == 0 {
 		return
 	}
 
 	c.connStateCleanupMu.Lock()
-	redirectDeleted := c.cleanupRedirectTrackMapBeforeLocked(staleBeforeNs)
-	cookieDeleted := c.cleanupCookiePidMapBeforeLocked(staleBeforeNs)
-	routingHandoffDeleted := c.cleanupRoutingHandoffMapBeforeLocked(staleBeforeNs)
-	udpStats, tcpStats := c.cleanupConnStateMapBeforeLocked(true, staleBeforeNs)
+	redirectDeleted := c.cleanupRedirectTrackMapBeforeLocked(0)
+	cookieDeleted := c.cleanupCookiePidMapBeforeLocked(0)
+	routingHandoffDeleted := c.cleanupRoutingHandoffMapBeforeLocked(0)
+	udpStats, tcpStats := c.cleanupConnStateMapBeforeLocked(true, 0)
 	c.connStateCleanupMu.Unlock()
 
 	if c.log == nil {
@@ -2765,6 +2993,7 @@ func (c *ControlPlane) cleanupRedirectTrackMapBeforeLocked(staleBeforeNs uint64)
 	}()
 
 	var cursor ebpf.MapBatchCursor
+	manager, _ := c.controlPlaneSessionManager()
 	for {
 		count, err := bpf.RedirectTrack.BatchLookup(&cursor, keysOut, valuesOut, nil)
 		if count > 0 {
@@ -2776,6 +3005,9 @@ func (c *ControlPlane) cleanupRedirectTrackMapBeforeLocked(staleBeforeNs uint64)
 				totalAge += age
 				if age > maxAge {
 					maxAge = age
+				}
+				if manager != nil && manager.isRedirectTrackPinned(key) {
+					continue
 				}
 				if age > timeoutNano ||
 					(staleBeforeNs > 0 && (value.LastSeenNs == 0 || value.LastSeenNs < staleBeforeNs)) {
@@ -2977,6 +3209,7 @@ func (c *ControlPlane) cleanupConnStateMap(aggressiveCleanup bool) (udpStats, tc
 }
 
 func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, staleBeforeNs uint64) (udpStats, tcpStats mapCleanupStats) {
+	_ = staleBeforeNs
 	select {
 	case <-c.connStateJanitorStop:
 		return
@@ -3000,9 +3233,7 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 	aggressiveTimeout := normalTimeoutNano / 2
 	aggressiveDnsTimeout := dnsTimeoutNano / 2
 
-	establishedTimeoutNano := tcpConnStateTimeoutEstablished.Nanoseconds()
 	closingTimeoutNano := tcpConnStateTimeoutClosing.Nanoseconds()
-	aggressiveEstablishedTimeout := establishedTimeoutNano / 2
 	aggressiveClosingTimeout := closingTimeoutNano / 2
 
 	scratch := c.connStateJanitorScratch()
@@ -3018,6 +3249,7 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 	}()
 
 	var cursor ebpf.MapBatchCursor
+	manager, _ := c.controlPlaneSessionManager()
 
 	for {
 		count, err := bpf.ConnStateMap.BatchLookup(&cursor, keysOut, valuesOut, nil)
@@ -3028,6 +3260,9 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 				switch key.L4proto {
 				case unix.IPPROTO_UDP:
 					udpStats.entries++
+					if manager != nil && manager.isUDPConnStatePinned(key) {
+						continue
+					}
 					isDNS := key.Sport == dnsPortNetworkOrder || key.Dport == dnsPortNetworkOrder
 					timeout := normalTimeoutNano
 					if isDNS {
@@ -3041,16 +3276,16 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 						}
 					}
 					age := nowNano - int64(value.LastSeenNs)
-					if age > timeout ||
-						(staleBeforeNs > 0 && (value.LastSeenNs == 0 || value.LastSeenNs < staleBeforeNs)) {
+					if age > timeout {
 						udpKeysToDelete = append(udpKeysToDelete, key)
 					}
 				case unix.IPPROTO_TCP:
 					tcpStats.entries++
-					establishedTimeout := establishedTimeoutNano
+					if manager != nil && manager.isTCPConnStatePinned(key) {
+						continue
+					}
 					closingTimeout := closingTimeoutNano
 					if aggressiveCleanup {
-						establishedTimeout = aggressiveEstablishedTimeout
 						closingTimeout = aggressiveClosingTimeout
 					}
 					shouldDelete := false
@@ -3059,15 +3294,6 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 						if age > closingTimeout {
 							shouldDelete = true
 						}
-					} else {
-						age := nowNano - int64(value.LastSeenNs)
-						if age > establishedTimeout {
-							shouldDelete = true
-						}
-					}
-					if !shouldDelete && staleBeforeNs > 0 &&
-						(value.LastSeenNs == 0 || value.LastSeenNs < staleBeforeNs) {
-						shouldDelete = true
 					}
 					if shouldDelete {
 						tcpKeysToDelete = append(tcpKeysToDelete, key)
@@ -3089,6 +3315,32 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 		tcpStats.maxEntries = int(maxEntries)
 		udpStats.usagePercent = udpStats.entries * 100 / int(maxEntries)
 		tcpStats.usagePercent = tcpStats.entries * 100 / int(maxEntries)
+	}
+
+	// Recheck pins while blocking process-owned flow adoption and release. This
+	// closes the scan-to-delete race without holding the manager locks during a
+	// potentially large map walk.
+	if manager != nil && (len(udpKeysToDelete) > 0 || len(tcpKeysToDelete) > 0) {
+		manager.mu.RLock()
+		manager.udpStateMu.RLock()
+		defer manager.mu.RUnlock()
+		defer manager.udpStateMu.RUnlock()
+
+		udpPinnedFiltered := udpKeysToDelete[:0]
+		for _, key := range udpKeysToDelete {
+			if manager.pinnedUDP[key] == 0 {
+				udpPinnedFiltered = append(udpPinnedFiltered, key)
+			}
+		}
+		udpKeysToDelete = udpPinnedFiltered
+
+		tcpPinnedFiltered := tcpKeysToDelete[:0]
+		for _, key := range tcpKeysToDelete {
+			if manager.pinnedTCP[key] == 0 {
+				tcpPinnedFiltered = append(tcpPinnedFiltered, key)
+			}
+		}
+		tcpKeysToDelete = tcpPinnedFiltered
 	}
 
 	if len(udpKeysToDelete) > 0 {
@@ -3592,6 +3844,16 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 	if err := validateListener(listener); err != nil {
 		return err
 	}
+	publishListenerSockets := c.publishListenerSockets
+	if hooks.PublishListenerSockets != nil {
+		publishListenerSockets = hooks.PublishListenerSockets
+	}
+	publishBeforeCommit := c.preparedDatapathCommit && !c.sharedBpfReload && c.core != nil
+	if publishBeforeCommit {
+		if err := publishListenerSockets(listener); err != nil {
+			return err
+		}
+	}
 	commitPreparedDatapath := c.CommitPreparedDatapath
 	if hooks.CommitPreparedDatapath != nil {
 		commitPreparedDatapath = hooks.CommitPreparedDatapath
@@ -3599,12 +3861,10 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 	if err := commitPreparedDatapath(); err != nil {
 		return err
 	}
-	publishListenerSockets := c.publishListenerSockets
-	if hooks.PublishListenerSockets != nil {
-		publishListenerSockets = hooks.PublishListenerSockets
-	}
-	if err := publishListenerSockets(listener); err != nil {
-		return err
+	if !publishBeforeCommit {
+		if err := publishListenerSockets(listener); err != nil {
+			return err
+		}
 	}
 	activatePreparedRuntime := c.activatePreparedRuntime
 	if hooks.ActivatePreparedRuntime != nil {
@@ -4164,10 +4424,28 @@ func (c *ControlPlane) chooseBestDnsDialerSnapshot(
 }
 
 func (c *ControlPlane) AbortConnections() (err error) {
+	return c.abortConnections(true)
+}
+
+// AbortPendingConnections stops generation-owned admission and UDP work while
+// preserving TCP flows already promoted into the process SessionManager.
+func (c *ControlPlane) AbortPendingConnections() error {
+	return c.abortConnections(false)
+}
+
+func (c *ControlPlane) abortConnections(abortManagedTCP bool) (err error) {
 	if c == nil {
 		return nil
 	}
 	connections, flows, errs := c.takeIncomingConnectionsForAbort()
+	if abortManagedTCP {
+		manager, _ := c.controlPlaneSessionManager()
+		if manager != nil {
+			if abortErr := manager.AbortGeneration(c.PolicyEpoch()); abortErr != nil {
+				errs = append(errs, abortErr)
+			}
+		}
+	}
 	c.closeUDPOrderedDispatcher()
 	c.udpIngressAdmission.closeAndWait()
 	c.waitUDPOrderedDispatcher()
@@ -4180,11 +4458,11 @@ func (c *ControlPlane) AbortConnections() (err error) {
 			errs = append(errs, cerr)
 		}
 	}
-	for _, flow := range flows {
-		if flow.Egress == nil {
+	for _, egress := range flows {
+		if egress == nil {
 			continue
 		}
-		if cerr := flow.Egress.Close(); cerr != nil && !commonerrors.IsClosedConnection(cerr) {
+		if cerr := egress.Close(); cerr != nil && !commonerrors.IsClosedConnection(cerr) {
 			errs = append(errs, cerr)
 		}
 	}
@@ -4258,6 +4536,11 @@ func (c *ControlPlane) closeTail() error {
 			errs = append(errs, e)
 		}
 	}
+	if c.egressRuntime != nil {
+		if err := c.egressRuntime.releaseOwner(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 
 	// Clear sync.Maps to prevent memory leak on reload.
 	// These maps accumulate data over time and must be explicitly cleared.
@@ -4319,7 +4602,9 @@ func (c *ControlPlane) releaseRetainedState() {
 	c.lanInterface = nil
 	c.udpUnorderedRunner = nil
 	c.udpOrderedDispatcher = nil
+	c.udpOrderedDispatcherShared = false
 	c.udpReplyDispatcher = nil
+	c.udpReplyDispatcherShared = false
 	c.failedQuicDcidCache = nil
 	c.listenerPublishMu.Lock()
 	c.listenerFiles = nil
@@ -4327,6 +4612,12 @@ func (c *ControlPlane) releaseRetainedState() {
 	c.routingKernspaceSnapshot = nil
 	c.pendingDnsReloadCache = nil
 	c.ClearReloadDnsCacheSource()
+	c.sessionManagerMu.Lock()
+	c.sessionManager = nil
+	c.ownsSessionManager = false
+	c.sessionManagerBinding.Store(nil)
+	c.sessionManagerMu.Unlock()
+	c.egressRuntime = nil
 	c.core = nil
 }
 
@@ -4338,9 +4629,13 @@ func (c *ControlPlane) Close() (err error) {
 	c.ClearReloadDnsCacheSource()
 
 	c.closeOnce.Do(func() {
+		c.unpublishActiveControlPlane()
 		c.unpublishRuntimeStats()
 		if c.cancel != nil {
 			c.cancel()
+		}
+		if manager, owned := c.controlPlaneSessionManager(); owned && manager != nil {
+			c.closeErr = stderrors.Join(c.closeErr, manager.Close())
 		}
 		c.closeUDPOrderedDispatcher()
 		c.udpIngressAdmission.closeAndWait()
@@ -4383,13 +4678,13 @@ func (c *ControlPlane) Close() (err error) {
 
 		select {
 		case tailErr := <-done:
-			c.closeErr = stderrors.Join(coreErr, tailErr)
+			c.closeErr = stderrors.Join(c.closeErr, coreErr, tailErr)
 		case <-timer.C:
 			timeoutErr := fmt.Errorf("control plane close tail timed out after %v", controlPlaneDeferredCleanupTimeout)
 			if c.log != nil {
 				c.log.WithError(timeoutErr).Warn("ControlPlane.Close: continuing while tail cleanup finishes in background")
 			}
-			c.closeErr = stderrors.Join(coreErr, timeoutErr)
+			c.closeErr = stderrors.Join(c.closeErr, coreErr, timeoutErr)
 		}
 	})
 	c.UnlinkRoutingEpochPeer(nil)

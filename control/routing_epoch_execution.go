@@ -11,6 +11,8 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+
+	"github.com/daeuniverse/outbound/netproxy"
 )
 
 var (
@@ -101,8 +103,8 @@ func (g *routingEpochIngressGate) closeAndWait() {
 
 // LinkRoutingEpochPeer links two generations that share one BPF object during
 // a staged reload. The association is intentionally pairwise and temporary:
-// routing slots are reused by later reloads and must never form a global
-// generation registry.
+// routing slots are reused by later reloads, so slot ownership remains local
+// to the linked pair even though published execution owners are process-wide.
 func (c *ControlPlane) LinkRoutingEpochPeer(peer *ControlPlane) error {
 	if c == nil || peer == nil || c == peer {
 		return fmt.Errorf("routing epoch peer must be a distinct control plane")
@@ -115,8 +117,34 @@ func (c *ControlPlane) LinkRoutingEpochPeer(peer *ControlPlane) error {
 	if cSlot == peerSlot {
 		return fmt.Errorf("routing epoch peers use the same slot %d", cSlot)
 	}
-	if cBpf, peerBpf := c.core.PeekBpf(), peer.core.PeekBpf(); cBpf != nil && peerBpf != nil && cBpf != peerBpf {
+	cBpf, peerBpf := c.core.PeekBpf(), peer.core.PeekBpf()
+	if cBpf != nil && peerBpf != nil && cBpf != peerBpf {
 		return fmt.Errorf("routing epoch peers do not share BPF objects")
+	}
+	cGeneration := uint16(c.core.datapathGeneration.Load())
+	peerGeneration := uint16(peer.core.datapathGeneration.Load())
+	if cBpf != nil && cBpf == peerBpf {
+		if registered := bpfDatapathGeneration(cBpf); registered != 0 {
+			if cGeneration != 0 && cGeneration != registered {
+				return fmt.Errorf("routing epoch owner generation %d does not match shared BPF generation %d", cGeneration, registered)
+			}
+			if peerGeneration != 0 && peerGeneration != registered {
+				return fmt.Errorf("routing epoch peer generation %d does not match shared BPF generation %d", peerGeneration, registered)
+			}
+			cGeneration = registered
+			peerGeneration = registered
+		}
+	}
+	if cGeneration != 0 && peerGeneration != 0 && cGeneration != peerGeneration {
+		return fmt.Errorf("routing epoch peers use different datapath generations %d and %d", cGeneration, peerGeneration)
+	}
+	sharedGeneration := cGeneration
+	if sharedGeneration == 0 {
+		sharedGeneration = peerGeneration
+	}
+	if sharedGeneration != 0 {
+		c.core.datapathGeneration.Store(uint32(sharedGeneration))
+		peer.core.datapathGeneration.Store(uint32(sharedGeneration))
 	}
 
 	routingEpochPeerLinkMu.Lock()
@@ -177,28 +205,76 @@ func (c *ControlPlane) routingEpochSlotMatches(slot uint32) bool {
 	return c.core != nil && c.core.RoutingEpochSlot() == slot
 }
 
+func (c *ControlPlane) routingEpochExecutionMatches(result *bpfRoutingResult) bool {
+	if c == nil {
+		return false
+	}
+	if result == nil {
+		return true
+	}
+	resultGeneration := result.DatapathGeneration
+	ownerGeneration := uint16(0)
+	if c.core != nil {
+		ownerGeneration = uint16(c.core.datapathGeneration.Load())
+	}
+	if resultGeneration != 0 && resultGeneration != ownerGeneration {
+		return false
+	}
+	slot, known := decodeBpfRoutingEpochSlot(result.RoutingEpochSlot)
+	return !known || c.routingEpochSlotMatches(slot)
+}
+
+func routingEpochOwnerUnavailableError(result *bpfRoutingResult) error {
+	if result == nil {
+		return errRoutingEpochOwnerUnavailable
+	}
+	slot, known := decodeBpfRoutingEpochSlot(result.RoutingEpochSlot)
+	if !known {
+		return fmt.Errorf("%w for unknown slot in datapath generation %d", errRoutingEpochOwnerUnavailable, result.DatapathGeneration)
+	}
+	return fmt.Errorf("%w for slot %d in datapath generation %d", errRoutingEpochOwnerUnavailable, slot, result.DatapathGeneration)
+}
+
+func publishedRoutingEpochExecutionOwner(source *ControlPlane, result *bpfRoutingResult) *ControlPlane {
+	activeControlPlanePublication.mu.RLock()
+	defer activeControlPlanePublication.mu.RUnlock()
+
+	owner := activeControlPlanePublication.plane.Load()
+	if owner != nil && owner != source && owner.acceptsRoutingEpochExecutionLocked() && owner.routingEpochExecutionMatches(result) {
+		return owner
+	}
+	for candidate, publication := range activeControlPlanePublication.owners {
+		if publication == 0 {
+			continue
+		}
+		if candidate == nil || candidate == source || candidate == owner {
+			continue
+		}
+		if candidate.acceptsRoutingEpochExecutionLocked() && candidate.routingEpochExecutionMatches(result) {
+			return candidate
+		}
+	}
+	return nil
+}
+
 func (c *ControlPlane) routingEpochExecutionOwner(result *bpfRoutingResult) (*ControlPlane, error) {
 	if c == nil {
 		return nil, errRoutingEpochOwnerUnavailable
 	}
-	if result == nil {
-		return c, nil
-	}
-	slot, known := decodeBpfRoutingEpochSlot(result.RoutingEpochSlot)
-	if !known {
-		return c, nil
-	}
-	if c.routingEpochSlotMatches(slot) {
+	if c.routingEpochExecutionMatches(result) {
 		return c, nil
 	}
 
 	c.routingEpochPeerMu.RLock()
 	peer := c.routingEpochPeer
 	c.routingEpochPeerMu.RUnlock()
-	if peer != nil && peer.routingEpochSlotMatches(slot) {
+	if peer != nil && peer.routingEpochExecutionMatches(result) {
 		return peer, nil
 	}
-	return nil, fmt.Errorf("%w for slot %d", errRoutingEpochOwnerUnavailable, slot)
+	if published := publishedRoutingEpochExecutionOwner(c, result); published != nil {
+		return published, nil
+	}
+	return nil, routingEpochOwnerUnavailableError(result)
 }
 
 // acquireRoutingEpochExecutionOwner resolves an attributed BPF result and,
@@ -210,11 +286,7 @@ func (c *ControlPlane) acquireRoutingEpochExecutionOwner(result *bpfRoutingResul
 	if c == nil {
 		return nil, nil, errRoutingEpochOwnerUnavailable
 	}
-	if result == nil {
-		return c, nil, nil
-	}
-	slot, known := decodeBpfRoutingEpochSlot(result.RoutingEpochSlot)
-	if !known || c.routingEpochSlotMatches(slot) {
+	if c.routingEpochExecutionMatches(result) {
 		return c, nil, nil
 	}
 
@@ -223,14 +295,17 @@ func (c *ControlPlane) acquireRoutingEpochExecutionOwner(result *bpfRoutingResul
 	c.routingEpochPeerMu.RLock()
 	peer := c.routingEpochPeer
 	c.routingEpochPeerMu.RUnlock()
-	if peer == nil || !peer.routingEpochSlotMatches(slot) {
-		return nil, nil, fmt.Errorf("%w for slot %d", errRoutingEpochOwnerUnavailable, slot)
+	if peer == nil || !peer.routingEpochExecutionMatches(result) {
+		peer = publishedRoutingEpochExecutionOwner(c, result)
+		if peer == nil {
+			return nil, nil, routingEpochOwnerUnavailableError(result)
+		}
 	}
 
 	incomingConnectionOwnershipMu.Lock()
-	if !peer.acceptsRoutingEpochExecutionLocked() {
+	if !peer.acceptsRoutingEpochExecutionLocked() || !peer.routingEpochExecutionMatches(result) {
 		incomingConnectionOwnershipMu.Unlock()
-		return nil, nil, fmt.Errorf("%w for slot %d", errRoutingEpochOwnerUnavailable, slot)
+		return nil, nil, routingEpochOwnerUnavailableError(result)
 	}
 	release := peer.acquireDrainTicket()
 	incomingConnectionOwnershipMu.Unlock()
@@ -250,9 +325,13 @@ func (c *ControlPlane) acceptsRoutingEpochExecutionLocked() bool {
 }
 
 func (c *ControlPlane) acquireRoutingEpochExecutionLease() (func(), bool) {
+	return c.acquireRoutingEpochExecutionLeaseFor(nil)
+}
+
+func (c *ControlPlane) acquireRoutingEpochExecutionLeaseFor(result *bpfRoutingResult) (func(), bool) {
 	incomingConnectionOwnershipMu.Lock()
 	defer incomingConnectionOwnershipMu.Unlock()
-	if !c.acceptsRoutingEpochExecutionLocked() {
+	if !c.acceptsRoutingEpochExecutionLocked() || !c.routingEpochExecutionMatches(result) {
 		return nil, false
 	}
 	return c.acquireDrainTicket(), true
@@ -278,11 +357,18 @@ func (c *ControlPlane) acquireIncomingConnectionLease(conn net.Conn) (*incomingC
 }
 
 func (l *incomingConnectionLease) transfer(owner *ControlPlane) bool {
+	return l.transferRoutingEpoch(owner, nil)
+}
+
+func (l *incomingConnectionLease) transferRoutingEpoch(owner *ControlPlane, result *bpfRoutingResult) bool {
 	if l == nil || owner == nil || owner == l.owner {
-		return l != nil && owner == l.owner
+		return l != nil && owner == l.owner && owner.routingEpochExecutionMatches(result)
 	}
 	incomingConnectionOwnershipMu.Lock()
-	if l.owner == nil || !l.owner.acceptsRoutingEpochExecutionLocked() || !owner.acceptsRoutingEpochExecutionLocked() {
+	if l.owner == nil ||
+		!l.owner.acceptsRoutingEpochExecutionLocked() ||
+		!owner.acceptsRoutingEpochExecutionLocked() ||
+		!owner.routingEpochExecutionMatches(result) {
 		incomingConnectionOwnershipMu.Unlock()
 		return false
 	}
@@ -304,21 +390,31 @@ func (l *incomingConnectionLease) release() {
 	if l == nil {
 		return
 	}
+	incomingConnectionOwnershipMu.Lock()
+	drainRelease := l.releaseLocked()
+	incomingConnectionOwnershipMu.Unlock()
+	if drainRelease != nil {
+		drainRelease()
+	}
+}
+
+// releaseLocked detaches the generation-owned ingress while the caller holds
+// incomingConnectionOwnershipMu. The returned drain release must run after the
+// ownership mutex is unlocked.
+func (l *incomingConnectionLease) releaseLocked() (drainRelease func()) {
+	if l == nil {
+		return nil
+	}
 	l.once.Do(func() {
-		incomingConnectionOwnershipMu.Lock()
 		owner := l.owner
-		drainRelease := l.drainRelease
+		drainRelease = l.drainRelease
 		l.owner = nil
 		l.drainRelease = nil
 		if owner != nil && l.conn != nil {
-			owner.tcpFlows.removeIngress(l.conn)
 			owner.inConnections.Delete(l.conn)
 		}
-		incomingConnectionOwnershipMu.Unlock()
-		if drainRelease != nil {
-			drainRelease()
-		}
 	})
+	return drainRelease
 }
 
 func (c *ControlPlane) closeRoutingEpochExecution() {
@@ -328,6 +424,7 @@ func (c *ControlPlane) closeRoutingEpochExecution() {
 	incomingConnectionOwnershipMu.Lock()
 	c.routingEpochExecutionClosed.Store(true)
 	incomingConnectionOwnershipMu.Unlock()
+	c.unregisterRoutingEpochExecutionOwner()
 }
 
 // StopRoutingEpochExecution prevents further staged-peer dispatch and waits
@@ -345,7 +442,7 @@ func (c *ControlPlane) StopRoutingEpochExecution() {
 	}
 }
 
-func (c *ControlPlane) takeIncomingConnectionsForAbort() ([]net.Conn, []*tcpFlowEntry, []error) {
+func (c *ControlPlane) takeIncomingConnectionsForAbort() ([]net.Conn, []netproxy.Conn, []error) {
 	if c == nil {
 		return nil, nil, nil
 	}
@@ -353,14 +450,14 @@ func (c *ControlPlane) takeIncomingConnectionsForAbort() ([]net.Conn, []*tcpFlow
 	c.routingEpochExecutionClosed.Store(true)
 	c.rejectNewConnections.Store(true)
 	var connections []net.Conn
-	var flows []*tcpFlowEntry
+	var flows []netproxy.Conn
 	var errs []error
 	c.inConnections.Range(func(key, value any) bool {
 		conn, ok := key.(net.Conn)
 		if ok {
 			connections = append(connections, conn)
-			if flow := c.tcpFlows.removeIngress(conn); flow != nil {
-				flows = append(flows, flow)
+			if egress, flowOK := value.(netproxy.Conn); flowOK && egress != nil {
+				flows = append(flows, egress)
 			}
 		} else {
 			errs = append(errs, fmt.Errorf("unexpected type %T in inConnections", key))
@@ -369,5 +466,6 @@ func (c *ControlPlane) takeIncomingConnectionsForAbort() ([]net.Conn, []*tcpFlow
 		return true
 	})
 	incomingConnectionOwnershipMu.Unlock()
+	c.unregisterRoutingEpochExecutionOwner()
 	return connections, flows, errs
 }

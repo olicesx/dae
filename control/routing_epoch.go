@@ -6,17 +6,94 @@
 package control
 
 import (
+	"context"
 	stderrors "errors"
 	"fmt"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/daeuniverse/dae/component/routing"
 )
 
 const (
-	routingEpochSlotCount = 2
-	routingEpochSlotUnset = ^uint32(0)
+	routingEpochSlotCount                = 2
+	routingEpochSlotUnset                = ^uint32(0)
+	routingEpochCleanupMaxAttempts       = 5
+	routingEpochCleanupInitialRetryDelay = 25 * time.Millisecond
+	routingEpochCleanupMaximumRetryDelay = 200 * time.Millisecond
 )
+
+type (
+	routingEpochCleanupWaitFunc func(context.Context, time.Duration) error
+	routingEpochMapCleanupFunc  func(*bpfObjects, uint32) error
+)
+
+func waitForRoutingEpochCleanupRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func routingEpochCleanupRetryDelay(attempt int) time.Duration {
+	delay := routingEpochCleanupInitialRetryDelay << max(attempt-1, 0)
+	return min(delay, routingEpochCleanupMaximumRetryDelay)
+}
+
+func retryPreviousRoutingEpochCleanup(
+	ctx context.Context,
+	cleanup func() error,
+	wait routingEpochCleanupWaitFunc,
+) error {
+	if cleanup == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if wait == nil {
+		wait = waitForRoutingEpochCleanupRetry
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= routingEpochCleanupMaxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			if lastErr == nil {
+				return fmt.Errorf("routing epoch cleanup canceled before attempt %d: %w", attempt, err)
+			}
+			return fmt.Errorf(
+				"routing epoch cleanup canceled after %d attempts: %w",
+				attempt-1,
+				stderrors.Join(lastErr, err),
+			)
+		}
+
+		lastErr = cleanup()
+		if lastErr == nil {
+			return nil
+		}
+		if attempt == routingEpochCleanupMaxAttempts {
+			break
+		}
+		if err := wait(ctx, routingEpochCleanupRetryDelay(attempt)); err != nil {
+			return fmt.Errorf(
+				"routing epoch cleanup interrupted after %d attempts: %w",
+				attempt,
+				stderrors.Join(lastErr, err),
+			)
+		}
+	}
+
+	return fmt.Errorf(
+		"routing epoch cleanup failed after %d attempts: %w",
+		routingEpochCleanupMaxAttempts,
+		lastErr,
+	)
+}
 
 func validRoutingEpochSlot(slot uint32) bool {
 	return slot < routingEpochSlotCount
@@ -81,8 +158,14 @@ func (c *controlPlaneCore) PrepareRoutingEpoch(epoch routing.PolicyEpoch, shared
 	target := active
 	if sharedReload {
 		target ^= 1
+		c.routingEpochPreviousSlot.Store(active)
+	} else {
+		// A fresh datapath has an isolated, zero-initialized selector. Its
+		// predecessor remains owned by the old hook and is not a projection in
+		// these maps that can be rolled back or retired.
+		c.routingEpochPreviousSlot.Store(routingEpochSlotUnset)
 	}
-	c.routingEpochPreviousSlot.Store(active)
+	c.routingEpochRollbackOff.Store(false)
 	c.routingEpochSlot.Store(target)
 	c.routingEpochPolicyEpoch.Store(uint64(epoch))
 	observePhase0RoutingEpoch(phase0RoutingEpochPrepare, phase0ObservationSuccess)
@@ -196,6 +279,10 @@ func (c *controlPlaneCore) RollbackRoutingEpoch() error {
 		endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishRollback, phase1BPFPublishSuccess)
 		return nil
 	}
+	if c.routingEpochRollbackOff.Load() {
+		endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishRollback, phase1BPFPublishSuccess)
+		return nil
+	}
 	previous := c.routingEpochPreviousSlot.Load()
 	if !validRoutingEpochSlot(previous) {
 		endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishRollback, phase1BPFPublishSuccess)
@@ -209,6 +296,94 @@ func (c *controlPlaneCore) RollbackRoutingEpoch() error {
 	observePhase0RoutingEpoch(phase0RoutingEpochRollback, phase0ObservationSuccess)
 	endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishRollback, phase1BPFPublishSuccess)
 	return nil
+}
+
+func clearPreviousRoutingEpochMaps(bpf *bpfObjects, previous uint32) error {
+	var errs []error
+	if bpf != nil && bpf.RoutingEpochMap != nil {
+		if err := bpf.RoutingEpochMap.Update(previous, uint64(0), ebpf.UpdateAny); err != nil {
+			errs = append(errs, fmt.Errorf("clear routing epoch metadata for slot %d: %w", previous, err))
+		}
+	}
+	if bpf != nil && bpf.RoutingMetaMap != nil {
+		if err := bpf.RoutingMetaMap.Update(previous, uint32(0), ebpf.UpdateAny); err != nil {
+			errs = append(errs, fmt.Errorf("clear routing metadata for slot %d: %w", previous, err))
+		}
+	}
+	if err := clearReloadDomainRoutingMapSlot(bpf, previous); err != nil {
+		errs = append(errs, err)
+	}
+	return stderrors.Join(errs...)
+}
+
+// finalizePreviousRoutingEpoch releases the inactive domain projection after
+// the previous generation has drained and rollback is no longer possible.
+func (c *controlPlaneCore) finalizePreviousRoutingEpoch() error {
+	return c.finalizePreviousRoutingEpochWithCleanup(clearPreviousRoutingEpochMaps)
+}
+
+func (c *controlPlaneCore) finalizePreviousRoutingEpochWithCleanup(cleanup routingEpochMapCleanupFunc) error {
+	if c == nil || c.routingEpochPolicyEpoch.Load() == 0 {
+		return nil
+	}
+	if cleanup == nil {
+		cleanup = clearPreviousRoutingEpochMaps
+	}
+
+	for {
+		previous := c.routingEpochPreviousSlot.Load()
+		if !validRoutingEpochSlot(previous) {
+			return nil
+		}
+
+		// Projection writers take this lock before consulting the slot tracker.
+		// Preserve that ordering while excluding a final write to the retiring
+		// slot and serializing against prepare/publish/rollback.
+		c.domainRoutingProjectionMu[previous].Lock()
+		c.routingEpochMu.Lock()
+		if c.routingEpochPreviousSlot.Load() != previous {
+			c.routingEpochMu.Unlock()
+			c.domainRoutingProjectionMu[previous].Unlock()
+			continue
+		}
+
+		active, err := c.readActiveRoutingEpochSlot()
+		if err != nil {
+			c.routingEpochMu.Unlock()
+			c.domainRoutingProjectionMu[previous].Unlock()
+			return err
+		}
+		current := c.routingEpochSlot.Load()
+		if !validRoutingEpochSlot(current) || active != current || previous == current {
+			c.routingEpochMu.Unlock()
+			c.domainRoutingProjectionMu[previous].Unlock()
+			return fmt.Errorf(
+				"cannot retire routing epoch slot %d while active=%d current=%d",
+				previous,
+				active,
+				current,
+			)
+		}
+
+		// Disable rollback before erasing the previous projection. The caller
+		// reaches this method only after the old generation has drained and
+		// closed, so retaining a selector back to partially cleared state would
+		// be less safe than reporting a cleanup error.
+		c.routingEpochRollbackOff.Store(true)
+		bpf := c.PeekBpf()
+		cleanupErr := cleanup(bpf, previous)
+
+		c.domainRoutingSlots[previous] = newDomainRoutingTracker()
+		if previous == 0 {
+			c.domainRouting = c.domainRoutingSlots[previous]
+		}
+		if cleanupErr == nil {
+			c.routingEpochPreviousSlot.Store(routingEpochSlotUnset)
+		}
+		c.routingEpochMu.Unlock()
+		c.domainRoutingProjectionMu[previous].Unlock()
+		return cleanupErr
+	}
 }
 
 // RoutingEpochForSlot returns metadata for diagnostics and replay. It never

@@ -246,7 +246,7 @@ func newUdpReuseSimulationControlPlane(outbound *ob.DialerGroup) *ControlPlane {
 func newTestAnyfromPoolWithoutJanitor() *AnyfromPool {
 	p := &AnyfromPool{}
 	for i := range anyfromPoolShardCount {
-		p.shards[i].pool = make(map[netip.AddrPort]*Anyfrom, 16)
+		p.shards[i].pool = make(map[anyfromPoolKey]*Anyfrom, 16)
 	}
 	return p
 }
@@ -488,7 +488,7 @@ func TestAnyfromPool_ConcurrentExistingSocketReusesCachedBind(t *testing.T) {
 
 	shard := pool.shardFor(lAddr)
 	shard.mu.Lock()
-	shard.pool[lAddr] = af
+	shard.pool[anyfromPoolKey{lAddr: lAddr}] = af
 	shard.mu.Unlock()
 
 	const callers = 128
@@ -543,7 +543,7 @@ func TestAnyfromPool_ConcurrentFailedBindEntrySuppressesRetryStorm(t *testing.T)
 
 	shard := pool.shardFor(lAddr)
 	shard.mu.Lock()
-	shard.pool[lAddr] = failed
+	shard.pool[anyfromPoolKey{lAddr: lAddr}] = failed
 	shard.mu.Unlock()
 
 	const callers = 128
@@ -582,7 +582,7 @@ func TestAnyfromPool_ConcurrentFailedBindEntrySuppressesRetryStorm(t *testing.T)
 	}
 
 	shard.mu.RLock()
-	current := shard.pool[lAddr]
+	current := shard.pool[anyfromPoolKey{lAddr: lAddr}]
 	shard.mu.RUnlock()
 	if current != failed {
 		t.Fatal("expected failed bind cache entry to remain unchanged during retry storm suppression")
@@ -602,13 +602,13 @@ func TestAnyfromPool_JanitorKeepsPinnedConnUntilReleased(t *testing.T) {
 
 	shard := pool.shardFor(lAddr)
 	shard.mu.Lock()
-	shard.pool[lAddr] = af
+	shard.pool[anyfromPoolKey{lAddr: lAddr}] = af
 	shard.mu.Unlock()
 
 	time.Sleep(anyfromJanitorPeriod + 100*time.Millisecond)
 
 	shard.mu.RLock()
-	_, ok := shard.pool[lAddr]
+	_, ok := shard.pool[anyfromPoolKey{lAddr: lAddr}]
 	shard.mu.RUnlock()
 	if !ok {
 		t.Fatal("expected pinned anyfrom conn to survive janitor sweep")
@@ -618,7 +618,7 @@ func TestAnyfromPool_JanitorKeepsPinnedConnUntilReleased(t *testing.T) {
 	time.Sleep(anyfromJanitorPeriod + 100*time.Millisecond)
 
 	shard.mu.RLock()
-	_, ok = shard.pool[lAddr]
+	_, ok = shard.pool[anyfromPoolKey{lAddr: lAddr}]
 	shard.mu.RUnlock()
 	if ok {
 		t.Fatal("expected released anyfrom conn to be reclaimed by janitor")

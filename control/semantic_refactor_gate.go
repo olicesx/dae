@@ -143,3 +143,7 @@ func semanticRefactorFeatureGateSnapshot() SemanticRefactorFeatureSet {
 	}
 	return SemanticRefactorFeatureSet{}
 }
+
+func requiresFullPolicySnapshot(features SemanticRefactorFeatureSet, shadow *phase4DecisionShadowSetting) bool {
+	return features.CompiledPolicy || shadow != nil
+}

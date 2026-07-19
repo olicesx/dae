@@ -37,7 +37,7 @@ type bpfDaeParam struct {
 	PaddingAfterMac      [2]uint8
 	UseRedirectPeer      uint8 // 0=use bpf_redirect(), 1=use bpf_redirect_peer() when safe
 	HasBpfGetCurrentTask uint8
-	Padding2             uint16
+	DatapathGeneration   uint16
 	DaeSocketMark        uint32 // mark set on dae's own sockets to identify them in eBPF
 }
 
@@ -97,16 +97,16 @@ type bpfRedirectTuple struct {
 }
 
 type bpfRoutingResult struct {
-	_                structs.HostLayout
-	Mark             uint32
-	Must             uint8
-	Mac              [6]uint8
-	Outbound         uint8
-	Pname            [16]uint8
-	Pid              uint32
-	Dscp             uint8
-	RoutingEpochSlot uint8
-	Padding          [2]uint8
+	_                  structs.HostLayout
+	Mark               uint32
+	Must               uint8
+	Mac                [6]uint8
+	Outbound           uint8
+	Pname              [16]uint8
+	Pid                uint32
+	Dscp               uint8
+	RoutingEpochSlot   uint8
+	DatapathGeneration uint16
 }
 
 type bpfRoutingHandoffEntry struct {
@@ -148,12 +148,13 @@ type bpfConnState struct {
 			HasRouting uint8
 		}
 	}
-	Mac              [6]uint8
-	_                [2]byte
-	Pname            [16]uint8
-	Pid              uint32
-	RoutingEpochSlot uint8
-	PaddingAfterPid  [3]uint8
+	Mac                [6]uint8
+	_                  [2]byte
+	Pname              [16]uint8
+	Pid                uint32
+	RoutingEpochSlot   uint8
+	PaddingAfterPid    uint8
+	DatapathGeneration uint16
 }
 
 type bpfDaeEvent struct {
@@ -369,6 +370,7 @@ type loadBpfOptions struct {
 	BigEndianTproxyPort    uint32
 	CollectionOptions      *ebpf.CollectionOptions
 	ConnStateMapMaxEntries uint32
+	DatapathGeneration     uint16
 }
 
 const (

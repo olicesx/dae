@@ -27,7 +27,6 @@ func setSnapshotBestDialerChooser(ctrl *DnsController, chooser func(context.Cont
 	updated := *runtime
 	updated.bestDialerSnapshotChooser = chooser
 	updated.bestDialerChooser = nil
-	ctrl.runtimeState.Store(&updated)
 	ctrl.dnsControllerStore.runtimeState.Store(&updated)
 }
 

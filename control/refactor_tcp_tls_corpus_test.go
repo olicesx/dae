@@ -133,7 +133,7 @@ func replayPhase0TCPTLSCorpusFixture(t *testing.T, fixture phase0TCPTLSCorpusFix
 	if result.OutboundIndex != fixture.expectedOutbound || result.Mark != fixture.expectedMark || result.Must != fixture.expectedMust {
 		t.Fatalf("dial result = (outbound=%v mark=%d must=%v), want (%v %d %v)", result.OutboundIndex, result.Mark, result.Must, fixture.expectedOutbound, fixture.expectedMark, fixture.expectedMust)
 	}
-	if binding := result.Binding; binding.Route.Outbound != fixture.expectedOutbound || binding.Route.Mark != fixture.expectedMark || binding.Route.Must != fixture.expectedMust || binding.Egress.Target != fixture.expectedTarget {
+	if binding := newTcpFlowBinding(cp.PolicyEpoch(), result); binding.Route.Outbound != fixture.expectedOutbound || binding.Route.Mark != fixture.expectedMark || binding.Route.Must != fixture.expectedMust || binding.Egress.Target != fixture.expectedTarget {
 		t.Fatalf("TCP flow binding = %+v, want outbound=%v mark=%d must=%v target=%q", binding, fixture.expectedOutbound, fixture.expectedMark, fixture.expectedMust, fixture.expectedTarget)
 	}
 	if result.DialTarget != fixture.expectedTarget || !result.IsDialIp {

@@ -39,11 +39,9 @@ type TcpFlowBinding struct {
 	Egress TcpEgressBinding
 }
 
-func newTcpFlowBinding(snapshot *routing.PolicySnapshot, result *proxyDialResult) TcpFlowBinding {
+func newTcpFlowBinding(policyEpoch routing.PolicyEpoch, result *proxyDialResult) TcpFlowBinding {
 	binding := TcpFlowBinding{}
-	if snapshot != nil {
-		binding.Route.PolicyEpoch = snapshot.Epoch()
-	}
+	binding.Route.PolicyEpoch = policyEpoch
 	if result == nil {
 		return binding
 	}

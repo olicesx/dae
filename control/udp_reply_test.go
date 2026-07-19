@@ -235,12 +235,12 @@ func TestForwardUdpEndpointReplyToClient_FullConeCacheTracksReplySourceAddr(t *t
 
 	shardA := DefaultAnyfromPool.shardFor(replyAddrA)
 	shardA.mu.Lock()
-	shardA.pool[replyAddrA] = afA
+	shardA.pool[anyfromPoolKey{lAddr: replyAddrA}] = afA
 	shardA.mu.Unlock()
 
 	shardB := DefaultAnyfromPool.shardFor(replyAddrB)
 	shardB.mu.Lock()
-	shardB.pool[replyAddrB] = afB
+	shardB.pool[anyfromPoolKey{lAddr: replyAddrB}] = afB
 	shardB.mu.Unlock()
 
 	ue := &UdpEndpoint{

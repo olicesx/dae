@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/netip"
 	"os"
@@ -944,6 +945,28 @@ func TestBpfDatapathChangedDetectsKernelDatapathInputs(t *testing.T) {
 	}
 }
 
+func TestPreserveReloadInterfaceBindingsOnlyAddsDuringHotReload(t *testing.T) {
+	oldConf := &config.Config{Global: config.Global{
+		LanInterface: []string{"lan0", "shared0"},
+		WanInterface: []string{"wan0"},
+	}}
+	newConf := &config.Config{Global: config.Global{
+		LanInterface: []string{"lan1", "wan0"},
+		WanInterface: []string{"wan1", "lan0"},
+	}}
+
+	deferred := preserveReloadInterfaceBindings(oldConf, newConf)
+	if got, want := fmt.Sprint(deferred), "[lan:lan0 lan:shared0 wan:wan0]"; got != want {
+		t.Fatalf("deferred bindings = %s, want %s", got, want)
+	}
+	if got, want := fmt.Sprint(newConf.Global.LanInterface), "[lan1 lan0 shared0]"; got != want {
+		t.Fatalf("effective LAN interfaces = %s, want %s", got, want)
+	}
+	if got, want := fmt.Sprint(newConf.Global.WanInterface), "[wan1 wan0]"; got != want {
+		t.Fatalf("effective WAN interfaces = %s, want %s", got, want)
+	}
+}
+
 // TestBpfDatapathChangedRoutesPolicyChangesViaStagedHandoff verifies that
 // policy-level config changes (routing rules, fallback, groups, DNS upstream)
 // do NOT trigger a fresh BPF reload. These changes are delivered via BPF map
@@ -1023,6 +1046,26 @@ func TestBuildPreparedDNSHandoffHooksReuseHookReusesControllerAndListener(t *tes
 	}
 	if reuseListenerCalls != 1 {
 		t.Fatalf("reuseListenerCalls = %d, want 1", reuseListenerCalls)
+	}
+}
+
+func TestBuildPreparedDNSHandoffHooksReuseHookRejectsControllerFailure(t *testing.T) {
+	var reuseListenerCalls int
+	hooks := buildPreparedDNSHandoffHooks(newDiscardLogger(), true, preparedDNSHandoffHookCallbacks{
+		reuseController: func() bool { return false },
+		reuseListener: func() bool {
+			reuseListenerCalls++
+			return true
+		},
+	})
+	if hooks.reuseHook == nil {
+		t.Fatal("reuseHook = nil, want non-nil")
+	}
+	if err := hooks.reuseHook(); err == nil {
+		t.Fatal("reuseHook() error = nil after controller reuse failure")
+	}
+	if reuseListenerCalls != 0 {
+		t.Fatalf("reuseListenerCalls = %d, want 0 after controller failure", reuseListenerCalls)
 	}
 }
 
@@ -1283,13 +1326,37 @@ func TestWaitForControlPlaneDrainReturnsTimeout(t *testing.T) {
 // abort → !overlap → drain.
 type retirementBehaviorPlane struct {
 	*fakeRetirementControlPlane
-	abortCalled atomic.Bool
-	abortErr    error
+	abortCalled         atomic.Bool
+	pendingAbortCalled  atomic.Bool
+	stopExecutionCalled atomic.Bool
+	abortErr            error
+	pendingAbortErr     error
+}
+
+type blockingStopRetirementPlane struct {
+	*retirementBehaviorPlane
+	stopStarted chan struct{}
+	stopRelease chan struct{}
+}
+
+func (r *blockingStopRetirementPlane) StopRoutingEpochExecution() {
+	close(r.stopStarted)
+	<-r.stopRelease
+	r.retirementBehaviorPlane.StopRoutingEpochExecution()
 }
 
 func (r *retirementBehaviorPlane) AbortConnections() error {
 	r.abortCalled.Store(true)
 	return r.abortErr
+}
+
+func (r *retirementBehaviorPlane) AbortPendingConnections() error {
+	r.pendingAbortCalled.Store(true)
+	return r.pendingAbortErr
+}
+
+func (r *retirementBehaviorPlane) StopRoutingEpochExecution() {
+	r.stopExecutionCalled.Store(true)
 }
 
 func TestReloadRetirementBehavior(t *testing.T) {
@@ -1300,11 +1367,11 @@ func TestReloadRetirementBehavior(t *testing.T) {
 		expectDrain bool
 	}{
 		{"staged_overlap_no_abortfile_graceful", true, false, true},
-		{"staged_no_overlap_no_abortfile_immediate_abort", false, false, false},
+		{"staged_no_overlap_no_abortfile_graceful", false, false, true},
 		{"staged_overlap_abortfile_immediate_abort", true, true, false},
 		{"staged_no_overlap_abortfile_immediate_abort", false, true, false},
 		{"nonstaged_overlap_no_abortfile_graceful", true, false, true},
-		{"nonstaged_no_overlap_no_abortfile_immediate_abort", false, false, false},
+		{"nonstaged_no_overlap_no_abortfile_graceful", false, false, true},
 		{"nonstaged_overlap_abortfile_immediate_abort", true, true, false},
 		{"nonstaged_no_overlap_abortfile_immediate_abort", false, true, false},
 	}
@@ -1334,6 +1401,9 @@ func TestReloadRetirementBehavior(t *testing.T) {
 				case <-time.After(time.Second):
 					t.Fatal("graceful retirement did not complete after drain release")
 				}
+				if !plane.stopExecutionCalled.Load() {
+					t.Fatal("graceful retirement did not seal routing epoch execution")
+				}
 			} else {
 				select {
 				case <-done:
@@ -1343,24 +1413,62 @@ func TestReloadRetirementBehavior(t *testing.T) {
 				if !plane.abortCalled.Load() {
 					t.Fatal("expected AbortConnections to be called for immediate-abort case")
 				}
+				if !plane.stopExecutionCalled.Load() {
+					t.Fatal("immediate-abort retirement did not seal routing epoch execution")
+				}
 			}
 		})
 	}
 }
 
-func TestReloadRetirementAbortsAfterDrainTimeout(t *testing.T) {
+func TestReloadRetirementAbortWaitsForRoutingExecutionLeases(t *testing.T) {
+	plane := &blockingStopRetirementPlane{
+		retirementBehaviorPlane: &retirementBehaviorPlane{
+			fakeRetirementControlPlane: newFakeRetirementControlPlane(1),
+		},
+		stopStarted: make(chan struct{}),
+		stopRelease: make(chan struct{}),
+	}
+	done := make(chan struct{})
+	go func() {
+		retireControlPlaneConnections(newDiscardLogger(), context.Background(), plane, true, true, time.Second)
+		close(done)
+	}()
+
+	select {
+	case <-plane.stopStarted:
+	case <-time.After(time.Second):
+		t.Fatal("abort retirement did not begin routing execution shutdown")
+	}
+	if !plane.abortCalled.Load() {
+		t.Fatal("abort retirement reached execution shutdown before AbortConnections")
+	}
+	select {
+	case <-done:
+		t.Fatal("abort retirement returned before routing execution leases drained")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(plane.stopRelease)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("abort retirement did not finish after routing execution leases drained")
+	}
+}
+
+func TestReloadRetirementAbortsPendingWorkAfterDrainTimeout(t *testing.T) {
 	plane := &retirementBehaviorPlane{
 		fakeRetirementControlPlane: newFakeRetirementControlPlane(1),
 	}
 
 	retireControlPlaneConnections(newDiscardLogger(), context.Background(), plane, false, true, 10*time.Millisecond)
 
-	if !plane.abortCalled.Load() {
-		t.Fatal("expected AbortConnections to be called after drain timeout")
+	if !plane.pendingAbortCalled.Load() || plane.abortCalled.Load() {
+		t.Fatal("expected only AbortPendingConnections after drain timeout")
 	}
 }
 
-func TestReloadRetirementAbortsAfterDrainCancel(t *testing.T) {
+func TestReloadRetirementAbortsPendingWorkAfterDrainCancel(t *testing.T) {
 	plane := &retirementBehaviorPlane{
 		fakeRetirementControlPlane: newFakeRetirementControlPlane(1),
 	}
@@ -1369,8 +1477,8 @@ func TestReloadRetirementAbortsAfterDrainCancel(t *testing.T) {
 
 	retireControlPlaneConnections(newDiscardLogger(), ctx, plane, false, true, time.Second)
 
-	if !plane.abortCalled.Load() {
-		t.Fatal("expected AbortConnections to be called after drain cancellation")
+	if !plane.pendingAbortCalled.Load() || plane.abortCalled.Load() {
+		t.Fatal("expected only AbortPendingConnections after drain cancellation")
 	}
 }
 

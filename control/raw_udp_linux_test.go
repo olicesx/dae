@@ -62,7 +62,7 @@ func TestSendUDPv4RawDirect(t *testing.T) {
 
 	from := netip.MustParseAddrPort("127.0.0.2:" + strconv.Itoa(conflictPort))
 	realTo := netip.MustParseAddrPort(clientAddr.String())
-	if err := sendUDPv4RawDirect([]byte("hello"), from, realTo); err != nil {
+	if err := sendUDPv4RawDirect([]byte("hello"), from, realTo, soMarkFromDae.Load()); err != nil {
 		t.Fatalf("sendUDPv4RawDirect: %v", err)
 	}
 
@@ -112,7 +112,7 @@ func TestSendUDPv6RawDirect(t *testing.T) {
 
 	from := netip.MustParseAddrPort("[2001:4860:4860::8844]:" + strconv.Itoa(conflictPort))
 	realTo := netip.MustParseAddrPort(clientAddr.String())
-	if err := sendUDPv6RawDirect([]byte("hello"), from, realTo); err != nil {
+	if err := sendUDPv6RawDirect([]byte("hello"), from, realTo, soMarkFromDae.Load()); err != nil {
 		t.Fatalf("sendUDPv6RawDirect: %v", err)
 	}
 

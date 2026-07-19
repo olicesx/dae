@@ -119,6 +119,29 @@ func TestDnsControllerOptionUsesGenerationFeatureGate(t *testing.T) {
 	}
 }
 
+func TestFullPolicySnapshotRequirements(t *testing.T) {
+	shadow := &phase4DecisionShadowSetting{sampleEvery: 1}
+	for _, tc := range []struct {
+		name     string
+		features SemanticRefactorFeatureSet
+		shadow   *phase4DecisionShadowSetting
+		want     bool
+	}{
+		{name: "legacy"},
+		{name: "routing epoch identity only", features: SemanticRefactorFeatureSet{RoutingEpoch: true}},
+		{name: "unrelated features", features: SemanticRefactorFeatureSet{DNSResolver: true, UDPOrderedDispatcher: true, UDPReplyDispatcher: true}},
+		{name: "compiled policy", features: SemanticRefactorFeatureSet{CompiledPolicy: true}, want: true},
+		{name: "decision shadow", shadow: shadow, want: true},
+		{name: "compiled policy and decision shadow", features: SemanticRefactorFeatureSet{CompiledPolicy: true}, shadow: shadow, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := requiresFullPolicySnapshot(tc.features, tc.shadow); got != tc.want {
+				t.Fatalf("requiresFullPolicySnapshot() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestUDPOrderedDispatcherUsesGenerationFeatureGate(t *testing.T) {
 	legacy := newUDPOrderedDispatcherForFeatures(SemanticRefactorFeatureSet{})
 	if legacy != nil {

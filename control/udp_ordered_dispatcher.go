@@ -27,10 +27,10 @@ type udpOrderedDispatchQueue struct {
 	ready   bool
 }
 
-// udpOrderedDispatcher provides bounded, per-generation execution for UDP
-// flows that require FIFO ingress. It intentionally does not use the control
-// plane context: Close must release accepted ingress work before callers wait
-// on the admission gate.
+// udpOrderedDispatcher provides bounded execution for UDP flows that require
+// FIFO ingress. A process SessionManager shares one instance across reload
+// generations; standalone control planes retain a private fallback instance.
+// The dispatcher intentionally does not use a generation context.
 type udpOrderedDispatcher struct {
 	mu      sync.Mutex
 	queues  map[UdpFlowKey]*udpOrderedDispatchQueue

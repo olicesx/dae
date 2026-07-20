@@ -21,16 +21,14 @@ const (
 // defaultSemanticRefactorFeatures returns the production default set of
 // semantic-refactor execution paths.
 //
-// Both UDP dispatchers are now competitive with the legacy hot path:
+// Both UDP dispatchers use bounded schedulers:
 //
-//   - udpOrderedDispatcher matches the legacy DefaultUdpTaskPool shape
-//     (sync.Map + per-flow convoy) and both now use batch-drain + idle-only
-//     timer reset, eliminating the per-packet safeTimerReset bottleneck.
-//   - udpReplyDispatcher was slimmed down by removing the redundant q.slots
-//     channel (backpressure is already provided by
-//     UdpEndpoint.replyRuntime.slots in the caller). The remaining hot path
-//     is sync.Map.Load + atomic CAS + channel send, comparable to the legacy
-//     replySender goroutine's channel send + receive.
+//   - Queue lookup uses sync.Map and unrelated flows synchronize only on their
+//     own queue locks.
+//   - A fixed worker cap bounds goroutine and timer pressure under
+//     high-cardinality UDP traffic.
+//   - Per-endpoint reply backpressure remains owned by
+//     UdpEndpoint.replyRuntime.slots.
 //
 // Both are enabled by default. Opt out via DAE_SEMANTIC_REFACTOR_FEATURES=none
 // or pick a subset.

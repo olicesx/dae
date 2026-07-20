@@ -814,12 +814,7 @@ func (ue *UdpEndpoint) submitReplyWithMode(reply udpEndpointReply, release func(
 			ue.logEndpointExit(err, "reply sender")
 		}
 	}
-	var submitted bool
-	if nonBlocking {
-		submitted = runtime.dispatcher.submitNonBlocking(ue, run, complete)
-	} else {
-		submitted = runtime.dispatcher.submit(ue, run, complete)
-	}
+	submitted := runtime.dispatcher.submit(ue, run, complete)
 	if submitted {
 		return true, true
 	}

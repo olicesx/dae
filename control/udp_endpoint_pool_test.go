@@ -2095,7 +2095,7 @@ func TestUdpEndpointStart_UsesGenerationReplyDispatcher(t *testing.T) {
 	conn := &scriptedPacketConn{
 		reads: make(chan scriptedPacketRead, 3),
 	}
-	dispatcher := newUDPReplyDispatcher(1, 2, udpEndpointReplyQueueSize)
+	dispatcher := newUDPReplyDispatcher(1, 2)
 	t.Cleanup(func() {
 		dispatcher.close()
 		dispatcher.wait()
@@ -2149,7 +2149,7 @@ func TestUdpEndpointStart_UsesTransportOwnedPacketReceiver(t *testing.T) {
 	conn := &scriptedPacketReceiverConn{
 		scriptedPacketConn: &scriptedPacketConn{reads: make(chan scriptedPacketRead)},
 	}
-	dispatcher := newUDPReplyDispatcher(1, 2, udpEndpointReplyQueueSize)
+	dispatcher := newUDPReplyDispatcher(1, 2)
 	t.Cleanup(func() {
 		dispatcher.close()
 		dispatcher.wait()
@@ -2216,7 +2216,7 @@ func TestUdpEndpointStart_UsesTransportOwnedPacketReceiver(t *testing.T) {
 }
 
 func TestUdpEndpointCloseDrainsAcceptedRepliesWithGenerationDispatcher(t *testing.T) {
-	dispatcher := newUDPReplyDispatcher(1, 1, udpEndpointReplyQueueSize)
+	dispatcher := newUDPReplyDispatcher(1, 1)
 	t.Cleanup(func() {
 		dispatcher.close()
 		dispatcher.wait()
@@ -2279,7 +2279,7 @@ func TestUdpEndpointSubmitReplyRejectedReleasesBufferOnce(t *testing.T) {
 		released.Add(1)
 	}
 
-	dispatcher := newUDPReplyDispatcher(1, 1, 1)
+	dispatcher := newUDPReplyDispatcher(1, 1)
 	dispatcher.close()
 	ue := &UdpEndpoint{
 		replyRuntime: newUdpEndpointReplyRuntime(dispatcher, newControlPlaneDrainTracker(), 1),
@@ -2296,7 +2296,7 @@ func TestUdpEndpointSubmitReplyRejectedReleasesBufferOnce(t *testing.T) {
 }
 
 func TestUdpEndpointTransportReplyBackpressureKeepsReceiverAlive(t *testing.T) {
-	dispatcher := newUDPReplyDispatcher(1, 1, 1)
+	dispatcher := newUDPReplyDispatcher(1, 1)
 	t.Cleanup(func() {
 		dispatcher.close()
 		dispatcher.wait()

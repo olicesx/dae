@@ -13,7 +13,7 @@ import (
 )
 
 func TestUDPReplyDispatcherPreservesEndpointFIFOAndRunsIndependentEndpoints(t *testing.T) {
-	dispatcher := newUDPReplyDispatcher(2, 1, 8)
+	dispatcher := newUDPReplyDispatcher(2, 1)
 	t.Cleanup(func() {
 		dispatcher.close()
 		dispatcher.wait()
@@ -72,7 +72,7 @@ func TestUDPReplyDispatcherAppliesPerEndpointBackpressure(t *testing.T) {
 	// Backpressure is provided by UdpEndpoint.replyRuntime.slots, which the
 	// production caller (submitReplyWithMode) acquires before invoking the
 	// dispatcher. Test that path end-to-end with a capacity-1 runtime.
-	dispatcher := newUDPReplyDispatcher(1, 1, udpEndpointReplyQueueSize)
+	dispatcher := newUDPReplyDispatcher(1, 1)
 	t.Cleanup(func() {
 		dispatcher.close()
 		dispatcher.wait()
@@ -127,7 +127,7 @@ func TestUDPReplyDispatcherAppliesPerEndpointBackpressure(t *testing.T) {
 }
 
 func TestUDPReplyDispatcherCloseInputDrainsAcceptedReplies(t *testing.T) {
-	dispatcher := newUDPReplyDispatcher(1, 2, 8)
+	dispatcher := newUDPReplyDispatcher(1, 2)
 	t.Cleanup(func() {
 		dispatcher.close()
 		dispatcher.wait()
@@ -172,7 +172,7 @@ func TestUDPReplyDispatcherCloseInputDrainsAcceptedReplies(t *testing.T) {
 }
 
 func TestUDPReplyDispatcherAbortReleasesPendingRepliesOnce(t *testing.T) {
-	dispatcher := newUDPReplyDispatcher(1, 4, 8)
+	dispatcher := newUDPReplyDispatcher(1, 4)
 	t.Cleanup(func() {
 		dispatcher.close()
 		dispatcher.wait()
@@ -230,7 +230,7 @@ func TestUDPReplyDispatcherAbortReleasesPendingRepliesOnce(t *testing.T) {
 }
 
 func TestUDPReplyDispatcherCloseReleasesPendingRepliesOnce(t *testing.T) {
-	dispatcher := newUDPReplyDispatcher(1, 1, 8)
+	dispatcher := newUDPReplyDispatcher(1, 1)
 	endpoint := &UdpEndpoint{}
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -285,7 +285,7 @@ func TestUDPReplyDispatcherCloseReleasesPendingRepliesOnce(t *testing.T) {
 
 func TestUDPReplyDispatcherRepeatedGenerationLifecycleReclaimsWorkers(t *testing.T) {
 	for generation := 0; generation < 128; generation++ {
-		dispatcher := newUDPReplyDispatcher(2, 4, 4)
+		dispatcher := newUDPReplyDispatcher(2, 4)
 		endpoint := &UdpEndpoint{}
 		ran := make(chan struct{}, 1)
 		if !dispatcher.submit(endpoint, func() { ran <- struct{}{} }, nil) {
@@ -305,12 +305,11 @@ func TestUDPReplyDispatcherRepeatedGenerationLifecycleReclaimsWorkers(t *testing
 	}
 }
 
-// TestUDPReplyDispatcherIdleConvoySelfExits guards against the goroutine leak
-// where a convoy blocks forever on select after its endpoint stops receiving
-// replies. The idle timer must retire the convoy and remove the queue so the
-// next reply creates a fresh one.
-func TestUDPReplyDispatcherIdleConvoySelfExits(t *testing.T) {
-	dispatcher := newUDPReplyDispatcher(1, 1, 4)
+// TestUDPReplyDispatcherIdleQueueSelfReclaims verifies that an endpoint queue
+// is removed after its accepted work drains, without retaining per-endpoint
+// goroutines or timers.
+func TestUDPReplyDispatcherIdleQueueSelfReclaims(t *testing.T) {
+	dispatcher := newUDPReplyDispatcher(1, 1)
 	t.Cleanup(func() {
 		dispatcher.close()
 		dispatcher.wait()
@@ -320,9 +319,8 @@ func TestUDPReplyDispatcherIdleConvoySelfExits(t *testing.T) {
 	if !dispatcher.submit(endpoint, func() {}, nil) {
 		t.Fatal("submit initial reply")
 	}
-	// The convoy should self-exit after the aging idle window with no further
-	// traffic. Poll queueCount rather than sleeping for the exact timeout.
-	deadline := time.Now().Add(UdpTaskPoolAgingTime * 10)
+	// The worker removes the queue as soon as it drains.
+	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		if dispatcher.queueCount() == 0 {
 			break
@@ -330,10 +328,10 @@ func TestUDPReplyDispatcherIdleConvoySelfExits(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	if got := dispatcher.queueCount(); got != 0 {
-		t.Fatalf("idle convoy did not self-exit: queueCount = %d", got)
+		t.Fatalf("idle reply queue was not reclaimed: queueCount = %d", got)
 	}
 
-	// A fresh reply after idle retirement must create a new queue/convoy.
+	// A fresh reply after idle retirement must create a new queue.
 	ran := make(chan struct{}, 1)
 	if !dispatcher.submit(endpoint, func() { ran <- struct{}{} }, nil) {
 		t.Fatal("submit after idle retirement")
@@ -350,7 +348,7 @@ func TestUDPReplyDispatcherIdleConvoySelfExits(t *testing.T) {
 // task's discard hook, leaking the caller's runtime.slots / WaitGroup /
 // drain-tracker bookkeeping.
 func TestUDPReplyDispatcherReleaseAndCleanupInvokesDiscard(t *testing.T) {
-	dispatcher := newUDPReplyDispatcher(1, 1, 8)
+	dispatcher := newUDPReplyDispatcher(1, 1)
 	t.Cleanup(func() {
 		dispatcher.close()
 		dispatcher.wait()

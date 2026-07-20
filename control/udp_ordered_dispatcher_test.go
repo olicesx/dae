@@ -137,11 +137,9 @@ func TestUDPOrderedDispatcherRunsIndependentFlowsConcurrently(t *testing.T) {
 }
 
 func TestUDPOrderedDispatcherQuantumPreventsHotFlowStarvation(t *testing.T) {
-	// In the convoy model each flow owns an independent goroutine, so a busy
-	// hot flow cannot starve a cold flow. The test retains the "fairness"
-	// intent of the original worker-pool quantum test: while the hot flow is
-	// blocked, the cold flow must complete.
-	dispatcher := newUDPOrderedDispatcher(1, 4)
+	// A blocked handler occupies one bounded worker. Keep a second worker
+	// available so an unrelated cold flow can still make progress.
+	dispatcher := newUDPOrderedDispatcher(2, 4)
 	t.Cleanup(func() { closeUDPOrderedDispatcherForTest(t, dispatcher) })
 
 	hotKey := udpOrderedDispatcherTestKey(1)
@@ -174,8 +172,8 @@ func TestUDPOrderedDispatcherQuantumPreventsHotFlowStarvation(t *testing.T) {
 		t.Fatal("submit cold task returned false")
 	}
 
-	// The hot flow is still blocked, but the cold flow must complete because
-	// it owns an independent convoy goroutine.
+	// The hot flow is still blocked, but the second bounded worker must let the
+	// cold flow complete.
 	select {
 	case <-coldDone:
 	case <-time.After(time.Second):

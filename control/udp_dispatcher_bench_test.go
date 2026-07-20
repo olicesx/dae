@@ -11,9 +11,9 @@ import (
 )
 
 // BenchmarkUDPReplyDispatcherSubmitDrain measures the steady-state cost of
-// dispatching replies across N concurrent endpoints. It guards against
-// regressions in the slimmed-down hot path (sync.Map.Load + atomic CAS +
-// channel send, no redundant per-queue slots).
+// dispatching replies across N concurrent endpoints. It guards the bounded
+// worker scheduler and per-endpoint queue path against throughput and
+// allocation regressions.
 func BenchmarkUDPReplyDispatcherSubmitDrain(b *testing.B) {
 	cases := []struct {
 		endpoints int
@@ -51,13 +51,10 @@ func BenchmarkUDPReplyDispatcherSubmitDrain(b *testing.B) {
 	}
 }
 
-
 // BenchmarkUDPOrderedDispatcherSubmitDrain measures the steady-state cost of
-// dispatching a high packet rate across N concurrent UDP flows. It exists to
-// guard the semantic-refactor dispatcher against regressions versus the legacy
-// DefaultUdpTaskPool: the legacy path is lock-free on its fast path, so any
-// dispatcher that reintroduces a contended mutex on submit needs to be visible
-// here.
+// dispatching a high packet rate across N concurrent UDP flows. It compares
+// the bounded worker scheduler with the legacy per-flow convoy pool so submit
+// and drain overhead remain visible.
 func BenchmarkUDPOrderedDispatcherSubmitDrain(b *testing.B) {
 	cases := []struct {
 		flows     int

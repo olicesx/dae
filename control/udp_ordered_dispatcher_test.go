@@ -63,9 +63,6 @@ func TestUDPOrderedDispatcherHighCardinalityUsesFixedWorkersWithoutDrops(t *test
 	waitForCondition(t, time.Second, "all high-cardinality UDP tasks complete", func() bool {
 		return completed.Load() == want
 	})
-	if dispatcher.workerCount != 3 {
-		t.Fatalf("worker count = %d, want 3", dispatcher.workerCount)
-	}
 	if discarded.Load() != 0 {
 		t.Fatalf("discarded tasks = %d, want 0", discarded.Load())
 	}
@@ -140,8 +137,11 @@ func TestUDPOrderedDispatcherRunsIndependentFlowsConcurrently(t *testing.T) {
 }
 
 func TestUDPOrderedDispatcherQuantumPreventsHotFlowStarvation(t *testing.T) {
-	const quantum = 4
-	dispatcher := newUDPOrderedDispatcher(1, quantum)
+	// In the convoy model each flow owns an independent goroutine, so a busy
+	// hot flow cannot starve a cold flow. The test retains the "fairness"
+	// intent of the original worker-pool quantum test: while the hot flow is
+	// blocked, the cold flow must complete.
+	dispatcher := newUDPOrderedDispatcher(1, 4)
 	t.Cleanup(func() { closeUDPOrderedDispatcherForTest(t, dispatcher) })
 
 	hotKey := udpOrderedDispatcherTestKey(1)
@@ -151,15 +151,10 @@ func TestUDPOrderedDispatcherQuantumPreventsHotFlowStarvation(t *testing.T) {
 	var releaseOnce sync.Once
 	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseFirst) }) })
 	coldDone := make(chan struct{})
-	var mu sync.Mutex
-	var order []string
 
 	if !dispatcher.submit(hotKey, func() {
 		close(firstStarted)
 		<-releaseFirst
-		mu.Lock()
-		order = append(order, "hot-0")
-		mu.Unlock()
 	}, nil) {
 		t.Fatal("submit first hot task returned false")
 	}
@@ -168,47 +163,25 @@ func TestUDPOrderedDispatcherQuantumPreventsHotFlowStarvation(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("first hot task did not start")
 	}
-	for index := 1; index <= quantum*2; index++ {
-		if !dispatcher.submit(hotKey, func() {
-			mu.Lock()
-			order = append(order, "hot")
-			mu.Unlock()
-		}, nil) {
+	for index := 1; index <= 8; index++ {
+		if !dispatcher.submit(hotKey, func() {}, nil) {
 			t.Fatalf("submit hot task %d returned false", index)
 		}
 	}
 	if !dispatcher.submit(coldKey, func() {
-		mu.Lock()
-		order = append(order, "cold")
-		mu.Unlock()
 		close(coldDone)
 	}, nil) {
 		t.Fatal("submit cold task returned false")
 	}
 
-	releaseOnce.Do(func() { close(releaseFirst) })
+	// The hot flow is still blocked, but the cold flow must complete because
+	// it owns an independent convoy goroutine.
 	select {
 	case <-coldDone:
 	case <-time.After(time.Second):
 		t.Fatal("hot flow starved the cold flow")
 	}
-	waitForCondition(t, time.Second, "all fairness tasks complete", func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(order) == quantum*2+2
-	})
-	mu.Lock()
-	defer mu.Unlock()
-	coldIndex := -1
-	for index, value := range order {
-		if value == "cold" {
-			coldIndex = index
-			break
-		}
-	}
-	if coldIndex < 0 || coldIndex > quantum {
-		t.Fatalf("cold task index = %d, want no later than quantum %d; order=%v", coldIndex, quantum, order)
-	}
+	releaseOnce.Do(func() { close(releaseFirst) })
 }
 
 func TestUDPOrderedDispatcherCloseDiscardsQueuedWorkAndStops(t *testing.T) {

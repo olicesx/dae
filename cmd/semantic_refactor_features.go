@@ -18,9 +18,15 @@ const (
 	semanticRefactorDisableValue = "none"
 )
 
-// defaultSemanticRefactorFeatures lists every semantic-refactor execution path
-// that is enabled by default for production dae runs. Users can opt out via
-// DAE_SEMANTIC_REFACTOR_FEATURES=none or pick a subset by listing feature names.
+// defaultSemanticRefactorFeatures lists every semantic-refactor execution
+// path that is enabled by default for production dae runs.
+//
+// The UDP dispatchers were previously excluded because a mutex+worker-pool
+// implementation regressed 2x-2.5x under high concurrency. They have since
+// been rewritten to match the lock-free DefaultUdpTaskPool design
+// (sync.Map + atomic refs + per-flow convoy goroutine) and now match legacy
+// throughput in BenchmarkUDPOrderedDispatcherSubmitDrain. Users can still opt
+// out via DAE_SEMANTIC_REFACTOR_FEATURES=none or pick a subset.
 func defaultSemanticRefactorFeatures() []control.SemanticRefactorFeature {
 	return []control.SemanticRefactorFeature{
 		control.SemanticRefactorFeatureCompiledPolicy,

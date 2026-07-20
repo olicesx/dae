@@ -10,6 +10,48 @@ import (
 	"testing"
 )
 
+// BenchmarkUDPReplyDispatcherSubmitDrain measures the steady-state cost of
+// dispatching replies across N concurrent endpoints. It guards against
+// regressions in the slimmed-down hot path (sync.Map.Load + atomic CAS +
+// channel send, no redundant per-queue slots).
+func BenchmarkUDPReplyDispatcherSubmitDrain(b *testing.B) {
+	cases := []struct {
+		endpoints int
+		producers int
+	}{
+		{endpoints: 1, producers: 1},
+		{endpoints: 64, producers: 1},
+		{endpoints: 64, producers: 8},
+		{endpoints: 1024, producers: 8},
+	}
+	for _, tc := range cases {
+		b.Run(fmt.Sprintf("e=%d_p=%d", tc.endpoints, tc.producers), func(b *testing.B) {
+			dispatcher := newDefaultUDPReplyDispatcher()
+			b.Cleanup(func() {
+				dispatcher.close()
+				dispatcher.wait()
+			})
+
+			endpoints := make([]*UdpEndpoint, tc.endpoints)
+			for i := range endpoints {
+				endpoints[i] = &UdpEndpoint{}
+			}
+			task := func() {}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			runProducers(b, tc.producers, func(workerID int, op int) {
+				ep := endpoints[op%len(endpoints)]
+				if !dispatcher.submit(ep, task, nil) {
+					b.Fatalf("submit rejected on op %d", op)
+				}
+			})
+		})
+	}
+}
+
+
 // BenchmarkUDPOrderedDispatcherSubmitDrain measures the steady-state cost of
 // dispatching a high packet rate across N concurrent UDP flows. It exists to
 // guard the semantic-refactor dispatcher against regressions versus the legacy

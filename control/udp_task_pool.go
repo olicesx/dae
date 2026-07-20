@@ -139,11 +139,6 @@ func (q *UdpTaskQueue) safeTimerReset(timer *time.Timer) {
 	timer.Reset(q.agingTime)
 }
 
-func (q *UdpTaskQueue) executeTask(task UdpTask, timer *time.Timer) {
-	task()
-	q.safeTimerReset(timer)
-}
-
 func (q *UdpTaskQueue) convoy() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -159,14 +154,38 @@ func (q *UdpTaskQueue) convoy() {
 	defer timer.Stop()
 
 	for {
-		if task, ok := q.popReadyTask(); ok {
-			q.executeTask(task, timer)
+		// Batch drain: process every immediately-ready task in a tight loop
+		// without touching the timer between iterations. This replaces the
+		// legacy per-task safeTimerReset (Stop + drain + Reset) that
+		// dominated the hot path under high packet rates. The idle timer is
+		// only armed once the queue goes quiet.
+		drainedAny := false
+		for {
+			if task, ok := q.popReadyTask(); ok {
+				task()
+				drainedAny = true
+				continue
+			}
+			break
+		}
+		if drainedAny {
+			q.safeTimerReset(timer)
 			continue
 		}
 
 		select {
 		case task := <-q.ch:
-			q.executeTask(task, timer)
+			task()
+			// Drain follow-up tasks that arrived while we were running the
+			// first one, then re-arm the timer once.
+			for {
+				if task, ok := q.popReadyTask(); ok {
+					task()
+					continue
+				}
+				break
+			}
+			q.safeTimerReset(timer)
 		case <-q.wake:
 			// Check if pool is shutting down
 			if q.refs.Load() < 0 {

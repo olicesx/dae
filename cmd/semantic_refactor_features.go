@@ -21,21 +21,18 @@ const (
 // defaultSemanticRefactorFeatures returns the production default set of
 // semantic-refactor execution paths.
 //
-// The two UDP dispatchers were previously disabled after a lock-free rewrite
-// regressed QUIC routing and doubled CPU under speedtest. The dispatchers
-// have since been fixed:
-//   - udpReplyDispatcher.releaseAndCleanup now invokes each pending task's
-//     discard hook instead of leaking the runtime.slots / WaitGroup /
-//     drain-tracker bookkeeping.
-//   - Both dispatchers flip refs<0 under enqueueMu during reap / close /
-//     abort so a late submit is rejected by enqueue() instead of landing
-//     after drainPending returns.
-//   - Both convoy loops now batch-drain and reset the idle timer only when
-//     the queue goes quiet, instead of paying Stop+drain+Reset per packet.
-//   - The reply dispatcher convoy now self-exits on the idle timer instead
-//     of leaking one goroutine per idle endpoint.
+// Both UDP dispatchers are now competitive with the legacy hot path:
 //
-// They are enabled by default; opt out via DAE_SEMANTIC_REFACTOR_FEATURES=none
+//   - udpOrderedDispatcher matches the legacy DefaultUdpTaskPool shape
+//     (sync.Map + per-flow convoy) and both now use batch-drain + idle-only
+//     timer reset, eliminating the per-packet safeTimerReset bottleneck.
+//   - udpReplyDispatcher was slimmed down by removing the redundant q.slots
+//     channel (backpressure is already provided by
+//     UdpEndpoint.replyRuntime.slots in the caller). The remaining hot path
+//     is sync.Map.Load + atomic CAS + channel send, comparable to the legacy
+//     replySender goroutine's channel send + receive.
+//
+// Both are enabled by default. Opt out via DAE_SEMANTIC_REFACTOR_FEATURES=none
 // or pick a subset.
 func defaultSemanticRefactorFeatures() []control.SemanticRefactorFeature {
 	return []control.SemanticRefactorFeature{

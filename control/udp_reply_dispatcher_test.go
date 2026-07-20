@@ -6,6 +6,7 @@
 package control
 
 import (
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -68,20 +69,30 @@ func TestUDPReplyDispatcherPreservesEndpointFIFOAndRunsIndependentEndpoints(t *t
 }
 
 func TestUDPReplyDispatcherAppliesPerEndpointBackpressure(t *testing.T) {
-	dispatcher := newUDPReplyDispatcher(1, 1, 1)
+	// Backpressure is provided by UdpEndpoint.replyRuntime.slots, which the
+	// production caller (submitReplyWithMode) acquires before invoking the
+	// dispatcher. Test that path end-to-end with a capacity-1 runtime.
+	dispatcher := newUDPReplyDispatcher(1, 1, udpEndpointReplyQueueSize)
 	t.Cleanup(func() {
 		dispatcher.close()
 		dispatcher.wait()
 	})
 
-	endpoint := &UdpEndpoint{}
+	endpoint := &UdpEndpoint{
+		replyRuntime: newUdpEndpointReplyRuntime(dispatcher, newControlPlaneDrainTracker(), 1),
+	}
 	started := make(chan struct{})
 	release := make(chan struct{})
-	if !dispatcher.submit(endpoint, func() {
+	endpoint.handler = func(_ *UdpEndpoint, _ []byte, _ netip.AddrPort) error {
 		close(started)
 		<-release
-	}, nil) {
-		t.Fatal("submit blocking task")
+		return nil
+	}
+
+	// First reply takes the only runtime slot and blocks inside the handler.
+	first := udpEndpointReply{data: []byte("first"), from: netip.MustParseAddrPort("198.51.100.1:1")}
+	if accepted, _ := endpoint.submitReplyWithMode(first, nil, false); !accepted {
+		t.Fatal("first submit rejected")
 	}
 	select {
 	case <-started:
@@ -89,20 +100,25 @@ func TestUDPReplyDispatcherAppliesPerEndpointBackpressure(t *testing.T) {
 		t.Fatal("blocking task did not start")
 	}
 
-	accepted := make(chan bool, 1)
+	// Second reply must block on the runtime slot, not be accepted.
+	secondAccepted := make(chan bool, 1)
 	go func() {
-		accepted <- dispatcher.submit(endpoint, func() {}, nil)
+		accepted, _ := endpoint.submitReplyWithMode(
+			udpEndpointReply{data: []byte("second"), from: netip.MustParseAddrPort("198.51.100.1:1")},
+			nil, false)
+		secondAccepted <- accepted
 	}()
 	select {
-	case result := <-accepted:
-		t.Fatalf("second submit completed before queue capacity became available: %v", result)
+	case result := <-secondAccepted:
+		t.Fatalf("second submit completed before slot became available: %v", result)
 	case <-time.After(50 * time.Millisecond):
 	}
+
 	close(release)
 	select {
-	case result := <-accepted:
+	case result := <-secondAccepted:
 		if !result {
-			t.Fatal("second submit rejected after capacity became available")
+			t.Fatal("second submit rejected after slot became available")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("second submit remained blocked after first task completed")

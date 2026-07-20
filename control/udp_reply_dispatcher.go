@@ -21,7 +21,6 @@ type udpReplyDispatchQueue struct {
 	endpoint     *UdpEndpoint
 	ch           chan udpReplyDispatchTask
 	wake         chan struct{}
-	slots        chan struct{}
 	inputStop    chan struct{}
 	done         chan struct{}
 	overflow     []udpReplyDispatchTask
@@ -123,44 +122,22 @@ func (d *udpReplyDispatcher) submitMode(endpoint *UdpEndpoint, run, discard func
 		return false
 	}
 
-	// Take a backlog slot before enqueuing so one slow endpoint cannot consume
-	// unbounded reply memory. Slot release happens in the convoy after the
-	// task runs (or on discard paths).
-	if nonBlocking {
-		select {
-		case q.slots <- struct{}{}:
-		case <-q.inputStop:
-			q.refs.Add(-1)
-			return false
-		default:
-			q.refs.Add(-1)
-			return false
-		}
-	} else {
-		select {
-		case q.slots <- struct{}{}:
-		case <-q.inputStop:
-			q.refs.Add(-1)
-			return false
-		}
-	}
+	// Backpressure is provided by UdpEndpoint.replyRuntime.slots, which the
+	// caller (submitReplyWithMode) takes before invoking the dispatcher.
+	// Adding a second slot channel here would just double the per-reply
+	// channel bookkeeping without bounding memory any tighter.
 
-	// Re-check the closed/input flags under the slot so a concurrent close
-	// cannot strand the slot. If we miss, release the slot and bail out.
-	// inputClosed covers both normal endpoint close and abort paths because
-	// abortInput / dispatcher close both call closeInputLocked first.
-	if d.closed.Load() || q.inputClosed.Load() {
-		<-q.slots
+	// Re-check input flags under the acquired ref so a concurrent close cannot
+	// strand the task. inputClosed covers both normal endpoint close and
+	// abort paths because abortInput / dispatcher close both call
+	// closeInputLocked first.
+	if q.inputClosed.Load() {
 		q.refs.Add(-1)
 		return false
 	}
 
 	accepted := q.enqueue(udpReplyDispatchTask{run: run, discard: discard})
 	if !accepted {
-		// A concurrent reap/closeInput flipped the dying flag between the
-		// inputClosed check above and enqueue. Release the slot we took and
-		// tell the caller the task was rejected so it can invoke discard.
-		<-q.slots
 		q.refs.Add(-1)
 		return false
 	}
@@ -192,7 +169,6 @@ createNew:
 		endpoint:   endpoint,
 		ch:         ch,
 		wake:       make(chan struct{}, 1),
-		slots:      make(chan struct{}, d.queueCapacity),
 		inputStop:  make(chan struct{}),
 		done:       make(chan struct{}),
 	}
@@ -312,7 +288,6 @@ func (q *udpReplyDispatchQueue) convoy() {
 			for {
 				if task, ok := q.popReadyTask(); ok {
 					runUDPReplyTask(task)
-					q.releaseSlot()
 					drainedAny = true
 					continue
 				}
@@ -340,7 +315,6 @@ func (q *udpReplyDispatchQueue) convoy() {
 		for {
 			if task, ok := q.popReadyTask(); ok {
 				runUDPReplyTask(task)
-				q.releaseSlot()
 				drainedAny = true
 				continue
 			}
@@ -354,11 +328,9 @@ func (q *udpReplyDispatchQueue) convoy() {
 		select {
 		case task := <-q.ch:
 			runUDPReplyTask(task)
-			q.releaseSlot()
 			for {
 				if task, ok := q.popReadyTask(); ok {
 					runUDPReplyTask(task)
-					q.releaseSlot()
 					continue
 				}
 				break
@@ -417,7 +389,6 @@ func (q *udpReplyDispatchQueue) releaseAndCleanup() {
 	pending := q.drainPending()
 	for _, task := range pending {
 		discardUDPReplyTask(task)
-		q.releaseSlot()
 	}
 	if q.dispatcher.queues.CompareAndDelete(q.endpoint, q) {
 		q.dispatcher.queueChPool.Put(q.ch)
@@ -433,13 +404,6 @@ func (q *udpReplyDispatchQueue) safeTimerReset(timer *time.Timer) {
 		}
 	}
 	timer.Reset(dispatcherAgingTime())
-}
-
-func (q *udpReplyDispatchQueue) releaseSlot() {
-	select {
-	case <-q.slots:
-	default:
-	}
 }
 
 func (q *udpReplyDispatchQueue) finishOnce() {
@@ -497,7 +461,6 @@ func (d *udpReplyDispatcher) abortInput(endpoint *UdpEndpoint) {
 	q.notifyWake()
 	for _, task := range pending {
 		discardUDPReplyTask(task)
-		q.releaseSlot()
 	}
 }
 
@@ -549,7 +512,6 @@ func (d *udpReplyDispatcher) close() {
 			q.notifyWake()
 			for _, task := range pending {
 				discardUDPReplyTask(task)
-				q.releaseSlot()
 			}
 			if d.queues.CompareAndDelete(key, q) {
 				d.queueChPool.Put(q.ch)

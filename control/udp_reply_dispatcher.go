@@ -8,6 +8,7 @@ package control
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type udpReplyDispatchTask struct {
@@ -154,7 +155,15 @@ func (d *udpReplyDispatcher) submitMode(endpoint *UdpEndpoint, run, discard func
 		return false
 	}
 
-	q.enqueue(udpReplyDispatchTask{run: run, discard: discard})
+	accepted := q.enqueue(udpReplyDispatchTask{run: run, discard: discard})
+	if !accepted {
+		// A concurrent reap/closeInput flipped the dying flag between the
+		// inputClosed check above and enqueue. Release the slot we took and
+		// tell the caller the task was rejected so it can invoke discard.
+		<-q.slots
+		q.refs.Add(-1)
+		return false
+	}
 	q.refs.Add(-1)
 	return true
 }
@@ -208,23 +217,31 @@ createNew:
 	return q
 }
 
-func (q *udpReplyDispatchQueue) enqueue(task udpReplyDispatchTask) {
+func (q *udpReplyDispatchQueue) enqueue(task udpReplyDispatchTask) bool {
 	q.enqueueMu.Lock()
 	defer q.enqueueMu.Unlock()
+	// A concurrent close/abort/reap may have flipped refs<0 or inputClosed
+	// between submitMode's check and here. Reject so the caller releases the
+	// slot and invokes discard instead of leaking the task (and its
+	// runtime.slots / WaitGroup / drain-tracker bookkeeping).
+	if q.refs.Load() < 0 || q.inputClosed.Load() {
+		return false
+	}
 	if q.overflowMode {
 		q.overflow = append(q.overflow, task)
 		q.overflowLen.Store(int32(len(q.overflow)))
 		q.notifyWake()
-		return
+		return true
 	}
 	select {
 	case q.ch <- task:
-		return
+		return true
 	default:
 		q.overflowMode = true
 		q.overflow = append(q.overflow, task)
 		q.overflowLen.Store(int32(len(q.overflow)))
 		q.notifyWake()
+		return true
 	}
 }
 
@@ -281,28 +298,56 @@ func (q *udpReplyDispatchQueue) convoy() {
 		}
 	}()
 
+	timer := time.NewTimer(dispatcherAgingTime())
+	defer timer.Stop()
+
 	for {
 		// Normal drain: once input is closed, finish any queued replies and
 		// exit. The queue removes itself from the dispatcher map so future
 		// submits for this endpoint create a fresh queue.
 		if q.inputClosed.Load() {
-			if task, ok := q.popReadyTask(); ok {
-				runUDPReplyTask(task)
-				q.releaseSlot()
+			// Batch-drain everything that is immediately ready so we exit
+			// quickly without per-task timer churn.
+			drainedAny := false
+			for {
+				if task, ok := q.popReadyTask(); ok {
+					runUDPReplyTask(task)
+					q.releaseSlot()
+					drainedAny = true
+					continue
+				}
+				break
+			}
+			if drainedAny {
 				continue
 			}
+			// Queue looks empty. Re-check under enqueueMu so we cannot race
+			// with a late enqueue and strand a task without its discard.
 			q.enqueueMu.Lock()
 			overflowEmpty := len(q.overflow) == 0
+			chanLen := len(q.ch)
 			q.enqueueMu.Unlock()
-			if overflowEmpty && len(q.ch) == 0 {
+			if overflowEmpty && chanLen == 0 && q.refs.Load() <= 0 {
 				q.releaseAndCleanup()
 				return
 			}
+			// Either there is pending work we lost the race on, or a submit
+			// is still in flight. Fall through to the select to wait.
 		}
 
-		if task, ok := q.popReadyTask(); ok {
-			runUDPReplyTask(task)
-			q.releaseSlot()
+		// Batch drain for the normal (input-open) path.
+		drainedAny := false
+		for {
+			if task, ok := q.popReadyTask(); ok {
+				runUDPReplyTask(task)
+				q.releaseSlot()
+				drainedAny = true
+				continue
+			}
+			break
+		}
+		if drainedAny {
+			q.safeTimerReset(timer)
 			continue
 		}
 
@@ -310,29 +355,84 @@ func (q *udpReplyDispatchQueue) convoy() {
 		case task := <-q.ch:
 			runUDPReplyTask(task)
 			q.releaseSlot()
+			for {
+				if task, ok := q.popReadyTask(); ok {
+					runUDPReplyTask(task)
+					q.releaseSlot()
+					continue
+				}
+				break
+			}
+			q.safeTimerReset(timer)
 		case <-q.wake:
 			if q.refs.Load() < 0 {
 				q.releaseAndCleanup()
 				return
 			}
+		case <-timer.C:
+			// Idle GC: if no in-flight submit and no pending work, retire
+			// this convoy so we do not leak a goroutine per idle endpoint.
+			if q.refs.Load() > 0 || len(q.ch) > 0 || q.overflowLen.Load() > 0 {
+				q.safeTimerReset(timer)
+				continue
+			}
+			if !q.refs.CompareAndSwap(0, -1) {
+				q.safeTimerReset(timer)
+				continue
+			}
+			// Re-check for late work under the lock before tearing down.
+			q.enqueueMu.Lock()
+			lateWork := len(q.overflow) > 0 || len(q.ch) > 0
+			q.enqueueMu.Unlock()
+			if lateWork {
+				q.refs.Store(0)
+				q.safeTimerReset(timer)
+				continue
+			}
+			// Remove from map BEFORE closing done so a concurrent
+			// closeInputAndWait observes queueCount==0 once it unblocks.
+			if q.dispatcher.queues.CompareAndDelete(q.endpoint, q) {
+				q.dispatcher.queueChPool.Put(q.ch)
+				q.finishOnce()
+				return
+			}
+			if v, ok := q.dispatcher.queues.Load(q.endpoint); !ok || v.(*udpReplyDispatchQueue) != q {
+				q.dispatcher.queueChPool.Put(q.ch)
+				q.finishOnce()
+				return
+			}
+			q.refs.Store(0)
+			q.safeTimerReset(timer)
 		}
 	}
 }
 
-// releaseAndCleanup drains any leftover overflow, releases the slot each
+// releaseAndCleanup drains any leftover overflow, invokes each pending task's
+// discard hook (so the caller's runtime.slots / WaitGroup / drain-tracker /
+// reply-buffer bookkeeping is released exactly once), releases the slot each
 // pending task still holds, and removes the queue from the dispatcher map.
-// Called once when the convoy is about to exit. Safe to call even if the
-// queue was already removed.
+// The queue is removed from the map BEFORE done is closed so any
+// closeInputAndWait caller observes queueCount==0 once it unblocks.
 func (q *udpReplyDispatchQueue) releaseAndCleanup() {
 	pending := q.drainPending()
-	for range pending {
-		// Each pending task acquired a slot in submitMode; release it now.
+	for _, task := range pending {
+		discardUDPReplyTask(task)
 		q.releaseSlot()
 	}
-	q.finishOnce()
 	if q.dispatcher.queues.CompareAndDelete(q.endpoint, q) {
 		q.dispatcher.queueChPool.Put(q.ch)
 	}
+	q.finishOnce()
+}
+
+func (q *udpReplyDispatchQueue) safeTimerReset(timer *time.Timer) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(dispatcherAgingTime())
 }
 
 func (q *udpReplyDispatchQueue) releaseSlot() {
@@ -388,6 +488,11 @@ func (d *udpReplyDispatcher) abortInput(endpoint *UdpEndpoint) {
 	}
 	q := v.(*udpReplyDispatchQueue)
 	q.closeInputLocked()
+	// Flip refs under enqueueMu so late enqueues from in-flight submits are
+	// rejected by enqueue() instead of landing after we drain.
+	q.enqueueMu.Lock()
+	q.refs.Store(-1)
+	q.enqueueMu.Unlock()
 	pending := q.drainPending()
 	q.notifyWake()
 	for _, task := range pending {
@@ -432,8 +537,15 @@ func (d *udpReplyDispatcher) close() {
 		d.queues.Range(func(key, value any) bool {
 			q := value.(*udpReplyDispatchQueue)
 			q.closeInputLocked()
-			pending := q.drainPending()
+			// Flip refs under enqueueMu so a late enqueue observes refs<0
+			// inside enqueue() and rejects the task. Without this, a submit
+			// that already passed acquireQueue + the inputClosed check could
+			// land a task into overflow after drainPending returns, leaking
+			// the discard hook (runtime.slots, WaitGroup, drain tracker).
+			q.enqueueMu.Lock()
 			q.refs.Store(-1)
+			q.enqueueMu.Unlock()
+			pending := q.drainPending()
 			q.notifyWake()
 			for _, task := range pending {
 				discardUDPReplyTask(task)

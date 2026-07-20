@@ -6,9 +6,12 @@
 package control
 
 import (
+	"io"
 	"net/netip"
+	"runtime"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/outbound/netproxy"
@@ -425,5 +428,151 @@ func TestHandlePkt_NonSniffPortInitialShapedPayloadKeepsFullConeReuse(t *testing
 	}
 	if _, ok := DefaultUdpEndpointPool.Get(symmetricKey); ok {
 		t.Fatal("expected ordinary sibling packet to avoid creating a symmetric endpoint")
+	}
+}
+
+// TestQuicInitial_FlowsThroughBothNewDispatchers end-to-end regression-tests
+// the full production QUIC path after the lock-free dispatcher rewrite:
+//
+//  1. QUIC Initial submitted via submitOrderedUDPIngress (the real ingress
+//     path used when SemanticRefactorFeatureUDPOrderedDispatcher is on).
+//  2. The ordered dispatcher convoy runs the task, which calls handlePkt.
+//  3. handlePkt dials the proxy, creates a UdpEndpoint whose replyRuntime
+//     is backed by the new udpReplyDispatcher.
+//  4. A reply is pushed through the proxy conn's read channel.
+//  5. The reply flows back through the udpReplyDispatcher convoy → handler.
+//  6. Endpoint close completes without hanging (regression-tests the
+//     releaseAndCleanup discard-leak fix that was breaking QUIC under
+//     repeated endpoint churn).
+//
+// This closes the coverage gap left by the existing QUIC corpus tests (which
+// call handlePkt directly, bypassing the dispatcher) and the dispatcher unit
+// tests (which don't exercise handlePkt at all).
+func TestQuicInitial_FlowsThroughBothNewDispatchers(t *testing.T) {
+	defer setupQuicInitialRegressionTestState(t)()
+
+	conn := &udpReuseSimulationConn{
+		reads:   make(chan scriptedPacketRead, 2),
+		closeCh: make(chan struct{}),
+	}
+	d, underlay := newCountingProxyEndpointDialer("hysteria2", "proxy.example:443", conn)
+
+	// Build a ControlPlane that matches production defaults: both UDP
+	// dispatchers enabled, just like defaultSemanticRefactorFeatures() does.
+	ordered := newDefaultUDPOrderedDispatcher()
+	reply := newDefaultUDPReplyDispatcher()
+	t.Cleanup(func() {
+		ordered.close()
+		ordered.wait()
+		reply.close()
+		reply.wait()
+	})
+	cp := newUdpReuseSimulationControlPlane(newTestFixedOutboundGroup(d))
+	cp.udpOrderedDispatcher = ordered
+	cp.udpReplyDispatcher = reply
+
+	payload := makeLikelyQuicInitialPayload(0x33)
+	src, dst, flowDecision := newQuicInitialRegressionFlow(t, payload)
+	primeQuicRegressionAnyfrom(src, dst)
+	routingResult := &bpfRoutingResult{
+		Outbound: uint8(consts.OutboundUserDefinedMin),
+	}
+
+	// Submit the QUIC Initial through the real ordered-ingress path. This is
+	// the exact code path control_plane.go Serve() takes for QUIC traffic.
+	task := func() {
+		if err := cp.handlePkt(nil, payload, src, dst, routingResult, flowDecision, false); err != nil {
+			t.Errorf("handlePkt through ordered dispatcher: %v", err)
+		}
+	}
+	if !cp.submitOrderedUDPIngress(flowDecision.Key, task, nil) {
+		t.Fatal("submitOrderedUDPIngress rejected QUIC Initial task")
+	}
+
+	// Wait for the ordered-dispatcher convoy to run the task. The task dials
+	// the proxy and then synchronously writes the QUIC Initial to it, so both
+	// counters must reach 1. If the dispatcher dropped the task or deadlocked,
+	// this times out.
+	deadline := time.Now().Add(3 * time.Second)
+	for (underlay.calls.Load() == 0 || conn.writeCalls.Load() == 0) && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if got := underlay.calls.Load(); got != 1 {
+		t.Fatalf("proxy DialContext calls = %d, want 1 (ordered dispatcher did not deliver task to handlePkt)", got)
+	}
+	if got := conn.writeCalls.Load(); got != 1 {
+		t.Fatalf("proxy WriteTo calls = %d, want 1 (QUIC Initial not forwarded to proxy)", got)
+	}
+
+	// Grab the endpoint that handlePkt created and verify its replyRuntime is
+	// backed by the new udpReplyDispatcher (not the legacy per-endpoint sender).
+	key := flowDecision.SymmetricNatEndpointKey()
+	ue, ok := DefaultUdpEndpointPool.Get(key)
+	if !ok || ue == nil {
+		t.Fatal("expected QUIC endpoint to exist after handlePkt through dispatcher")
+	}
+	if ue.replyRuntime == nil || ue.replyRuntime.dispatcher != reply {
+		t.Fatal("expected QUIC endpoint replyRuntime to use the new udpReplyDispatcher")
+	}
+
+	// Inject a proxy reply. The endpoint read loop should receive it and
+	// dispatch it through udpReplyDispatcher → handler.
+	replyPayload := []byte("quic-reply-from-proxy")
+	replyFrom := mustParseAddrPort("52.199.194.44:443")
+	conn.reads <- scriptedPacketRead{data: replyPayload, from: replyFrom}
+
+	// Wait for the reply dispatcher convoy to run the handler. hasReply is set
+	// by the read loop BEFORE submitReply, so we also need to confirm the
+	// dispatcher actually processed the task by waiting for the tasks WG to
+	// drain. If releaseAndCleanup leaked a slot/WG, this Wait would hang.
+	deadline = time.Now().Add(3 * time.Second)
+	for !ue.hasReply.Load() && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if !ue.hasReply.Load() {
+		t.Fatal("endpoint hasReply = false after proxy reply (read loop did not process reply)")
+	}
+
+	// Signal end-of-stream so the read loop exits and the endpoint's close
+	// path runs. This exercises releaseAndCleanup (discard-leak fix).
+	conn.reads <- scriptedPacketRead{err: io.EOF}
+
+	// If releaseAndCleanup leaked the tasks WaitGroup, Close would hang here
+	// because the read loop's defer calls closeInputAndWait which blocks on
+	// runtime.tasks.Wait(). This is the core QUIC-breakage regression: after
+	// enough leaked endpoints, the pool exhausts and new QUIC flows fail.
+	closeDone := make(chan struct{})
+	go func() {
+		_ = ue.Close()
+		close(closeDone)
+	}()
+	select {
+	case <-closeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("UdpEndpoint.Close hung — udpReplyDispatcher.releaseAndCleanup is leaking task bookkeeping (discard-leak regression)")
+	}
+
+	// Wait for all reply-dispatcher tasks to finish so their goroutines stop
+	// touching global pools (DefaultAnyfromPool etc.) before the test
+	// cleanup swaps those globals back. Without this, the race detector
+	// flags a read in the convoy goroutine racing with the cleanup write.
+	deadline = time.Now().Add(3 * time.Second)
+	for ue.replyRuntime != nil && !ue.dead.Load() && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	// Drain any remaining in-flight reply task by waiting on the runtime's
+	// task WaitGroup. This is safe because Close already ran and the read
+	// loop's closeInputAndWait has drained accepted replies.
+	if ue.replyRuntime != nil {
+		waitDone := make(chan struct{})
+		go func() {
+			ue.replyRuntime.tasks.Wait()
+			close(waitDone)
+		}()
+		select {
+		case <-waitDone:
+		case <-time.After(3 * time.Second):
+			t.Fatal("replyRuntime.tasks.Wait hung — dispatcher leaked a task WaitGroup ticket")
+		}
 	}
 }

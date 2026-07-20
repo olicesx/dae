@@ -863,3 +863,49 @@ func exerciseControlPlaneUDPOrderedDispatcherShutdown(t *testing.T, shutdown fun
 		t.Fatal("queued ingress task ran after dispatcher closure")
 	}
 }
+
+// TestUDPOrderedDispatcherReapDoesNotLeakAcceptedDiscards regression-tests the
+// fix where reapQueues set refs=-1 outside enqueueMu, allowing a submit that
+// already passed acquireQueue to land its task into overflow after
+// drainPending returned. That task's discard hook was never invoked, leaking
+// the ingress buffer and admission ticket. With the fix, enqueue checks
+// refs<0 under enqueueMu and rejects the task; the caller then invokes
+// discard itself via the submit false return.
+func TestUDPOrderedDispatcherReapDoesNotLeakAcceptedDiscards(t *testing.T) {
+	const iterations = 64
+	for iteration := range iterations {
+		dispatcher := newUDPOrderedDispatcher(2, 4)
+		key := udpOrderedDispatcherTestKey(iteration)
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var accepted atomic.Int32
+		var settled atomic.Int32
+
+		// Producer: fire tasks at the same flow while closer races.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for range 256 {
+				if dispatcher.submit(key, func() {
+					settled.Add(1)
+				}, func() {
+					settled.Add(1)
+				}) {
+					accepted.Add(1)
+				}
+			}
+		}()
+
+		close(start)
+		// Close immediately to maximally race with in-flight submits.
+		dispatcher.close()
+		wg.Wait()
+		dispatcher.wait()
+
+		if got, want := settled.Load(), accepted.Load(); got != want {
+			t.Fatalf("iteration %d: settled = %d, want %d (accepted tasks leaked)", iteration, got, want)
+		}
+	}
+}

@@ -288,3 +288,98 @@ func TestUDPReplyDispatcherRepeatedGenerationLifecycleReclaimsWorkers(t *testing
 		dispatcher.wait()
 	}
 }
+
+// TestUDPReplyDispatcherIdleConvoySelfExits guards against the goroutine leak
+// where a convoy blocks forever on select after its endpoint stops receiving
+// replies. The idle timer must retire the convoy and remove the queue so the
+// next reply creates a fresh one.
+func TestUDPReplyDispatcherIdleConvoySelfExits(t *testing.T) {
+	dispatcher := newUDPReplyDispatcher(1, 1, 4)
+	t.Cleanup(func() {
+		dispatcher.close()
+		dispatcher.wait()
+	})
+
+	endpoint := &UdpEndpoint{}
+	if !dispatcher.submit(endpoint, func() {}, nil) {
+		t.Fatal("submit initial reply")
+	}
+	// The convoy should self-exit after the aging idle window with no further
+	// traffic. Poll queueCount rather than sleeping for the exact timeout.
+	deadline := time.Now().Add(UdpTaskPoolAgingTime * 10)
+	for time.Now().Before(deadline) {
+		if dispatcher.queueCount() == 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := dispatcher.queueCount(); got != 0 {
+		t.Fatalf("idle convoy did not self-exit: queueCount = %d", got)
+	}
+
+	// A fresh reply after idle retirement must create a new queue/convoy.
+	ran := make(chan struct{}, 1)
+	if !dispatcher.submit(endpoint, func() { ran <- struct{}{} }, nil) {
+		t.Fatal("submit after idle retirement")
+	}
+	select {
+	case <-ran:
+	case <-time.After(time.Second):
+		t.Fatal("reply did not run after idle retirement")
+	}
+}
+
+// TestUDPReplyDispatcherReleaseAndCleanupInvokesDiscard regression-tests the
+// fix where releaseAndCleanup drained pending overflow without calling each
+// task's discard hook, leaking the caller's runtime.slots / WaitGroup /
+// drain-tracker bookkeeping.
+func TestUDPReplyDispatcherReleaseAndCleanupInvokesDiscard(t *testing.T) {
+	dispatcher := newUDPReplyDispatcher(1, 1, 8)
+	t.Cleanup(func() {
+		dispatcher.close()
+		dispatcher.wait()
+	})
+
+	endpoint := &UdpEndpoint{}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	// Block the single convoy on the first task so subsequent submits
+	// accumulate in the queue before we trigger abortInput.
+	if !dispatcher.submit(endpoint, func() {
+		close(started)
+		<-release
+	}, nil) {
+		t.Fatal("submit blocking task")
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("blocking task did not start")
+	}
+
+	var discardMu sync.Mutex
+	discarded := make(map[int]int)
+	for index := 1; index <= 4; index++ {
+		index := index
+		if !dispatcher.submit(endpoint, func() {}, func() {
+			discardMu.Lock()
+			discarded[index]++
+			discardMu.Unlock()
+		}) {
+			t.Fatalf("submit pending task %d", index)
+		}
+	}
+
+	// abortInput drains pending and must invoke each discard exactly once.
+	dispatcher.abortInput(endpoint)
+	close(release)
+	dispatcher.closeInputAndWait(endpoint)
+
+	discardMu.Lock()
+	defer discardMu.Unlock()
+	for index := 1; index <= 4; index++ {
+		if discarded[index] != 1 {
+			t.Fatalf("discarded[%d] = %d, want 1", index, discarded[index])
+		}
+	}
+}

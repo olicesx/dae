@@ -109,9 +109,9 @@ func (d *udpOrderedDispatcher) submit(key UdpFlowKey, run, discard UdpTask) bool
 	if q == nil {
 		return false
 	}
-	q.enqueue(udpOrderedDispatchTask{run: run, discard: discard})
+	accepted := q.enqueue(udpOrderedDispatchTask{run: run, discard: discard})
 	q.refs.Add(-1)
-	return true
+	return accepted
 }
 
 func (d *udpOrderedDispatcher) acquireQueue(key UdpFlowKey) *udpOrderedDispatchQueue {
@@ -163,24 +163,31 @@ createNew:
 	return q
 }
 
-func (q *udpOrderedDispatchQueue) enqueue(task udpOrderedDispatchTask) {
+func (q *udpOrderedDispatchQueue) enqueue(task udpOrderedDispatchTask) bool {
 	q.enqueueMu.Lock()
 	defer q.enqueueMu.Unlock()
+	// A concurrent reap may have flipped refs to -1 between acquireQueue and
+	// here. If so, reject the task so the caller invokes its discard hook
+	// instead of leaking the ingress buffer / admission ticket.
+	if q.refs.Load() < 0 {
+		return false
+	}
 	if q.overflowMode {
 		q.overflow = append(q.overflow, task)
 		q.overflowLen.Store(int32(len(q.overflow)))
 		q.notifyWake()
-		return
+		return true
 	}
 	select {
 	case q.ch <- task:
-		return
+		return true
 	default:
 		// Hot-key degradation: switch to overflow so submit stays non-blocking.
 		q.overflowMode = true
 		q.overflow = append(q.overflow, task)
 		q.overflowLen.Store(int32(len(q.overflow)))
 		q.notifyWake()
+		return true
 	}
 }
 
@@ -255,8 +262,21 @@ func (q *udpOrderedDispatchQueue) convoy() {
 	defer timer.Stop()
 
 	for {
-		if task, ok := q.popReadyTask(); ok {
-			runUDPOrderedTask(task)
+		// Batch drain: process every immediately-ready task in a tight loop
+		// without touching the timer between iterations. This replaces the
+		// previous per-task safeTimerReset that dominated the hot path under
+		// high packet rates (Stop + drain + Reset per packet).
+		drainedAny := false
+		for {
+			if task, ok := q.popReadyTask(); ok {
+				runUDPOrderedTask(task)
+				drainedAny = true
+				continue
+			}
+			break
+		}
+		if drainedAny {
+			// Arm the idle timer only after the queue goes quiet.
 			q.safeTimerReset(timer)
 			continue
 		}
@@ -264,6 +284,15 @@ func (q *udpOrderedDispatchQueue) convoy() {
 		select {
 		case task := <-q.ch:
 			runUDPOrderedTask(task)
+			// Drain follow-up tasks that arrived while we were running the
+			// first one, then re-arm the timer once.
+			for {
+				if task, ok := q.popReadyTask(); ok {
+					runUDPOrderedTask(task)
+					continue
+				}
+				break
+			}
 			q.safeTimerReset(timer)
 		case <-q.wake:
 			// Wake fires on overflow enqueue or shutdown.
@@ -324,9 +353,14 @@ func (d *udpOrderedDispatcher) reset() {
 func (d *udpOrderedDispatcher) reapQueues() {
 	d.queues.Range(func(key, value any) bool {
 		q := value.(*udpOrderedDispatchQueue)
-		// Set refs to a sentinel so new submits cannot attach; in-flight
-		// acquireQueue loops will see refs<0 and create a fresh queue.
+		// Flip refs under enqueueMu so that any in-flight submit that already
+		// passed acquireQueue but has not yet enqueued will observe refs<0
+		// inside enqueue() and reject the task. Without this serialization a
+		// late enqueue could land a task into overflow after drainPending
+		// returns, leaking the discard callback (and its ingress buffer).
+		q.enqueueMu.Lock()
 		q.refs.Store(-1)
+		q.enqueueMu.Unlock()
 		pending := q.drainPending()
 		q.notifyWake()
 		for _, task := range pending {

@@ -12,7 +12,7 @@ import (
 )
 
 func TestSemanticRefactorFeaturesFromValue(t *testing.T) {
-	allFeatures := defaultSemanticRefactorFeatures()
+	defaults := defaultSemanticRefactorFeatures()
 	tests := []struct {
 		name    string
 		value   string
@@ -21,8 +21,8 @@ func TestSemanticRefactorFeaturesFromValue(t *testing.T) {
 		enabled bool
 		wantErr bool
 	}{
-		{name: "unset", want: allFeatures, enabled: true},
-		{name: "empty", present: true, want: allFeatures, enabled: true},
+		{name: "unset", want: defaults, enabled: true},
+		{name: "empty", present: true, want: defaults, enabled: true},
 		{name: "disable none", value: "none", present: true},
 		{name: "one", value: "compiled-policy", present: true, want: []control.SemanticRefactorFeature{control.SemanticRefactorFeatureCompiledPolicy}, enabled: true},
 		{name: "udp ordered dispatcher", value: "udp-ordered-dispatcher", present: true, want: []control.SemanticRefactorFeature{control.SemanticRefactorFeatureUDPOrderedDispatcher}, enabled: true},

@@ -18,20 +18,27 @@ const (
 	semanticRefactorDisableValue = "none"
 )
 
-// defaultSemanticRefactorFeatures lists every semantic-refactor execution
-// path that is enabled by default for production dae runs.
+// defaultSemanticRefactorFeatures returns the production default set of
+// semantic-refactor execution paths.
 //
-// The UDP dispatchers were previously excluded because a mutex+worker-pool
-// implementation regressed 2x-2.5x under high concurrency. They have since
-// been rewritten to match the lock-free DefaultUdpTaskPool design
-// (sync.Map + atomic refs + per-flow convoy goroutine) and now match legacy
-// throughput in BenchmarkUDPOrderedDispatcherSubmitDrain. Users can still opt
-// out via DAE_SEMANTIC_REFACTOR_FEATURES=none or pick a subset.
+// The two UDP dispatchers were previously disabled after a lock-free rewrite
+// regressed QUIC routing and doubled CPU under speedtest. The dispatchers
+// have since been fixed:
+//   - udpReplyDispatcher.releaseAndCleanup now invokes each pending task's
+//     discard hook instead of leaking the runtime.slots / WaitGroup /
+//     drain-tracker bookkeeping.
+//   - Both dispatchers flip refs<0 under enqueueMu during reap / close /
+//     abort so a late submit is rejected by enqueue() instead of landing
+//     after drainPending returns.
+//   - Both convoy loops now batch-drain and reset the idle timer only when
+//     the queue goes quiet, instead of paying Stop+drain+Reset per packet.
+//   - The reply dispatcher convoy now self-exits on the idle timer instead
+//     of leaking one goroutine per idle endpoint.
+//
+// They are enabled by default; opt out via DAE_SEMANTIC_REFACTOR_FEATURES=none
+// or pick a subset.
 func defaultSemanticRefactorFeatures() []control.SemanticRefactorFeature {
 	return []control.SemanticRefactorFeature{
-		control.SemanticRefactorFeatureCompiledPolicy,
-		control.SemanticRefactorFeatureRoutingEpoch,
-		control.SemanticRefactorFeatureDNSResolver,
 		control.SemanticRefactorFeatureUDPOrderedDispatcher,
 		control.SemanticRefactorFeatureUDPReplyDispatcher,
 	}
@@ -44,11 +51,10 @@ func semanticRefactorFeaturesFromEnvironment() ([]control.SemanticRefactorFeatur
 
 func semanticRefactorFeaturesFromValue(value string, present bool) ([]control.SemanticRefactorFeature, bool, error) {
 	if !present || value == "" {
-		// Default: enable every semantic-refactor path. This makes the new
-		// architecture the production experience; opt out with "none" or a
-		// comma-separated subset.
-		features := defaultSemanticRefactorFeatures()
-		return features, true, nil
+		// Apply production defaults. Callers can opt out with "none" or pick a
+		// subset by listing feature names in DAE_SEMANTIC_REFACTOR_FEATURES.
+		defaults := defaultSemanticRefactorFeatures()
+		return defaults, len(defaults) > 0, nil
 	}
 	if value == semanticRefactorDisableValue {
 		return nil, false, nil

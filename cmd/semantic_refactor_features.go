@@ -13,7 +13,23 @@ import (
 	"github.com/daeuniverse/dae/control"
 )
 
-const semanticRefactorFeaturesEnv = "DAE_SEMANTIC_REFACTOR_FEATURES"
+const (
+	semanticRefactorFeaturesEnv  = "DAE_SEMANTIC_REFACTOR_FEATURES"
+	semanticRefactorDisableValue = "none"
+)
+
+// defaultSemanticRefactorFeatures lists every semantic-refactor execution path
+// that is enabled by default for production dae runs. Users can opt out via
+// DAE_SEMANTIC_REFACTOR_FEATURES=none or pick a subset by listing feature names.
+func defaultSemanticRefactorFeatures() []control.SemanticRefactorFeature {
+	return []control.SemanticRefactorFeature{
+		control.SemanticRefactorFeatureCompiledPolicy,
+		control.SemanticRefactorFeatureRoutingEpoch,
+		control.SemanticRefactorFeatureDNSResolver,
+		control.SemanticRefactorFeatureUDPOrderedDispatcher,
+		control.SemanticRefactorFeatureUDPReplyDispatcher,
+	}
+}
 
 func semanticRefactorFeaturesFromEnvironment() ([]control.SemanticRefactorFeature, bool, error) {
 	value, present := os.LookupEnv(semanticRefactorFeaturesEnv)
@@ -22,6 +38,13 @@ func semanticRefactorFeaturesFromEnvironment() ([]control.SemanticRefactorFeatur
 
 func semanticRefactorFeaturesFromValue(value string, present bool) ([]control.SemanticRefactorFeature, bool, error) {
 	if !present || value == "" {
+		// Default: enable every semantic-refactor path. This makes the new
+		// architecture the production experience; opt out with "none" or a
+		// comma-separated subset.
+		features := defaultSemanticRefactorFeatures()
+		return features, true, nil
+	}
+	if value == semanticRefactorDisableValue {
 		return nil, false, nil
 	}
 	parts := strings.Split(value, ",")

@@ -250,18 +250,19 @@ func (d *udpReplyDispatcher) finishTurn(q *udpReplyDispatchQueue) {
 	reschedule := false
 	q.mu.Lock()
 	q.running = false
-	if q.retired || d.closed.Load() {
+	switch {
+	case q.retired || d.closed.Load():
 		q.retired = true
 		d.queues.CompareAndDelete(q.endpoint, q)
 		finish = true
-	} else if q.taskHead == len(q.tasks) {
+	case q.taskHead == len(q.tasks):
 		q.idleSince = time.Now()
 		if q.inputClosed {
 			q.retired = true
 			d.queues.CompareAndDelete(q.endpoint, q)
 			finish = true
 		}
-	} else {
+	default:
 		q.ready = true
 		reschedule = true
 	}

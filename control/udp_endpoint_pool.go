@@ -30,9 +30,10 @@ import (
 )
 
 var (
-	UdpRoutingResultCacheTtl      = 300 * time.Millisecond
-	ErrEndpointFailed             = fmt.Errorf("endpoint creation recently failed (negative cache)")
-	errUdpEndpointAdmissionClosed = stderrors.New("udp endpoint admission closed")
+	UdpRoutingResultCacheTtl          = 300 * time.Millisecond
+	ErrEndpointFailed                 = fmt.Errorf("endpoint creation recently failed (negative cache)")
+	errUdpEndpointAdmissionClosed     = stderrors.New("udp endpoint admission closed")
+	errUdpEndpointCreateAdmissionFull = stderrors.New("udp endpoint create admission full")
 )
 
 // udpEndpointCreateShardCount is the number of sharded mutexes that guard
@@ -58,13 +59,17 @@ type udpEndpointReplyRuntime struct {
 	receiverStop func()
 	receiveMu    sync.Mutex
 
-	dispatcher   *udpReplyDispatcher
-	slots        chan struct{}
-	stop         chan struct{}
-	stopOnce     sync.Once
-	failed       atomic.Bool
-	tasks        sync.WaitGroup
-	drainTracker *controlPlaneDrainTracker
+	dispatcher        *udpReplyDispatcher
+	slots             chan struct{}
+	stop              chan struct{}
+	stopOnce          sync.Once
+	admissionMu       sync.Mutex
+	admissionClosed   bool
+	admissions        int
+	admissionsDrained chan struct{}
+	failed            atomic.Bool
+	tasks             sync.WaitGroup
+	drainTracker      *controlPlaneDrainTracker
 }
 
 func newUdpEndpointReplyRuntime(dispatcher *udpReplyDispatcher, drainTracker *controlPlaneDrainTracker, queueCapacity int) *udpEndpointReplyRuntime {
@@ -75,11 +80,44 @@ func newUdpEndpointReplyRuntime(dispatcher *udpReplyDispatcher, drainTracker *co
 		queueCapacity = udpEndpointReplyQueueSize
 	}
 	return &udpEndpointReplyRuntime{
-		dispatcher:   dispatcher,
-		slots:        make(chan struct{}, queueCapacity),
-		stop:         make(chan struct{}),
-		drainTracker: drainTracker,
+		dispatcher:        dispatcher,
+		slots:             make(chan struct{}, queueCapacity),
+		stop:              make(chan struct{}),
+		admissionsDrained: make(chan struct{}),
+		drainTracker:      drainTracker,
 	}
+}
+
+func (runtime *udpEndpointReplyRuntime) beginReplyAdmission() bool {
+	runtime.admissionMu.Lock()
+	defer runtime.admissionMu.Unlock()
+	if runtime.admissionClosed {
+		return false
+	}
+	runtime.admissions++
+	return true
+}
+
+func (runtime *udpEndpointReplyRuntime) finishReplyAdmission() {
+	runtime.admissionMu.Lock()
+	runtime.admissions--
+	if runtime.admissionClosed && runtime.admissions == 0 {
+		close(runtime.admissionsDrained)
+	}
+	runtime.admissionMu.Unlock()
+}
+
+func (runtime *udpEndpointReplyRuntime) stopReplyAdmissions() {
+	runtime.stopOnce.Do(func() {
+		runtime.admissionMu.Lock()
+		runtime.admissionClosed = true
+		close(runtime.stop)
+		if runtime.admissions == 0 {
+			close(runtime.admissionsDrained)
+		}
+		runtime.admissionMu.Unlock()
+		<-runtime.admissionsDrained
+	})
 }
 
 // sameUdpConnStateOwner compares owner identities without panicking when an
@@ -776,12 +814,17 @@ func (ue *UdpEndpoint) submitReplyWithMode(reply udpEndpointReply, release func(
 		return false, false
 	}
 	runtime := ue.replyRuntime
+	if !runtime.beginReplyAdmission() {
+		return false, false
+	}
 	if nonBlocking {
 		select {
 		case runtime.slots <- struct{}{}:
 		case <-runtime.stop:
+			runtime.finishReplyAdmission()
 			return false, false
 		default:
+			runtime.finishReplyAdmission()
 			releaseUdpEndpointReply(reply, release)
 			return false, true
 		}
@@ -789,10 +832,18 @@ func (ue *UdpEndpoint) submitReplyWithMode(reply udpEndpointReply, release func(
 		select {
 		case runtime.slots <- struct{}{}:
 		case <-runtime.stop:
+			runtime.finishReplyAdmission()
 			return false, false
 		}
 	}
 
+	runtime.admissionMu.Lock()
+	if runtime.admissionClosed {
+		runtime.admissionMu.Unlock()
+		<-runtime.slots
+		runtime.finishReplyAdmission()
+		return false, false
+	}
 	drainRelease := runtime.drainTracker.Acquire()
 	runtime.tasks.Add(1)
 	complete := func() {
@@ -815,6 +866,8 @@ func (ue *UdpEndpoint) submitReplyWithMode(reply udpEndpointReply, release func(
 		}
 	}
 	submitted := runtime.dispatcher.submit(ue, run, complete)
+	runtime.admissionMu.Unlock()
+	runtime.finishReplyAdmission()
 	if submitted {
 		return true, true
 	}
@@ -843,7 +896,7 @@ func (ue *UdpEndpoint) stopReplyDispatcher() {
 		return
 	}
 	runtime := ue.replyRuntime
-	runtime.stopOnce.Do(func() { close(runtime.stop) })
+	runtime.stopReplyAdmissions()
 }
 
 func (ue *UdpEndpoint) startTransportReceiver() bool {
@@ -1611,6 +1664,8 @@ func (g *udpEndpointAdmissionGate) closeAndWait() {
 	g.mu.Unlock()
 }
 
+type udpEndpointCreateAdmission func() (release func(), ok bool)
+
 type UdpEndpointOptions struct {
 	Ctx        context.Context
 	Handler    UdpHandler
@@ -1623,6 +1678,9 @@ type UdpEndpointOptions struct {
 	// admissionGate prevents endpoint creation after its control plane begins
 	// forced retirement and keeps in-flight creation visible to retirement.
 	admissionGate *udpEndpointAdmissionGate
+	// createAdmission reserves cold-path capacity before waiting for a creation
+	// shard or dialing. It is never invoked when an existing endpoint is reused.
+	createAdmission udpEndpointCreateAdmission
 	// GetTarget is useful only if the underlay does not support Full-cone.
 	GetDialOption func(ctx context.Context) (option *DialOption, err error)
 	// Log is the logger to use for endpoint lifecycle events.
@@ -2292,6 +2350,9 @@ func shouldCacheUdpEndpointCreateFailure(err error) bool {
 	if stderrors.Is(err, outbound.ErrNoAliveDialer) {
 		return false
 	}
+	if stderrors.Is(err, errUdpEndpointCreateAdmissionFull) {
+		return false
+	}
 	if isTransientLocalUdpDialCreateError(err) {
 		return false
 	}
@@ -2357,6 +2418,19 @@ func (p *UdpEndpointPool) GetOrCreate(key UdpEndpointKey, createOption *UdpEndpo
 		}
 	}
 	shard.mu.RUnlock()
+
+	// Reserve cold-path capacity before waiting for this creation shard. The
+	// creation mutex is held through proxy dialing, so admitting after Lock
+	// would still let one slow dial block unrelated keys in the same shard.
+	if createOption != nil && createOption.createAdmission != nil {
+		release, admitted := createOption.createAdmission()
+		if !admitted {
+			return nil, false, errUdpEndpointCreateAdmissionFull
+		}
+		if release != nil {
+			defer release()
+		}
+	}
 
 	// Slow path: serialize creation for the same key using a creation shard lock.
 	shard.createMu.Lock()

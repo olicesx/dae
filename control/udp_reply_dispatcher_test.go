@@ -397,3 +397,32 @@ func TestUDPReplyDispatcherReleaseAndCleanupInvokesDiscard(t *testing.T) {
 		}
 	}
 }
+
+func TestUDPReplyDispatcherReportsRecoveredPanic(t *testing.T) {
+	dispatcher := newUDPReplyDispatcher(1, 1)
+	t.Cleanup(func() {
+		dispatcher.close()
+		dispatcher.wait()
+	})
+
+	endpoint := &UdpEndpoint{}
+	completed := make(chan struct{})
+	if !dispatcher.submit(endpoint, func() {
+		panic("reply dispatcher test panic")
+	}, nil) {
+		t.Fatal("submit panic task")
+	}
+	if !dispatcher.submit(endpoint, func() {
+		close(completed)
+	}, nil) {
+		t.Fatal("submit task after panic")
+	}
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not continue after recovered panic")
+	}
+	if got := dispatcher.panicCount.Load(); got != 1 {
+		t.Fatalf("panic count = %d, want 1", got)
+	}
+}

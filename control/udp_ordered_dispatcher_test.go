@@ -7,6 +7,7 @@ package control
 
 import (
 	"context"
+	stderrors "errors"
 	"net"
 	"net/netip"
 	"runtime"
@@ -134,6 +135,185 @@ func TestUDPOrderedDispatcherRunsIndependentFlowsConcurrently(t *testing.T) {
 	waitForCondition(t, time.Second, "independent flow tasks complete", func() bool {
 		return completed.Load() == 2
 	})
+}
+
+func TestUDPOrderedDispatcherCompensatesForColdEndpointCreation(t *testing.T) {
+	dispatcher := newUDPOrderedDispatcherWithLimitsAndCompensation(1, 1, 16, 16, 1)
+	t.Cleanup(func() { closeUDPOrderedDispatcherForTest(t, dispatcher) })
+
+	coldStarted := make(chan struct{})
+	releaseCold := make(chan struct{})
+	var releaseColdOnce sync.Once
+	t.Cleanup(func() { releaseColdOnce.Do(func() { close(releaseCold) }) })
+	taskFailure := make(chan string, 1)
+	if !dispatcher.submit(udpOrderedDispatcherTestKey(1), func() {
+		release, ok := dispatcher.acquireEndpointCreateAdmission()
+		if !ok {
+			taskFailure <- "cold endpoint creation was not admitted"
+			return
+		}
+		defer release()
+		close(coldStarted)
+		<-releaseCold
+	}, nil) {
+		t.Fatal("submit cold endpoint creation returned false")
+	}
+
+	select {
+	case <-coldStarted:
+	case failure := <-taskFailure:
+		t.Fatal(failure)
+	case <-time.After(time.Second):
+		t.Fatal("cold endpoint creation did not start")
+	}
+	waitForCondition(t, time.Second, "compensating worker starts", func() bool {
+		reserved, workers := dispatcher.endpointCreateAdmissionState()
+		return reserved == 1 && workers == 1
+	})
+	if _, ok := dispatcher.acquireEndpointCreateAdmission(); ok {
+		t.Fatal("cold endpoint admission exceeded its configured limit")
+	}
+	if got := dispatcher.endpointCreateAdmissionRejects.Load(); got != 1 {
+		t.Fatalf("cold admission reject count = %d, want 1", got)
+	}
+
+	hotDone := make(chan struct{})
+	if !dispatcher.submit(udpOrderedDispatcherTestKey(2), func() {
+		close(hotDone)
+	}, nil) {
+		t.Fatal("submit established flow returned false")
+	}
+	select {
+	case <-hotDone:
+	case <-time.After(time.Second):
+		t.Fatal("blocked cold endpoint creation starved the established flow")
+	}
+
+	releaseColdOnce.Do(func() { close(releaseCold) })
+	waitForCondition(t, time.Second, "compensating worker retires", func() bool {
+		reserved, workers := dispatcher.endpointCreateAdmissionState()
+		return reserved == 0 && workers == 0
+	})
+}
+
+func TestUDPOrderedDispatcherEndpointPoolDialDoesNotStarveEstablishedFlow(t *testing.T) {
+	dispatcher := newUDPOrderedDispatcherWithLimitsAndCompensation(1, 1, 16, 16, 1)
+	t.Cleanup(func() { closeUDPOrderedDispatcherForTest(t, dispatcher) })
+	pool := NewUdpEndpointPool()
+	t.Cleanup(pool.Close)
+	dialer, blockingDialer := newTestEndpointBlockingDialer("socks5", "203.0.113.10:1080")
+	t.Cleanup(func() { _ = dialer.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	coldResult := make(chan error, 1)
+	if !dispatcher.submit(udpOrderedDispatcherTestKey(1), func() {
+		_, _, err := pool.GetOrCreate(UdpEndpointKey{
+			Src: netip.MustParseAddrPort("[::1]:15001"),
+			Dst: netip.MustParseAddrPort("[2001:db8::1]:443"),
+		}, &UdpEndpointOptions{
+			Ctx:             ctx,
+			Handler:         func(_ *UdpEndpoint, _ []byte, _ netip.AddrPort) error { return nil },
+			NatTimeout:      time.Second,
+			createAdmission: dispatcher.acquireEndpointCreateAdmission,
+			GetDialOption: func(context.Context) (*DialOption, error) {
+				return &DialOption{
+					Dialer:  dialer,
+					Network: "udp",
+					Target:  "[2001:db8::1]:443",
+				}, nil
+			},
+		})
+		coldResult <- err
+	}, nil) {
+		t.Fatal("submit cold endpoint creation returned false")
+	}
+	select {
+	case <-blockingDialer.started:
+	case <-time.After(time.Second):
+		t.Fatal("endpoint creation did not enter DialContext")
+	}
+
+	hotDone := make(chan struct{})
+	if !dispatcher.submit(udpOrderedDispatcherTestKey(2), func() {
+		close(hotDone)
+	}, nil) {
+		t.Fatal("submit established flow returned false")
+	}
+	select {
+	case <-hotDone:
+	case <-time.After(time.Second):
+		t.Fatal("DialContext blocked the established flow")
+	}
+
+	cancel()
+	select {
+	case err := <-coldResult:
+		if !stderrors.Is(err, context.Canceled) {
+			t.Fatalf("GetOrCreate() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled DialContext did not return")
+	}
+	waitForCondition(t, time.Second, "compensating worker retirement after DialContext", func() bool {
+		reserved, workers := dispatcher.endpointCreateAdmissionState()
+		return reserved == 0 && workers == 0
+	})
+}
+
+func TestUDPOrderedDispatcherEndpointCreateAdmissionSkipsShutdownRejections(t *testing.T) {
+	dispatcher := newUDPOrderedDispatcherWithLimitsAndCompensation(1, 1, 16, 16, 1)
+	dispatcher.close()
+	dispatcher.wait()
+	if _, ok := dispatcher.acquireEndpointCreateAdmission(); ok {
+		t.Fatal("closed dispatcher admitted endpoint creation")
+	}
+	if got := dispatcher.endpointCreateAdmissionRejects.Load(); got != 0 {
+		t.Fatalf("shutdown rejection count = %d, want 0", got)
+	}
+}
+
+func TestUDPOrderedDispatcherEndpointCreateAdmissionRacesClose(t *testing.T) {
+	const iterations = 64
+	for range iterations {
+		dispatcher := newUDPOrderedDispatcherWithLimitsAndCompensation(1, 1, 16, 16, 1)
+		start := make(chan struct{})
+		admissionDone := make(chan struct{})
+		closeDone := make(chan struct{})
+		go func() {
+			<-start
+			release, ok := dispatcher.acquireEndpointCreateAdmission()
+			if ok {
+				release()
+			}
+			close(admissionDone)
+		}()
+		go func() {
+			<-start
+			dispatcher.close()
+			close(closeDone)
+		}()
+		close(start)
+		select {
+		case <-admissionDone:
+		case <-time.After(time.Second):
+			t.Fatal("endpoint admission did not finish during close")
+		}
+		select {
+		case <-closeDone:
+		case <-time.After(time.Second):
+			t.Fatal("dispatcher close did not finish during endpoint admission")
+		}
+		select {
+		case <-dispatcher.done:
+		case <-time.After(time.Second):
+			t.Fatal("dispatcher did not drain workers after endpoint admission close race")
+		}
+		reserved, workers := dispatcher.endpointCreateAdmissionState()
+		if reserved != 0 || workers != 0 {
+			t.Fatalf("compensation state = (%d, %d), want (0, 0)", reserved, workers)
+		}
+	}
 }
 
 func TestUDPOrderedDispatcherQuantumPreventsHotFlowStarvation(t *testing.T) {
@@ -905,5 +1085,165 @@ func TestUDPOrderedDispatcherReapDoesNotLeakAcceptedDiscards(t *testing.T) {
 		if got, want := settled.Load(), accepted.Load(); got != want {
 			t.Fatalf("iteration %d: settled = %d, want %d (accepted tasks leaked)", iteration, got, want)
 		}
+	}
+}
+
+func TestUDPOrderedDispatcherBoundsPerFlowBacklogAndDiscardsRejectedWork(t *testing.T) {
+	dispatcher := newUDPOrderedDispatcherWithLimits(1, 1, 16, 2)
+	key := udpOrderedDispatcherTestKey(1)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		closeUDPOrderedDispatcherForTest(t, dispatcher)
+	})
+
+	var ran atomic.Int32
+	var discarded atomic.Int32
+	var released atomic.Int32
+	if !dispatcher.submit(key, func() {
+		close(started)
+		<-release
+		ran.Add(1)
+		released.Add(1)
+	}, nil) {
+		t.Fatal("submit blocking task")
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("blocking task did not start")
+	}
+
+	accepted := 0
+	for range 5 {
+		run := func() {
+			ran.Add(1)
+			released.Add(1)
+		}
+		discard := func() {
+			discarded.Add(1)
+			released.Add(1)
+		}
+		if dispatcher.submit(key, run, discard) {
+			accepted++
+		} else {
+			// The production ingress caller owns discard on submit=false.
+			discard()
+		}
+	}
+	if accepted != 2 {
+		t.Fatalf("accepted queued tasks = %d, want 2", accepted)
+	}
+	if got := dispatcher.pendingTaskCount(); got != 2 {
+		t.Fatalf("pending tasks = %d, want 2", got)
+	}
+	releaseOnce.Do(func() { close(release) })
+	waitForCondition(t, time.Second, "per-flow backlog settles", func() bool {
+		return released.Load() == 6
+	})
+	if got := ran.Load(); got != 3 {
+		t.Fatalf("ran tasks = %d, want 3", got)
+	}
+	if got := discarded.Load(); got != 3 {
+		t.Fatalf("discarded tasks = %d, want 3", got)
+	}
+}
+
+func TestUDPOrderedDispatcherBoundsGlobalBacklogAndRecoversCapacity(t *testing.T) {
+	dispatcher := newUDPOrderedDispatcherWithLimits(1, 1, 3, 8)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		closeUDPOrderedDispatcherForTest(t, dispatcher)
+	})
+
+	var ran atomic.Int32
+	var discarded atomic.Int32
+	var released atomic.Int32
+	if !dispatcher.submit(udpOrderedDispatcherTestKey(1), func() {
+		close(started)
+		<-release
+		ran.Add(1)
+		released.Add(1)
+	}, nil) {
+		t.Fatal("submit blocking task")
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("blocking task did not start")
+	}
+
+	accepted := 0
+	for index := 2; index < 7; index++ {
+		run := func() {
+			ran.Add(1)
+			released.Add(1)
+		}
+		discard := func() {
+			discarded.Add(1)
+			released.Add(1)
+		}
+		if dispatcher.submit(udpOrderedDispatcherTestKey(index), run, discard) {
+			accepted++
+		} else {
+			// The production ingress caller owns discard on submit=false.
+			discard()
+		}
+	}
+	if accepted != 3 {
+		t.Fatalf("accepted global backlog tasks = %d, want 3", accepted)
+	}
+	if got := dispatcher.pendingTaskCount(); got != 3 {
+		t.Fatalf("pending tasks = %d, want 3", got)
+	}
+	releaseOnce.Do(func() { close(release) })
+	waitForCondition(t, time.Second, "global backlog settles", func() bool {
+		return released.Load() == 6
+	})
+	if got := ran.Load(); got != 4 {
+		t.Fatalf("ran tasks = %d, want 4", got)
+	}
+	if got := discarded.Load(); got != 2 {
+		t.Fatalf("discarded tasks = %d, want 2", got)
+	}
+
+	recovered := make(chan struct{})
+	if !dispatcher.submit(udpOrderedDispatcherTestKey(7), func() { close(recovered) }, nil) {
+		t.Fatal("submit rejected after global backlog drained")
+	}
+	select {
+	case <-recovered:
+	case <-time.After(time.Second):
+		t.Fatal("dispatcher did not recover global capacity")
+	}
+}
+
+func TestUDPOrderedDispatcherReportsRecoveredPanic(t *testing.T) {
+	dispatcher := newUDPOrderedDispatcher(1, 1)
+	t.Cleanup(func() { closeUDPOrderedDispatcherForTest(t, dispatcher) })
+
+	completed := make(chan struct{})
+	if !dispatcher.submit(udpOrderedDispatcherTestKey(1), func() {
+		panic("ordered dispatcher test panic")
+	}, nil) {
+		t.Fatal("submit panic task")
+	}
+	if !dispatcher.submit(udpOrderedDispatcherTestKey(1), func() {
+		close(completed)
+	}, nil) {
+		t.Fatal("submit task after panic")
+	}
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not continue after recovered panic")
+	}
+	if got := dispatcher.panicCount.Load(); got != 1 {
+		t.Fatalf("panic count = %d, want 1", got)
 	}
 }

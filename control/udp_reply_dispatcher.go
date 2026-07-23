@@ -57,6 +57,7 @@ type udpReplyDispatcher struct {
 
 	workerCount  int
 	drainQuantum int
+	panicCount   atomic.Uint64
 }
 
 func newUDPReplyDispatcherForFeatures(features SemanticRefactorFeatureSet) *udpReplyDispatcher {
@@ -237,7 +238,7 @@ func (d *udpReplyDispatcher) runTurn(q *udpReplyDispatchQueue) {
 			q.taskHead = 0
 		}
 		q.mu.Unlock()
-		runUDPReplyTask(task)
+		d.runTask(task)
 	}
 	d.finishTurn(q)
 }
@@ -349,7 +350,7 @@ func (d *udpReplyDispatcher) abortInput(endpoint *UdpEndpoint) {
 	}
 
 	for _, task := range pending {
-		discardUDPReplyTask(task)
+		d.discardTask(task)
 	}
 }
 
@@ -391,7 +392,7 @@ func (d *udpReplyDispatcher) close() {
 			q.finishOnce()
 		}
 		for _, task := range pending {
-			discardUDPReplyTask(task)
+			d.discardTask(task)
 		}
 	})
 }
@@ -460,19 +461,23 @@ func (q *udpReplyDispatchQueue) finishOnce() {
 	q.doneOnce.Do(func() { close(q.done) })
 }
 
-func runUDPReplyTask(task udpReplyDispatchTask) {
+func (d *udpReplyDispatcher) runTask(task udpReplyDispatchTask) {
 	defer func() {
-		_ = recover()
+		if recovered := recover(); recovered != nil {
+			reportUDPDispatcherPanic("reply", "run", &d.panicCount, recovered)
+		}
 	}()
 	task.run()
 }
 
-func discardUDPReplyTask(task udpReplyDispatchTask) {
+func (d *udpReplyDispatcher) discardTask(task udpReplyDispatchTask) {
 	if task.discard == nil {
 		return
 	}
 	defer func() {
-		_ = recover()
+		if recovered := recover(); recovered != nil {
+			reportUDPDispatcherPanic("reply", "discard", &d.panicCount, recovered)
+		}
 	}()
 	task.discard()
 }

@@ -8,7 +8,8 @@ on:
       - "**/*.h"
       - "go.mod"
       - "go.sum"
-      - "scripts/semantic-refactor-live-smoke.sh"
+      - "scripts/semantic-refactor-*.sh"
+      - "scripts/semantic-refactor-*/**"
       - "install/empty.dae"
       - ".github/workflows/kernel-test.yml"
   push:
@@ -21,7 +22,8 @@ on:
       - "**/*.h"
       - "go.mod"
       - "go.sum"
-      - "scripts/semantic-refactor-live-smoke.sh"
+      - "scripts/semantic-refactor-*.sh"
+      - "scripts/semantic-refactor-*/**"
       - "install/empty.dae"
       - ".github/workflows/kernel-test.yml"
 
@@ -46,6 +48,11 @@ jobs:
         key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
         restore-keys: |
           ${{ runner.os }}-go-
+
+    - name: Validate semantic-refactor scripts
+      run: |
+        set -euo pipefail
+        find scripts -type f -name 'semantic-refactor-*.sh' -exec bash -n {} +
 
     - name: Generate and build
       run: |
@@ -105,7 +112,7 @@ jobs:
             chmod +x /host/dae/dae
 
             apt update
-            apt install -y unzip
+            apt install -y unzip python3
 
       - name: Check real-BPF reload lifecycle
         uses: cilium/little-vm-helper@v0.0.28
@@ -117,6 +124,26 @@ jobs:
             test ! -e /sys/fs/bpf/dae
             ! ip link show dae0 >/dev/null 2>&1
             ! ip netns list 2>/dev/null | grep -q '^daens'
+
+      - name: Check local UDP reload lifecycle
+        uses: cilium/little-vm-helper@v0.0.28
+        with:
+          provision: 'false'
+          cmd: |
+            set -euo pipefail
+            /host/scripts/semantic-refactor-live-local-udp-smoke.sh /host/dae/dae 8
+            test ! -e /sys/fs/bpf/dae
+            ! ip link show dae0 >/dev/null 2>&1
+            ! ip netns list 2>/dev/null | grep -q '^daens'
+            ! ip link show dsmoke-udp0 >/dev/null 2>&1
+            ! ip netns list 2>/dev/null | grep -q '^dae-semantic-udp-server'
+            env DAE_SEMANTIC_REFACTOR_FEATURES=udp-reply-dispatcher,udp-ordered-dispatcher \
+              /host/scripts/semantic-refactor-live-local-udp-smoke.sh /host/dae/dae 8
+            test ! -e /sys/fs/bpf/dae
+            ! ip link show dae0 >/dev/null 2>&1
+            ! ip netns list 2>/dev/null | grep -q '^daens'
+            ! ip link show dsmoke-udp0 >/dev/null 2>&1
+            ! ip netns list 2>/dev/null | grep -q '^dae-semantic-udp-server'
 
       - name: Setup network
         uses: cilium/little-vm-helper@v0.0.28

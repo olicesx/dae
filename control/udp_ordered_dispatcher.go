@@ -10,11 +10,20 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 const (
 	defaultUDPOrderedDispatcherWorkerCap = 8
 	defaultUDPOrderedDispatcherQuantum   = 32
+	// Bound queued packet buffers even when a flow handler or all workers are
+	// slower than ingress. Running tasks are bounded by the fixed worker count.
+	defaultUDPOrderedDispatcherMaxPending        = UdpTaskQueueLength * defaultUDPOrderedDispatcherWorkerCap
+	defaultUDPOrderedDispatcherMaxPendingPerFlow = UdpTaskQueueLength * 2
+	// Preserve the base hot-worker budget while endpoint dials wait on proxy
+	// handshakes, without allowing unbounded dial goroutines.
+	defaultUDPOrderedDispatcherMaxCompensatingWorkers = defaultUDPOrderedDispatcherWorkerCap * 8
 )
 
 type udpOrderedDispatchTask struct {
@@ -53,8 +62,18 @@ type udpOrderedDispatcher struct {
 	done      chan struct{}
 	workers   sync.WaitGroup
 
+	// compensationSlots bounds cold endpoint creations that borrow a temporary
+	// worker. The channel is never closed because release may race teardown.
+	compensationSlots              chan struct{}
+	compensatingWorkerCount        atomic.Int32
+	endpointCreateAdmissionRejects atomic.Uint64
+
 	workerCount  int
 	drainQuantum int
+	maxPending   int64
+	maxPerFlow   int
+	pending      atomic.Int64
+	panicCount   atomic.Uint64
 }
 
 func newDefaultUDPOrderedDispatcher() *udpOrderedDispatcher {
@@ -69,20 +88,53 @@ func newUDPOrderedDispatcherForFeatures(features SemanticRefactorFeatureSet) *ud
 }
 
 func newUDPOrderedDispatcher(workers, drainQuantum int) *udpOrderedDispatcher {
+	return newUDPOrderedDispatcherWithLimits(
+		workers,
+		drainQuantum,
+		defaultUDPOrderedDispatcherMaxPending,
+		defaultUDPOrderedDispatcherMaxPendingPerFlow,
+	)
+}
+
+func newUDPOrderedDispatcherWithLimits(workers, drainQuantum, maxPending, maxPerFlow int) *udpOrderedDispatcher {
+	return newUDPOrderedDispatcherWithLimitsAndCompensation(
+		workers,
+		drainQuantum,
+		maxPending,
+		maxPerFlow,
+		defaultUDPOrderedDispatcherMaxCompensatingWorkers,
+	)
+}
+
+func newUDPOrderedDispatcherWithLimitsAndCompensation(workers, drainQuantum, maxPending, maxPerFlow, maxCompensatingWorkers int) *udpOrderedDispatcher {
 	workers = normalizeUDPOrderedDispatcherWorkers(workers)
 	if drainQuantum <= 0 {
 		drainQuantum = defaultUDPOrderedDispatcherQuantum
 	}
+	if maxPending <= 0 {
+		maxPending = defaultUDPOrderedDispatcherMaxPending
+	}
+	if maxPerFlow <= 0 {
+		maxPerFlow = defaultUDPOrderedDispatcherMaxPendingPerFlow
+	}
+	if maxPerFlow > maxPending {
+		maxPerFlow = maxPending
+	}
+	if maxCompensatingWorkers <= 0 {
+		maxCompensatingWorkers = defaultUDPOrderedDispatcherMaxCompensatingWorkers
+	}
 	d := &udpOrderedDispatcher{
-		wake:         make(chan struct{}, workers),
-		stop:         make(chan struct{}),
-		done:         make(chan struct{}),
-		workerCount:  workers,
-		drainQuantum: drainQuantum,
+		wake:              make(chan struct{}, workers),
+		stop:              make(chan struct{}),
+		done:              make(chan struct{}),
+		workerCount:       workers,
+		drainQuantum:      drainQuantum,
+		maxPending:        int64(maxPending),
+		maxPerFlow:        maxPerFlow,
+		compensationSlots: make(chan struct{}, maxCompensatingWorkers),
 	}
 	for range workers {
-		d.workers.Add(1)
-		go d.worker()
+		d.startWorker(nil)
 	}
 	d.workers.Add(1)
 	go d.janitor()
@@ -91,6 +143,11 @@ func newUDPOrderedDispatcher(workers, drainQuantum int) *udpOrderedDispatcher {
 		close(d.done)
 	}()
 	return d
+}
+
+func (d *udpOrderedDispatcher) startWorker(retire <-chan struct{}) {
+	d.workers.Add(1)
+	go d.worker(retire)
 }
 
 func normalizeUDPOrderedDispatcherWorkers(workers int) int {
@@ -125,6 +182,10 @@ func (d *udpOrderedDispatcher) submit(key UdpFlowKey, run, discard UdpTask) bool
 			d.queues.CompareAndDelete(key, q)
 			continue
 		}
+		if len(q.tasks)-q.taskHead >= d.maxPerFlow || !d.reservePending() {
+			q.mu.Unlock()
+			return false
+		}
 		q.tasks = append(q.tasks, udpOrderedDispatchTask{run: run, discard: discard})
 		q.idleSince = time.Time{}
 		shouldWake := !q.running && !q.ready
@@ -137,6 +198,18 @@ func (d *udpOrderedDispatcher) submit(key UdpFlowKey, run, discard UdpTask) bool
 			d.enqueueReady(q)
 		}
 		return true
+	}
+}
+
+func (d *udpOrderedDispatcher) reservePending() bool {
+	for {
+		pending := d.pending.Load()
+		if pending >= d.maxPending {
+			return false
+		}
+		if d.pending.CompareAndSwap(pending, pending+1) {
+			return true
+		}
 	}
 }
 
@@ -168,9 +241,22 @@ func (d *udpOrderedDispatcher) notify() {
 	}
 }
 
-func (d *udpOrderedDispatcher) worker() {
+func (d *udpOrderedDispatcher) worker(retire <-chan struct{}) {
 	defer d.workers.Done()
+	if retire != nil {
+		defer func() {
+			d.compensatingWorkerCount.Add(-1)
+			<-d.compensationSlots
+		}()
+	}
 	for {
+		select {
+		case <-d.stop:
+			return
+		case <-retire:
+			return
+		default:
+		}
 		if q := d.takeReadyQueue(); q != nil {
 			d.runTurn(q)
 			continue
@@ -178,9 +264,61 @@ func (d *udpOrderedDispatcher) worker() {
 		select {
 		case <-d.stop:
 			return
+		case <-retire:
+			return
 		case <-d.wake:
 		}
 	}
+}
+
+// acquireEndpointCreateAdmission reserves a bounded cold-path slot before a
+// task waits for endpoint creation or DialContext. Its temporary worker keeps
+// the base worker budget available to already-established UDP and QUIC flows.
+func (d *udpOrderedDispatcher) acquireEndpointCreateAdmission() (release func(), ok bool) {
+	if d == nil {
+		return func() {}, true
+	}
+	select {
+	case d.compensationSlots <- struct{}{}:
+	default:
+		d.reportEndpointCreateAdmissionSaturated()
+		return nil, false
+	}
+	// Close takes lifecycleMu exclusively before closing stop. Holding its read
+	// side prevents a WaitGroup Add after worker shutdown has begun.
+	d.lifecycleMu.RLock()
+	if d.closed.Load() {
+		d.lifecycleMu.RUnlock()
+		<-d.compensationSlots
+		return nil, false
+	}
+	retire := make(chan struct{})
+	d.compensatingWorkerCount.Add(1)
+	d.startWorker(retire)
+	d.lifecycleMu.RUnlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(retire) })
+	}, true
+}
+
+func (d *udpOrderedDispatcher) endpointCreateAdmissionState() (reserved, workers int) {
+	if d == nil {
+		return 0, 0
+	}
+	return len(d.compensationSlots), int(d.compensatingWorkerCount.Load())
+}
+
+func (d *udpOrderedDispatcher) reportEndpointCreateAdmissionSaturated() {
+	count := d.endpointCreateAdmissionRejects.Add(1)
+	if count&(count-1) != 0 {
+		return
+	}
+	logrus.WithFields(logrus.Fields{
+		"dispatcher":        "ordered",
+		"event":             "endpoint_create_admission_saturated",
+		"rejected_requests": count,
+	}).Warn("UDP ordered endpoint creation admission is saturated")
 }
 
 func (d *udpOrderedDispatcher) takeReadyQueue() *udpOrderedDispatchQueue {
@@ -223,12 +361,13 @@ func (d *udpOrderedDispatcher) runTurn(q *udpOrderedDispatchQueue) {
 		task := q.tasks[q.taskHead]
 		q.tasks[q.taskHead] = udpOrderedDispatchTask{}
 		q.taskHead++
+		d.pending.Add(-1)
 		if q.taskHead == len(q.tasks) {
 			q.tasks = q.tasks[:0]
 			q.taskHead = 0
 		}
 		q.mu.Unlock()
-		runUDPOrderedTask(task)
+		d.runTask(task)
 	}
 	d.finishTurn(q)
 }
@@ -269,7 +408,9 @@ func (d *udpOrderedDispatcher) close() {
 			q.mu.Lock()
 			q.retired = true
 			q.ready = false
-			pending = append(pending, q.tasks[q.taskHead:]...)
+			queued := q.tasks[q.taskHead:]
+			pending = append(pending, queued...)
+			d.pending.Add(-int64(len(queued)))
 			clear(q.tasks[q.taskHead:])
 			q.tasks = nil
 			q.taskHead = 0
@@ -286,7 +427,7 @@ func (d *udpOrderedDispatcher) close() {
 		d.lifecycleMu.Unlock()
 
 		for _, task := range pending {
-			discardUDPOrderedTask(task)
+			d.discardTask(task)
 		}
 	})
 }
@@ -304,7 +445,9 @@ func (d *udpOrderedDispatcher) reset() {
 	d.queues.Range(func(key, value any) bool {
 		q := value.(*udpOrderedDispatchQueue)
 		q.mu.Lock()
-		pending = append(pending, q.tasks[q.taskHead:]...)
+		queued := q.tasks[q.taskHead:]
+		pending = append(pending, queued...)
+		d.pending.Add(-int64(len(queued)))
 		clear(q.tasks[q.taskHead:])
 		q.tasks = nil
 		q.taskHead = 0
@@ -324,7 +467,7 @@ func (d *udpOrderedDispatcher) reset() {
 	d.lifecycleMu.Unlock()
 
 	for _, task := range pending {
-		discardUDPOrderedTask(task)
+		d.discardTask(task)
 	}
 }
 
@@ -390,6 +533,13 @@ func (d *udpOrderedDispatcher) queueCount() int {
 	return count
 }
 
+func (d *udpOrderedDispatcher) pendingTaskCount() int64 {
+	if d == nil {
+		return 0
+	}
+	return d.pending.Load()
+}
+
 func (d *udpOrderedDispatcher) isClosed() bool {
 	if d == nil {
 		return true
@@ -397,19 +547,36 @@ func (d *udpOrderedDispatcher) isClosed() bool {
 	return d.closed.Load()
 }
 
-func runUDPOrderedTask(task udpOrderedDispatchTask) {
+func (d *udpOrderedDispatcher) runTask(task udpOrderedDispatchTask) {
 	defer func() {
-		_ = recover()
+		if recovered := recover(); recovered != nil {
+			reportUDPDispatcherPanic("ordered", "run", &d.panicCount, recovered)
+		}
 	}()
 	task.run()
 }
 
-func discardUDPOrderedTask(task udpOrderedDispatchTask) {
+func (d *udpOrderedDispatcher) discardTask(task udpOrderedDispatchTask) {
 	if task.discard == nil {
 		return
 	}
 	defer func() {
-		_ = recover()
+		if recovered := recover(); recovered != nil {
+			reportUDPDispatcherPanic("ordered", "discard", &d.panicCount, recovered)
+		}
 	}()
 	task.discard()
+}
+
+func reportUDPDispatcherPanic(dispatcher, taskKind string, panicCount *atomic.Uint64, recovered any) {
+	count := panicCount.Add(1)
+	if count&(count-1) != 0 {
+		return
+	}
+	logrus.WithFields(logrus.Fields{
+		"dispatcher":  dispatcher,
+		"task_kind":   taskKind,
+		"panic":       recovered,
+		"panic_count": count,
+	}).Error("recovered panic in UDP dispatcher task")
 }

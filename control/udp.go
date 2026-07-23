@@ -1109,6 +1109,7 @@ getNew:
 			ConnStateOwner:  connStateOwner,
 			DrainTracker:    endpointDrainTracker,
 			admissionGate:   &c.udpEndpointAdmission,
+			createAdmission: c.orderedUDPEndpointCreateAdmission(flowDecision),
 			Log:             c.log,
 			NowNano:         nowNano,
 			replyDispatcher: c.udpReplyDispatcher,
@@ -1177,7 +1178,8 @@ getNew:
 		})
 		if err != nil {
 			if stderrors.Is(err, ob.ErrNoAliveDialer) || stderrors.Is(err, ErrEndpointFailed) ||
-				stderrors.Is(err, errUdpEndpointAdmissionClosed) {
+				stderrors.Is(err, errUdpEndpointAdmissionClosed) ||
+				stderrors.Is(err, errUdpEndpointCreateAdmissionFull) {
 				// Already emitted a rate-limited diagnostic log above, or hit negative cache.
 				return nil
 			}

@@ -12,6 +12,14 @@ func (c *ControlPlane) submitOrderedUDPIngress(key UdpFlowKey, run, discard UdpT
 	return DefaultUdpTaskPool.EmitTask(key, run)
 }
 
+func (c *ControlPlane) orderedUDPEndpointCreateAdmission(flowDecision UdpFlowDecision) udpEndpointCreateAdmission {
+	if c == nil || c.udpOrderedDispatcher == nil ||
+		flowDecision.DispatchStrategy() != StrategyOrderedIngress {
+		return nil
+	}
+	return c.udpOrderedDispatcher.acquireEndpointCreateAdmission
+}
+
 func (c *ControlPlane) closeUDPOrderedDispatcher() {
 	if c == nil || c.udpOrderedDispatcher == nil || c.udpOrderedDispatcherShared {
 		return

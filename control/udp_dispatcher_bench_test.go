@@ -7,13 +7,15 @@ import (
 	"fmt"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
-// BenchmarkUDPReplyDispatcherSubmitDrain measures the steady-state cost of
-// dispatching replies across N concurrent endpoints. It guards the bounded
-// worker scheduler and per-endpoint queue path against throughput and
-// allocation regressions.
+const udpDispatcherBenchmarkMaxInFlight = UdpTaskQueueLength / 2
+
+// BenchmarkUDPReplyDispatcherSubmitDrain measures completed scheduler work
+// across N concurrent endpoints. It does not include endpoint admission or
+// transport writes.
 func BenchmarkUDPReplyDispatcherSubmitDrain(b *testing.B) {
 	cases := []struct {
 		endpoints int
@@ -36,25 +38,17 @@ func BenchmarkUDPReplyDispatcherSubmitDrain(b *testing.B) {
 			for i := range endpoints {
 				endpoints[i] = &UdpEndpoint{}
 			}
-			task := func() {}
-
-			b.ReportAllocs()
-			b.ResetTimer()
-
-			runProducers(b, tc.producers, func(workerID int, op int) {
-				ep := endpoints[op%len(endpoints)]
-				if !dispatcher.submit(ep, task, nil) {
-					b.Fatalf("submit rejected on op %d", op)
-				}
+			runBoundedUDPDispatcherBenchmark(b, tc.producers, func(workerID, localOp int, task UdpTask) bool {
+				ep := endpoints[((localOp%len(endpoints))*tc.producers+workerID)%len(endpoints)]
+				return dispatcher.submit(ep, task, nil)
 			})
 		})
 	}
 }
 
-// BenchmarkUDPOrderedDispatcherSubmitDrain measures the steady-state cost of
-// dispatching a high packet rate across N concurrent UDP flows. It compares
-// the bounded worker scheduler with the legacy per-flow convoy pool so submit
-// and drain overhead remain visible.
+// BenchmarkUDPOrderedDispatcherSubmitDrain compares completed scheduler work
+// under the same bounded in-flight load. It stays below both queue capacities,
+// so overload policy is not part of the comparison.
 func BenchmarkUDPOrderedDispatcherSubmitDrain(b *testing.B) {
 	cases := []struct {
 		flows     int
@@ -83,23 +77,10 @@ func benchLegacyUDPPoolSubmitDrain(flows, producers int) func(*testing.B) {
 		pool := NewUdpTaskPool()
 		b.Cleanup(func() { pool.Close() })
 
-		keys := make([]UdpFlowKey, flows)
-		for i := range keys {
-			keys[i] = UdpFlowKey{
-				Src: netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, byte(i >> 8)}), uint16(i&0xffff)),
-				Dst: netip.AddrPortFrom(netip.AddrFrom4([4]byte{8, 8, 8, 8}), 53),
-			}
-		}
-		task := func() {}
-
-		b.ReportAllocs()
-		b.ResetTimer()
-
-		runProducers(b, producers, func(workerID int, op int) {
-			key := keys[op%len(keys)]
-			if !pool.EmitTask(key, task) {
-				b.Fatalf("EmitTask rejected on op %d", op)
-			}
+		keys := udpDispatcherBenchmarkKeys(flows)
+		runBoundedUDPDispatcherBenchmark(b, producers, func(workerID, localOp int, task UdpTask) bool {
+			key := keys[udpDispatcherBenchmarkKeyIndex(localOp, workerID, producers, len(keys))]
+			return pool.EmitTask(key, task)
 		})
 	}
 }
@@ -112,30 +93,63 @@ func benchNewUDPOrderedDispatcherSubmitDrain(flows, producers int) func(*testing
 			d.wait()
 		})
 
-		keys := make([]UdpFlowKey, flows)
-		for i := range keys {
-			keys[i] = UdpFlowKey{
-				Src: netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, byte(i >> 8)}), uint16(i&0xffff)),
-				Dst: netip.AddrPortFrom(netip.AddrFrom4([4]byte{8, 8, 8, 8}), 53),
-			}
-		}
-		task := func() {}
-
-		b.ReportAllocs()
-		b.ResetTimer()
-
-		runProducers(b, producers, func(workerID int, op int) {
-			key := keys[op%len(keys)]
-			if !d.submit(key, task, nil) {
-				b.Fatalf("submit rejected on op %d", op)
-			}
+		keys := udpDispatcherBenchmarkKeys(flows)
+		runBoundedUDPDispatcherBenchmark(b, producers, func(workerID, localOp int, task UdpTask) bool {
+			key := keys[udpDispatcherBenchmarkKeyIndex(localOp, workerID, producers, len(keys))]
+			return d.submit(key, task, nil)
 		})
 	}
 }
 
+func udpDispatcherBenchmarkKeys(flows int) []UdpFlowKey {
+	keys := make([]UdpFlowKey, flows)
+	for i := range keys {
+		keys[i] = UdpFlowKey{
+			Src: netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, byte(i >> 8)}), uint16(i&0xffff)),
+			Dst: netip.AddrPortFrom(netip.AddrFrom4([4]byte{8, 8, 8, 8}), 53),
+		}
+	}
+	return keys
+}
+
+func runBoundedUDPDispatcherBenchmark(b *testing.B, producers int, submit func(workerID, localOp int, task UdpTask) bool) {
+	permits := make(chan struct{}, udpDispatcherBenchmarkMaxInFlight)
+	for range udpDispatcherBenchmarkMaxInFlight {
+		permits <- struct{}{}
+	}
+
+	var completed sync.WaitGroup
+	completed.Add(b.N)
+	var rejected atomic.Bool
+	task := func() {
+		permits <- struct{}{}
+		completed.Done()
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	runProducers(b, producers, func(workerID, localOp int) {
+		<-permits
+		if submit(workerID, localOp, task) {
+			return
+		}
+		permits <- struct{}{}
+		completed.Done()
+		rejected.Store(true)
+	})
+	completed.Wait()
+	b.StopTimer()
+	if rejected.Load() {
+		b.Fatal("bounded benchmark submission was rejected")
+	}
+}
+
+func udpDispatcherBenchmarkKeyIndex(localOp, workerID, producers, flowCount int) int {
+	return ((localOp%flowCount)*producers + workerID) % flowCount
+}
+
 // runProducers distributes b.N operations across `producers` goroutines. Each
-// produced task is immediately drainable by the dispatcher workers, so the
-// benchmark measures submit+execute throughput rather than queue backlog.
+// task is submitted by exactly one producer and completed by the dispatcher.
 func runProducers(b *testing.B, producers int, emit func(workerID int, op int)) {
 	if producers <= 1 {
 		for op := range b.N {
@@ -149,8 +163,8 @@ func runProducers(b *testing.B, producers int, emit func(workerID int, op int)) 
 	wg.Add(producers)
 	for worker := range producers {
 		count := opsPerProducer
-		if worker == 0 {
-			count += remainder
+		if worker < remainder {
+			count++
 		}
 		go func(workerID, count int) {
 			defer wg.Done()

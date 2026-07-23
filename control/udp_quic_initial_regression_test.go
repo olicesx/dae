@@ -457,8 +457,8 @@ func TestQuicInitial_FlowsThroughBothNewDispatchers(t *testing.T) {
 	}
 	d, underlay := newCountingProxyEndpointDialer("hysteria2", "proxy.example:443", conn)
 
-	// Build a ControlPlane that matches production defaults: both UDP
-	// dispatchers enabled, just like defaultSemanticRefactorFeatures() does.
+	// Exercise the explicit ordered-ingress opt-in together with the default
+	// reply dispatcher.
 	ordered := newDefaultUDPOrderedDispatcher()
 	reply := newDefaultUDPReplyDispatcher()
 	t.Cleanup(func() {

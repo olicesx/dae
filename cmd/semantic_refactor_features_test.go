@@ -11,6 +11,21 @@ import (
 	"github.com/daeuniverse/dae/control"
 )
 
+func TestDefaultSemanticRefactorFeaturesKeepsOrderedIngressOptIn(t *testing.T) {
+	want := []control.SemanticRefactorFeature{
+		control.SemanticRefactorFeatureUDPReplyDispatcher,
+	}
+	got := defaultSemanticRefactorFeatures()
+	if len(got) != len(want) {
+		t.Fatalf("defaultSemanticRefactorFeatures() = %v, want %v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("default feature[%d] = %q, want %q", index, got[index], want[index])
+		}
+	}
+}
+
 func TestSemanticRefactorFeaturesFromValue(t *testing.T) {
 	defaults := defaultSemanticRefactorFeatures()
 	tests := []struct {

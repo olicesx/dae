@@ -21,20 +21,14 @@ const (
 // defaultSemanticRefactorFeatures returns the production default set of
 // semantic-refactor execution paths.
 //
-// Both UDP dispatchers use bounded schedulers:
+// The reply dispatcher is enabled by default. Ordered UDP ingress remains an
+// explicit opt-in until end-to-end QUIC and proxy-dial benchmarks establish
+// production rollout SLOs.
 //
-//   - Queue lookup uses sync.Map and unrelated flows synchronize only on their
-//     own queue locks.
-//   - A fixed worker cap bounds goroutine and timer pressure under
-//     high-cardinality UDP traffic.
-//   - Per-endpoint reply backpressure remains owned by
-//     UdpEndpoint.replyRuntime.slots.
-//
-// Both are enabled by default. Opt out via DAE_SEMANTIC_REFACTOR_FEATURES=none
-// or pick a subset.
+// Opt in by listing udp-ordered-dispatcher in DAE_SEMANTIC_REFACTOR_FEATURES,
+// opt out with none, or select another subset.
 func defaultSemanticRefactorFeatures() []control.SemanticRefactorFeature {
 	return []control.SemanticRefactorFeature{
-		control.SemanticRefactorFeatureUDPOrderedDispatcher,
 		control.SemanticRefactorFeatureUDPReplyDispatcher,
 	}
 }

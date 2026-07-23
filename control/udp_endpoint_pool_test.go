@@ -1798,6 +1798,177 @@ func TestUdpEndpointPoolUnregisterKeepsDialerBucketForReuse(t *testing.T) {
 	bucket.mu.RUnlock()
 }
 
+func TestUdpEndpointPoolGetOrCreate_FastHitSkipsColdAdmission(t *testing.T) {
+	pool := NewUdpEndpointPool()
+	t.Cleanup(pool.Close)
+	conn := &scriptedPacketConn{
+		reads:   make(chan scriptedPacketRead),
+		closeCh: make(chan struct{}),
+	}
+	dialer := newTestEndpointDialer(conn)
+	t.Cleanup(func() { _ = dialer.Close() })
+	key := UdpEndpointKey{
+		Src: netip.MustParseAddrPort("[::1]:12999"),
+		Dst: netip.MustParseAddrPort("[2001:db8::99]:443"),
+	}
+	var dialOptionCalls atomic.Int32
+	option := &UdpEndpointOptions{
+		Handler:    func(_ *UdpEndpoint, _ []byte, _ netip.AddrPort) error { return nil },
+		NatTimeout: time.Second,
+		GetDialOption: func(context.Context) (*DialOption, error) {
+			dialOptionCalls.Add(1)
+			return &DialOption{
+				Dialer:  dialer,
+				Network: "udp",
+				Target:  key.Dst.String(),
+			}, nil
+		},
+	}
+	created, isNew, err := pool.GetOrCreate(key, option)
+	if err != nil || !isNew || created == nil {
+		t.Fatalf("initial GetOrCreate() = (%p, %t, %v), want a new endpoint", created, isNew, err)
+	}
+	var admissionCalls atomic.Int32
+	option.createAdmission = func() (func(), bool) {
+		admissionCalls.Add(1)
+		return nil, false
+	}
+	reused, isNew, err := pool.GetOrCreate(key, option)
+	if err != nil || isNew || reused != created {
+		t.Fatalf("fast-hit GetOrCreate() = (%p, %t, %v), want (%p, false, nil)", reused, isNew, err, created)
+	}
+	if got := admissionCalls.Load(); got != 0 {
+		t.Fatalf("cold admission calls on fast hit = %d, want 0", got)
+	}
+	if got := dialOptionCalls.Load(); got != 1 {
+		t.Fatalf("GetDialOption calls = %d, want 1", got)
+	}
+}
+
+func TestUdpEndpointPoolGetOrCreate_RejectsColdAdmissionWithoutDialOrCache(t *testing.T) {
+	pool := NewUdpEndpointPool()
+	t.Cleanup(pool.Close)
+	key := UdpEndpointKey{Src: netip.MustParseAddrPort("[::1]:13000")}
+	var admissionCalls atomic.Int32
+	var dialOptionCalls atomic.Int32
+	endpoint, isNew, err := pool.GetOrCreate(key, &UdpEndpointOptions{
+		Handler:    func(_ *UdpEndpoint, _ []byte, _ netip.AddrPort) error { return nil },
+		NatTimeout: time.Second,
+		createAdmission: func() (func(), bool) {
+			admissionCalls.Add(1)
+			return nil, false
+		},
+		GetDialOption: func(context.Context) (*DialOption, error) {
+			dialOptionCalls.Add(1)
+			return nil, io.EOF
+		},
+	})
+	if endpoint != nil || isNew || !stderrors.Is(err, errUdpEndpointCreateAdmissionFull) {
+		t.Fatalf("GetOrCreate() = (%p, %t, %v), want (nil, false, create admission full)", endpoint, isNew, err)
+	}
+	if got := admissionCalls.Load(); got != 1 {
+		t.Fatalf("create admission calls = %d, want 1", got)
+	}
+	if got := dialOptionCalls.Load(); got != 0 {
+		t.Fatalf("GetDialOption calls = %d, want 0", got)
+	}
+	if shouldCacheUdpEndpointCreateFailure(err) {
+		t.Fatal("cold admission rejection should not enter the endpoint failure cache")
+	}
+	shard := pool.shardFor(key)
+	shard.mu.RLock()
+	_, cached := shard.pool[key]
+	shard.mu.RUnlock()
+	if cached {
+		t.Fatal("cold admission rejection left a pool entry")
+	}
+}
+
+func TestUdpEndpointPoolGetOrCreate_AdmitsBeforeCreateShardLock(t *testing.T) {
+	pool := NewUdpEndpointPool()
+	t.Cleanup(pool.Close)
+	firstKey := UdpEndpointKey{
+		Src: netip.MustParseAddrPort("[::1]:13001"),
+		Dst: netip.MustParseAddrPort("[2001:db8::1]:443"),
+	}
+	var secondKey UdpEndpointKey
+	foundSecondKey := false
+	for port := 13002; port < 14000; port++ {
+		candidate := UdpEndpointKey{
+			Src: netip.AddrPortFrom(netip.MustParseAddr("::1"), uint16(port)),
+			Dst: firstKey.Dst,
+		}
+		if pool.shardFor(candidate) == pool.shardFor(firstKey) {
+			secondKey = candidate
+			foundSecondKey = true
+			break
+		}
+	}
+	if !foundSecondKey {
+		t.Fatal("could not find a second endpoint key in the same creation shard")
+	}
+	firstCreateStarted := make(chan struct{})
+	releaseFirstCreate := make(chan struct{})
+	var releaseFirstOnce sync.Once
+	t.Cleanup(func() { releaseFirstOnce.Do(func() { close(releaseFirstCreate) }) })
+	firstResult := make(chan error, 1)
+	go func() {
+		_, _, err := pool.GetOrCreate(firstKey, &UdpEndpointOptions{
+			Handler:    func(_ *UdpEndpoint, _ []byte, _ netip.AddrPort) error { return nil },
+			NatTimeout: time.Second,
+			GetDialOption: func(context.Context) (*DialOption, error) {
+				close(firstCreateStarted)
+				<-releaseFirstCreate
+				return nil, ob.ErrNoAliveDialer
+			},
+		})
+		firstResult <- err
+	}()
+	select {
+	case <-firstCreateStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first endpoint creation did not acquire the creation shard")
+	}
+	secondAdmission := make(chan struct{})
+	secondResult := make(chan error, 1)
+	go func() {
+		_, _, err := pool.GetOrCreate(secondKey, &UdpEndpointOptions{
+			Handler:    func(_ *UdpEndpoint, _ []byte, _ netip.AddrPort) error { return nil },
+			NatTimeout: time.Second,
+			createAdmission: func() (func(), bool) {
+				close(secondAdmission)
+				return func() {}, true
+			},
+			GetDialOption: func(context.Context) (*DialOption, error) {
+				return nil, ob.ErrNoAliveDialer
+			},
+		})
+		secondResult <- err
+	}()
+	select {
+	case <-secondAdmission:
+	case <-time.After(time.Second):
+		t.Fatal("second endpoint creation was admitted only after the shard lock")
+	}
+	releaseFirstOnce.Do(func() { close(releaseFirstCreate) })
+	select {
+	case err := <-firstResult:
+		if !stderrors.Is(err, ob.ErrNoAliveDialer) {
+			t.Fatalf("first GetOrCreate() error = %v, want no alive dialer", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first endpoint creation did not finish")
+	}
+	select {
+	case err := <-secondResult:
+		if !stderrors.Is(err, ob.ErrNoAliveDialer) {
+			t.Fatalf("second GetOrCreate() error = %v, want no alive dialer", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second endpoint creation did not finish")
+	}
+}
+
 func TestUdpEndpointPoolGetOrCreate_NoAliveDialerDoesNotNegativeCachePerFlow(t *testing.T) {
 	pool := NewUdpEndpointPool()
 	key := UdpEndpointKey{Src: netip.MustParseAddrPort("[::1]:13001")}
@@ -2677,4 +2848,135 @@ func TestUdpEndpointPoolGetOrCreate_NoReplyTimeoutReleasesPrewarmedAnyfrom(t *te
 	waitForCondition(t, 2*time.Second, "anyfrom janitor reclaims released prewarm socket", func() bool {
 		return countPooledAnyfromConns(DefaultAnyfromPool) == 0
 	})
+}
+
+func TestUdpEndpointCloseRejectsConcurrentPostCloseReplySubmissions(t *testing.T) {
+	dispatcher := newUDPReplyDispatcher(1, 1)
+	t.Cleanup(func() {
+		dispatcher.close()
+		dispatcher.wait()
+	})
+
+	const attempts = 128
+	var handled atomic.Int32
+	var released atomic.Int32
+	ue := &UdpEndpoint{
+		replyRuntime: newUdpEndpointReplyRuntime(dispatcher, newControlPlaneDrainTracker(), attempts),
+		handler: func(_ *UdpEndpoint, _ []byte, _ netip.AddrPort) error {
+			handled.Add(1)
+			return nil
+		},
+	}
+	if err := ue.Close(); err != nil {
+		t.Fatalf("UdpEndpoint.Close() error = %v", err)
+	}
+
+	from := netip.MustParseAddrPort("198.51.100.1:1")
+	var wg sync.WaitGroup
+	for range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			accepted, keepReceiver := ue.submitReplyFromReceiver(
+				udpEndpointReply{data: pool.PB([]byte("late")), from: from},
+				func() { released.Add(1) },
+			)
+			if accepted || keepReceiver {
+				t.Errorf("post-close submit = (%v, %v), want (false, false)", accepted, keepReceiver)
+				return
+			}
+			// Mirrors handleReceivedPacket ownership on false/false.
+			released.Add(1)
+		}()
+	}
+	wg.Wait()
+	ue.replyRuntime.tasks.Wait()
+	if got := handled.Load(); got != 0 {
+		t.Fatalf("post-close handler runs = %d, want 0", got)
+	}
+	if got := released.Load(); got != attempts {
+		t.Fatalf("post-close releases = %d, want %d", got, attempts)
+	}
+}
+
+func TestUdpEndpointCloseLinearizesConcurrentReplySubmission(t *testing.T) {
+	dispatcher := newUDPReplyDispatcher(1, 1)
+	t.Cleanup(func() {
+		dispatcher.close()
+		dispatcher.wait()
+	})
+
+	const (
+		producers = 16
+		overlap   = 16
+		postClose = 8
+	)
+	var releases atomic.Int32
+	var postCloseAccepted atomic.Int32
+	var postCloseHandled atomic.Int32
+	ue := &UdpEndpoint{
+		replyRuntime: newUdpEndpointReplyRuntime(dispatcher, newControlPlaneDrainTracker(), producers*(overlap+postClose)),
+		handler: func(_ *UdpEndpoint, data []byte, _ netip.AddrPort) error {
+			if string(data) == "post-close" {
+				postCloseHandled.Add(1)
+			}
+			return nil
+		},
+	}
+	from := netip.MustParseAddrPort("198.51.100.1:1")
+	submit := func(data string) (bool, bool) {
+		accepted, keepReceiver := ue.submitReplyFromReceiver(
+			udpEndpointReply{data: pool.PB([]byte(data)), from: from},
+			func() { releases.Add(1) },
+		)
+		if !accepted && !keepReceiver {
+			releases.Add(1)
+		}
+		return accepted, keepReceiver
+	}
+
+	start := make(chan struct{})
+	ready := make(chan struct{}, producers)
+	closeDone := make(chan struct{})
+	var wg sync.WaitGroup
+	for range producers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			ready <- struct{}{}
+			for range overlap {
+				submit("overlap")
+			}
+			<-closeDone
+			for range postClose {
+				accepted, keepReceiver := submit("post-close")
+				if accepted {
+					postCloseAccepted.Add(1)
+				}
+				if keepReceiver {
+					t.Error("post-close submit kept receiver registered")
+				}
+			}
+		}()
+	}
+	close(start)
+	for range producers {
+		<-ready
+	}
+	if err := ue.Close(); err != nil {
+		t.Fatalf("UdpEndpoint.Close() error = %v", err)
+	}
+	close(closeDone)
+	wg.Wait()
+	ue.replyRuntime.tasks.Wait()
+	if got := postCloseAccepted.Load(); got != 0 {
+		t.Fatalf("accepted post-close replies = %d, want 0", got)
+	}
+	if got := postCloseHandled.Load(); got != 0 {
+		t.Fatalf("post-close handler runs = %d, want 0", got)
+	}
+	if want := int32(producers * (overlap + postClose)); releases.Load() != want {
+		t.Fatalf("reply releases = %d, want %d", releases.Load(), want)
+	}
 }

@@ -209,23 +209,28 @@ type bpfProgramSpecs struct {
 }
 
 type bpfMapSpecs struct {
-	ActiveRoutingEpochMap   *ebpf.MapSpec `ebpf:"active_routing_epoch_map"`
-	BpfStatsMap             *ebpf.MapSpec `ebpf:"bpf_stats_map"`
-	CookiePidMap            *ebpf.MapSpec `ebpf:"cookie_pid_map"`
-	DomainRoutingMap        *ebpf.MapSpec `ebpf:"domain_routing_map"`
-	EventRingbuf            *ebpf.MapSpec `ebpf:"event_ringbuf"`
-	FastSock                *ebpf.MapSpec `ebpf:"fast_sock"`
-	ListenSocketMap         *ebpf.MapSpec `ebpf:"listen_socket_map"`
-	LpmArrayMap             *ebpf.MapSpec `ebpf:"lpm_array_map"`
-	OutboundConnectivityMap *ebpf.MapSpec `ebpf:"outbound_connectivity_map"`
-	RedirectTrack           *ebpf.MapSpec `ebpf:"redirect_track"`
-	RoutingHandoffMap       *ebpf.MapSpec `ebpf:"routing_handoff_map"`
-	RoutingMap              *ebpf.MapSpec `ebpf:"routing_map"`
-	RoutingEpochMap         *ebpf.MapSpec `ebpf:"routing_epoch_map"`
-	RoutingMetaMap          *ebpf.MapSpec `ebpf:"routing_meta_map"`
-	ConnStateMap            *ebpf.MapSpec `ebpf:"conn_state_map"`
-	UnusedLpmType           *ebpf.MapSpec `ebpf:"unused_lpm_type"`
-	PktScratchMap           *ebpf.MapSpec `ebpf:"pkt_scratch_map"`
+	ActiveRoutingEpochMap    *ebpf.MapSpec `ebpf:"active_routing_epoch_map"`
+	BpfStatsMap              *ebpf.MapSpec `ebpf:"bpf_stats_map"`
+	ConntrackArgsMap         *ebpf.MapSpec `ebpf:"conntrack_args_map"`
+	CookiePidMap             *ebpf.MapSpec `ebpf:"cookie_pid_map"`
+	DaeIfindexMap            *ebpf.MapSpec `ebpf:"dae_ifindex_map"`
+	DomainRoutingMap         *ebpf.MapSpec `ebpf:"domain_routing_map"`
+	EventRingbuf             *ebpf.MapSpec `ebpf:"event_ringbuf"`
+	FastSock                 *ebpf.MapSpec `ebpf:"fast_sock"`
+	ListenSocketMap          *ebpf.MapSpec `ebpf:"listen_socket_map"`
+	LpmArrayMap              *ebpf.MapSpec `ebpf:"lpm_array_map"`
+	OutboundConnectivityMap  *ebpf.MapSpec `ebpf:"outbound_connectivity_map"`
+	ParseCtxScratchMap       *ebpf.MapSpec `ebpf:"parse_ctx_scratch_map"`
+	RedirectTrack            *ebpf.MapSpec `ebpf:"redirect_track"`
+	RouteCtxScratchMap       *ebpf.MapSpec `ebpf:"route_ctx_scratch_map"`
+	RoutingHandoffMap        *ebpf.MapSpec `ebpf:"routing_handoff_map"`
+	RoutingMap               *ebpf.MapSpec `ebpf:"routing_map"`
+	RoutingEpochMap          *ebpf.MapSpec `ebpf:"routing_epoch_map"`
+	RoutingMetaMap           *ebpf.MapSpec `ebpf:"routing_meta_map"`
+	ConnStateMap             *ebpf.MapSpec `ebpf:"conn_state_map"`
+	UnusedLpmType            *ebpf.MapSpec `ebpf:"unused_lpm_type"`
+	WanEgressRouteScratchMap *ebpf.MapSpec `ebpf:"wan_egress_route_scratch_map"`
+	PktScratchMap            *ebpf.MapSpec `ebpf:"pkt_scratch_map"`
 }
 
 type bpfVariableSpecs struct {
@@ -246,30 +251,35 @@ func (o *bpfObjects) Close() error {
 }
 
 type bpfMaps struct {
-	ActiveRoutingEpochMap   *ebpf.Map `ebpf:"active_routing_epoch_map"`
-	BpfStatsMap             *ebpf.Map `ebpf:"bpf_stats_map"`
-	CookiePidMap            *ebpf.Map `ebpf:"cookie_pid_map"`
-	DaeIfindexMap           *ebpf.Map `ebpf:"dae_ifindex_map"`
-	DomainRoutingMap        *ebpf.Map `ebpf:"domain_routing_map"`
-	EventRingbuf            *ebpf.Map `ebpf:"event_ringbuf"`
-	FastSock                *ebpf.Map `ebpf:"fast_sock"`
-	ListenSocketMap         *ebpf.Map `ebpf:"listen_socket_map"`
-	LpmArrayMap             *ebpf.Map `ebpf:"lpm_array_map"`
-	OutboundConnectivityMap *ebpf.Map `ebpf:"outbound_connectivity_map"`
-	RedirectTrack           *ebpf.Map `ebpf:"redirect_track"`
-	RoutingHandoffMap       *ebpf.Map `ebpf:"routing_handoff_map"`
-	RoutingMap              *ebpf.Map `ebpf:"routing_map"`
-	RoutingEpochMap         *ebpf.Map `ebpf:"routing_epoch_map"`
-	RoutingMetaMap          *ebpf.Map `ebpf:"routing_meta_map"`
-	ConnStateMap            *ebpf.Map `ebpf:"conn_state_map"`
-	UnusedLpmType           *ebpf.Map `ebpf:"unused_lpm_type"`
-	PktScratchMap           *ebpf.Map `ebpf:"pkt_scratch_map"`
+	ActiveRoutingEpochMap    *ebpf.Map `ebpf:"active_routing_epoch_map"`
+	BpfStatsMap              *ebpf.Map `ebpf:"bpf_stats_map"`
+	ConntrackArgsMap         *ebpf.Map `ebpf:"conntrack_args_map"`
+	CookiePidMap             *ebpf.Map `ebpf:"cookie_pid_map"`
+	DaeIfindexMap            *ebpf.Map `ebpf:"dae_ifindex_map"`
+	DomainRoutingMap         *ebpf.Map `ebpf:"domain_routing_map"`
+	EventRingbuf             *ebpf.Map `ebpf:"event_ringbuf"`
+	FastSock                 *ebpf.Map `ebpf:"fast_sock"`
+	ListenSocketMap          *ebpf.Map `ebpf:"listen_socket_map"`
+	LpmArrayMap              *ebpf.Map `ebpf:"lpm_array_map"`
+	OutboundConnectivityMap  *ebpf.Map `ebpf:"outbound_connectivity_map"`
+	ParseCtxScratchMap       *ebpf.Map `ebpf:"parse_ctx_scratch_map"`
+	RedirectTrack            *ebpf.Map `ebpf:"redirect_track"`
+	RouteCtxScratchMap       *ebpf.Map `ebpf:"route_ctx_scratch_map"`
+	RoutingHandoffMap        *ebpf.Map `ebpf:"routing_handoff_map"`
+	RoutingMap               *ebpf.Map `ebpf:"routing_map"`
+	RoutingEpochMap          *ebpf.Map `ebpf:"routing_epoch_map"`
+	RoutingMetaMap           *ebpf.Map `ebpf:"routing_meta_map"`
+	ConnStateMap             *ebpf.Map `ebpf:"conn_state_map"`
+	UnusedLpmType            *ebpf.Map `ebpf:"unused_lpm_type"`
+	WanEgressRouteScratchMap *ebpf.Map `ebpf:"wan_egress_route_scratch_map"`
+	PktScratchMap            *ebpf.Map `ebpf:"pkt_scratch_map"`
 }
 
 func (m *bpfMaps) Close() error {
 	return _BpfClose(
 		m.ActiveRoutingEpochMap,
 		m.BpfStatsMap,
+		m.ConntrackArgsMap,
 		m.CookiePidMap,
 		m.DaeIfindexMap,
 		m.DomainRoutingMap,
@@ -278,13 +288,16 @@ func (m *bpfMaps) Close() error {
 		m.ListenSocketMap,
 		m.LpmArrayMap,
 		m.OutboundConnectivityMap,
+		m.ParseCtxScratchMap,
 		m.RedirectTrack,
+		m.RouteCtxScratchMap,
 		m.RoutingHandoffMap,
 		m.RoutingMap,
 		m.RoutingEpochMap,
 		m.RoutingMetaMap,
 		m.ConnStateMap,
 		m.UnusedLpmType,
+		m.WanEgressRouteScratchMap,
 		m.PktScratchMap,
 	)
 }

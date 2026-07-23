@@ -15,6 +15,7 @@ peer_link=dsmoke-udp-peer
 host_ip=198.19.0.1
 server_ip=198.19.0.2
 server_port=18081
+shutdown_timeout_seconds=${DAE_SMOKE_SHUTDOWN_TIMEOUT_SECONDS:-15}
 
 if [ "$#" -ge 1 ]; then
 	binary=$1
@@ -39,6 +40,10 @@ if [ ! -x "$binary" ]; then
 fi
 if ! [[ "$rounds" =~ ^[1-9][0-9]*$ ]]; then
 	echo "rounds must be a positive integer" >&2
+	exit 1
+fi
+if ! [[ "$shutdown_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
+	echo "DAE_SMOKE_SHUTDOWN_TIMEOUT_SECONDS must be a positive integer" >&2
 	exit 1
 fi
 
@@ -71,6 +76,46 @@ server_pid=
 mounted_here=0
 cleanup_done=0
 
+daemon_has_exited() {
+	local pid=$1
+	local state
+	if ! kill -0 "$pid" 2>/dev/null; then
+		return 0
+	fi
+	state=$(awk '{ print $3 }' "/proc/$pid/stat" 2>/dev/null || true)
+	[ "$state" = "Z" ]
+}
+
+wait_for_daemon_exit() {
+	local pid=$1
+	local timeout_seconds=$2
+	local deadline=$((SECONDS + timeout_seconds))
+	while ! daemon_has_exited "$pid"; do
+		if [ "$SECONDS" -ge "$deadline" ]; then
+			return 1
+		fi
+		sleep 1
+	done
+	wait "$pid" 2>/dev/null || true
+}
+
+stop_daemon() {
+	local log_file=$1
+	local pid=$daemon_pid
+	if [ -z "$pid" ]; then
+		return 0
+	fi
+	kill -TERM "$pid" 2>/dev/null || true
+	if ! wait_for_daemon_exit "$pid" "$shutdown_timeout_seconds"; then
+		echo "daemon did not exit within ${shutdown_timeout_seconds}s" >&2
+		if [ -f "$log_file" ]; then
+			cat "$log_file" >&2
+		fi
+		return 1
+	fi
+	daemon_pid=
+}
+
 cleanup() {
 	if [ "$cleanup_done" -eq 1 ]; then
 		return
@@ -83,9 +128,10 @@ cleanup() {
 	fi
 	if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null; then
 		kill -TERM "$daemon_pid" 2>/dev/null
-		sleep 2
-		kill -KILL "$daemon_pid" 2>/dev/null
-		wait "$daemon_pid" 2>/dev/null
+		if ! wait_for_daemon_exit "$daemon_pid" "$shutdown_timeout_seconds"; then
+			kill -KILL "$daemon_pid" 2>/dev/null
+			wait_for_daemon_exit "$daemon_pid" 5 || true
+		fi
 	fi
 	ip link del dae0 2>/dev/null
 	ip netns del daens 2>/dev/null
@@ -275,9 +321,9 @@ while [ "$round" -le "$rounds" ]; do
 	round=$((round + 1))
 done
 
-kill -TERM "$daemon_pid"
-wait "$daemon_pid" 2>/dev/null || true
-daemon_pid=
+if ! stop_daemon "$tmp_dir/daemon.log"; then
+	exit 1
+fi
 
 latency_summary=$(awk -F '\t' '
 {

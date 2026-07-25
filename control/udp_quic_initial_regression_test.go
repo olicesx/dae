@@ -32,7 +32,7 @@ func makeLikelyQuicInitialPayload(dcidSeed byte) []byte {
 	}
 }
 
-func setupQuicInitialRegressionTestState(t *testing.T) func() {
+func setupQuicInitialRegressionTestState(t testing.TB) func() {
 	t.Helper()
 
 	oldUdpPool := DefaultUdpEndpointPool
@@ -61,7 +61,7 @@ func setupQuicInitialRegressionTestState(t *testing.T) func() {
 	}
 }
 
-func newQuicInitialRegressionFlow(t *testing.T, payload []byte) (src, dst netip.AddrPort, decision UdpFlowDecision) {
+func newQuicInitialRegressionFlow(t testing.TB, payload []byte) (src, dst netip.AddrPort, decision UdpFlowDecision) {
 	t.Helper()
 
 	src = mustParseAddrPort("192.168.89.3:42687")

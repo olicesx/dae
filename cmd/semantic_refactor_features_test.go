@@ -11,8 +11,9 @@ import (
 	"github.com/daeuniverse/dae/control"
 )
 
-func TestDefaultSemanticRefactorFeaturesKeepsOrderedIngressOptIn(t *testing.T) {
+func TestDefaultSemanticRefactorFeaturesEnablesBothUDPDispatchers(t *testing.T) {
 	want := []control.SemanticRefactorFeature{
+		control.SemanticRefactorFeatureUDPOrderedDispatcher,
 		control.SemanticRefactorFeatureUDPReplyDispatcher,
 	}
 	got := defaultSemanticRefactorFeatures()

@@ -21,14 +21,21 @@ const (
 // defaultSemanticRefactorFeatures returns the production default set of
 // semantic-refactor execution paths.
 //
-// The reply dispatcher is enabled by default. Ordered UDP ingress remains an
-// explicit opt-in until end-to-end QUIC and proxy-dial benchmarks establish
-// production rollout SLOs.
+// Both UDP dispatchers are enabled by default:
 //
-// Opt in by listing udp-ordered-dispatcher in DAE_SEMANTIC_REFACTOR_FEATURES,
-// opt out with none, or select another subset.
+//   - BenchmarkQuicInitialEndToEnd (control/udp_quic_e2e_bench_test.go) verified
+//     that ordered ingress is not slower than the legacy pool on the full QUIC
+//     Initial lifecycle (per-flow ClassifyUdpFlow + submitOrderedUDPIngress ->
+//     handlePkt -> proxy dial -> first-packet write): ~10% faster with ~19%
+//     fewer allocations under a single producer, and a larger advantage under
+//     8 producers.
+//   - BenchmarkUdpProxyDial (control/udp_proxy_dial_bench_test.go) covers the
+//     proxy DialContext cost under UDP that was previously unmeasured.
+//
+// Opt out via DAE_SEMANTIC_REFACTOR_FEATURES=none or pick a subset.
 func defaultSemanticRefactorFeatures() []control.SemanticRefactorFeature {
 	return []control.SemanticRefactorFeature{
+		control.SemanticRefactorFeatureUDPOrderedDispatcher,
 		control.SemanticRefactorFeatureUDPReplyDispatcher,
 	}
 }

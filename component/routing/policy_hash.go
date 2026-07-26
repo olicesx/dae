@@ -9,11 +9,9 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"hash"
-	"net/netip"
-
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
+	"hash"
 )
 
 const normalizedPolicyHashSchema = "dae.normalized-policy.v1"
@@ -63,18 +61,9 @@ func (h *canonicalPolicyHasher) writeUint64(value uint64) {
 	h.writeRawBytes(h.scratch[:])
 }
 
-func (h *canonicalPolicyHasher) writeInt(value int) {
-	h.writeUint64(uint64(int64(value)))
-}
-
 func (h *canonicalPolicyHasher) writeString(value string) {
 	h.writeUint64(uint64(len(value)))
 	h.writeRawString(value)
-}
-
-func (h *canonicalPolicyHasher) writeBytes(value []byte) {
-	h.writeUint64(uint64(len(value)))
-	h.writeRawBytes(value)
 }
 
 func (h *canonicalPolicyHasher) writeRawString(value string) {
@@ -194,42 +183,3 @@ func hashNormalizedProgram(program *NormalizedProgram) ([sha256.Size]byte, error
 	}
 	return hasher.sum(), nil
 }
-
-func (h *canonicalPolicyHasher) writeStrings(values []string) {
-	h.writeBool(values != nil)
-	h.writeUint64(uint64(len(values)))
-	for _, value := range values {
-		h.writeString(value)
-	}
-}
-
-func (h *canonicalPolicyHasher) writePrefix(prefix netip.Prefix) {
-	address := prefix.Addr()
-	h.writeBool(address.IsValid())
-	h.writeBool(address.Is4())
-	h.writeString(address.Zone())
-	switch {
-	case address.Is4():
-		bytes := address.As4()
-		h.writeBytes(bytes[:])
-	case address.IsValid():
-		bytes := address.As16()
-		h.writeBytes(bytes[:])
-	default:
-		h.writeBytes(nil)
-	}
-	h.writeInt(prefix.Bits())
-}
-
-func (h *canonicalPolicyHasher) writePrefixSets(prefixSets [][]netip.Prefix) {
-	h.writeBool(prefixSets != nil)
-	h.writeUint64(uint64(len(prefixSets)))
-	for _, prefixes := range prefixSets {
-		h.writeBool(prefixes != nil)
-		h.writeUint64(uint64(len(prefixes)))
-		for _, prefix := range prefixes {
-			h.writePrefix(prefix)
-		}
-	}
-}
-

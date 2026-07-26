@@ -1734,9 +1734,9 @@ func (c *ControlPlane) dnsControllerOption() *DnsControllerOption {
 	policyIdentity := c.PolicyIdentity()
 	routeProjectionEpoch := uint64(policyIdentity.Epoch())
 	return &DnsControllerOption{
-		Log:                c.log,
-		LifecycleContext:   c.ctx,
-		ConcurrencyLimit:   0,
+		Log:              c.log,
+		LifecycleContext: c.ctx,
+		ConcurrencyLimit: 0,
 		CacheAccessCallback: func(cache *DnsCache) (err error) {
 			if err = c.core.BatchUpdateDomainRouting(cache); err != nil {
 				if stderrors.Is(err, ErrBpfMapFull) {
@@ -4206,12 +4206,6 @@ func (c *ControlPlane) ListenAndServe(readyChan chan<- bool, port uint16) (liste
 	}
 
 	return listener, nil
-}
-
-func (c *ControlPlane) chooseBestDnsDialer(
-	ctx context.Context, req *udpRequest, dnsUpstream *dns.Upstream,
-) (*dialArgument, error) {
-	return c.chooseBestDnsDialerSnapshot(ctx, dnsRequestSnapshotFromUDPRequest(req), dnsUpstream)
 }
 
 func (c *ControlPlane) chooseBestDnsDialerSnapshot(

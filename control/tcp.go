@@ -156,16 +156,6 @@ func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn, ownership
 	return c.handleConnWithRoutingResultOwned(ctx, lConn, src, dst, routingResult, ownership)
 }
 
-func (c *ControlPlane) handleConnWithRoutingResult(
-	ctx context.Context,
-	lConn net.Conn,
-	src netip.AddrPort,
-	dst netip.AddrPort,
-	routingResult *bpfRoutingResult,
-) (err error) {
-	return c.handleConnWithRoutingResultOwned(ctx, lConn, src, dst, routingResult, nil)
-}
-
 func (c *ControlPlane) handleConnWithRoutingResultOwned(
 	ctx context.Context,
 	lConn net.Conn,

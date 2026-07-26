@@ -95,18 +95,18 @@ type DnsControllerOption struct {
 }
 
 type dnsControllerRuntimeState struct {
-	routing                   *dns.Dns
-	lifecycleCtx              context.Context
-	cacheAccessCallback       func(cache *DnsCache) (err error)
-	cacheRemoveCallback       func(cache *DnsCache) (err error)
-	cacheDeleteCallback       func(cacheKey string, cache *DnsCache) (err error)
-	newCache                  func(fqdn string, answers, ns, extra []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
-	routeProjectionEpoch      uint64
-	routeProjectionHash       [32]byte
-	projectCacheRoute         func(cache *DnsCache) []uint32
-	bestDialerChooser         func(ctx context.Context, snapshot DnsRequestSnapshot, upstream *dns.Upstream) (*dialArgument, error)
-	timeoutExceedCallback     func(dialArgument *dialArgument, err error)
-	fixedDomainTtl            map[string]int
+	routing               *dns.Dns
+	lifecycleCtx          context.Context
+	cacheAccessCallback   func(cache *DnsCache) (err error)
+	cacheRemoveCallback   func(cache *DnsCache) (err error)
+	cacheDeleteCallback   func(cacheKey string, cache *DnsCache) (err error)
+	newCache              func(fqdn string, answers, ns, extra []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
+	routeProjectionEpoch  uint64
+	routeProjectionHash   [32]byte
+	projectCacheRoute     func(cache *DnsCache) []uint32
+	bestDialerChooser     func(ctx context.Context, snapshot DnsRequestSnapshot, upstream *dns.Upstream) (*dialArgument, error)
+	timeoutExceedCallback func(dialArgument *dialArgument, err error)
+	fixedDomainTtl        map[string]int
 }
 
 type dnsKnowledgeEntry struct {
@@ -722,18 +722,18 @@ func (c *DnsController) updateRuntime(option *DnsControllerOption, routing *dns.
 		lifecycleCtx = context.Background()
 	}
 	runtimeState := &dnsControllerRuntimeState{
-		routing:                   routing,
-		lifecycleCtx:              lifecycleCtx,
-		cacheAccessCallback:       option.CacheAccessCallback,
-		cacheRemoveCallback:       option.CacheRemoveCallback,
-		cacheDeleteCallback:       option.CacheDeleteCallback,
-		newCache:                  option.NewCache,
-		routeProjectionEpoch:      option.RouteProjectionEpoch,
-		routeProjectionHash:       option.RouteProjectionHash,
-		projectCacheRoute:         option.ProjectCacheRoute,
-		bestDialerChooser:         option.BestDialerChooser,
-		timeoutExceedCallback:     option.TimeoutExceedCallback,
-		fixedDomainTtl:            option.FixedDomainTtl,
+		routing:               routing,
+		lifecycleCtx:          lifecycleCtx,
+		cacheAccessCallback:   option.CacheAccessCallback,
+		cacheRemoveCallback:   option.CacheRemoveCallback,
+		cacheDeleteCallback:   option.CacheDeleteCallback,
+		newCache:              option.NewCache,
+		routeProjectionEpoch:  option.RouteProjectionEpoch,
+		routeProjectionHash:   option.RouteProjectionHash,
+		projectCacheRoute:     option.ProjectCacheRoute,
+		bestDialerChooser:     option.BestDialerChooser,
+		timeoutExceedCallback: option.TimeoutExceedCallback,
+		fixedDomainTtl:        option.FixedDomainTtl,
 	}
 	c.runtimeMu.Lock()
 	c.runtimeState.Store(runtimeState)

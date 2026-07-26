@@ -770,16 +770,6 @@ func (m *SessionManager) GenerationIdle(epoch routing.PolicyEpoch) <-chan struct
 	return ch
 }
 
-func (m *SessionManager) flowForIngress(ingress net.Conn) (*FlowRuntime, bool) {
-	if m == nil || ingress == nil {
-		return nil, false
-	}
-	m.mu.RLock()
-	flow, ok := m.flows[ingress]
-	m.mu.RUnlock()
-	return flow, ok
-}
-
 func (m *SessionManager) isTCPConnStatePinned(key bpfTuplesKey) bool {
 	if m == nil {
 		return false

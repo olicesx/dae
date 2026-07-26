@@ -138,10 +138,7 @@ func (c *controlPlaneCore) PrepareRoutingEpoch(epoch routing.PolicyEpoch, shared
 	if c == nil {
 		return 0, nil
 	}
-	phase1Recorder, phase1StartedAt := beginPhase1BPFPublishObservation()
 	if epoch == 0 {
-		observePhase0RoutingEpoch(phase0RoutingEpochPrepare, phase0ObservationFailure)
-		endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishPrepare, phase1BPFPublishFailure)
 		return 0, fmt.Errorf("routing policy epoch must be non-zero")
 	}
 
@@ -151,8 +148,6 @@ func (c *controlPlaneCore) PrepareRoutingEpoch(epoch routing.PolicyEpoch, shared
 
 	active, err := c.readActiveRoutingEpochSlot()
 	if err != nil {
-		observePhase0RoutingEpoch(phase0RoutingEpochPrepare, phase0ObservationFailure)
-		endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishPrepare, phase1BPFPublishFailure)
 		return 0, err
 	}
 	target := active
@@ -168,8 +163,6 @@ func (c *controlPlaneCore) PrepareRoutingEpoch(epoch routing.PolicyEpoch, shared
 	c.routingEpochRollbackOff.Store(false)
 	c.routingEpochSlot.Store(target)
 	c.routingEpochPolicyEpoch.Store(uint64(epoch))
-	observePhase0RoutingEpoch(phase0RoutingEpochPrepare, phase0ObservationSuccess)
-	endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishPrepare, phase1BPFPublishSuccess)
 	return target, nil
 }
 
@@ -196,38 +189,28 @@ func (c *controlPlaneCore) StageRoutingEpoch() error {
 	if c == nil {
 		return nil
 	}
-	phase1Recorder, phase1StartedAt := beginPhase1BPFPublishObservation()
 	c.routingEpochMu.Lock()
 	defer c.routingEpochMu.Unlock()
 	c.clearStagedRoutingEpochLocked()
 
 	bpf := c.PeekBpf()
 	if !c.hasRoutingEpochMaps(bpf) {
-		endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishStage, phase1BPFPublishSuccess)
 		return nil
 	}
 	slot := c.routingEpochSlot.Load()
 	epoch := c.routingEpochPolicyEpoch.Load()
 	if !validRoutingEpochSlot(slot) {
-		observePhase0RoutingEpoch(phase0RoutingEpochStage, phase0ObservationFailure)
-		endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishStage, phase1BPFPublishFailure)
 		return fmt.Errorf("routing epoch slot %d is invalid", slot)
 	}
 	if epoch == 0 {
-		observePhase0RoutingEpoch(phase0RoutingEpochStage, phase0ObservationFailure)
-		endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishStage, phase1BPFPublishFailure)
 		return fmt.Errorf("routing epoch slot %d has no policy epoch", slot)
 	}
 	if err := bpf.RoutingEpochMap.Update(slot, epoch, ebpf.UpdateAny); err != nil {
-		observePhase0RoutingEpoch(phase0RoutingEpochStage, phase0ObservationFailure)
-		endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishStage, phase1BPFPublishFailure)
 		return fmt.Errorf("stage routing epoch %d in slot %d: %w", epoch, slot, err)
 	}
 	c.routingEpochStaged = true
 	c.routingEpochStagedSlot = slot
 	c.routingEpochStagedEpoch = epoch
-	observePhase0RoutingEpoch(phase0RoutingEpochStage, phase0ObservationSuccess)
-	endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishStage, phase1BPFPublishSuccess)
 	return nil
 }
 
@@ -238,29 +221,21 @@ func (c *controlPlaneCore) PublishRoutingEpoch() error {
 	if c == nil {
 		return nil
 	}
-	phase1Recorder, phase1StartedAt := beginPhase1BPFPublishObservation()
 	c.routingEpochMu.Lock()
 	defer c.routingEpochMu.Unlock()
 
 	bpf := c.PeekBpf()
 	if !c.hasRoutingEpochMaps(bpf) {
-		endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishPublish, phase1BPFPublishSuccess)
 		return nil
 	}
 	slot := c.routingEpochSlot.Load()
 	epoch := c.routingEpochPolicyEpoch.Load()
 	if !validRoutingEpochSlot(slot) || epoch == 0 || !c.hasStagedRoutingEpochLocked(slot, epoch) {
-		observePhase0RoutingEpoch(phase0RoutingEpochPublish, phase0ObservationFailure)
-		endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishPublish, phase1BPFPublishFailure)
 		return fmt.Errorf("routing epoch slot %d with policy epoch %d has not been staged", slot, epoch)
 	}
 	if err := bpf.ActiveRoutingEpochMap.Update(uint32(0), slot, ebpf.UpdateAny); err != nil {
-		observePhase0RoutingEpoch(phase0RoutingEpochPublish, phase0ObservationFailure)
-		endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishPublish, phase1BPFPublishFailure)
 		return fmt.Errorf("publish routing epoch slot %d: %w", slot, err)
 	}
-	observePhase0RoutingEpoch(phase0RoutingEpochPublish, phase0ObservationSuccess)
-	endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishPublish, phase1BPFPublishSuccess)
 	return nil
 }
 
@@ -270,31 +245,23 @@ func (c *controlPlaneCore) RollbackRoutingEpoch() error {
 	if c == nil {
 		return nil
 	}
-	phase1Recorder, phase1StartedAt := beginPhase1BPFPublishObservation()
 	c.routingEpochMu.Lock()
 	defer c.routingEpochMu.Unlock()
 
 	bpf := c.PeekBpf()
 	if !c.hasRoutingEpochMaps(bpf) {
-		endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishRollback, phase1BPFPublishSuccess)
 		return nil
 	}
 	if c.routingEpochRollbackOff.Load() {
-		endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishRollback, phase1BPFPublishSuccess)
 		return nil
 	}
 	previous := c.routingEpochPreviousSlot.Load()
 	if !validRoutingEpochSlot(previous) {
-		endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishRollback, phase1BPFPublishSuccess)
 		return nil
 	}
 	if err := bpf.ActiveRoutingEpochMap.Update(uint32(0), previous, ebpf.UpdateAny); err != nil {
-		observePhase0RoutingEpoch(phase0RoutingEpochRollback, phase0ObservationFailure)
-		endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishRollback, phase1BPFPublishFailure)
 		return fmt.Errorf("rollback routing epoch slot %d: %w", previous, err)
 	}
-	observePhase0RoutingEpoch(phase0RoutingEpochRollback, phase0ObservationSuccess)
-	endPhase1BPFPublishObservation(phase1Recorder, phase1StartedAt, phase1BPFPublishRollback, phase1BPFPublishSuccess)
 	return nil
 }
 

@@ -19,36 +19,12 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/consts"
-	"github.com/daeuniverse/dae/component/routing"
 	"golang.org/x/sys/unix"
 )
 
-// Route applies the legacy matcher to a final routing input. An empty domain
-// therefore means a known-absent fact for this invocation; callers that are
-// still waiting for sniffing evidence use routeWithDomainFacts internally.
+// Route resolves a routing input with the userspace matcher. An empty domain
+// means no domain is known for this invocation.
 func (c *ControlPlane) Route(src, dst netip.AddrPort, domain string, l4proto consts.L4ProtoType, routingResult *bpfRoutingResult) (outboundIndex consts.OutboundIndex, mark uint32, must bool, err error) {
-	return c.routeWithDomainFacts(
-		src,
-		dst,
-		domain,
-		l4proto,
-		routingResult,
-		true,
-		routeEvidenceForDomain(dst, domain),
-	)
-}
-
-// routeWithDomainFacts evaluates the legacy matcher while supplying the
-// shadow path with whether this caller has finalized its domain observation.
-// Legacy routing remains authoritative regardless of the supplied facts.
-func (c *ControlPlane) routeWithDomainFacts(
-	src, dst netip.AddrPort,
-	domain string,
-	l4proto consts.L4ProtoType,
-	routingResult *bpfRoutingResult,
-	domainKnown bool,
-	evidence routing.EvidenceSource,
-) (outboundIndex consts.OutboundIndex, mark uint32, must bool, err error) {
 	var ipVersion consts.IpVersionType
 	if dst.Addr().Is4() || dst.Addr().Is4In6() {
 		ipVersion = consts.IpVersion_4
@@ -71,71 +47,7 @@ func (c *ControlPlane) routeWithDomainFacts(
 		routingResult.Dscp,
 		mac16,
 	)
-	if err == nil && c.decisionShadow != nil {
-		c.decisionShadow.Observe(c.newPhase4DecisionShadowInput(src, dst, domain, l4proto, routingResult, domainKnown, evidence), LegacyRouteOutcome{
-			Outbound: outboundIndex,
-			Mark:     mark,
-			Must:     must,
-		})
-	}
 	return
-}
-
-func (c *ControlPlane) observePendingRoute(
-	src, dst netip.AddrPort,
-	l4proto consts.L4ProtoType,
-	routingResult *bpfRoutingResult,
-) {
-	if c == nil || c.decisionShadow == nil || routingResult == nil {
-		return
-	}
-	c.decisionShadow.ObservePending(c.newPhase4DecisionShadowInput(
-		src,
-		dst,
-		"",
-		l4proto,
-		routingResult,
-		false,
-		routing.EvidenceNone,
-	))
-}
-
-func (c *ControlPlane) newPhase4DecisionShadowInput(
-	src, dst netip.AddrPort,
-	domain string,
-	l4proto consts.L4ProtoType,
-	routingResult *bpfRoutingResult,
-	domainKnown bool,
-	evidence routing.EvidenceSource,
-) phase4DecisionShadowInput {
-	routingSlot, routingSlotKnown := decodeBpfRoutingEpochSlot(routingResult.RoutingEpochSlot)
-	if !routingSlotKnown && c.core != nil {
-		routingSlot = c.core.RoutingEpochSlot()
-	}
-	return phase4DecisionShadowInput{
-		source:           src,
-		destination:      dst,
-		l4Proto:          l4proto,
-		domain:           domain,
-		domainKnown:      domainKnown,
-		evidence:         evidence,
-		processName:      routingResult.Pname,
-		pid:              routingResult.Pid,
-		dscp:             routingResult.Dscp,
-		mac:              routingResult.Mac,
-		routingSlot:      routingSlot,
-		routingSlotKnown: routingSlotKnown,
-	}
-}
-
-func routeEvidenceForDomain(dst netip.AddrPort, domain string) routing.EvidenceSource {
-	if domain == "" {
-		return routing.EvidenceNone
-	}
-	if dst.Port() == 53 {
-		return routing.EvidenceDNSAssociation
-	}
-	return routing.EvidenceTLSSNI
 }
 
 func bpfTuplesKeyFromAddrPorts(src, dst netip.AddrPort, l4proto uint8) bpfTuplesKey {
@@ -155,30 +67,18 @@ func (c *controlPlaneCore) RetrieveRoutingResult(src, dst netip.AddrPort, l4prot
 	tuples := bpfTuplesKeyFromAddrPorts(src, dst, l4proto)
 
 	if c == nil || c.bpf.Load() == nil {
-		observePhase1RoutingLookup(phase1RoutingLookupUnavailable, phase1RoutingLookupMiss)
 		return nil, ebpf.ErrKeyNotExist
 	}
 
 	routingResult, err := c.retrieveEmbeddedRoutingResult(&tuples, l4proto)
 	if err == nil {
-		observePhase1RoutingLookup(phase1RoutingLookupEmbedded, phase1RoutingLookupHit)
 		return routingResult, nil
 	}
 	if !stderrors.Is(err, ebpf.ErrKeyNotExist) {
-		observePhase1RoutingLookup(phase1RoutingLookupEmbedded, phase1RoutingLookupFailure)
 		return nil, err
 	}
 
-	routingResult, err = c.retrieveRoutingHandoffResult(&tuples)
-	switch {
-	case err == nil:
-		observePhase1RoutingLookup(phase1RoutingLookupHandoff, phase1RoutingLookupHit)
-	case stderrors.Is(err, ebpf.ErrKeyNotExist):
-		observePhase1RoutingLookup(phase1RoutingLookupHandoff, phase1RoutingLookupMiss)
-	default:
-		observePhase1RoutingLookup(phase1RoutingLookupHandoff, phase1RoutingLookupFailure)
-	}
-	return routingResult, err
+	return c.retrieveRoutingHandoffResult(&tuples)
 }
 
 func (c *controlPlaneCore) retrieveEmbeddedRoutingResult(tuples *bpfTuplesKey, l4proto uint8) (*bpfRoutingResult, error) {

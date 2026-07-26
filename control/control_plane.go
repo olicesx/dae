@@ -112,7 +112,6 @@ type ControlPlane struct {
 	soMarkFromDae                  uint32
 	mptcp                          bool
 	udpRouteScopeSensitive         bool
-	udpUnorderedRunner             *udpUnorderedTaskRunner
 	udpOrderedDispatcher           *udpOrderedDispatcher
 	udpOrderedDispatcherShared     bool
 	udpReplyDispatcher             *udpReplyDispatcher
@@ -876,8 +875,7 @@ func newControlPlaneWithContextOptions(
 	}
 	routingA.Rules = nil // Release.
 	policyEpoch := routing.PolicyEpoch(policyEpochSequence.Add(1))
-	decisionShadowSetting := phase4DecisionShadowSettingValue.Load()
-	needsPolicySnapshot := requiresFullPolicySnapshot(refactorFeatures, decisionShadowSetting)
+	needsPolicySnapshot := requiresFullPolicySnapshot(refactorFeatures)
 	var (
 		policyIdentity routing.PolicyIdentity
 		policySnapshot *routing.PolicySnapshot
@@ -930,12 +928,10 @@ func newControlPlaneWithContextOptions(
 			return nil, fmt.Errorf("NewRoutingMatcherBuilder: %w", err)
 		}
 	}
-	if decisionShadowSetting == nil {
-		// The builder owns all data needed below. Drop source/compiler references
-		// before BuildUserspace reaches its routing-build GC checkpoint.
-		policySnapshot = nil
-		compiledPolicy = nil
-	}
+	// The builder owns all data needed below. Drop source/compiler references
+	// before BuildUserspace reaches its routing-build GC checkpoint.
+	policySnapshot = nil
+	compiledPolicy = nil
 	kernspaceSnapshot := builder.KernspaceSnapshot()
 	if !buildOpts.delayDatapathCommit {
 		log.Infoln("Loading routing rules into kernel space (BPF)...")
@@ -958,14 +954,6 @@ func newControlPlaneWithContextOptions(
 	routingMatcher, err := builder.BuildUserspace()
 	if err != nil {
 		return nil, fmt.Errorf("RoutingMatcherBuilder.BuildUserspace: %w", err)
-	}
-	var decisionShadow *phase4DecisionShadow
-	if decisionShadowSetting != nil {
-		decisionShadow, err = newPhase4DecisionShadowWithProcessState(policySnapshot, compiledPolicy, decisionShadowSetting.sampleEvery, decisionShadowSetting.state)
-		if err != nil {
-			return nil, fmt.Errorf("create phase 4 decision shadow: %w", err)
-		}
-		decisionShadow.setLiveMatcher(routingMatcher)
 	}
 
 	// Get referenced outbounds to limit health checks.
@@ -1025,7 +1013,6 @@ func newControlPlaneWithContextOptions(
 			policyIdentity:      policyIdentity,
 			policySnapshot:      policySnapshot,
 			routingMatcher:      routingMatcher,
-			decisionShadow:      decisionShadow,
 			bootstrapResolvers:  bootstrapResolvers,
 		},
 		controlPlaneDNSRuntime:      newControlPlaneDNSRuntime(buildOpts.delayDNSListenerStart),
@@ -1054,7 +1041,6 @@ func newControlPlaneWithContextOptions(
 		soMarkFromDae:               global.SoMarkFromDae,
 		mptcp:                       global.Mptcp,
 		udpRouteScopeSensitive:      builder.UsesPacketMetadataRouting(),
-		udpUnorderedRunner:          newDefaultUdpUnorderedTaskRunner(cctx),
 		failedQuicDcidCache:         newFailedQuicDcidCache(failedQuicDcidCacheMaxEntries),
 	}
 	SetFailedQuicDcidCache(plane.failedQuicDcidCache)
@@ -4173,20 +4159,12 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				c.udpIngressAdmission.release()
 				pktBuf.Put()
 			}
-			switch flowDecision.DispatchStrategy() {
-			case StrategyOrderedIngress:
-				if !c.submitOrderedUDPIngress(flowDecision.Key, task, discardTask) {
-					discardTask()
-				}
-			case StrategyDirectGoroutine:
+			if flowDecision.DispatchStrategy() == StrategyDirectGoroutine {
 				// DNS, VoIP, and other low-latency exception traffic bypasses the
 				// ordered per-flow queue and runs immediately.
 				go task()
-			default:
-				// Defensive fallback for unknown future strategy values.
-				if !c.udpUnorderedRunner.Submit(flowDecision.Key, task) {
-					discardTask()
-				}
+			} else if !c.submitOrderedUDPIngress(flowDecision.Key, task, discardTask) {
+				discardTask()
 			}
 			// if d := time.Since(t); d > 100*time.Millisecond {
 			// 	logrus.Println(d)
@@ -4371,14 +4349,12 @@ func (c *ControlPlane) chooseBestDnsDialerSnapshot(
 			default:
 				return nil, fmt.Errorf("unexpected ipversion: %v", ver)
 			}
-			outboundIndex, mark, _, err := c.routeWithDomainFacts(
+			outboundIndex, mark, _, err := c.Route(
 				snapshot.RealSrc,
 				netip.AddrPortFrom(dAddr, dnsUpstream.Port),
 				dnsUpstream.Hostname,
 				proto.ToL4ProtoType(),
 				snapshot.routingResultForRoute(),
-				true,
-				routing.EvidenceDNSAssociation,
 			)
 			if err != nil {
 				return nil, err

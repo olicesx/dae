@@ -458,23 +458,12 @@ func (c *DnsController) restoreReloadCache(entries map[string]*DnsCache, matchDo
 			_, loaded := c.storeDnsCache(k, restored)
 			c.rememberDnsKnowledge(dnsCacheBaseKey(k), restored.OriginalDeadline, !loaded)
 			if projectSynchronously && rt != nil && rt.cacheAccessCallback != nil {
-				projectionRecorder, projectionStartedAt := beginPhase0DNSProjectionObservation()
 				if err := rt.cacheAccessCallback(restored); err != nil {
-					projectionRecorder.recordDNSProjection(
-						phase0DNSProjectionReloadSync,
-						phase0DNSProjectionFailed,
-						projectionStartedAt,
-					)
 					c.cacheProjectionMu.Unlock()
 					c.runtimeMu.RUnlock()
 					return count, fmt.Errorf("project restored DNS cache %q: %w", k, err)
 				}
 				restored.MarkBpfUpdated(now)
-				projectionRecorder.recordDNSProjection(
-					phase0DNSProjectionReloadSync,
-					phase0DNSProjectionApplied,
-					projectionStartedAt,
-				)
 			} else {
 				c.triggerBpfUpdateIfNeededForRuntime(restored, now, rt)
 			}
@@ -493,19 +482,6 @@ type bpfUpdateTask struct {
 	cache                *DnsCache
 	routeProjectionEpoch uint64
 	retryAttempt         uint8
-	observation          *bpfUpdateTaskObservation
-}
-
-type bpfUpdateTaskObservation struct {
-	recorder  *phase0Observability
-	startedAt time.Time
-}
-
-func newBpfUpdateTaskObservation(recorder *phase0Observability, startedAt time.Time) *bpfUpdateTaskObservation {
-	if recorder == nil {
-		return nil
-	}
-	return &bpfUpdateTaskObservation{recorder: recorder, startedAt: startedAt}
 }
 
 const (
@@ -649,12 +625,6 @@ func bpfProjectionRetryDelay(attempt uint8) time.Duration {
 		return bpfProjectionRetryMaxDelay
 	}
 	return delay
-}
-
-func (task *bpfUpdateTask) observePhase0DNSProjection(outcome phase0DNSProjectionOutcome) {
-	if task != nil && task.observation != nil {
-		task.observation.recorder.recordDNSProjection(phase0DNSProjectionAsync, outcome, task.observation.startedAt)
-	}
 }
 
 // cacheEntry represents a DNS cache entry with its access time for LRU eviction.
@@ -1356,7 +1326,6 @@ func (c *DnsController) processBpfUpdateTaskInternal(task *bpfUpdateTask, draini
 		return false, false
 	}
 	if c.bpfUpdateClosed.Load() {
-		task.observePhase0DNSProjection(phase0DNSProjectionStale)
 		return true, false
 	}
 	c.runtimeMu.RLock()
@@ -1364,16 +1333,13 @@ func (c *DnsController) processBpfUpdateTaskInternal(task *bpfUpdateTask, draini
 	c.cacheProjectionMu.RLock()
 	defer c.cacheProjectionMu.RUnlock()
 	if c.bpfUpdateClosed.Load() {
-		task.observePhase0DNSProjection(phase0DNSProjectionStale)
 		return true, false
 	}
 	rt := c.runtime()
 	if !c.bpfUpdateTaskCurrent(task, rt) {
-		task.observePhase0DNSProjection(phase0DNSProjectionStale)
 		return true, false
 	}
 	if err := rt.cacheAccessCallback(task.cache); err != nil {
-		task.observePhase0DNSProjection(phase0DNSProjectionFailed)
 		if c.log != nil {
 			suffix := ""
 			if draining {
@@ -1387,7 +1353,6 @@ func (c *DnsController) processBpfUpdateTaskInternal(task *bpfUpdateTask, draini
 		failed = true
 	} else {
 		task.cache.MarkBpfUpdated(time.Now())
-		task.observePhase0DNSProjection(phase0DNSProjectionApplied)
 	}
 	return true, failed
 }
@@ -1654,11 +1619,9 @@ func (c *DnsController) triggerBpfUpdateIfNeededForRuntime(cache *DnsCache, now 
 		return
 	}
 
-	projectionRecorder, projectionStartedAt := beginPhase0DNSProjectionObservation()
 	task := &bpfUpdateTask{
 		cache:                cache,
 		routeProjectionEpoch: rt.routeProjectionEpoch,
-		observation:          newBpfUpdateTaskObservation(projectionRecorder, projectionStartedAt),
 	}
 	if !c.sendBpfUpdateTask(task) {
 		c.scheduleBpfProjectionRetry(task)
@@ -1672,14 +1635,12 @@ func (c *DnsController) sendBpfUpdateTask(task *bpfUpdateTask) (sent bool) {
 	// Check if controller is shutting down before attempting send.
 	// This avoids the data race of reading bpfUpdateStop while it's being initialized.
 	if c.bpfUpdateClosed.Load() {
-		task.observePhase0DNSProjection(phase0DNSProjectionQueueDrop)
 		return false
 	}
 	c.bpfUpdateStopMu.Lock()
 	bpfUpdateCh := c.bpfUpdateCh
 	c.bpfUpdateStopMu.Unlock()
 	if bpfUpdateCh == nil {
-		task.observePhase0DNSProjection(phase0DNSProjectionQueueDrop)
 		return false
 	}
 
@@ -1691,7 +1652,6 @@ func (c *DnsController) sendBpfUpdateTask(task *bpfUpdateTask) (sent bool) {
 	default:
 		// Queue is full; the caller decides whether this cache is eligible for
 		// a bounded delayed retry.
-		task.observePhase0DNSProjection(phase0DNSProjectionQueueDrop)
 		return false
 	}
 }
@@ -2163,11 +2123,9 @@ func (c *DnsController) LookupDnsRespCache(cacheKey string, ignoreFixedTtl bool)
 // Falls back to an owned in-place TTL-aware pack if pre-packed response is not available.
 func (c *DnsController) LookupDnsRespCache_(msg *dnsmessage.Msg, cacheKey string, ignoreFixedTtl bool) (resp []byte, needRefresh bool) {
 	c.requireStore()
-	phase1Recorder, phase1StartedAt := beginPhase1DNSCacheObservation()
 	// Load cache directly without expiry check (to support optimistic cache)
 	val, ok := c.dnsCache.Load(cacheKey)
 	if !ok {
-		endPhase1DNSCacheObservation(phase1Recorder, phase1StartedAt, phase1DNSCacheMiss)
 		return nil, false
 	}
 	cache := val.(*DnsCache)
@@ -2199,7 +2157,6 @@ func (c *DnsController) LookupDnsRespCache_(msg *dnsmessage.Msg, cacheKey string
 			// Fresh cache hit - return immediately
 			// Trigger async BPF update if needed
 			c.triggerBpfUpdateIfNeeded(cache, now)
-			endPhase1DNSCacheObservation(phase1Recorder, phase1StartedAt, phase1DNSCacheHit)
 			return resp, false
 		}
 
@@ -2208,10 +2165,8 @@ func (c *DnsController) LookupDnsRespCache_(msg *dnsmessage.Msg, cacheKey string
 		// to mutate it in place, so this avoids the extra request copy on the
 		// remaining TTL-aware cache-hit fallback.
 		if resp = cache.fillIntoWithTTLInPlace(msg, now); resp != nil {
-			endPhase1DNSCacheObservation(phase1Recorder, phase1StartedAt, phase1DNSCacheHit)
 			return resp, false
 		}
-		endPhase1DNSCacheObservation(phase1Recorder, phase1StartedAt, phase1DNSCacheUnavailable)
 		return nil, false
 	}
 
@@ -2226,7 +2181,6 @@ func (c *DnsController) LookupDnsRespCache_(msg *dnsmessage.Msg, cacheKey string
 			if cache.refreshing.CompareAndSwap(false, true) {
 				needRefresh = true
 			}
-			endPhase1DNSCacheObservation(phase1Recorder, phase1StartedAt, phase1DNSCacheStale)
 			return resp, needRefresh
 		}
 	}
@@ -2234,7 +2188,6 @@ func (c *DnsController) LookupDnsRespCache_(msg *dnsmessage.Msg, cacheKey string
 	// Cache expired and beyond stale window (or optimistic cache disabled)
 	// Evict the cache
 	c.evictDnsRespCacheIfSame(cacheKey, cache)
-	endPhase1DNSCacheObservation(phase1Recorder, phase1StartedAt, phase1DNSCacheUnavailable)
 	return nil, false
 }
 

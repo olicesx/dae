@@ -10,55 +10,41 @@ import "testing"
 func TestActiveControlPlanePublicationHandoff(t *testing.T) {
 	resetActiveControlPlanePublicationForTest(t)
 
-	oldPlane := testControlPlaneWithDecisionShadow(3, 3)
-	newPlane := testControlPlaneWithDecisionShadow(7, 7)
+	oldPlane := &ControlPlane{}
+	newPlane := &ControlPlane{}
 
 	oldPlane.publishActiveControlPlane()
-	assertActiveDecisionShadowSampled(t, 3)
+	assertActiveControlPlane(t, oldPlane)
 
 	newPlane.publishActiveControlPlane()
-	assertActiveDecisionShadowSampled(t, 7)
+	assertActiveControlPlane(t, newPlane)
 }
 
+// A retiring generation unpublishes after its successor has already taken over.
+// That late unpublish must not clear the successor, or process-wide lookups
+// would report no active control plane while one is serving traffic.
 func TestActiveControlPlaneStaleUnpublishKeepsSuccessor(t *testing.T) {
 	resetActiveControlPlanePublicationForTest(t)
 
-	oldPlane := testControlPlaneWithDecisionShadow(3, 3)
-	newPlane := testControlPlaneWithDecisionShadow(7, 7)
+	oldPlane := &ControlPlane{}
+	newPlane := &ControlPlane{}
 	oldPlane.publishActiveControlPlane()
 	newPlane.publishActiveControlPlane()
 
 	oldPlane.unpublishActiveControlPlane()
-	assertActiveDecisionShadowSampled(t, 7)
+	assertActiveControlPlane(t, newPlane)
 
 	newPlane.unpublishActiveControlPlane()
-	if _, enabled := SnapshotActivePhase4DecisionShadow(); enabled {
-		t.Fatal("decision shadow remains enabled after active generation unpublish")
-	}
+	assertActiveControlPlane(t, nil)
 }
 
-func testControlPlaneWithDecisionShadow(sampled, matched uint64) *ControlPlane {
-	shadow := &phase4DecisionShadow{
-		sampleEvery:  1,
-		processState: &phase4DecisionShadowProcessState{},
-	}
-	shadow.sampled.Store(sampled)
-	shadow.matched.Store(matched)
-	return &ControlPlane{
-		controlPlaneGenerationState: controlPlaneGenerationState{
-			decisionShadow: shadow,
-		},
-	}
-}
-
-func assertActiveDecisionShadowSampled(t *testing.T, want uint64) {
+func assertActiveControlPlane(t *testing.T, want *ControlPlane) {
 	t.Helper()
-	snapshot, enabled := SnapshotActivePhase4DecisionShadow()
-	if !enabled {
-		t.Fatal("active decision shadow is disabled")
-	}
-	if snapshot.Sampled != want {
-		t.Fatalf("active decision shadow Sampled = %d, want %d", snapshot.Sampled, want)
+	activeControlPlanePublication.mu.RLock()
+	got := activeControlPlanePublication.plane.Load()
+	activeControlPlanePublication.mu.RUnlock()
+	if got != want {
+		t.Fatalf("active control plane = %p, want %p", got, want)
 	}
 }
 

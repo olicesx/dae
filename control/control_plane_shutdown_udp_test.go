@@ -357,35 +357,9 @@ func TestControlPlaneClose_ReleasesRetainedState(t *testing.T) {
 		t.Fatalf("ControlPlane.Close() error = %v", err)
 	}
 
-	if plane.outbounds != nil {
-		t.Fatal("expected outbounds to be released on close")
-	}
-	if plane.referencedOutbounds != nil {
-		t.Fatal("expected referencedOutbounds to be released on close")
-	}
-	if plane.dnsRouting != nil {
-		t.Fatal("expected dnsRouting to be released on close")
-	}
-	if plane.dnsFixedDomainTtl != nil {
-		t.Fatal("expected dnsFixedDomainTtl to be released on close")
-	}
-	if plane.routingMatcher != nil {
-		t.Fatal("expected routingMatcher to be released on close")
-	}
-	plane.muRealDomainSet.RLock()
-	realDomainSetReleased := plane.realDomainSet == nil
-	plane.muRealDomainSet.RUnlock()
-	if !realDomainSetReleased {
-		t.Fatal("expected realDomainSet to be released on close")
-	}
+	// Close releases what this generation owns exclusively.
 	if plane.connStateScratch != nil {
-		t.Fatal("expected connStateScratch to be released on close")
-	}
-	if plane.pendingDnsReloadCache != nil {
-		t.Fatal("expected pendingDnsReloadCache to be released on close")
-	}
-	if plane.failedQuicDcidCache != nil {
-		t.Fatal("expected failedQuicDcidCache to be released on close")
+		t.Fatal("expected janitor scratch buffers to be released on close")
 	}
 	if getFailedQuicDcidCache() != nil {
 		t.Fatal("expected global failedQuicDcidCache pointer to be cleared when closing the active cache")
@@ -393,7 +367,34 @@ func TestControlPlaneClose_ReleasesRetainedState(t *testing.T) {
 	if plane.ActiveDnsController() != nil {
 		t.Fatal("expected active DNS controller pointer to be cleared on close")
 	}
-	if plane.core != nil {
-		t.Fatal("expected control plane core to be released on close")
+
+	// It must not clear state that established flows keep reading. SessionManager
+	// lets a flow outlive the generation that routed it, and those flow goroutines
+	// dereference these fields; clearing them races with live readers and turns a
+	// reload into a nil dereference. Dropping them also buys nothing, since an
+	// unreachable generation is collected together with everything it points at.
+	if plane.outbounds == nil {
+		t.Fatal("outbounds cleared on close; in-flight flows still select dialers through it")
+	}
+	if plane.referencedOutbounds == nil {
+		t.Fatal("referencedOutbounds cleared on close")
+	}
+	if plane.routingMatcher == nil {
+		t.Fatal("routingMatcher cleared on close; in-flight flows still re-route through it")
+	}
+	if plane.dnsRouting == nil {
+		t.Fatal("dnsRouting cleared on close")
+	}
+	if plane.dnsFixedDomainTtl == nil {
+		t.Fatal("dnsFixedDomainTtl cleared on close")
+	}
+	plane.muRealDomainSet.RLock()
+	realDomainSetCleared := plane.realDomainSet == nil
+	plane.muRealDomainSet.RUnlock()
+	if realDomainSetCleared {
+		t.Fatal("realDomainSet cleared on close; sniffing still consults it")
+	}
+	if plane.core == nil {
+		t.Fatal("core cleared on close; in-flight flows still read BPF maps through it")
 	}
 }

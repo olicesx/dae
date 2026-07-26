@@ -708,11 +708,6 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 	}
 	ueKey = flowDecision.EndpointKeyForInitialLookupWithScope(routeScope, forceSymmetricKey)
 	ue, ueExists = DefaultUdpEndpointPool.Get(ueKey)
-	if ueExists {
-		observePhase1UDPKeyProbe(phase1UDPKeyProbePrimary, phase1UDPKeyProbeHit)
-	} else {
-		observePhase1UDPKeyProbe(phase1UDPKeyProbePrimary, phase1UDPKeyProbeMiss)
-	}
 	if !ueExists && !forceSymmetricKey {
 		if ueKey.Dst.Port() != 0 {
 			// Sniff-eligible UDP can re-enter here with a symmetric lookup even
@@ -722,17 +717,11 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 			// same 4-tuple and start another read loop.
 			srcOnlyKey := flowDecision.FullConeNatEndpointKeyWithScope(routeScope)
 			if srcOnlyKey != ueKey {
-				if candidate, ok := DefaultUdpEndpointPool.Get(srcOnlyKey); ok {
-					if candidate.DialTarget != realDst.String() {
-						observePhase1UDPKeyProbe(phase1UDPKeyProbeSibling, phase1UDPKeyProbeTargetMismatch)
-					} else {
-						observePhase1UDPKeyProbe(phase1UDPKeyProbeSibling, phase1UDPKeyProbeHit)
-						ueKey = srcOnlyKey
-						ue = candidate
-						ueExists = true
-					}
-				} else {
-					observePhase1UDPKeyProbe(phase1UDPKeyProbeSibling, phase1UDPKeyProbeMiss)
+				if candidate, ok := DefaultUdpEndpointPool.Get(srcOnlyKey); ok &&
+					candidate.DialTarget == realDst.String() {
+					ueKey = srcOnlyKey
+					ue = candidate
+					ueExists = true
 				}
 			}
 		} else {
@@ -743,17 +732,11 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 			// single-instanced.
 			symmetricKey := flowDecision.SymmetricNatEndpointKeyWithScope(routeScope)
 			if symmetricKey != ueKey {
-				if candidate, ok := DefaultUdpEndpointPool.Get(symmetricKey); ok {
-					if candidate.DialTarget != realDst.String() {
-						observePhase1UDPKeyProbe(phase1UDPKeyProbeSibling, phase1UDPKeyProbeTargetMismatch)
-					} else {
-						observePhase1UDPKeyProbe(phase1UDPKeyProbeSibling, phase1UDPKeyProbeHit)
-						ueKey = symmetricKey
-						ue = candidate
-						ueExists = true
-					}
-				} else {
-					observePhase1UDPKeyProbe(phase1UDPKeyProbeSibling, phase1UDPKeyProbeMiss)
+				if candidate, ok := DefaultUdpEndpointPool.Get(symmetricKey); ok &&
+					candidate.DialTarget == realDst.String() {
+					ueKey = symmetricKey
+					ue = candidate
+					ueExists = true
 				}
 			}
 		}
@@ -762,11 +745,6 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 		if fallbackKey, ok := flowDecision.InitialLookupFallbackKeyWithScope(routeScope, forceSymmetricKey); ok {
 			ueKey = fallbackKey
 			ue, ueExists = DefaultUdpEndpointPool.Get(ueKey)
-			if ueExists {
-				observePhase1UDPKeyProbe(phase1UDPKeyProbeFallback, phase1UDPKeyProbeHit)
-			} else {
-				observePhase1UDPKeyProbe(phase1UDPKeyProbeFallback, phase1UDPKeyProbeMiss)
-			}
 		}
 	}
 	if ueExists {
@@ -1008,7 +986,6 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 				sniffer.Mu.Unlock()
 			}()
 			if sniffer.NeedMore() {
-				c.observePendingRoute(realSrc, realDst, consts.L4ProtoType_UDP, routingResult)
 				return nil
 			}
 
@@ -1120,7 +1097,6 @@ getNew:
 					Outbound:    consts.OutboundIndex(routingResult.Outbound),
 					Must:        routingResult.Must != 0,
 					Domain:      domain,
-					DomainKnown: true,
 					Mac:         routingResult.Mac,
 					Dscp:        routingResult.Dscp,
 					ProcessName: routingResult.Pname,

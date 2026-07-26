@@ -20,7 +20,5 @@ type controlPlaneGenerationState struct {
 	policyIdentity      routing.PolicyIdentity
 	policySnapshot      *routing.PolicySnapshot
 	routingMatcher      *RoutingMatcher
-	decisionShadow      *phase4DecisionShadow
 	bootstrapResolvers  []netip.AddrPort
 }
-

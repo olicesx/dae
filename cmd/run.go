@@ -419,20 +419,6 @@ func (r *Runner) Run() (err error) {
 		err = errors.Join(err, processSessions.Close())
 	}()
 
-	phase1Observability, err := enablePhase1ObservabilityFromEnvironment()
-	if err != nil {
-		return err
-	}
-	if phase1Observability != nil {
-		defer phase1Observability.Disable()
-	}
-	phase4DecisionShadow, err := enablePhase4DecisionShadowFromEnvironment()
-	if err != nil {
-		return err
-	}
-	if phase4DecisionShadow != nil {
-		defer phase4DecisionShadow.Disable()
-	}
 	semanticRefactorFeatures, err := enableSemanticRefactorFeaturesFromEnvironment()
 	if err != nil {
 		return err
@@ -488,7 +474,6 @@ func (r *Runner) Run() (err error) {
 	}
 	var pprofServer *http.Server
 	if conf.Global.PprofPort != 0 {
-		registerDaeDebugHandlers()
 		pprofAddr := fmt.Sprintf("localhost:%d", conf.Global.PprofPort)
 		pprofServer = &http.Server{Addr: pprofAddr, Handler: nil}
 		go func() { _ = pprofServer.ListenAndServe() }()
@@ -1618,37 +1603,28 @@ func retireControlPlaneConnections(
 	maxDrain time.Duration,
 ) {
 	_ = hasOverlap
-	observation := control.BeginPhase1ReloadDrainObservation()
-	outcome := control.Phase1ReloadDrainCompleted
-	defer func() {
-		observation.End(outcome)
-	}()
 
 	switch {
 	case abort:
 		log.Warnln("[Reload] Abort requested; aborting stale connections immediately")
 		if err := c.AbortConnections(); err != nil {
-			outcome = control.Phase1ReloadDrainFailed
+			log.WithError(err).Warnln("[Reload] Failed to abort stale connections")
 		}
 	default:
 		switch waitForControlPlaneDrain(log, ctx, c, maxDrain, controlPlaneRetirementLogEvery) {
 		case controlPlaneDrainIdle:
 			log.Infoln("[Reload] Old control plane drained active sessions; retiring immediately")
 		case controlPlaneDrainCanceled:
-			outcome = control.Phase1ReloadDrainCanceled
 			log.Warnln("[Reload] Retirement canceled; aborting generation-owned pending work")
 			if err := c.AbortPendingConnections(); err != nil {
-				outcome = control.Phase1ReloadDrainFailed
+				log.WithError(err).Warnln("[Reload] Failed to abort pending connections")
 			}
 		case controlPlaneDrainTimeout:
-			outcome = control.Phase1ReloadDrainTimedOut
 			log.WithField("active_sessions", c.ActiveSessionCount()).
 				Warnln("[Reload] Old control plane drain timed out; aborting pending generation work")
 			if err := c.AbortPendingConnections(); err != nil {
-				outcome = control.Phase1ReloadDrainFailed
+				log.WithError(err).Warnln("[Reload] Failed to abort pending connections")
 			}
-		default:
-			outcome = control.Phase1ReloadDrainFailed
 		}
 	}
 	// Seal generation admission on every retirement path and wait for any lease

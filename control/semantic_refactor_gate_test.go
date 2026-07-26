@@ -119,23 +119,21 @@ func TestDnsControllerOptionUsesGenerationFeatureGate(t *testing.T) {
 	}
 }
 
+// Building the full policy snapshot is the expensive path. Only compiled-policy
+// consumes it, so any other feature combination must stay on the cheap identity.
 func TestFullPolicySnapshotRequirements(t *testing.T) {
-	shadow := &phase4DecisionShadowSetting{sampleEvery: 1}
 	for _, tc := range []struct {
 		name     string
 		features SemanticRefactorFeatureSet
-		shadow   *phase4DecisionShadowSetting
 		want     bool
 	}{
 		{name: "legacy"},
 		{name: "routing epoch identity only", features: SemanticRefactorFeatureSet{RoutingEpoch: true}},
 		{name: "unrelated features", features: SemanticRefactorFeatureSet{DNSResolver: true, UDPOrderedDispatcher: true, UDPReplyDispatcher: true}},
 		{name: "compiled policy", features: SemanticRefactorFeatureSet{CompiledPolicy: true}, want: true},
-		{name: "decision shadow", shadow: shadow, want: true},
-		{name: "compiled policy and decision shadow", features: SemanticRefactorFeatureSet{CompiledPolicy: true}, shadow: shadow, want: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := requiresFullPolicySnapshot(tc.features, tc.shadow); got != tc.want {
+			if got := requiresFullPolicySnapshot(tc.features); got != tc.want {
 				t.Fatalf("requiresFullPolicySnapshot() = %v, want %v", got, tc.want)
 			}
 		})

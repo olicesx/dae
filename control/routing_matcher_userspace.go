@@ -58,44 +58,6 @@ type routingMatcherFacts struct {
 	domainBitmap   []uint32
 }
 
-// routingMatcherGroupResolver adapts live matcher predicate evaluation to the
-// callback shape required by PolicySnapshot.EvaluateGroups. Errors are kept
-// separately because the routing callback only returns a Truth value.
-type routingMatcherGroupResolver struct {
-	matcher *RoutingMatcher
-	facts   routingMatcherFacts
-	err     error
-}
-
-func newRoutingMatcherGroupResolver(matcher *RoutingMatcher, facts routingMatcherFacts) *routingMatcherGroupResolver {
-	return &routingMatcherGroupResolver{
-		matcher: matcher,
-		facts:   facts,
-	}
-}
-
-func (r *routingMatcherGroupResolver) Resolve(group routing.PredicateGroup) routing.Truth {
-	if r == nil || r.matcher == nil {
-		return routing.TruthFalse
-	}
-	if r.err != nil {
-		return routing.TruthFalse
-	}
-	truth, err := r.matcher.predicateGroupTruth(group, &r.facts)
-	if err != nil {
-		r.err = err
-		return routing.TruthFalse
-	}
-	return truth
-}
-
-func (r *routingMatcherGroupResolver) Err() error {
-	if r == nil {
-		return fmt.Errorf("nil routing matcher group resolver")
-	}
-	return r.err
-}
-
 type compiledRoutingMatch struct {
 	matchType consts.MatchType
 	outbound  consts.OutboundIndex
@@ -234,40 +196,6 @@ func (m *RoutingMatcher) matchCompiledMatch(index int, match compiledRoutingMatc
 	default:
 		return false, fmt.Errorf("unknown match type: %v", match.matchType)
 	}
-}
-
-// predicateGroupTruth resolves the positive result of one PolicySnapshot
-// predicate group against the live matcher. EvaluateGroups combines groups in
-// each function before applying that function's configured negation.
-func (m *RoutingMatcher) predicateGroupTruth(group routing.PredicateGroup, facts *routingMatcherFacts) (routing.Truth, error) {
-	if m == nil {
-		return routing.TruthFalse, fmt.Errorf("nil routing matcher")
-	}
-	if group.InstructionID < 0 || group.InstructionID >= len(m.predicateGroups) {
-		return routing.TruthFalse, fmt.Errorf("predicate instruction %d is outside matcher groups", group.InstructionID)
-	}
-	span := m.predicateGroups[group.InstructionID]
-	if span.name != group.Name || span.key != group.Key || span.not != group.Not {
-		return routing.TruthFalse, fmt.Errorf("predicate instruction %d does not match live matcher layout", group.InstructionID)
-	}
-	if span.start < 0 || span.end <= span.start || span.end > len(m.compiledMatches) {
-		return routing.TruthFalse, fmt.Errorf("predicate instruction %d has invalid matcher span [%d,%d)", group.InstructionID, span.start, span.end)
-	}
-
-	for index := span.start; index < span.end; index++ {
-		match := m.compiledMatches[index]
-		if match.not != group.Not {
-			return routing.TruthFalse, fmt.Errorf("predicate instruction %d has inconsistent negation", group.InstructionID)
-		}
-		matched, err := m.matchCompiledMatch(index, match, facts)
-		if err != nil {
-			return routing.TruthFalse, err
-		}
-		if matched {
-			return routing.TruthTrue, nil
-		}
-	}
-	return routing.TruthFalse, nil
 }
 
 // Match is modified from kern/tproxy.c; please keep sync.

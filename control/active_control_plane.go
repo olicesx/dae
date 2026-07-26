@@ -165,17 +165,3 @@ func withActiveDNSController(
 	}
 	return handle(plane.dnsRequestContext(ctx, controller), controller)
 }
-
-// SnapshotActivePhase4DecisionShadow returns the decision-shadow state of the
-// active control-plane generation. The boolean is false when no active
-// generation has decision shadowing enabled.
-func SnapshotActivePhase4DecisionShadow() (Phase4DecisionShadowSnapshot, bool) {
-	activeControlPlanePublication.mu.RLock()
-	defer activeControlPlanePublication.mu.RUnlock()
-
-	plane := activeControlPlanePublication.plane.Load()
-	if plane == nil {
-		return Phase4DecisionShadowSnapshot{}, false
-	}
-	return plane.Phase4DecisionShadowSnapshot()
-}

@@ -258,7 +258,6 @@ func (r *controlPlaneDNSRuntime) startPreparedDNSListenerWithWarmupTimeout(ctx c
 	return nil
 }
 
-
 // RestorePreparedDNSRuntimeForRollback returns DNS resources transferred to a
 // prepared candidate back to the still-active previous generation.
 func (c *ControlPlane) RestorePreparedDNSRuntimeForRollback(

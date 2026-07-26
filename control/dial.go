@@ -15,7 +15,6 @@ import (
 	commonerrors "github.com/daeuniverse/dae/common/errors"
 	ob "github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
-	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/outbound/netproxy"
 )
 
@@ -23,7 +22,6 @@ type proxyDialParam struct {
 	Outbound    consts.OutboundIndex
 	Must        bool
 	Domain      string
-	DomainKnown bool
 	Mac         [6]uint8
 	Dscp        uint8
 	ProcessName [16]uint8
@@ -132,19 +130,15 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 		if p.Network == "udp" {
 			proto = consts.L4ProtoType_UDP
 		}
-		if outboundIndex, newMark, must, err = c.routeWithDomainFacts(
+		if outboundIndex, newMark, must, err = c.Route(
 			src,
 			dst,
 			domain,
 			proto,
 			routingResult,
-			p.DomainKnown,
-			p.domainEvidence(),
 		); err != nil {
-			observePhase1UserspaceRematch(phase1TransportForNetwork(p.Network), phase1UserspaceRematchFailure)
 			return nil, err
 		}
-		observePhase1UserspaceRematch(phase1TransportForNetwork(p.Network), phase1UserspaceRematchSuccess)
 		mark = newMark
 		// Reset dialTarget.
 		dialTarget, _, dialIp = c.ChooseDialTarget(outboundIndex, dst, domain)
@@ -189,27 +183,11 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 
 	strictIpVersion := dialIp
 	d, _, admissionNetworkType, err := outbound.SelectWithExclusionResult(selectionNetworkType, strictIpVersion, p.Excluded)
-	switch err {
-	case nil:
-		observePhase1Dial(phase1DialOperationSelectPrimary, phase1TransportForNetwork(p.Network), phase1DialOutcomeSuccess)
-	case ob.ErrNoAliveDialer:
-		observePhase1Dial(phase1DialOperationSelectPrimary, phase1TransportForNetwork(p.Network), phase1DialOutcomeNoAlive)
-	default:
-		observePhase1Dial(phase1DialOperationSelectPrimary, phase1TransportForNetwork(p.Network), phase1DialOutcomeFailure)
-	}
 	if err == ob.ErrNoAliveDialer {
 		// Fallback for UDP/TCP: if selection failed (probably due to health check fail),
 		// try the other IP version if strictIpVersion is not absolutely required by domain routing.
 		altType := alternateNetworkType(selectionNetworkType)
 		d, _, admissionNetworkType, err = outbound.SelectWithExclusionResult(altType, false, p.Excluded)
-		switch err {
-		case nil:
-			observePhase1Dial(phase1DialOperationSelectAlternateFamily, phase1TransportForNetwork(p.Network), phase1DialOutcomeSuccess)
-		case ob.ErrNoAliveDialer:
-			observePhase1Dial(phase1DialOperationSelectAlternateFamily, phase1TransportForNetwork(p.Network), phase1DialOutcomeNoAlive)
-		default:
-			observePhase1Dial(phase1DialOperationSelectAlternateFamily, phase1TransportForNetwork(p.Network), phase1DialOutcomeFailure)
-		}
 		if err == nil {
 			selectionNetworkType = altType
 		}
@@ -260,16 +238,6 @@ func (c *ControlPlane) chooseProxyDialer(ctx context.Context, p *proxyDialParam)
 	}, nil
 }
 
-func (p *proxyDialParam) domainEvidence() routing.EvidenceSource {
-	if p == nil || p.Domain == "" {
-		return routing.EvidenceNone
-	}
-	if p.Network == "udp" {
-		return routing.EvidenceQUICSNI
-	}
-	return routing.EvidenceTLSSNI
-}
-
 func (c *ControlPlane) routeDial(ctx context.Context, p *proxyDialParam) (netproxy.Conn, *proxyDialResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -283,18 +251,12 @@ func (c *ControlPlane) routeDial(ctx context.Context, p *proxyDialParam) (netpro
 		}
 		lastRes = res
 
-		operation := phase1DialOperationConnectInitial
-		if attempt > 0 {
-			operation = phase1DialOperationConnectRetry
-		}
 		dialCtx, cancel := context.WithTimeout(ctx, consts.DefaultDialTimeout)
 		conn, err := res.Dialer.DialContext(dialCtx, res.Network, res.DialTarget)
 		cancel()
 		if err == nil {
-			observePhase1Dial(operation, phase1TransportForNetwork(p.Network), phase1DialOutcomeSuccess)
 			return conn, res, nil
 		}
-		observePhase1Dial(operation, phase1TransportForNetwork(p.Network), phase1DialOutcomeFailure)
 		lastErr = err
 		if attempt > 0 || !shouldForceMarkUnavailableOnProxyDialError(err) {
 			l4proto := consts.L4ProtoStr(p.Network)

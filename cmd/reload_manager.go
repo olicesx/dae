@@ -465,7 +465,6 @@ func (m *reloadManager) refreshPprofServer(log *logrus.Logger, server **http.Ser
 		*server = nil
 	}
 	if port != 0 {
-		registerDaeDebugHandlers()
 		pprofAddr := "localhost:" + strconv.Itoa(int(port))
 		*server = &http.Server{Addr: pprofAddr, Handler: nil}
 		go func() { _ = (*server).ListenAndServe() }()

@@ -22,9 +22,9 @@ func TestTcpFlowBindingCapturesFinalRouteAndEgress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNormalizedProgram() error = %v", err)
 	}
-	snapshot, err := routing.NewPolicySnapshot(9, program)
+	identity, err := routing.NewPolicyIdentity(9, program)
 	if err != nil {
-		t.Fatalf("NewPolicySnapshot() error = %v", err)
+		t.Fatalf("NewPolicyIdentity() error = %v", err)
 	}
 	d := newTestEndpointDialer()
 	outbound := newTestFixedOutboundGroup(d)
@@ -45,8 +45,8 @@ func TestTcpFlowBindingCapturesFinalRouteAndEgress(t *testing.T) {
 		SelectionNetworkTypeObj: &networkType,
 	}
 
-	binding := newTcpFlowBinding(snapshot.Epoch(), result)
-	if binding.Route.PolicyEpoch != snapshot.Epoch() || binding.Route.Outbound != result.OutboundIndex || binding.Route.Mark != result.Mark || !binding.Route.Must {
+	binding := newTcpFlowBinding(identity.Epoch(), result)
+	if binding.Route.PolicyEpoch != identity.Epoch() || binding.Route.Outbound != result.OutboundIndex || binding.Route.Mark != result.Mark || !binding.Route.Must {
 		t.Fatalf("route binding = %+v", binding.Route)
 	}
 	if binding.Egress.Dialer != d || binding.Egress.Outbound != outbound || binding.Egress.Target != result.DialTarget || binding.Egress.Network != result.Network || binding.Egress.NetworkType != networkType || binding.Egress.SniffedDomain != result.SniffedDomain || !binding.Egress.IsDialIp {

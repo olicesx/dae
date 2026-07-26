@@ -85,7 +85,7 @@ type DnsCorpusFixture struct {
 	BuildConfig func() *config.Dns
 	// BestDialerChooser lets each fixture decide how the dial argument is
 	// built. The default corpus chooser just returns the request's realDst.
-	BestDialerChooser func(ctx context.Context, req *udpRequest, upstream *componentdns.Upstream) (*dialArgument, error)
+	BestDialerChooser func(ctx context.Context, snapshot DnsRequestSnapshot, upstream *componentdns.Upstream) (*dialArgument, error)
 	// ForwarderFactory lets each fixture decide how upstream traffic is
 	// served. Most fixtures inject a canned response, occasionally gated on
 	// l4proto to simulate UDP failure / TCP fallback.
@@ -167,16 +167,8 @@ func ReplayDns(t *testing.T, fixture DnsCorpusFixture) {
 	}
 }
 
-// newCorpusDnsController builds a controller from a Dns config the same way
-// that newScopedDnsController does, but accepts the fixture-provided config.
+// newCorpusDnsController builds a controller wired to a fixture's DNS config.
 func newCorpusDnsController(t testing.TB, cfg *config.Dns) *DnsController {
-	return newCorpusDnsControllerWithResolvePipeline(t, cfg, false)
-}
-
-// newCorpusDnsControllerWithResolvePipeline builds a corpus controller with a
-// specific handler implementation selected. The corpus uses this to compare
-// the legacy coupled handler against the split Resolve/delivery pipeline.
-func newCorpusDnsControllerWithResolvePipeline(t testing.TB, cfg *config.Dns, useResolvePipeline bool) *DnsController {
 	t.Helper()
 	if cfg == nil {
 		t.Fatalf("fixture returned nil Dns config")
@@ -192,7 +184,6 @@ func newCorpusDnsControllerWithResolvePipeline(t testing.TB, cfg *config.Dns, us
 	ctrl, err := NewDnsController(routing, &DnsControllerOption{
 		Log:                logrus.New(),
 		LifecycleContext:   context.Background(),
-		UseResolvePipeline: useResolvePipeline,
 		OptimisticCache:    true,
 		OptimisticCacheTtl: 60,
 		CacheAccessCallback: func(*DnsCache) error {
@@ -218,11 +209,11 @@ func newCorpusDnsControllerWithResolvePipeline(t testing.TB, cfg *config.Dns, us
 
 // defaultCorpusChooser matches the request's destination (UDP/IPv4). Sufficient
 // for fixtures that do not need to dial a specific upstream host.
-func defaultCorpusChooser(ctx context.Context, req *udpRequest, upstream *componentdns.Upstream) (*dialArgument, error) {
+func defaultCorpusChooser(ctx context.Context, snapshot DnsRequestSnapshot, upstream *componentdns.Upstream) (*dialArgument, error) {
 	return &dialArgument{
 		l4proto:    consts.L4ProtoStr_UDP,
 		ipversion:  consts.IpVersionStr_4,
-		bestTarget: req.realDst,
+		bestTarget: snapshot.RealDst,
 	}, nil
 }
 

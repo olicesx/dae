@@ -148,6 +148,11 @@ type UdpEndpoint struct {
 	// Reduces atomic store + time.Now() frequency under high QPS from every packet to ~5/sec max.
 	lastRefreshNano atomic.Int64
 
+	// writeDeadlineArmedAtNano tracks when the proxy-side write deadline was
+	// last armed, so the hot path pays one SetWriteDeadline per half-interval
+	// window instead of one syscall per packet.
+	writeDeadlineArmedAtNano atomic.Int64
+
 	// hasReply indicates the upstream side has replied at least once.
 	// Before this flips true, the endpoint is still probing and must not
 	// use the normal sliding NAT lifetime.
@@ -1270,6 +1275,31 @@ func (ue *UdpEndpoint) retire() {
 	_ = ue.Close()
 }
 
+// udpEndpointWriteTimeout bounds how long one proxy-side write may block. A
+// UDP datagram normally leaves the socket immediately, but many proxies carry
+// UDP over a TCP transport whose peer can stop ACKing; without a deadline one
+// stalled upstream parks its calling goroutine forever, and under a shared
+// dispatcher a handful of stalled flows would park every worker. A write that
+// hits the deadline errors out and retires the endpoint, which is the correct
+// outcome for a transport that has stopped draining.
+const udpEndpointWriteTimeout = 10 * time.Second
+
+// armWriteDeadline keeps a write deadline of [T/2, T] ahead of every write
+// while re-arming at most once per T/2 window. Transports that do not support
+// write deadlines return an error, which is deliberately ignored: they simply
+// keep their previous unbounded behaviour.
+func (ue *UdpEndpoint) armWriteDeadline(now time.Time) {
+	last := ue.writeDeadlineArmedAtNano.Load()
+	if now.UnixNano()-last < int64(udpEndpointWriteTimeout/2) {
+		return
+	}
+	if !ue.writeDeadlineArmedAtNano.CompareAndSwap(last, now.UnixNano()) {
+		// Another writer is re-arming this window.
+		return
+	}
+	_ = ue.conn.SetWriteDeadline(now.Add(udpEndpointWriteTimeout))
+}
+
 func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	// Fast dead check: avoid work on an already-dead endpoint.
 	if ue.dead.Load() {
@@ -1294,6 +1324,8 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 
 	// Refresh TTL on write to keep endpoint alive for active connections
 	ue.RefreshTtl()
+
+	ue.armWriteDeadline(time.Now())
 
 	// Check again - endpoint may have died.
 	// The underlying conn.WriteTo is thread-safe; we accept a small race window

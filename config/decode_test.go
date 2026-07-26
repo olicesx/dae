@@ -81,7 +81,9 @@ routing {
 
 	conf, err := New(sections)
 	require.NoError(t, err)
-	require.True(t, conf.Global.DisableTHP)
+	// disable_thp defaults to false: dae does not alter kernel memory policy
+	// unless the user opts in.
+	require.False(t, conf.Global.DisableTHP)
 	require.EqualValues(t, 262144, conf.Global.BpfConnStateMapSize)
 }
 

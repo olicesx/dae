@@ -17,9 +17,19 @@ import (
 )
 
 type controlPlaneDNSRuntime struct {
-	dnsController             *DnsController
-	dnsRouting                *dns.Dns
-	dnsFixedDomainTtl         map[string]int
+	dnsController     *DnsController
+	dnsRouting        *dns.Dns
+	dnsFixedDomainTtl map[string]int
+	// The config-derived controller tunables are retained here so that every
+	// dnsControllerOption() caller — the initial build, reload reuse, and the
+	// staged handoff — assembles the same behaviour. Patching them onto the
+	// option at one call site silently resets them to zero at the others,
+	// which turned the cache size limit off after a reload.
+	dnsOptimisticCache    bool
+	dnsOptimisticCacheTtl int
+	dnsMaxCacheSize       int
+	dnsIpVersionPrefer    int
+
 	dnsListener               *DNSListener
 	dnsListenerStopRegistered bool
 	delayDNSListenerStart     bool

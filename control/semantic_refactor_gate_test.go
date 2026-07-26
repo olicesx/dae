@@ -17,22 +17,24 @@ func TestSemanticRefactorFeatureGateDefaultsDisabled(t *testing.T) {
 }
 
 func TestSemanticRefactorFeatureGateOwnership(t *testing.T) {
-	handle, err := EnableSemanticRefactorFeatures(SemanticRefactorFeatureCompiledPolicy, SemanticRefactorFeatureDNSResolver)
+	handle, err := EnableSemanticRefactorFeatures(SemanticRefactorFeatureUDPOrderedDispatcher)
 	if err != nil {
 		t.Fatalf("EnableSemanticRefactorFeatures() error = %v", err)
 	}
 	t.Cleanup(handle.Disable)
-	if got := semanticRefactorFeatureGateSnapshot(); !got.CompiledPolicy || got.RoutingEpoch || !got.DNSResolver || got.UDPOrderedDispatcher || got.UDPReplyDispatcher {
-		t.Fatalf("semanticRefactorFeatureGateSnapshot() = %+v, want compiled policy and DNS resolver", got)
+	if got := semanticRefactorFeatureGateSnapshot(); !got.UDPOrderedDispatcher || got.UDPReplyDispatcher {
+		t.Fatalf("semanticRefactorFeatureGateSnapshot() = %+v, want only the ordered dispatcher", got)
 	}
-	if !handle.Enabled(SemanticRefactorFeatureCompiledPolicy) || handle.Enabled(SemanticRefactorFeatureRoutingEpoch) || !handle.Enabled(SemanticRefactorFeatureDNSResolver) || handle.Enabled(SemanticRefactorFeatureUDPOrderedDispatcher) || handle.Enabled(SemanticRefactorFeatureUDPReplyDispatcher) || handle.Enabled("unknown") {
+	if !handle.Enabled(SemanticRefactorFeatureUDPOrderedDispatcher) ||
+		handle.Enabled(SemanticRefactorFeatureUDPReplyDispatcher) ||
+		handle.Enabled("unknown") {
 		t.Fatal("SemanticRefactorFeatureGateHandle.Enabled() did not report its owned features")
 	}
-	if _, err := EnableSemanticRefactorFeatures(SemanticRefactorFeatureRoutingEpoch); !stderrors.Is(err, ErrSemanticRefactorFeatureAlreadyEnabled) {
+	if _, err := EnableSemanticRefactorFeatures(SemanticRefactorFeatureUDPReplyDispatcher); !stderrors.Is(err, ErrSemanticRefactorFeatureAlreadyEnabled) {
 		t.Fatalf("second EnableSemanticRefactorFeatures() error = %v, want ownership error", err)
 	}
 	handle.Disable()
-	if handle.Enabled(SemanticRefactorFeatureCompiledPolicy) {
+	if handle.Enabled(SemanticRefactorFeatureUDPOrderedDispatcher) {
 		t.Fatal("SemanticRefactorFeatureGateHandle.Enabled() = true after Disable()")
 	}
 	if got := semanticRefactorFeatureGateSnapshot(); got != (SemanticRefactorFeatureSet{}) {
@@ -42,9 +44,6 @@ func TestSemanticRefactorFeatureGateOwnership(t *testing.T) {
 
 func TestSemanticRefactorFeatureGateGenerationSnapshotSurvivesOwnerDisable(t *testing.T) {
 	handle, err := EnableSemanticRefactorFeatures(
-		SemanticRefactorFeatureCompiledPolicy,
-		SemanticRefactorFeatureRoutingEpoch,
-		SemanticRefactorFeatureDNSResolver,
 		SemanticRefactorFeatureUDPOrderedDispatcher,
 		SemanticRefactorFeatureUDPReplyDispatcher,
 	)
@@ -58,9 +57,6 @@ func TestSemanticRefactorFeatureGateGenerationSnapshotSurvivesOwnerDisable(t *te
 		t.Fatalf("global feature snapshot after owner disable = %+v, want all disabled", got)
 	}
 	want := SemanticRefactorFeatureSet{
-		CompiledPolicy:       true,
-		RoutingEpoch:         true,
-		DNSResolver:          true,
 		UDPOrderedDispatcher: true,
 		UDPReplyDispatcher:   true,
 	}
@@ -80,9 +76,6 @@ func TestSemanticRefactorFeatureGateGenerationSnapshotSurvivesOwnerDisable(t *te
 		udpOrderedDispatcher:     ordered,
 		udpReplyDispatcher:       reply,
 	}
-	if option := plane.dnsControllerOption(); option == nil || !option.UseResolvePipeline {
-		t.Fatalf("captured generation DNS option = %+v, want resolver pipeline enabled", option)
-	}
 	if err := plane.Close(); err != nil {
 		t.Fatalf("captured generation ControlPlane.Close() error = %v", err)
 	}
@@ -90,9 +83,6 @@ func TestSemanticRefactorFeatureGateGenerationSnapshotSurvivesOwnerDisable(t *te
 
 func TestParseSemanticRefactorFeature(t *testing.T) {
 	for _, feature := range []SemanticRefactorFeature{
-		SemanticRefactorFeatureCompiledPolicy,
-		SemanticRefactorFeatureRoutingEpoch,
-		SemanticRefactorFeatureDNSResolver,
 		SemanticRefactorFeatureUDPOrderedDispatcher,
 		SemanticRefactorFeatureUDPReplyDispatcher,
 	} {
@@ -101,42 +91,12 @@ func TestParseSemanticRefactorFeature(t *testing.T) {
 			t.Fatalf("ParseSemanticRefactorFeature(%q) = (%q, %v), want (%q, nil)", feature, got, err, feature)
 		}
 	}
-	if _, err := ParseSemanticRefactorFeature("unknown"); err == nil {
-		t.Fatal("ParseSemanticRefactorFeature(unknown) error = nil")
-	}
-}
-
-func TestDnsControllerOptionUsesGenerationFeatureGate(t *testing.T) {
-	legacy := (&ControlPlane{}).dnsControllerOption()
-	if legacy == nil || legacy.UseResolvePipeline {
-		t.Fatalf("legacy DNS controller option = %+v, want Resolve pipeline disabled", legacy)
-	}
-	refactored := (&ControlPlane{
-		semanticRefactorFeatures: SemanticRefactorFeatureSet{DNSResolver: true},
-	}).dnsControllerOption()
-	if refactored == nil || !refactored.UseResolvePipeline {
-		t.Fatalf("refactored DNS controller option = %+v, want Resolve pipeline enabled", refactored)
-	}
-}
-
-// Building the full policy snapshot is the expensive path. Only compiled-policy
-// consumes it, so any other feature combination must stay on the cheap identity.
-func TestFullPolicySnapshotRequirements(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		features SemanticRefactorFeatureSet
-		want     bool
-	}{
-		{name: "legacy"},
-		{name: "routing epoch identity only", features: SemanticRefactorFeatureSet{RoutingEpoch: true}},
-		{name: "unrelated features", features: SemanticRefactorFeatureSet{DNSResolver: true, UDPOrderedDispatcher: true, UDPReplyDispatcher: true}},
-		{name: "compiled policy", features: SemanticRefactorFeatureSet{CompiledPolicy: true}, want: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := requiresFullPolicySnapshot(tc.features); got != tc.want {
-				t.Fatalf("requiresFullPolicySnapshot() = %v, want %v", got, tc.want)
-			}
-		})
+	// Names of migration paths that have since been collapsed into the single
+	// production path must not silently parse into a no-op gate.
+	for _, retired := range []string{"compiled-policy", "routing-epoch", "dns-resolver", "unknown"} {
+		if _, err := ParseSemanticRefactorFeature(retired); err == nil {
+			t.Fatalf("ParseSemanticRefactorFeature(%q) error = nil, want rejection", retired)
+		}
 	}
 }
 

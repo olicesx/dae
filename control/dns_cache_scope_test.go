@@ -128,7 +128,7 @@ func readUDPDNSResponse(t *testing.T, conn *net.UDPConn) (*dnsmessage.Msg, netip
 	return &msg, from
 }
 
-func setScopedBestDialerChooser(ctrl *DnsController, chooser func(ctx context.Context, req *udpRequest, upstream *componentdns.Upstream) (*dialArgument, error)) {
+func setScopedBestDialerChooser(ctrl *DnsController, chooser func(ctx context.Context, snapshot DnsRequestSnapshot, upstream *componentdns.Upstream) (*dialArgument, error)) {
 	rt := ctrl.runtime()
 	if rt == nil {
 		return
@@ -145,11 +145,11 @@ func TestDnsController_AsIsCacheIsScopedByResolver(t *testing.T) {
 	}()
 
 	ctrl := newScopedDnsController(t)
-	setScopedBestDialerChooser(ctrl, func(ctx context.Context, req *udpRequest, upstream *componentdns.Upstream) (*dialArgument, error) {
+	setScopedBestDialerChooser(ctrl, func(ctx context.Context, snapshot DnsRequestSnapshot, upstream *componentdns.Upstream) (*dialArgument, error) {
 		return &dialArgument{
 			l4proto:    consts.L4ProtoStr_UDP,
 			ipversion:  consts.IpVersionStr_4,
-			bestTarget: req.realDst,
+			bestTarget: snapshot.RealDst,
 		}, nil
 	})
 
@@ -191,11 +191,11 @@ func TestDnsController_AsIsSingleflightIsScopedByResolver(t *testing.T) {
 	}()
 
 	ctrl := newScopedDnsController(t)
-	setScopedBestDialerChooser(ctrl, func(ctx context.Context, req *udpRequest, upstream *componentdns.Upstream) (*dialArgument, error) {
+	setScopedBestDialerChooser(ctrl, func(ctx context.Context, snapshot DnsRequestSnapshot, upstream *componentdns.Upstream) (*dialArgument, error) {
 		return &dialArgument{
 			l4proto:    consts.L4ProtoStr_UDP,
 			ipversion:  consts.IpVersionStr_4,
-			bestTarget: req.realDst,
+			bestTarget: snapshot.RealDst,
 		}, nil
 	})
 
@@ -259,11 +259,11 @@ func TestDnsController_Handle_LoopbackReplyInjectionDeliversMissAndCacheHit(t *t
 	})
 
 	ctrl := newScopedDnsController(t)
-	setScopedBestDialerChooser(ctrl, func(ctx context.Context, req *udpRequest, upstream *componentdns.Upstream) (*dialArgument, error) {
+	setScopedBestDialerChooser(ctrl, func(ctx context.Context, snapshot DnsRequestSnapshot, upstream *componentdns.Upstream) (*dialArgument, error) {
 		return &dialArgument{
 			l4proto:    consts.L4ProtoStr_UDP,
 			ipversion:  consts.IpVersionStr_4,
-			bestTarget: req.realDst,
+			bestTarget: snapshot.RealDst,
 		}, nil
 	})
 
@@ -351,11 +351,11 @@ func TestDnsController_OptimisticCacheBackgroundRefreshBypassesStaleCache(t *tes
 	ctrl := newScopedDnsController(t)
 	ctrl.optimisticCacheEnabled.Store(true)
 	ctrl.optimisticCacheTtl.Store(60)
-	setScopedBestDialerChooser(ctrl, func(ctx context.Context, req *udpRequest, upstream *componentdns.Upstream) (*dialArgument, error) {
+	setScopedBestDialerChooser(ctrl, func(ctx context.Context, snapshot DnsRequestSnapshot, upstream *componentdns.Upstream) (*dialArgument, error) {
 		return &dialArgument{
 			l4proto:    consts.L4ProtoStr_UDP,
 			ipversion:  consts.IpVersionStr_4,
-			bestTarget: req.realDst,
+			bestTarget: snapshot.RealDst,
 		}, nil
 	})
 

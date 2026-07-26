@@ -21,9 +21,9 @@ func TestUdpFlowBindingKeepsRouteAndEgressSeparate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNormalizedProgram() error = %v", err)
 	}
-	snapshot, err := routing.NewPolicySnapshot(9, program)
+	identity, err := routing.NewPolicyIdentity(9, program)
 	if err != nil {
-		t.Fatalf("NewPolicySnapshot() error = %v", err)
+		t.Fatalf("NewPolicyIdentity() error = %v", err)
 	}
 	networkType := dialer.NetworkType{
 		L4Proto:   consts.L4ProtoStr_UDP,
@@ -36,9 +36,9 @@ func TestUdpFlowBindingKeepsRouteAndEgressSeparate(t *testing.T) {
 		SniffedDomain: "example.com",
 		IsDialIp:      true,
 	}
-	binding := newUdpFlowBinding(snapshot.Epoch(), 7, 42, true, option)
+	binding := newUdpFlowBinding(identity.Epoch(), 7, 42, true, option)
 
-	if binding.Route.PolicyEpoch != snapshot.Epoch() || binding.Route.Outbound != 7 || binding.Route.Mark != 42 || !binding.Route.Must {
+	if binding.Route.PolicyEpoch != identity.Epoch() || binding.Route.Outbound != 7 || binding.Route.Mark != 42 || !binding.Route.Must {
 		t.Fatalf("route binding = %+v", binding.Route)
 	}
 	if binding.Egress.Target != option.Target || binding.Egress.Network != option.Network || binding.Egress.NetworkType != networkType || binding.Egress.SniffedDomain != option.SniffedDomain || binding.Egress.IsDialIp != option.IsDialIp {

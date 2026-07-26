@@ -418,19 +418,19 @@ func tcpUdpFallbackFixture() DnsCorpusFixture {
 				},
 			}
 		},
-		BestDialerChooser: func(ctx context.Context, req *udpRequest, upstream *componentdns.Upstream) (*dialArgument, error) {
+		BestDialerChooser: func(ctx context.Context, snapshot DnsRequestSnapshot, upstream *componentdns.Upstream) (*dialArgument, error) {
 			switch upstream.Scheme {
 			case componentdns.UpstreamScheme_TCP_UDP:
 				return &dialArgument{
 					l4proto:    consts.L4ProtoStr_UDP,
 					ipversion:  consts.IpVersionStr_4,
-					bestTarget: req.realDst,
+					bestTarget: snapshot.RealDst,
 				}, nil
 			case componentdns.UpstreamScheme_TCP:
 				return &dialArgument{
 					l4proto:    consts.L4ProtoStr_TCP,
 					ipversion:  consts.IpVersionStr_4,
-					bestTarget: req.realDst,
+					bestTarget: snapshot.RealDst,
 				}, nil
 			default:
 				return nil, stderrors.New("unexpected upstream scheme")

@@ -365,7 +365,7 @@ func TestRunnerConstructionFailureReleasesSemanticFeatureGate(t *testing.T) {
 	t.Cleanup(func() {
 		cfgFile = previousConfigFile
 	})
-	t.Setenv(semanticRefactorFeaturesEnv, "compiled-policy,routing-epoch,dns-resolver,udp-ordered-dispatcher,udp-reply-dispatcher")
+	t.Setenv(semanticRefactorFeaturesEnv, "udp-ordered-dispatcher,udp-reply-dispatcher")
 
 	wantErr := stderrors.New("runner construction failure")
 	installControlPlaneRuntimeBuilderForTest(t, func(
@@ -392,9 +392,6 @@ func TestRunnerConstructionFailureReleasesSemanticFeatureGate(t *testing.T) {
 	}
 
 	handle, err := control.EnableSemanticRefactorFeatures(
-		control.SemanticRefactorFeatureCompiledPolicy,
-		control.SemanticRefactorFeatureRoutingEpoch,
-		control.SemanticRefactorFeatureDNSResolver,
 		control.SemanticRefactorFeatureUDPOrderedDispatcher,
 		control.SemanticRefactorFeatureUDPReplyDispatcher,
 	)
@@ -640,7 +637,8 @@ func TestRunnerStagedWarmupFailureProcessHelper(t *testing.T) {
 		restoreDNSListenerFunc = previousRestoreDNSListener
 		withDaeNetnsRequiredFunc = previousWithDaeNetnsRequired
 	})
-	t.Setenv(semanticRefactorFeaturesEnv, string(control.SemanticRefactorFeatureRoutingEpoch))
+	// The routing epoch is unconditional now, so no migration gate is needed.
+	t.Setenv(semanticRefactorFeaturesEnv, semanticRefactorDisableValue)
 
 	var buildCalls atomic.Int32
 	installControlPlaneRuntimeBuilderForTest(t, func(
@@ -823,7 +821,8 @@ func TestRunnerLiveStageFailureProcessHelper(t *testing.T) {
 		withDaeNetnsRequiredFunc = previousWithDaeNetnsRequired
 		reloadFailureCompletionHook = previousReloadFailureCompletionHook
 	})
-	t.Setenv(semanticRefactorFeaturesEnv, string(control.SemanticRefactorFeatureRoutingEpoch))
+	// The routing epoch is unconditional now, so no migration gate is needed.
+	t.Setenv(semanticRefactorFeaturesEnv, semanticRefactorDisableValue)
 
 	var buildCalls atomic.Int32
 	restoreErr := stderrors.New("injected restore failure")

@@ -14,18 +14,13 @@ import (
 // SemanticRefactorFeature identifies one internal, opt-in execution path from
 // the semantic architecture migration. These gates deliberately do not affect
 // the user-facing configuration language.
+//
+// A gate is not a permanent home for an alternative implementation: each one
+// either becomes the single path or is removed, so that no behaviour ships
+// with two implementations and only one of them carrying real traffic.
 type SemanticRefactorFeature string
 
 const (
-	// SemanticRefactorFeatureCompiledPolicy lets the immutable compiled policy
-	// build the kernel and userspace matchers.
-	SemanticRefactorFeatureCompiledPolicy SemanticRefactorFeature = "compiled-policy"
-	// SemanticRefactorFeatureRoutingEpoch lets BPF publication switch between
-	// prepared routing epoch slots during reload.
-	SemanticRefactorFeatureRoutingEpoch SemanticRefactorFeature = "routing-epoch"
-	// SemanticRefactorFeatureDNSResolver lets the split Resolve/delivery DNS
-	// pipeline serve requests.
-	SemanticRefactorFeatureDNSResolver SemanticRefactorFeature = "dns-resolver"
 	// SemanticRefactorFeatureUDPOrderedDispatcher lets ordered UDP ingress use
 	// the bounded generation-owned dispatcher instead of one convoy per flow.
 	SemanticRefactorFeatureUDPOrderedDispatcher SemanticRefactorFeature = "udp-ordered-dispatcher"
@@ -46,9 +41,6 @@ var (
 // SemanticRefactorFeatureSet is an immutable copy of the process-wide
 // migration gate state used by each control-plane generation.
 type SemanticRefactorFeatureSet struct {
-	CompiledPolicy       bool
-	RoutingEpoch         bool
-	DNSResolver          bool
 	UDPOrderedDispatcher bool
 	UDPReplyDispatcher   bool
 }
@@ -73,12 +65,6 @@ func (h *SemanticRefactorFeatureGateHandle) Enabled(feature SemanticRefactorFeat
 		return false
 	}
 	switch feature {
-	case SemanticRefactorFeatureCompiledPolicy:
-		return h.setting.features.CompiledPolicy
-	case SemanticRefactorFeatureRoutingEpoch:
-		return h.setting.features.RoutingEpoch
-	case SemanticRefactorFeatureDNSResolver:
-		return h.setting.features.DNSResolver
 	case SemanticRefactorFeatureUDPOrderedDispatcher:
 		return h.setting.features.UDPOrderedDispatcher
 	case SemanticRefactorFeatureUDPReplyDispatcher:
@@ -92,7 +78,7 @@ func (h *SemanticRefactorFeatureGateHandle) Enabled(feature SemanticRefactorFeat
 func ParseSemanticRefactorFeature(value string) (SemanticRefactorFeature, error) {
 	feature := SemanticRefactorFeature(value)
 	switch feature {
-	case SemanticRefactorFeatureCompiledPolicy, SemanticRefactorFeatureRoutingEpoch, SemanticRefactorFeatureDNSResolver, SemanticRefactorFeatureUDPOrderedDispatcher, SemanticRefactorFeatureUDPReplyDispatcher:
+	case SemanticRefactorFeatureUDPOrderedDispatcher, SemanticRefactorFeatureUDPReplyDispatcher:
 		return feature, nil
 	default:
 		return "", fmt.Errorf("unknown semantic refactor feature %q", value)
@@ -105,12 +91,6 @@ func EnableSemanticRefactorFeatures(features ...SemanticRefactorFeature) (*Seman
 	setting := &semanticRefactorFeatureGateSetting{}
 	for _, feature := range features {
 		switch feature {
-		case SemanticRefactorFeatureCompiledPolicy:
-			setting.features.CompiledPolicy = true
-		case SemanticRefactorFeatureRoutingEpoch:
-			setting.features.RoutingEpoch = true
-		case SemanticRefactorFeatureDNSResolver:
-			setting.features.DNSResolver = true
 		case SemanticRefactorFeatureUDPOrderedDispatcher:
 			setting.features.UDPOrderedDispatcher = true
 		case SemanticRefactorFeatureUDPReplyDispatcher:
@@ -142,8 +122,4 @@ func semanticRefactorFeatureGateSnapshot() SemanticRefactorFeatureSet {
 		return setting.features
 	}
 	return SemanticRefactorFeatureSet{}
-}
-
-func requiresFullPolicySnapshot(features SemanticRefactorFeatureSet) bool {
-	return features.CompiledPolicy
 }

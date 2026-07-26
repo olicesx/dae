@@ -526,9 +526,14 @@ func (w *tcpDnsResponseWriter) Hijack() {}
 
 // readDnsMsgFromBufio reads a single DNS message from a buffered reader.
 // DNS-over-TCP messages are prefixed with a 2-byte length field.
-// Returns the message, framed byte length, or error. Does not consume data on
-// parse failure.
-func readDnsMsgFromBufio(reader *bufio.Reader, timeout time.Duration, conn net.Conn) (*dnsmessage.Msg, int, error) {
+// Returns the message, framed byte length, or error.
+//
+// With consumeLarge=false nothing is consumed on failure, which is what the
+// first-frame probe needs to fall back to the plain relay. Once the session is
+// known to be DNS there is no fallback left to preserve, so consumeLarge=true
+// additionally accepts frames larger than the reader's buffer — RFC 7766
+// allows up to 65535 bytes while the probe reader stays small.
+func readDnsMsgFromBufio(reader *bufio.Reader, timeout time.Duration, conn net.Conn, consumeLarge bool) (*dnsmessage.Msg, int, error) {
 	// Set read deadline
 	if timeout > 0 {
 		if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
@@ -554,6 +559,9 @@ func readDnsMsgFromBufio(reader *bufio.Reader, timeout time.Duration, conn net.C
 	// Now read and consume the full message (length prefix + data)
 	fullData, err := reader.Peek(int(2 + length))
 	if err != nil {
+		if consumeLarge && stderrors.Is(err, bufio.ErrBufferFull) {
+			return readLargeDnsMsgFromBufio(reader, int(length))
+		}
 		return nil, 0, err
 	}
 	data := fullData[2:]
@@ -571,6 +579,25 @@ func readDnsMsgFromBufio(reader *bufio.Reader, timeout time.Duration, conn net.C
 	}
 
 	return &msg, int(2 + length), nil
+}
+
+// readLargeDnsMsgFromBufio consumes one DNS frame that exceeds the reader's
+// peek window. Consuming is safe here because the caller is inside an
+// established DNS session: on any error the session closes, exactly as it did
+// before, but a valid large frame is now served instead of being dropped.
+func readLargeDnsMsgFromBufio(reader *bufio.Reader, length int) (*dnsmessage.Msg, int, error) {
+	if _, err := reader.Discard(2); err != nil {
+		return nil, 0, err
+	}
+	data := make([]byte, length)
+	if _, err := io.ReadFull(reader, data); err != nil {
+		return nil, 0, err
+	}
+	var msg dnsmessage.Msg
+	if err := msg.Unpack(data); err != nil {
+		return nil, 0, err
+	}
+	return &msg, 2 + length, nil
 }
 
 // bufioConn wraps a net.Conn with a bufio.Reader, allowing buffered data
@@ -694,11 +721,21 @@ func (c *ControlPlane) handleTCPDnsFastPathOwned(
 	ownership *incomingConnectionLease,
 ) (handled bool, err error) {
 	// Try to read the first DNS query to verify this is actually DNS traffic
-	msg, frameLen, err := readDnsMsgFromBufio(bufReader, TCPDNSFirstReadTimeout, lConn)
+	msg, frameLen, err := readDnsMsgFromBufio(bufReader, TCPDNSFirstReadTimeout, lConn, false)
 	if err != nil {
 		// Not a valid DNS query - not DNS traffic, fall through to normal TCP handling
 		// The bufio.Reader has buffered but not consumed the data, so the caller
 		// should use a bufioConn wrapper to preserve the buffered data.
+		//
+		// The probe armed a read deadline on lConn. This function owns that
+		// deadline, so it must disarm it here: the relay never re-arms read
+		// deadlines, and a leftover probe deadline would kill a healthy
+		// non-DNS port-53 connection a few seconds in. A conn that cannot
+		// clear its deadline is unusable, so report it handled to stop the
+		// caller from relaying on it.
+		if clearErr := lConn.SetReadDeadline(time.Time{}); clearErr != nil {
+			return true, clearErr
+		}
 		return false, nil
 	}
 
@@ -774,7 +811,7 @@ func (c *ControlPlane) handleTCPDnsFastPathOwned(
 		}
 
 		// Try to read next query
-		msg, frameLen, err = readDnsMsgFromBufio(bufReader, TCPDNSNextReadTimeout, lConn)
+		msg, frameLen, err = readDnsMsgFromBufio(bufReader, TCPDNSNextReadTimeout, lConn, true)
 		if err != nil {
 			// Connection closed or timeout - normal termination
 			if daerrors.IsIgnorableConnectionError(err) || err == io.EOF {

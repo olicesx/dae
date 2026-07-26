@@ -178,7 +178,6 @@ type stagedReloadHandoff struct {
 	preparedDNSHandoff    bool
 	bpfTransferred        bool
 	sharedBpfHandoff      bool
-	routingEpochReady     bool
 	oldConnectivityPaused bool
 	freshCutoverStarted   bool
 	flowDatapathAdopted   bool
@@ -258,22 +257,19 @@ func clearReloadPending(flag *atomic.Bool) {
 // shouldUseStagedHotHandoff reports whether a reload may overlap the outgoing
 // and incoming datapaths on a shared listener.
 //
-// It requires the routing-epoch feature: overlapping generations both publish
-// routing state, and only the epoch's prepared-slot indirection keeps the
-// kernel from observing a half-written rule set while the flip happens. With
-// the epoch disabled the staged path has no such protection, so fall back to
-// the non-overlapping reload.
-func shouldUseStagedHotHandoff(routingEpochEnabled, freshDatapathReload, listenerPresent bool) bool {
-	return routingEpochEnabled && !freshDatapathReload && listenerPresent
+// Overlapping generations both publish routing state; what keeps the kernel
+// from observing a half-written rule set is the routing epoch's prepared-slot
+// indirection, which every generation now goes through unconditionally.
+func shouldUseStagedHotHandoff(freshDatapathReload, listenerPresent bool) bool {
+	return !freshDatapathReload && listenerPresent
 }
 
 func shouldStreamStagedDnsCache(
 	stagedHotHandoff,
-	routingEpochEnabled,
 	dnsConfigUnchanged,
 	ipVersionPreferenceUnchanged bool,
 ) bool {
-	return stagedHotHandoff && routingEpochEnabled && dnsConfigUnchanged && ipVersionPreferenceUnchanged
+	return stagedHotHandoff && dnsConfigUnchanged && ipVersionPreferenceUnchanged
 }
 
 func listenControlPlaneInDaeNetns(c *control.ControlPlane, port uint16) (*control.Listener, error) {
@@ -426,8 +422,6 @@ func (r *Runner) Run() (err error) {
 	if semanticRefactorFeatures != nil {
 		defer semanticRefactorFeatures.Disable()
 	}
-	routingEpochHandoffEnabled := semanticRefactorFeatures.Enabled(control.SemanticRefactorFeatureRoutingEpoch)
-
 	var currCancel context.CancelFunc
 
 	// Remove AbortFile at beginning.
@@ -593,7 +587,7 @@ func (r *Runner) Run() (err error) {
 			portChanged := conf.Global.TproxyPort != newConf.Global.TproxyPort
 			datapathChanged := bpfDatapathChanged(conf, newConf)
 			freshDatapathReload := portChanged || datapathChanged
-			stagedHotHandoff := shouldUseStagedHotHandoff(routingEpochHandoffEnabled, freshDatapathReload, listener != nil)
+			stagedHotHandoff := shouldUseStagedHotHandoff(freshDatapathReload, listener != nil)
 			freshDatapathHandoff := freshDatapathReload && listener != nil
 			if !reloadManager.beginReloadTransition() {
 				reloadErr := errRuntimeSupervisorClosed
@@ -632,7 +626,6 @@ func (r *Runner) Run() (err error) {
 			ipVersionPreferenceUnchanged := conf.Dns.IpVersionPrefer == newConf.Dns.IpVersionPrefer
 			streamStagedDnsCache := shouldStreamStagedDnsCache(
 				stagedHotHandoff,
-				routingEpochHandoffEnabled,
 				dnsConfigUnchanged,
 				ipVersionPreferenceUnchanged,
 			)
@@ -688,27 +681,25 @@ func (r *Runner) Run() (err error) {
 				oldCancel := currCancel
 				oldConf := conf
 				oldListener := listener
-				if routingEpochHandoffEnabled {
-					if err := linkRoutingEpochPeerFunc(oldC, newC); err != nil {
-						reloadErr := fmt.Errorf("link staged routing epochs: %w", err)
-						reloadManager.setReloadError(reloadErr)
-						if closeErr := stagedListener.Close(); closeErr != nil {
-							log.WithError(closeErr).Warnln("[Reload] Failed to close staged listener after epoch link failure")
-						}
-						if closeErr := (&runtimeGeneration{controlPlane: newC, cancel: cancel}).cleanup(); closeErr != nil {
-							log.WithError(closeErr).Warnln("[Reload] Failed to close staged generation after epoch link failure")
-						}
-						log.WithError(reloadErr).Errorln("[Reload] Failed to prepare staged reload; keeping current generation active")
-						_ = sdnotify.Ready()
-						_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
-						reloadManager.reloadActive.Store(false)
-						clearReloadPending(&reloadManager.reloadPending)
-						releaseReloadTransition()
-						continue
+				if err := linkRoutingEpochPeerFunc(oldC, newC); err != nil {
+					reloadErr := fmt.Errorf("link staged routing epochs: %w", err)
+					reloadManager.setReloadError(reloadErr)
+					if closeErr := stagedListener.Close(); closeErr != nil {
+						log.WithError(closeErr).Warnln("[Reload] Failed to close staged listener after epoch link failure")
 					}
+					if closeErr := (&runtimeGeneration{controlPlane: newC, cancel: cancel}).cleanup(); closeErr != nil {
+						log.WithError(closeErr).Warnln("[Reload] Failed to close staged generation after epoch link failure")
+					}
+					log.WithError(reloadErr).Errorln("[Reload] Failed to prepare staged reload; keeping current generation active")
+					_ = sdnotify.Ready()
+					_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
+					reloadManager.reloadActive.Store(false)
+					clearReloadPending(&reloadManager.reloadPending)
+					releaseReloadTransition()
+					continue
 				}
 
-				if routingEpochHandoffEnabled && ipVersionPreferenceUnchanged {
+				if ipVersionPreferenceUnchanged {
 					if streamStagedDnsCache {
 						newC.SetReloadDnsCacheStreamSource(oldC.StreamDnsCacheForReload, oldC.PolicyIdentity().Hash())
 					} else {
@@ -770,7 +761,6 @@ func (r *Runner) Run() (err error) {
 					hasOverlap:         hasOverlap,
 					preparedDNSHandoff: true,
 					sharedBpfHandoff:   true,
-					routingEpochReady:  routingEpochHandoffEnabled,
 				}, reloadStartedAt, reloadStartedAtMono)
 				reloadManager.beginHandoff()
 				releaseReloadTransition()
@@ -1825,12 +1815,12 @@ func rollbackStagedReloadHandoff(log *logrus.Logger, handoff *stagedReloadHandof
 
 	if handoff.newControlPlane != nil {
 		handoff.newControlPlane.ClearReloadDnsCacheSource()
-		if handoff.routingEpochReady {
-			if err := handoff.newControlPlane.RollbackPreparedRoutingEpoch(); err != nil {
-				errs = append(errs, fmt.Errorf("restore previous routing epoch: %w", err))
-				if log != nil {
-					log.WithError(err).Errorln("[Reload] Failed to restore previous routing epoch before closing staged control plane")
-				}
+		// Self-noops when this handoff never reserved a peer slot, so it does
+		// not need a flag mirroring which reload shape got here.
+		if err := handoff.newControlPlane.RollbackPreparedRoutingEpoch(); err != nil {
+			errs = append(errs, fmt.Errorf("restore previous routing epoch: %w", err))
+			if log != nil {
+				log.WithError(err).Errorln("[Reload] Failed to restore previous routing epoch before closing staged control plane")
 			}
 		}
 	}

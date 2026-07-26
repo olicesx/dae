@@ -16,10 +16,7 @@ import (
 	"github.com/daeuniverse/dae/pkg/config_parser"
 )
 
-const (
-	normalizedPolicyHashSchema = "dae.normalized-policy.v1"
-	compiledPolicyHashSchema   = "dae.compiled-policy.v1"
-)
+const normalizedPolicyHashSchema = "dae.normalized-policy.v1"
 
 type canonicalPolicyHasher struct {
 	digest   hash.Hash
@@ -236,43 +233,3 @@ func (h *canonicalPolicyHasher) writePrefixSets(prefixSets [][]netip.Prefix) {
 	}
 }
 
-func hashCompiledPolicy(outboundIDs []OutboundID, plan CompiledPolicyPlan) [sha256.Size]byte {
-	hasher := newCanonicalPolicyHasher(compiledPolicyHashSchema)
-	hasher.writeBool(outboundIDs != nil)
-	hasher.writeUint64(uint64(len(outboundIDs)))
-	for _, binding := range outboundIDs {
-		hasher.writeString(binding.Name)
-		hasher.writeUint64(uint64(binding.ID))
-	}
-	hasher.writeBool(plan.Matches != nil)
-	hasher.writeUint64(uint64(len(plan.Matches)))
-	for _, match := range plan.Matches {
-		hasher.writeUint64(uint64(match.Type))
-		hasher.writeBool(match.Not)
-		hasher.writeUint64(uint64(match.Outbound))
-		hasher.writeUint64(uint64(match.Mark))
-		hasher.writeBool(match.Must)
-		hasher.writeString(string(match.DomainKey))
-		hasher.writeStrings(match.Domains)
-		hasher.writeUint64(uint64(match.PrefixSetIndex))
-		hasher.writeUint64(uint64(match.PortStart))
-		hasher.writeUint64(uint64(match.PortEnd))
-		hasher.writeUint64(uint64(match.Mask))
-		hasher.writeBytes(match.ProcessName[:])
-		hasher.writeUint64(uint64(match.DSCP))
-	}
-	hasher.writeBool(plan.PredicateGroups != nil)
-	hasher.writeUint64(uint64(len(plan.PredicateGroups)))
-	for _, group := range plan.PredicateGroups {
-		hasher.writeString(group.Name)
-		hasher.writeString(group.Key)
-		hasher.writeBool(group.Not)
-		hasher.writeInt(group.Start)
-		hasher.writeInt(group.End)
-	}
-	hasher.writePrefixSets(plan.PrefixSets)
-	hasher.writeInt(plan.DeduplicatedPrefixSetCount)
-	hasher.writeStrings(plan.ReferencedOutbounds)
-	hasher.writeBool(plan.PacketMetadataSensitive)
-	return hasher.sum()
-}

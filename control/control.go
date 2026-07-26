@@ -12,24 +12,12 @@ func (c *ControlPlane) PolicyIdentity() routing.PolicyIdentity {
 	if c == nil {
 		return routing.PolicyIdentity{}
 	}
-	if c.policyIdentity == (routing.PolicyIdentity{}) && c.policySnapshot != nil {
-		return c.policySnapshot.Identity()
-	}
 	return c.policyIdentity
 }
 
 // PolicyEpoch returns the immutable routing generation identifier.
 func (c *ControlPlane) PolicyEpoch() routing.PolicyEpoch {
 	return c.PolicyIdentity().Epoch()
-}
-
-// PolicySnapshot returns the retained routing policy used by decision shadowing.
-// Other execution paths retain only PolicyIdentity to avoid keeping the rule tree alive.
-func (c *ControlPlane) PolicySnapshot() *routing.PolicySnapshot {
-	if c == nil {
-		return nil
-	}
-	return c.policySnapshot
 }
 
 // RoutingEpochForSlot returns kernel-plan metadata for diagnostics and replay.

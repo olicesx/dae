@@ -46,9 +46,11 @@ global {
     # Disable waiting for network before pulling subscriptions.
     disable_waiting_network: false
 
-    # Disable transparent huge pages for dae userspace memory.
-    # This is enabled by default to keep RSS stable on systems with THP=always.
-    disable_thp: true
+    # Opt the dae process out of transparent huge pages.
+    # Off by default: dae leaves kernel memory policy untouched. Enable it if
+    # you observe RSS inflation from THP-backed matcher memory on THP=always
+    # systems.
+    disable_thp: false
 
     ##### Interface and kernel options.
 

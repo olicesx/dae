@@ -131,11 +131,11 @@ func phase0NamedUpstreamControllerOption(logger *logrus.Logger) *DnsControllerOp
 	return &DnsControllerOption{
 		Log:              logger,
 		LifecycleContext: context.Background(),
-		BestDialerChooser: func(_ context.Context, req *udpRequest, _ *componentdns.Upstream) (*dialArgument, error) {
+		BestDialerChooser: func(_ context.Context, snapshot DnsRequestSnapshot, _ *componentdns.Upstream) (*dialArgument, error) {
 			return &dialArgument{
 				l4proto:    consts.L4ProtoStr_UDP,
 				ipversion:  consts.IpVersionStr_4,
-				bestTarget: req.realDst,
+				bestTarget: snapshot.RealDst,
 			}, nil
 		},
 		NewCache: func(_ string, answers, ns, extra []dnsmessage.RR, deadline, originalDeadline time.Time) (*DnsCache, error) {

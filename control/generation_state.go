@@ -18,7 +18,6 @@ type controlPlaneGenerationState struct {
 	referencedOutbounds map[string]struct{}
 	dialMode            consts.DialMode
 	policyIdentity      routing.PolicyIdentity
-	policySnapshot      *routing.PolicySnapshot
 	routingMatcher      *RoutingMatcher
 	bootstrapResolvers  []netip.AddrPort
 }

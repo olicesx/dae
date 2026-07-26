@@ -8,6 +8,10 @@ import (
 	dnsmessage "github.com/miekg/dns"
 )
 
+// A singleflight leader must re-check the cache before going upstream: another
+// request may have populated the entry between the outer miss and the moment
+// this leader started resolving, and resolving again would send a duplicate
+// query for an answer that is already cached.
 func TestResolveForSingleflightRechecksCache(t *testing.T) {
 	controller := newTestDnsController()
 	query := new(dnsmessage.Msg)
@@ -32,10 +36,10 @@ func TestResolveForSingleflightRechecksCache(t *testing.T) {
 	const cacheKey = "singleflight-cache-key"
 	controller.dnsCache.Store(cacheKey, cache)
 
-	result, err := controller.resolveForSingleflightSnapshot(
+	response, err := controller.resolveForSingleflight(
 		context.Background(),
 		query,
-		DnsRequestSnapshot{},
+		&udpRequest{},
 		0,
 		nil,
 		cacheKey,
@@ -43,14 +47,14 @@ func TestResolveForSingleflightRechecksCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveForSingleflight() error = %v", err)
 	}
-	if result == nil || result.Response == nil {
-		t.Fatal("resolveForSingleflightSnapshot() returned no DNS response")
+	if response == nil {
+		t.Fatal("resolveForSingleflight() returned no DNS response")
 	}
-	if result.Response.Id != query.Id {
-		t.Fatalf("response ID = %d, want %d", result.Response.Id, query.Id)
+	if response.Id != query.Id {
+		t.Fatalf("response ID = %d, want %d", response.Id, query.Id)
 	}
-	if len(result.Response.Answer) != 1 {
-		t.Fatalf("answer count = %d, want 1", len(result.Response.Answer))
+	if len(response.Answer) != 1 {
+		t.Fatalf("answer count = %d, want 1", len(response.Answer))
 	}
 }
 

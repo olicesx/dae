@@ -49,6 +49,39 @@ curl --silent "https://api.github.com/repos/daeuniverse/dae/releases" | jq -r '.
 - [v0.1.0](#v010)
 <!-- BEGIN NEW CHANGELOGS -->
 
+### Unreleased
+
+#### Behavior changes / Upgrade notes
+
+Existing config files keep parsing, but the following defaults and semantics
+changed. Review them before upgrading:
+
+- `sniffing_timeout` default lowered from `100ms` to `30ms`. Slow first-packet
+  clients that previously sniffed successfully may now fall back to non-sniffed
+  routing; combined with the sniff negative cache this makes domain-based
+  splitting silently stop applying to such flows. Set
+  `sniffing_timeout: 100ms` explicitly to restore the old behavior.
+- New `bootstrap_resolver` option. When DNS upstream hostnames need resolving
+  before any upstream is ready, dae now defaults to `119.29.29.29:53` and
+  `223.5.5.5:53`. Users outside mainland China likely want to set
+  `bootstrap_resolver` to a closer resolver.
+- `so_mark_from_dae` semantics: when the option is absent, dae now
+  auto-selects an internal fwmark for its own egress traffic instead of
+  leaving it unset. Setups whose policy routing matched on "no mark" must set
+  `so_mark_from_dae: 0` explicitly (an explicit `0` keeps the old behavior).
+- New `disable_thp` option (default `false`) can opt the dae process out of
+  transparent huge pages via `prctl(PR_SET_THP_DISABLE)`. The default leaves
+  kernel memory policy untouched; enable it if you observe RSS inflation on
+  `THP=always` systems.
+- Routing optimizer no longer merges single-function `!`-negated rules into
+  combined match sets. Merging negated sets changed match semantics
+  (`!a` + `!b` merged is not `!a && !b`); affected configs may observe routing
+  results narrowing back to what the rules literally say.
+- The bundled systemd unit no longer sets `MemoryHigh=512M` and restarts only
+  on abnormal exits (`Restart=on-abnormal`) with a crash-loop limit. dae also
+  no longer derives `GOMEMLIMIT` from `memory.high` — only `memory.max`
+  participates, and an explicit `GOMEMLIMIT` environment variable always wins.
+
 ### v2.0.0rc1 (Pre-release)
 
 > Release date: 2026/04/23

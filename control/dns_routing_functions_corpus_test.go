@@ -180,11 +180,11 @@ func newPhase0DnsRoutingFunctionsController(t *testing.T, cfg *config.Dns) *DnsC
 	t.Helper()
 
 	ctrl := newCorpusDnsController(t, cfg)
-	setScopedBestDialerChooser(ctrl, func(_ context.Context, req *udpRequest, _ *componentdns.Upstream) (*dialArgument, error) {
+	setScopedBestDialerChooser(ctrl, func(_ context.Context, snapshot DnsRequestSnapshot, _ *componentdns.Upstream) (*dialArgument, error) {
 		return &dialArgument{
 			l4proto:    consts.L4ProtoStr_UDP,
 			ipversion:  consts.IpVersionStr_4,
-			bestTarget: req.realDst,
+			bestTarget: snapshot.RealDst,
 		}, nil
 	})
 	return ctrl

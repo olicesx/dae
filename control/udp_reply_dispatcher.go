@@ -47,13 +47,10 @@ type udpReplyDispatcher struct {
 	closed      atomic.Bool
 	closeMu     sync.Once
 
-	readyMu   sync.Mutex
-	ready     []*udpReplyDispatchQueue
-	readyHead int
-	wake      chan struct{}
-	stop      chan struct{}
-	done      chan struct{}
-	workers   sync.WaitGroup
+	ready   *readyRing[udpReplyDispatchQueue]
+	stop    chan struct{}
+	done    chan struct{}
+	workers sync.WaitGroup
 
 	workerCount  int
 	drainQuantum int
@@ -77,7 +74,7 @@ func newUDPReplyDispatcher(workers, drainQuantum int) *udpReplyDispatcher {
 		drainQuantum = defaultUDPReplyDispatcherQuantum
 	}
 	d := &udpReplyDispatcher{
-		wake:         make(chan struct{}, workers),
+		ready:        newReadyRing[udpReplyDispatchQueue](workers),
 		stop:         make(chan struct{}),
 		done:         make(chan struct{}),
 		workerCount:  workers,
@@ -141,7 +138,7 @@ func (d *udpReplyDispatcher) submit(endpoint *UdpEndpoint, run, discard func()) 
 		q.mu.Unlock()
 
 		if shouldWake {
-			d.enqueueReady(q)
+			d.ready.push(q)
 		}
 		return true
 	}
@@ -159,25 +156,6 @@ func (d *udpReplyDispatcher) acquireQueue(endpoint *UdpEndpoint) *udpReplyDispat
 	return actual.(*udpReplyDispatchQueue)
 }
 
-func (d *udpReplyDispatcher) enqueueReady(q *udpReplyDispatchQueue) {
-	d.readyMu.Lock()
-	if d.readyHead > 0 && len(d.ready) == cap(d.ready) {
-		copy(d.ready, d.ready[d.readyHead:])
-		d.ready = d.ready[:len(d.ready)-d.readyHead]
-		d.readyHead = 0
-	}
-	d.ready = append(d.ready, q)
-	d.readyMu.Unlock()
-	d.notify()
-}
-
-func (d *udpReplyDispatcher) notify() {
-	select {
-	case d.wake <- struct{}{}:
-	default:
-	}
-}
-
 func (d *udpReplyDispatcher) worker() {
 	defer d.workers.Done()
 	for {
@@ -188,27 +166,16 @@ func (d *udpReplyDispatcher) worker() {
 		select {
 		case <-d.stop:
 			return
-		case <-d.wake:
+		case <-d.ready.wake:
 		}
 	}
 }
 
 func (d *udpReplyDispatcher) takeReadyQueue() *udpReplyDispatchQueue {
 	for {
-		d.readyMu.Lock()
-		if d.readyHead == len(d.ready) {
-			d.ready = d.ready[:0]
-			d.readyHead = 0
-			d.readyMu.Unlock()
+		q := d.ready.pop()
+		if q == nil {
 			return nil
-		}
-		q := d.ready[d.readyHead]
-		d.ready[d.readyHead] = nil
-		d.readyHead++
-		wakeAnother := d.readyHead < len(d.ready)
-		d.readyMu.Unlock()
-		if wakeAnother {
-			d.notify()
 		}
 
 		q.mu.Lock()
@@ -274,7 +241,7 @@ func (d *udpReplyDispatcher) finishTurn(q *udpReplyDispatchQueue) {
 		return
 	}
 	if reschedule {
-		d.enqueueReady(q)
+		d.ready.push(q)
 	}
 }
 
@@ -380,11 +347,7 @@ func (d *udpReplyDispatcher) close() {
 			q.mu.Unlock()
 			return true
 		})
-		d.readyMu.Lock()
-		clear(d.ready)
-		d.ready = nil
-		d.readyHead = 0
-		d.readyMu.Unlock()
+		d.ready.reset()
 		close(d.stop)
 		d.lifecycleMu.Unlock()
 

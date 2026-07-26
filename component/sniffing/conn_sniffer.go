@@ -45,8 +45,15 @@ func (s *ConnSniffer) Read(p []byte) (n int, err error) {
 	return s.Sniffer.Read(p)
 }
 
-func (s *ConnSniffer) CopyRelayRemainder(dst io.Writer, buf []byte) (int64, error) {
-	return copyDirect(dst, s.Conn, buf)
+// CopyRelayRemainder streams the rest of the connection to dst, reading the
+// underlying conn directly. Callers must have drained the sniff buffer via
+// TakeRelaySegments/TakeRelayPrefix first. The record callback receives every
+// written chunk so relay traffic accounting stays exact; it may be nil.
+//
+// The signature must match control's relayContinuationSource — a mismatch is
+// not a compile error here, it just silently disables the relay fast path.
+func (s *ConnSniffer) CopyRelayRemainder(dst io.Writer, buf []byte, record func(int64)) (int64, error) {
+	return copyDirect(dst, s.Conn, buf, record)
 }
 
 func (s *ConnSniffer) TakeRelaySegments() [][]byte {
@@ -162,18 +169,22 @@ func (s *ConnSniffer) ReadFrom(r io.Reader) (int64, error) {
 	bufPtr := relayBufPool.Get().(*[]byte)
 	buf := *bufPtr
 	defer relayBufPool.Put(bufPtr)
-	return copyDirect(s.Conn, r, buf)
+	return copyDirect(s.Conn, r, buf, nil)
 }
 
 // copyDirect copies from src to dst using the provided buf without delegating
 // to io.WriterTo or io.ReaderFrom interfaces. This prevents stdlib wrappers
 // (e.g. net.TCPConn.ReadFrom) from silently heap-allocating their own buffers.
-func copyDirect(dst io.Writer, src io.Reader, buf []byte) (written int64, err error) {
+// record, when non-nil, observes every successfully written chunk.
+func copyDirect(dst io.Writer, src io.Reader, buf []byte, record func(int64)) (written int64, err error) {
 	for {
 		nr, er := src.Read(buf)
 		if nr > 0 {
 			nw, ew := dst.Write(buf[:nr])
 			written += int64(nw)
+			if nw > 0 && record != nil {
+				record(int64(nw))
+			}
 			if ew != nil {
 				return written, ew
 			}

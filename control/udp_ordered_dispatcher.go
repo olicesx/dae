@@ -15,6 +15,10 @@ import (
 )
 
 const (
+	// The worker cap bounds scheduler pressure, not throughput: tasks are
+	// per-packet and short. Worst-case liveness under stalled upstreams is
+	// owned by udpEndpointWriteTimeout, which unparks a worker in bounded
+	// time, so the cap does not need to scale with core count.
 	defaultUDPOrderedDispatcherWorkerCap = 8
 	defaultUDPOrderedDispatcherQuantum   = 32
 	// Bound queued packet buffers even when a flow handler or all workers are
@@ -54,13 +58,10 @@ type udpOrderedDispatcher struct {
 	closed      atomic.Bool
 	closeMu     sync.Once
 
-	readyMu   sync.Mutex
-	ready     []*udpOrderedDispatchQueue
-	readyHead int
-	wake      chan struct{}
-	stop      chan struct{}
-	done      chan struct{}
-	workers   sync.WaitGroup
+	ready   *readyRing[udpOrderedDispatchQueue]
+	stop    chan struct{}
+	done    chan struct{}
+	workers sync.WaitGroup
 
 	// compensationSlots bounds cold endpoint creations that borrow a temporary
 	// worker. The channel is never closed because release may race teardown.
@@ -124,7 +125,7 @@ func newUDPOrderedDispatcherWithLimitsAndCompensation(workers, drainQuantum, max
 		maxCompensatingWorkers = defaultUDPOrderedDispatcherMaxCompensatingWorkers
 	}
 	d := &udpOrderedDispatcher{
-		wake:              make(chan struct{}, workers),
+		ready:             newReadyRing[udpOrderedDispatchQueue](workers),
 		stop:              make(chan struct{}),
 		done:              make(chan struct{}),
 		workerCount:       workers,
@@ -195,7 +196,7 @@ func (d *udpOrderedDispatcher) submit(key UdpFlowKey, run, discard UdpTask) bool
 		q.mu.Unlock()
 
 		if shouldWake {
-			d.enqueueReady(q)
+			d.ready.push(q)
 		}
 		return true
 	}
@@ -220,25 +221,6 @@ func (d *udpOrderedDispatcher) acquireQueue(key UdpFlowKey) *udpOrderedDispatchQ
 	created := &udpOrderedDispatchQueue{key: key}
 	actual, _ := d.queues.LoadOrStore(key, created)
 	return actual.(*udpOrderedDispatchQueue)
-}
-
-func (d *udpOrderedDispatcher) enqueueReady(q *udpOrderedDispatchQueue) {
-	d.readyMu.Lock()
-	if d.readyHead > 0 && len(d.ready) == cap(d.ready) {
-		copy(d.ready, d.ready[d.readyHead:])
-		d.ready = d.ready[:len(d.ready)-d.readyHead]
-		d.readyHead = 0
-	}
-	d.ready = append(d.ready, q)
-	d.readyMu.Unlock()
-	d.notify()
-}
-
-func (d *udpOrderedDispatcher) notify() {
-	select {
-	case d.wake <- struct{}{}:
-	default:
-	}
 }
 
 func (d *udpOrderedDispatcher) worker(retire <-chan struct{}) {
@@ -266,7 +248,7 @@ func (d *udpOrderedDispatcher) worker(retire <-chan struct{}) {
 			return
 		case <-retire:
 			return
-		case <-d.wake:
+		case <-d.ready.wake:
 		}
 	}
 }
@@ -323,20 +305,9 @@ func (d *udpOrderedDispatcher) reportEndpointCreateAdmissionSaturated() {
 
 func (d *udpOrderedDispatcher) takeReadyQueue() *udpOrderedDispatchQueue {
 	for {
-		d.readyMu.Lock()
-		if d.readyHead == len(d.ready) {
-			d.ready = d.ready[:0]
-			d.readyHead = 0
-			d.readyMu.Unlock()
+		q := d.ready.pop()
+		if q == nil {
 			return nil
-		}
-		q := d.ready[d.readyHead]
-		d.ready[d.readyHead] = nil
-		d.readyHead++
-		wakeAnother := d.readyHead < len(d.ready)
-		d.readyMu.Unlock()
-		if wakeAnother {
-			d.notify()
 		}
 
 		q.mu.Lock()
@@ -392,7 +363,7 @@ func (d *udpOrderedDispatcher) finishTurn(q *udpOrderedDispatchQueue) {
 	}
 	q.ready = true
 	q.mu.Unlock()
-	d.enqueueReady(q)
+	d.ready.push(q)
 }
 
 func (d *udpOrderedDispatcher) close() {
@@ -418,11 +389,7 @@ func (d *udpOrderedDispatcher) close() {
 			q.mu.Unlock()
 			return true
 		})
-		d.readyMu.Lock()
-		clear(d.ready)
-		d.ready = nil
-		d.readyHead = 0
-		d.readyMu.Unlock()
+		d.ready.reset()
 		close(d.stop)
 		d.lifecycleMu.Unlock()
 
@@ -459,11 +426,7 @@ func (d *udpOrderedDispatcher) reset() {
 		q.mu.Unlock()
 		return true
 	})
-	d.readyMu.Lock()
-	clear(d.ready)
-	d.ready = nil
-	d.readyHead = 0
-	d.readyMu.Unlock()
+	d.ready.reset()
 	d.lifecycleMu.Unlock()
 
 	for _, task := range pending {

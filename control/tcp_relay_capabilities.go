@@ -25,6 +25,22 @@ type relayPrefixSource interface {
 	TakeRelayPrefix() []byte
 }
 
+// The relay capability interfaces are satisfied structurally, so a signature
+// drift in an implementer is not a compile error on its own — it just makes
+// the type assertion fail and silently disables the relay fast path. These
+// assertions turn that drift into a build failure.
+var (
+	_ relaySegmentSource      = (*sniffing.ConnSniffer)(nil)
+	_ relayContinuationSource = (*sniffing.ConnSniffer)(nil)
+	_ relayPrefixSource       = (*sniffing.ConnSniffer)(nil)
+	_ relaySegmentSource      = (*bufioConn)(nil)
+	_ relayContinuationSource = (*bufioConn)(nil)
+	_ relayPrefixSource       = (*bufioConn)(nil)
+	_ relaySegmentSource      = (*prefixedConn)(nil)
+	_ relayContinuationSource = (*prefixedConn)(nil)
+	_ relayPrefixSource       = (*prefixedConn)(nil)
+)
+
 const relayConnChainMaxDepth = 8
 
 // unwrapRelayTCPConn resolves transparent wrappers down to a concrete TCP

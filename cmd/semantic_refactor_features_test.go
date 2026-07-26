@@ -33,15 +33,17 @@ func TestSemanticRefactorFeaturesFromValue(t *testing.T) {
 		{name: "unset", want: defaults},
 		{name: "empty", present: true, want: defaults},
 		{name: "disable none", value: "none", present: true},
-		{name: "one", value: "compiled-policy", present: true, want: []control.SemanticRefactorFeature{control.SemanticRefactorFeatureCompiledPolicy}, enabled: true},
 		{name: "udp ordered dispatcher", value: "udp-ordered-dispatcher", present: true, want: []control.SemanticRefactorFeature{control.SemanticRefactorFeatureUDPOrderedDispatcher}, enabled: true},
 		{name: "udp reply dispatcher", value: "udp-reply-dispatcher", present: true, want: []control.SemanticRefactorFeature{control.SemanticRefactorFeatureUDPReplyDispatcher}, enabled: true},
-		{name: "multiple", value: "compiled-policy,dns-resolver", present: true, want: []control.SemanticRefactorFeature{control.SemanticRefactorFeatureCompiledPolicy, control.SemanticRefactorFeatureDNSResolver}, enabled: true},
-		{name: "multiple including udp ordered dispatcher", value: "compiled-policy,udp-ordered-dispatcher", present: true, want: []control.SemanticRefactorFeature{control.SemanticRefactorFeatureCompiledPolicy, control.SemanticRefactorFeatureUDPOrderedDispatcher}, enabled: true},
-		{name: "multiple including udp reply dispatcher", value: "compiled-policy,udp-reply-dispatcher", present: true, want: []control.SemanticRefactorFeature{control.SemanticRefactorFeatureCompiledPolicy, control.SemanticRefactorFeatureUDPReplyDispatcher}, enabled: true},
+		{name: "multiple", value: "udp-ordered-dispatcher,udp-reply-dispatcher", present: true, want: []control.SemanticRefactorFeature{control.SemanticRefactorFeatureUDPOrderedDispatcher, control.SemanticRefactorFeatureUDPReplyDispatcher}, enabled: true},
 		{name: "unknown", value: "unknown", present: true, wantErr: true},
-		{name: "duplicate", value: "routing-epoch,routing-epoch", present: true, wantErr: true},
-		{name: "whitespace", value: "compiled-policy, dns-resolver", present: true, wantErr: true},
+		// Paths that have been collapsed into the single production path must
+		// fail loudly rather than being accepted and silently doing nothing.
+		{name: "retired compiled-policy", value: "compiled-policy", present: true, wantErr: true},
+		{name: "retired routing-epoch", value: "routing-epoch", present: true, wantErr: true},
+		{name: "retired dns-resolver", value: "dns-resolver", present: true, wantErr: true},
+		{name: "duplicate", value: "udp-reply-dispatcher,udp-reply-dispatcher", present: true, wantErr: true},
+		{name: "whitespace", value: "udp-ordered-dispatcher, udp-reply-dispatcher", present: true, wantErr: true},
 	}
 	for _, tc := range tests {
 		tc := tc
@@ -65,25 +67,20 @@ func TestSemanticRefactorFeaturesFromValue(t *testing.T) {
 func TestShouldUseStagedHotHandoff(t *testing.T) {
 	tests := []struct {
 		name                string
-		routingEpochEnabled bool
 		freshDatapathReload bool
 		listenerPresent     bool
 		want                bool
 	}{
-		{name: "same port reload", routingEpochEnabled: true, listenerPresent: true, want: true},
-		{name: "fresh datapath reload", routingEpochEnabled: true, freshDatapathReload: true, listenerPresent: true},
-		{name: "no listener", routingEpochEnabled: true},
-		// The staged path overlaps two generations publishing routing state;
-		// without the epoch's prepared slot there is nothing keeping the kernel
-		// from reading a half-written rule set, so it must stay off.
-		{name: "routing epoch disabled", listenerPresent: true},
+		{name: "same port reload", listenerPresent: true, want: true},
+		{name: "fresh datapath reload", freshDatapathReload: true, listenerPresent: true},
+		{name: "no listener"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := shouldUseStagedHotHandoff(tc.routingEpochEnabled, tc.freshDatapathReload, tc.listenerPresent)
+			got := shouldUseStagedHotHandoff(tc.freshDatapathReload, tc.listenerPresent)
 			if got != tc.want {
-				t.Fatalf("shouldUseStagedHotHandoff(%v, %v, %v) = %v, want %v",
-					tc.routingEpochEnabled, tc.freshDatapathReload, tc.listenerPresent, got, tc.want)
+				t.Fatalf("shouldUseStagedHotHandoff(%v, %v) = %v, want %v",
+					tc.freshDatapathReload, tc.listenerPresent, got, tc.want)
 			}
 		})
 	}
@@ -93,29 +90,25 @@ func TestShouldStreamStagedDnsCache(t *testing.T) {
 	tests := []struct {
 		name                         string
 		stagedHotHandoff             bool
-		routingEpochEnabled          bool
 		dnsConfigUnchanged           bool
 		ipVersionPreferenceUnchanged bool
 		want                         bool
 	}{
 		{
-			name:                         "reusable routing epoch handoff",
+			name:                         "reusable staged handoff",
 			stagedHotHandoff:             true,
-			routingEpochEnabled:          true,
 			dnsConfigUnchanged:           true,
 			ipVersionPreferenceUnchanged: true,
 			want:                         true,
 		},
-		{name: "legacy handoff", stagedHotHandoff: true, dnsConfigUnchanged: true, ipVersionPreferenceUnchanged: true},
-		{name: "fresh datapath", routingEpochEnabled: true, dnsConfigUnchanged: true, ipVersionPreferenceUnchanged: true},
-		{name: "changed DNS config", stagedHotHandoff: true, routingEpochEnabled: true, ipVersionPreferenceUnchanged: true},
-		{name: "changed IP preference", stagedHotHandoff: true, routingEpochEnabled: true, dnsConfigUnchanged: true},
+		{name: "fresh datapath", dnsConfigUnchanged: true, ipVersionPreferenceUnchanged: true},
+		{name: "changed DNS config", stagedHotHandoff: true, ipVersionPreferenceUnchanged: true},
+		{name: "changed IP preference", stagedHotHandoff: true, dnsConfigUnchanged: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			got := shouldStreamStagedDnsCache(
 				tc.stagedHotHandoff,
-				tc.routingEpochEnabled,
 				tc.dnsConfigUnchanged,
 				tc.ipVersionPreferenceUnchanged,
 			)

@@ -82,22 +82,16 @@ type DnsControllerOption struct {
 	// changed.
 	RouteProjectionHash [32]byte
 	ProjectCacheRoute   func(cache *DnsCache) []uint32
-	// UseResolvePipeline selects the split Resolve/delivery path for this
-	// runtime generation. It is an internal migration gate, not a DNS config
-	// option exposed to users.
-	UseResolvePipeline bool
-	// BestDialerSnapshotChooser is the transport-independent dialer selector
-	// used by Resolve. BestDialerChooser remains for compatibility with callers
-	// that have not yet moved to DnsRequestSnapshot.
-	BestDialerSnapshotChooser func(ctx context.Context, snapshot DnsRequestSnapshot, upstream *dns.Upstream) (*dialArgument, error)
-	BestDialerChooser         func(ctx context.Context, req *udpRequest, upstream *dns.Upstream) (*dialArgument, error)
-	TimeoutExceedCallback     func(dialArgument *dialArgument, err error)
-	IpVersionPrefer           int
-	FixedDomainTtl            map[string]int
-	ConcurrencyLimit          int
-	OptimisticCache           bool
-	OptimisticCacheTtl        int // 0 means never expire (rely on LRU eviction)
-	MaxCacheSize              int // maximum number of cache entries (0 = unlimited)
+	// BestDialerChooser is the transport-independent dialer selector: it takes
+	// the routing facts of the request rather than its socket.
+	BestDialerChooser     func(ctx context.Context, snapshot DnsRequestSnapshot, upstream *dns.Upstream) (*dialArgument, error)
+	TimeoutExceedCallback func(dialArgument *dialArgument, err error)
+	IpVersionPrefer       int
+	FixedDomainTtl        map[string]int
+	ConcurrencyLimit      int
+	OptimisticCache       bool
+	OptimisticCacheTtl    int // 0 means never expire (rely on LRU eviction)
+	MaxCacheSize          int // maximum number of cache entries (0 = unlimited)
 }
 
 type dnsControllerRuntimeState struct {
@@ -110,9 +104,7 @@ type dnsControllerRuntimeState struct {
 	routeProjectionEpoch      uint64
 	routeProjectionHash       [32]byte
 	projectCacheRoute         func(cache *DnsCache) []uint32
-	useResolvePipeline        bool
-	bestDialerSnapshotChooser func(ctx context.Context, snapshot DnsRequestSnapshot, upstream *dns.Upstream) (*dialArgument, error)
-	bestDialerChooser         func(ctx context.Context, req *udpRequest, upstream *dns.Upstream) (*dialArgument, error)
+	bestDialerChooser         func(ctx context.Context, snapshot DnsRequestSnapshot, upstream *dns.Upstream) (*dialArgument, error)
 	timeoutExceedCallback     func(dialArgument *dialArgument, err error)
 	fixedDomainTtl            map[string]int
 }
@@ -739,8 +731,6 @@ func (c *DnsController) updateRuntime(option *DnsControllerOption, routing *dns.
 		routeProjectionEpoch:      option.RouteProjectionEpoch,
 		routeProjectionHash:       option.RouteProjectionHash,
 		projectCacheRoute:         option.ProjectCacheRoute,
-		useResolvePipeline:        option.UseResolvePipeline,
-		bestDialerSnapshotChooser: option.BestDialerSnapshotChooser,
 		bestDialerChooser:         option.BestDialerChooser,
 		timeoutExceedCallback:     option.TimeoutExceedCallback,
 		fixedDomainTtl:            option.FixedDomainTtl,
@@ -761,10 +751,6 @@ func (c *DnsController) runtime() *dnsControllerRuntimeState {
 		return nil
 	}
 	return c.runtimeState.Load()
-}
-
-func (c *DnsController) useResolvePipeline() bool {
-	return c != nil && c.runtime() != nil && c.runtime().useResolvePipeline
 }
 
 // TryUpdateRuntime updates generation-local DNS runtime state and reports
@@ -1011,8 +997,30 @@ func dnsCacheBaseKey(cacheKey string) string {
 	return cacheKey
 }
 
+// responseCacheKey scopes a base cache key to the upstream that produced the
+// answer, so an as-is answer for one destination cannot be served for another.
 func (c *DnsController) responseCacheKey(baseKey string, req *udpRequest, upstreamIndex consts.DnsRequestOutboundIndex, upstream *dns.Upstream) string {
-	return c.responseCacheKeyForSnapshot(baseKey, dnsRequestSnapshotFromUDPRequest(req), upstreamIndex, upstream)
+	var scope string
+	switch upstreamIndex {
+	case consts.DnsRequestOutboundIndex_AsIs:
+		scope = "asis"
+		if req != nil && req.realDst.IsValid() {
+			scope = "asis@" + req.realDst.String()
+		}
+	case consts.DnsRequestOutboundIndex_Reject:
+		scope = "reject"
+	default:
+		switch {
+		case upstream != nil:
+			scope = "upstream@" + upstream.String()
+		case upstreamIndex != 0:
+			scope = "upstream-index@" + strconv.Itoa(int(upstreamIndex))
+		}
+	}
+	if scope == "" {
+		return baseKey
+	}
+	return baseKey + "|" + scope
 }
 
 func ensureDNSCacheRouteOwnerKey(cacheKey string, cache *DnsCache) *DnsCache {
@@ -2820,11 +2828,7 @@ func (c *DnsController) forwardWithFallback(
 	fallbackUpstream := *upstream
 	fallbackUpstream.Scheme = dns.UpstreamScheme_TCP
 
-	rt := c.runtime()
-	if rt == nil || rt.bestDialerChooser == nil {
-		return nil, primaryDialArg, fmt.Errorf("dns controller runtime bestDialerChooser is not configured")
-	}
-	fallbackDialArg, chooseErr := rt.bestDialerChooser(ctx, req, &fallbackUpstream)
+	fallbackDialArg, chooseErr := c.runtime().chooseBestDnsDialer(ctx, dnsRequestSnapshotFromUDPRequest(req), &fallbackUpstream)
 	if chooseErr != nil {
 		return nil, primaryDialArg, fmt.Errorf("udp forward failed: %w; tcp fallback select failed: %v", primaryErr, chooseErr)
 	}
@@ -2852,22 +2856,10 @@ func (c *DnsController) forwardWithFallback(
 }
 
 func (c *DnsController) Handle_(ctx context.Context, dnsMessage *dnsmessage.Msg, req *udpRequest) (err error) {
-	if !c.useResolvePipeline() {
-		return c.handleWithResponseWriterLegacy(ctx, dnsMessage, req, nil)
-	}
-	return c.handleResolvedDNS(ctx, dnsMessage, req, nil)
+	return c.HandleWithResponseWriter_(ctx, dnsMessage, req, nil)
 }
 
 func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
-	if !c.useResolvePipeline() {
-		return c.handleWithResponseWriterLegacy(ctx, dnsMessage, req, responseWriter)
-	}
-	return c.handleResolvedDNS(ctx, dnsMessage, req, responseWriter)
-}
-
-// handleWithResponseWriterLegacy preserves the authoritative transport-coupled
-// path until the split Resolve/delivery pipeline is explicitly enabled.
-func (c *DnsController) handleWithResponseWriterLegacy(ctx context.Context, dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
 	c.requireStore()
 	var upstreamIndex consts.DnsRequestOutboundIndex
 	var upstream *dns.Upstream
@@ -3427,11 +3419,7 @@ func (c *DnsController) resolveDNSUpstream(
 	}
 
 	// Select best dial arguments (outbound, dialer, l4proto, ipversion, etc.)
-	rt := c.runtime()
-	if rt == nil || rt.bestDialerChooser == nil {
-		return nil, fmt.Errorf("dns controller runtime bestDialerChooser is not configured")
-	}
-	dialArg, err := rt.bestDialerChooser(ctx, req, upstream)
+	dialArg, err := c.runtime().chooseBestDnsDialer(ctx, dnsRequestSnapshotFromUDPRequest(req), upstream)
 	if err != nil {
 		return nil, err
 	}
@@ -3452,7 +3440,8 @@ func (c *DnsController) resolveDNSUpstream(
 	}
 
 	// Route response.
-	if rt.routing == nil {
+	rt := c.runtime()
+	if rt == nil || rt.routing == nil {
 		return nil, fmt.Errorf("dns routing is not configured")
 	}
 	upstreamIndex, nextUpstream, err := rt.routing.ResponseSelect(ctx, respMsg, upstream)

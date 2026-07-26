@@ -117,8 +117,11 @@ ebpf: ebpf-sync submodule clean-ebpf
 		echo > $(BUILD_TAGS_FILE); \
 	fi
 
+EBPF_LINT_SOURCES := control/kern/tproxy.c control/kern/tests/bpf_test.c trace/kern/trace.c
+EBPF_LINT_IGNORE := COMMIT_COMMENT_SYMBOL,NOT_UNIFIED_DIFF,COMMIT_LOG_LONG_LINE,LONG_LINE_COMMENT,VOLATILE,ASSIGN_IN_IF,PREFER_DEFINED_ATTRIBUTE_MACRO,CAMELCASE,LEADING_SPACE,OPEN_ENDED_LINE,SPACING,BLOCK_COMMENT_STYLE
+
 ebpf-lint:
-	./scripts/checkpatch.pl --no-tree --strict --no-summary --show-types --color=always control/kern/tproxy.c --ignore COMMIT_COMMENT_SYMBOL,NOT_UNIFIED_DIFF,COMMIT_LOG_LONG_LINE,LONG_LINE_COMMENT,VOLATILE,ASSIGN_IN_IF,PREFER_DEFINED_ATTRIBUTE_MACRO,CAMELCASE,LEADING_SPACE,OPEN_ENDED_LINE,SPACING,BLOCK_COMMENT_STYLE
+	./scripts/checkpatch.pl --no-tree --strict --no-summary --show-types --color=always $(EBPF_LINT_SOURCES) --ignore $(EBPF_LINT_IGNORE)
 
 ebpf-test: export BPF_CLANG := $(CLANG)
 ebpf-test: export BPF_STRIP_FLAG := $(STRIP_FLAG)

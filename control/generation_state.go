@@ -24,15 +24,3 @@ type controlPlaneGenerationState struct {
 	bootstrapResolvers  []netip.AddrPort
 }
 
-func (s *controlPlaneGenerationState) releaseRetainedState() {
-	if s == nil {
-		return
-	}
-	s.outbounds = nil
-	s.referencedOutbounds = nil
-	s.policyIdentity = routing.PolicyIdentity{}
-	s.policySnapshot = nil
-	s.routingMatcher = nil
-	s.decisionShadow = nil
-	s.bootstrapResolvers = nil
-}

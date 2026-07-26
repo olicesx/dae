@@ -21,23 +21,23 @@ const (
 // defaultSemanticRefactorFeatures returns the production default set of
 // semantic-refactor execution paths.
 //
-// Both UDP dispatchers are enabled by default:
+// The set is empty: every migration path stays opt-in until it has been
+// justified on its own terms.
 //
-//   - BenchmarkQuicInitialEndToEnd (control/udp_quic_e2e_bench_test.go) verified
-//     that ordered ingress is not slower than the legacy pool on the full QUIC
-//     Initial lifecycle (per-flow ClassifyUdpFlow + submitOrderedUDPIngress ->
-//     handlePkt -> proxy dial -> first-packet write): ~10% faster with ~19%
-//     fewer allocations under a single producer, and a larger advantage under
-//     8 producers.
-//   - BenchmarkUdpProxyDial (control/udp_proxy_dial_bench_test.go) covers the
-//     proxy DialContext cost under UDP that was previously unmeasured.
+// The UDP dispatchers were previously defaulted on, citing
+// BenchmarkQuicInitialEndToEnd (control/udp_quic_e2e_bench_test.go) for "~19%
+// fewer allocations". Re-running it does not reproduce that result — the
+// ordered arm allocates more than the legacy pool — and the benchmark's own
+// comment notes the two arms do not perform equivalent work. The second cited
+// benchmark, BenchmarkUdpProxyDial, has no legacy/ordered arms at all; it
+// compares a cold and a warm endpoint cache and says nothing about dispatch.
 //
-// Opt out via DAE_SEMANTIC_REFACTOR_FEATURES=none or pick a subset.
+// Re-enable them here only once a benchmark with equivalent work per arm (assert
+// dial count == b.N) shows a win.
+//
+// Select paths explicitly with DAE_SEMANTIC_REFACTOR_FEATURES=<name>[,<name>...].
 func defaultSemanticRefactorFeatures() []control.SemanticRefactorFeature {
-	return []control.SemanticRefactorFeature{
-		control.SemanticRefactorFeatureUDPOrderedDispatcher,
-		control.SemanticRefactorFeatureUDPReplyDispatcher,
-	}
+	return nil
 }
 
 func semanticRefactorFeaturesFromEnvironment() ([]control.SemanticRefactorFeature, bool, error) {

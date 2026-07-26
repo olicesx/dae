@@ -7,8 +7,10 @@ package control
 
 import (
 	stderrors "errors"
+	"fmt"
 	"net"
 	"net/netip"
+	"syscall"
 	"testing"
 
 	"github.com/cilium/ebpf"
@@ -217,5 +219,37 @@ func TestDomainRoutingTrackerKeepsEpochSlotsIndependent(t *testing.T) {
 	}
 	if got.Bitmap[0] != 0x1 {
 		t.Fatalf("slot zero bitmap after slot one remove = %#x, want %#x", got.Bitmap[0], uint32(0x1))
+	}
+}
+
+// A saturated domain_routing_map must stay distinguishable from a real failure:
+// the DNS path degrades to userspace routing on ErrBpfMapFull instead of
+// failing the answer, so misclassifying it either takes DNS down for every new
+// domain or silently hides a genuine map error.
+func TestIsBpfMapFullErrorClassifiesInsertionFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "e2big", err: fmt.Errorf("batch update: %w", syscall.E2BIG), want: true},
+		{name: "enospc", err: fmt.Errorf("batch update: %w", syscall.ENOSPC), want: true},
+		{name: "einval", err: fmt.Errorf("batch update: %w", syscall.EINVAL), want: false},
+		{name: "plain", err: stderrors.New("batch update failed"), want: false},
+		{name: "nil", err: nil, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isBpfMapFullError(tc.err); got != tc.want {
+				t.Fatalf("isBpfMapFullError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+
+	wrapped := fmt.Errorf("update domain_routing_map: %w: %w", ErrBpfMapFull, syscall.E2BIG)
+	if !stderrors.Is(wrapped, ErrBpfMapFull) {
+		t.Fatal("wrapped map-full error is not detectable via errors.Is")
+	}
+	if !stderrors.Is(wrapped, syscall.E2BIG) {
+		t.Fatal("wrapped map-full error lost the underlying errno")
 	}
 }

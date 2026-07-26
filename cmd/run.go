@@ -255,8 +255,16 @@ func clearReloadPending(flag *atomic.Bool) {
 	clearRejectedReloadProgress()
 }
 
-func shouldUseStagedHotHandoff(freshDatapathReload, listenerPresent bool) bool {
-	return !freshDatapathReload && listenerPresent
+// shouldUseStagedHotHandoff reports whether a reload may overlap the outgoing
+// and incoming datapaths on a shared listener.
+//
+// It requires the routing-epoch feature: overlapping generations both publish
+// routing state, and only the epoch's prepared-slot indirection keeps the
+// kernel from observing a half-written rule set while the flip happens. With
+// the epoch disabled the staged path has no such protection, so fall back to
+// the non-overlapping reload.
+func shouldUseStagedHotHandoff(routingEpochEnabled, freshDatapathReload, listenerPresent bool) bool {
+	return routingEpochEnabled && !freshDatapathReload && listenerPresent
 }
 
 func shouldStreamStagedDnsCache(
@@ -600,7 +608,7 @@ func (r *Runner) Run() (err error) {
 			portChanged := conf.Global.TproxyPort != newConf.Global.TproxyPort
 			datapathChanged := bpfDatapathChanged(conf, newConf)
 			freshDatapathReload := portChanged || datapathChanged
-			stagedHotHandoff := shouldUseStagedHotHandoff(freshDatapathReload, listener != nil)
+			stagedHotHandoff := shouldUseStagedHotHandoff(routingEpochHandoffEnabled, freshDatapathReload, listener != nil)
 			freshDatapathHandoff := freshDatapathReload && listener != nil
 			if !reloadManager.beginReloadTransition() {
 				reloadErr := errRuntimeSupervisorClosed
@@ -2152,8 +2160,10 @@ func configureTransparentHugePages(log *logrus.Logger, disable bool) {
 // which is critical for containerized deployments where GOGC's default
 // (100% heap growth) can overshoot the cgroup limit and trigger OOM kills.
 //
-// An explicit GOMEMLIMIT always wins. Otherwise memory.high participates in
-// the detected ceiling so systemd MemoryHigh works even without MemoryMax.
+// An explicit GOMEMLIMIT always wins. Only memory.max participates in the
+// detected ceiling: memory.high is a reclaim throttle the kernel lets the
+// process exceed, so deriving a soft heap limit from it makes the Go GC run
+// back-to-back against a threshold that was never meant to be a hard bound.
 // The function is a no-op when no finite cgroup ceiling is configured.
 func configureGcMemoryLimit(log *logrus.Logger) {
 	if value, ok := os.LookupEnv("GOMEMLIMIT"); ok {
@@ -2178,9 +2188,9 @@ func configureGcMemoryLimit(log *logrus.Logger) {
 	}
 }
 
-// detectCgroupMemLimit returns the smallest finite memory.max or memory.high
-// applying to the current cgroup. Parent ceilings still constrain children, so
-// the complete path is inspected instead of stopping at the first value.
+// detectCgroupMemLimit returns the smallest finite memory.max applying to the
+// current cgroup. Parent ceilings still constrain children, so the complete
+// path is inspected instead of stopping at the first value.
 func detectCgroupMemLimit() int64 {
 	data, err := os.ReadFile("/proc/self/cgroup")
 	if err != nil {
@@ -2215,17 +2225,14 @@ func detectCgroupMemLimitFrom(data []byte, root string) int64 {
 	return readCgroupMemoryCeiling(root)
 }
 
-// readMemMax reads memory.max from a cgroup v2 directory.
+// readCgroupMemoryCeiling reads memory.max from a cgroup v2 directory.
 // Returns 0 if the file is missing, set to "max", or unparseable.
-func readMemMax(dir string) int64 {
-	return readCgroupMemoryValue(dir, "memory.max")
-}
-
+//
+// memory.high is deliberately not consulted: it throttles reclaim rather than
+// capping the cgroup, so a process is allowed to sit above it. Feeding it to
+// SetMemoryLimit turns a soft systemd hint into a hard Go heap ceiling.
 func readCgroupMemoryCeiling(dir string) int64 {
-	return minPositive(
-		readMemMax(dir),
-		readCgroupMemoryValue(dir, "memory.high"),
-	)
+	return readCgroupMemoryValue(dir, "memory.max")
 }
 
 func readCgroupMemoryValue(dir, name string) int64 {

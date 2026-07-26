@@ -620,6 +620,10 @@ func (d *Dialer) aliveBackground() {
 	}
 	d.tickerMu.Lock()
 	d.ticker = time.NewTimer(initialDelay)
+	// A Timer's channel never changes across Reset, so capturing it once keeps
+	// the select below off d.ticker, which RetireForEstablishedFlows clears
+	// concurrently when a reload retires this dialer.
+	tickerC := d.ticker.C
 	d.tickerMu.Unlock()
 	defer func() {
 		d.tickerMu.Lock()
@@ -653,7 +657,7 @@ func (d *Dialer) aliveBackground() {
 		select {
 		case <-d.ctx.Done():
 			return
-		case <-d.ticker.C:
+		case <-tickerC:
 		case <-d.checkCh:
 		case <-d.checkDnsUdpCh:
 			checkFamily = consts.L4ProtoStr_UDP

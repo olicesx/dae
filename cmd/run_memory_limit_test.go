@@ -10,7 +10,10 @@ import (
 	"testing"
 )
 
-func TestReadCgroupMemoryCeilingUsesSmallestFiniteValue(t *testing.T) {
+// memory.high throttles reclaim instead of capping the cgroup, so it must not
+// pull GOMEMLIMIT down: systemd's MemoryHigh= would otherwise become a hard Go
+// heap ceiling and drive the GC into back-to-back cycles.
+func TestReadCgroupMemoryCeilingIgnoresMemoryHigh(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "memory.max"), []byte("1073741824\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -19,7 +22,7 @@ func TestReadCgroupMemoryCeilingUsesSmallestFiniteValue(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got, want := readCgroupMemoryCeiling(dir), int64(536870912); got != want {
+	if got, want := readCgroupMemoryCeiling(dir), int64(1073741824); got != want {
 		t.Fatalf("readCgroupMemoryCeiling() = %d, want %d", got, want)
 	}
 }
@@ -27,9 +30,6 @@ func TestReadCgroupMemoryCeilingUsesSmallestFiniteValue(t *testing.T) {
 func TestReadCgroupMemoryCeilingIgnoresUnlimitedAndInvalidValues(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "memory.max"), []byte("max\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "memory.high"), []byte("invalid\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -57,8 +57,8 @@ func TestDetectCgroupMemLimitUsesSmallestAncestorCeiling(t *testing.T) {
 	if err := os.MkdirAll(child, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	writeCgroupMemoryValue(t, root, "memory.max", "1073741824\n")
-	writeCgroupMemoryValue(t, filepath.Join(root, "service"), "memory.high", "268435456\n")
+	writeCgroupMemoryValue(t, root, "memory.max", "268435456\n")
+	writeCgroupMemoryValue(t, filepath.Join(root, "service"), "memory.high", "1048576\n")
 	writeCgroupMemoryValue(t, child, "memory.max", "536870912\n")
 
 	if got, want := detectCgroupMemLimitFrom([]byte("0::/service/worker\n"), root), int64(268435456); got != want {

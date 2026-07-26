@@ -11,7 +11,6 @@ on:
   push:
     branches:
       - main
-      - kdae
     paths:
       - "**/*.go"
       - "go.mod"
@@ -50,3 +49,72 @@ jobs:
         run: |
           git submodule update --init --recursive
           go test -tags dae_stub_ebpf ./...
+
+  go_test_race:
+    # Reload, UDP dispatch and connectivity checking are concurrent by
+    # construction. Their tests only mean something under the race detector.
+    name: Go Race Detector
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go 1.26
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.26
+
+      - name: Go cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-race-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-race-
+            ${{ runner.os }}-go-
+
+      - name: Run tests with race detector
+        run: |
+          git submodule update --init --recursive
+          go test -race -tags dae_stub_ebpf -timeout 30m ./control/... ./component/... ./cmd/...
+
+  go_vet_real_datapath:
+    # go_test builds everything with dae_stub_ebpf, which excludes the real
+    # datapath sources. Without this job a compile error in any !dae_stub_ebpf
+    # file reaches main unnoticed.
+    name: Go Vet (real eBPF datapath)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go 1.26
+        uses: actions/setup-go@v6
+        with:
+          go-version: 1.26
+
+      - name: Install eBPF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm
+
+      - name: Go cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-ebpf-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-ebpf-
+            ${{ runner.os }}-go-
+
+      - name: Generate eBPF bindings
+        run: |
+          git submodule update --init --recursive
+          make ebpf
+
+      - name: Vet real datapath
+        run: go vet ./...

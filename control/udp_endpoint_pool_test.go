@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/daeuniverse/dae/common/consts"
@@ -2439,30 +2440,60 @@ func TestUdpEndpointCloseDrainsAcceptedRepliesWithGenerationDispatcher(t *testin
 	}
 }
 
+// TestUdpEndpointSubmitReplyRejectedReleasesBufferOnce drives the real read
+// loop through a dispatcher rejection. The rejected reply aliases the read
+// buffer, so releasing it there in addition to the deferred release would put
+// the same backing array into the shared pool twice and let two unrelated flows
+// write into it.
 func TestUdpEndpointSubmitReplyRejectedReleasesBufferOnce(t *testing.T) {
 	oldPut := putUdpEndpointReplyData
 	defer func() {
 		putUdpEndpointReplyData = oldPut
 	}()
 
-	var released atomic.Int32
-	putUdpEndpointReplyData = func(pool.PB) {
-		released.Add(1)
+	var releaseMu sync.Mutex
+	released := make([]*byte, 0, 2)
+	putUdpEndpointReplyData = func(data pool.PB) {
+		releaseMu.Lock()
+		released = append(released, unsafe.SliceData([]byte(data)))
+		releaseMu.Unlock()
+		oldPut(data)
 	}
 
 	dispatcher := newUDPReplyDispatcher(1, 1)
 	dispatcher.close()
+	dispatcher.wait()
+
+	conn := &scriptedPacketConn{reads: make(chan scriptedPacketRead, 1)}
 	ue := &UdpEndpoint{
+		conn:         conn,
+		NatTimeout:   QuicNatTimeout,
+		handler:      func(*UdpEndpoint, []byte, netip.AddrPort) error { return nil },
 		replyRuntime: newUdpEndpointReplyRuntime(dispatcher, newControlPlaneDrainTracker(), 1),
 	}
+	ue.rememberPendingReplyPeer("203.0.113.10:3478")
 
-	if ue.submitReply(udpEndpointReply{data: pool.PB([]byte("rejected"))}) {
-		t.Fatal("submitReply() accepted a task after dispatcher close")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ue.startReadLoop()
+	}()
+
+	conn.reads <- scriptedPacketRead{
+		data: []byte("reply"),
+		from: netip.MustParseAddrPort("203.0.113.10:3478"),
 	}
-	putUdpEndpointReplyData(pool.PB([]byte("rejected")))
 
-	if got := released.Load(); got != 1 {
-		t.Fatalf("reply buffer releases = %d, want 1", got)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for read loop to exit after dispatcher rejection")
+	}
+
+	releaseMu.Lock()
+	defer releaseMu.Unlock()
+	if len(released) != 1 {
+		t.Fatalf("read buffer releases = %d, want exactly 1", len(released))
 	}
 }
 

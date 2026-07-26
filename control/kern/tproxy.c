@@ -644,8 +644,15 @@ parse_transport_fast(struct __sk_buff *skb, __u32 link_h_len,
 	__builtin_memset(udph, 0, sizeof(struct udphdr));
 
 	// Pull 128 bytes: eth(14)+IP(20)+TCP(20)+options. Larger sizes hurt verifier.
+	//
+	// pskb_may_pull() fails outright when the requested length exceeds skb->len,
+	// so asking for a fixed 128 makes every short frame fall back to the slow
+	// path. A 60-byte TCP SYN is exactly the frame LAN ingress routes, so the
+	// fast path would never run for new connections. Clamp to what is there.
 #define HEADER_PULL_SIZE 128
-	if (bpf_skb_pull_data(skb, HEADER_PULL_SIZE))
+	__u32 pull_len = skb->len < HEADER_PULL_SIZE ? skb->len : HEADER_PULL_SIZE;
+
+	if (bpf_skb_pull_data(skb, pull_len))
 		return -1;
 
 	data = (void *)(long)skb->data;
@@ -2331,9 +2338,11 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 	};
 
 	// Socket lookup before routing to detect local services (NAT loopback).
-	// TCP: only LISTEN sockets; skip SYN for CF back-to-source compat.
-	// UDP: any matching socket indicates local service.
-	if (pkt->l4proto == IPPROTO_TCP || pkt->l4proto == IPPROTO_UDP) {
+	//
+	// UDP only: any matching socket indicates a local service. TCP is not
+	// looked up here because every non-SYN TCP packet already returned above,
+	// so only SYNs reach this point and a SYN must go through routing.
+	if (pkt->l4proto == IPPROTO_UDP) {
 		struct bpf_sock_tuple tuple = { 0 };
 		__u32 tuple_size;
 		struct bpf_sock *sk;
@@ -2356,35 +2365,17 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 			tuple_size = sizeof(tuple.ipv6);
 		}
 
-		if (pkt->l4proto == IPPROTO_TCP) {
-			if (!(pkt->tcph.syn && !pkt->tcph.ack)) {
-				sk = bpf_skc_lookup_tcp(skb, &tuple, tuple_size,
-							PARAM.dae_netns_id, 0);
-				if (sk) {
-					if (!bpf_sock_is_dae_socket(sk) &&
-					    sk->state == BPF_TCP_LISTEN) {
-						bpf_sk_release(sk);
-#if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
-						bpf_printk("tcp(lan): local LISTEN socket found, pass through");
-#endif
-						return TC_ACT_OK;
-					}
-					bpf_sk_release(sk);
-				}
-			}
-		} else {
-			sk = bpf_sk_lookup_udp(skb, &tuple, tuple_size,
-					       PARAM.dae_netns_id, 0);
-			if (sk) {
-				if (!bpf_sock_is_dae_socket(sk)) {
-					bpf_sk_release(sk);
-#if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
-					bpf_printk("udp(lan): local socket found, pass through");
-#endif
-					return TC_ACT_OK;
-				}
+		sk = bpf_sk_lookup_udp(skb, &tuple, tuple_size,
+				       PARAM.dae_netns_id, 0);
+		if (sk) {
+			if (!bpf_sock_is_dae_socket(sk)) {
 				bpf_sk_release(sk);
+#if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
+				bpf_printk("udp(lan): local socket found, pass through");
+#endif
+				return TC_ACT_OK;
 			}
+			bpf_sk_release(sk);
 		}
 	}
 
@@ -3025,8 +3016,12 @@ load_redirect_tuple_fast(struct __sk_buff *skb,
 
 	// Pull header data to linear region for direct access.
 	// 128 bytes is enough for: ethhdr(14) + iphdr(40) + addresses.
+	// Clamp to skb->len: pskb_may_pull() rejects a request longer than the
+	// frame, which would send every small reply down the fallback path.
 #define REDIRECT_PULL_SIZE 128
-	if (bpf_skb_pull_data(skb, REDIRECT_PULL_SIZE))
+	__u32 pull_len = skb->len < REDIRECT_PULL_SIZE ? skb->len : REDIRECT_PULL_SIZE;
+
+	if (bpf_skb_pull_data(skb, pull_len))
 		return LOAD_REDIRECT_TUPLE_FALLBACK;
 
 	data = (void *)(long)skb->data;

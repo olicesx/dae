@@ -128,11 +128,13 @@ func TestPolicyFactsShadowDefersUnknownDomain(t *testing.T) {
 		t.Fatalf("ValidateContinuation() error = %v", err)
 	}
 
+	// A flow that outlives the generation which routed it keeps resolving its
+	// deferred continuation against the snapshot it captured. The generation
+	// must therefore never drop the snapshot out from under such a flow.
 	generation := controlPlaneGenerationState{policySnapshot: snapshot}
 	retainedSnapshot := generation.policySnapshot
-	generation.releaseRetainedState()
-	if generation.policySnapshot != nil {
-		t.Fatal("releaseRetainedState() retained generation snapshot")
+	if retainedSnapshot == nil {
+		t.Fatal("generation lost its policy snapshot")
 	}
 	resumed, err := retainedSnapshot.ResumeFacts(
 		deferred.Continuation,

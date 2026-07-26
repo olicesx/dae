@@ -9,7 +9,6 @@ import (
 	"context"
 	"path"
 	"sync"
-	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
@@ -61,86 +60,55 @@ func NewInterfaceManager(log *logrus.Logger) *InterfaceManager {
 	return mgr
 }
 
-type job struct {
-	ifName string
-	fn     func()
-}
-
-func tryEnqueueInterfaceCallback(ctx context.Context, ifQ chan<- func(), fn func()) bool {
-	select {
-	case <-ctx.Done():
-		return false
-	case ifQ <- fn:
-		return true
-	default:
-		return false
+// matchingCallbacksLocked collects every registered callback whose pattern
+// matches ifName. All of them must run: a single interface can be claimed by
+// more than one registration, for example when it matches both the LAN and the
+// WAN pattern.
+func (m *InterfaceManager) matchingCallbacksLocked(ifName string, pick func(callbackSet) func(netlink.Link)) []func(netlink.Link) {
+	var callbacks []func(netlink.Link)
+	for _, callback := range m.callbacks {
+		matched, err := path.Match(callback.pattern, ifName)
+		if err != nil || !matched {
+			continue
+		}
+		if cb := pick(callback); cb != nil {
+			callbacks = append(callbacks, cb)
+		}
 	}
+	return callbacks
 }
 
-func (m *InterfaceManager) enqueueJob(jobChan chan<- job, j job) {
+func (m *InterfaceManager) enqueueCallbacks(jobChan chan<- func(), link netlink.Link, callbacks []func(netlink.Link)) {
+	if len(callbacks) == 0 {
+		return
+	}
 	select {
 	case <-m.closed.Done():
-		return
-	case jobChan <- j:
+	case jobChan <- func() {
+		for _, cb := range callbacks {
+			cb(link)
+		}
+	}:
 	}
 }
 
 func (m *InterfaceManager) monitor(ch <-chan netlink.LinkUpdate, done chan struct{}) {
-	jobChan := make(chan job, 128)
+	// A single worker keeps callbacks off the netlink reader while running them
+	// in arrival order. Interfaces are not fanned out to per-interface queues:
+	// attaching or detaching a datapath is a bounded operation, and a map of
+	// per-interface queues and goroutines is never reclaimed, which leaks one
+	// goroutine per interface name on hosts that churn through veth devices.
+	jobChan := make(chan func(), 128)
 	go func() {
-		// Per-interface queues to preserve order
-		queues := make(map[string]chan func())
-		timers := make(map[string]*time.Timer)
-		stopTimers := func() {
-			for _, t := range timers {
-				t.Stop()
-			}
-		}
-		defer stopTimers()
-
 		for {
 			select {
 			case <-m.closed.Done():
 				return
-			case j, ok := <-jobChan:
+			case fn, ok := <-jobChan:
 				if !ok {
 					return
 				}
-				ifQ, exists := queues[j.ifName]
-				if !exists {
-					ifQ = make(chan func(), 32)
-					queues[j.ifName] = ifQ
-					go func(q chan func()) {
-						for {
-							select {
-							case <-m.closed.Done():
-								return
-							case f, ok := <-q:
-								if !ok {
-									return
-								}
-								f()
-							}
-						}
-					}(ifQ)
-				}
-
-				// Debounce logic: if a new event for the same interface arrives,
-				// reset the timer to delay execution.
-				fn := j.fn
-				if t, ok := timers[j.ifName]; ok {
-					t.Stop()
-				}
-				ifName := j.ifName
-				timers[j.ifName] = time.AfterFunc(200*time.Millisecond, func() {
-					if !tryEnqueueInterfaceCallback(m.closed, ifQ, fn) {
-						select {
-						case <-m.closed.Done():
-						default:
-							m.log.Warnf("Interface callback queue full for %s, skipping", ifName)
-						}
-					}
-				})
+				fn()
 			}
 		}
 	}()
@@ -165,49 +133,33 @@ func (m *InterfaceManager) monitor(ch <-chan netlink.LinkUpdate, done chan struc
 
 			switch update.Header.Type {
 			case unix.RTM_NEWLINK:
-				var jobs []job
 				m.mu.Lock()
-				_, exists := m.upLinks[ifName]
-				if exists {
+				if _, up := m.upLinks[ifName]; up {
 					m.mu.Unlock()
 					continue
 				}
 				m.upLinks[ifName] = true
-				for _, callback := range m.callbacks {
-					matched, err := path.Match(callback.pattern, ifName)
-					if err != nil || !matched {
-						continue
-					}
-					if callback.newCallback != nil {
-						cb := callback.newCallback
-						link := update.Link
-						jobs = append(jobs, job{ifName: ifName, fn: func() { cb(link) }})
-					}
-				}
+				callbacks := m.matchingCallbacksLocked(ifName, func(c callbackSet) func(netlink.Link) {
+					return c.newCallback
+				})
 				m.mu.Unlock()
-				for _, j := range jobs {
-					m.enqueueJob(jobChan, j)
-				}
+				m.enqueueCallbacks(jobChan, update.Link, callbacks)
 
 			case unix.RTM_DELLINK:
-				var jobs []job
 				m.mu.Lock()
+				if _, up := m.upLinks[ifName]; !up {
+					// The link is already down. Repeated RTM_DELLINK bursts are
+					// deduplicated here rather than by a timer, so no callback
+					// runs twice for a single down transition.
+					m.mu.Unlock()
+					continue
+				}
 				delete(m.upLinks, ifName)
-				for _, callback := range m.callbacks {
-					matched, err := path.Match(callback.pattern, ifName)
-					if err != nil || !matched {
-						continue
-					}
-					if callback.delCallback != nil {
-						cb := callback.delCallback
-						link := update.Link
-						jobs = append(jobs, job{ifName: ifName, fn: func() { cb(link) }})
-					}
-				}
+				callbacks := m.matchingCallbacksLocked(ifName, func(c callbackSet) func(netlink.Link) {
+					return c.delCallback
+				})
 				m.mu.Unlock()
-				for _, j := range jobs {
-					m.enqueueJob(jobChan, j)
-				}
+				m.enqueueCallbacks(jobChan, update.Link, callbacks)
 			}
 		}
 	}

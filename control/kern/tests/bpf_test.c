@@ -133,7 +133,7 @@ setup_routing_epoch_lan_ingress(struct __sk_buff *skb, __u32 active_slot)
 	if (set_routing_epoch_port_rule(0, 443, OUTBOUND_USER_DEFINED_MIN))
 		return TC_ACT_SHOT;
 	if (set_routing_epoch_port_rule(1, 443,
-				       OUTBOUND_USER_DEFINED_MIN + 1))
+					OUTBOUND_USER_DEFINED_MIN + 1))
 		return TC_ACT_SHOT;
 	if (bpf_map_update_elem(&active_routing_epoch_map, &zero_key,
 				&active_slot, BPF_ANY))
@@ -192,7 +192,7 @@ set_routing_epoch_domain_rule(__u32 slot, __u8 outbound, __u32 bitmap)
 
 static __always_inline int
 setup_routing_epoch_domain_lan_ingress(struct __sk_buff *skb,
-						__u32 active_slot)
+				       __u32 active_slot)
 {
 	__u32 zero_key = 0;
 	int ret;
@@ -227,8 +227,8 @@ check_routing_epoch_lan_ingress(struct __sk_buff *skb,
 	struct routing_handoff_entry *handoff;
 
 	if (check_tcp_conn_state_ipv4_tcp(skb, expected_status_code,
-					     saddr, daddr, sport, dport,
-					     expected_outbound, 0, true))
+					  saddr, daddr, sport, dport,
+					  expected_outbound, 0, true))
 		return TC_ACT_SHOT;
 
 	key.sip.u6_addr32[2] = bpf_htonl(0xffff);

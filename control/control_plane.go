@@ -1776,6 +1776,27 @@ func (c *ControlPlane) closeOwnedDNSController() error {
 	return c.controlPlaneDNSRuntime.closeOwnedDNSController()
 }
 
+var domainRoutingMapFullLastLog atomic.Int64
+
+// logDomainRoutingMapFull reports a saturated domain_routing_map at most once a
+// minute, so a sustained overflow cannot flood the log from the DNS hot path.
+func (c *ControlPlane) logDomainRoutingMapFull(cache *DnsCache) {
+	if c == nil || c.log == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := domainRoutingMapFullLastLog.Load()
+	if now-last < int64(time.Minute) || !domainRoutingMapFullLastLog.CompareAndSwap(last, now) {
+		return
+	}
+	var fqdn string
+	if cache != nil {
+		fqdn = cache.GetFqdn()
+	}
+	c.log.WithField("domain", fqdn).Warn(
+		"domain_routing_map is full; newly resolved domains fall back to userspace routing until cached entries expire")
+}
+
 func (c *ControlPlane) dnsControllerOption() *DnsControllerOption {
 	if c == nil {
 		return nil
@@ -1789,6 +1810,15 @@ func (c *ControlPlane) dnsControllerOption() *DnsControllerOption {
 		UseResolvePipeline: c.semanticRefactorFeatures.DNSResolver,
 		CacheAccessCallback: func(cache *DnsCache) (err error) {
 			if err = c.core.BatchUpdateDomainRouting(cache); err != nil {
+				if stderrors.Is(err, ErrBpfMapFull) {
+					// The answer itself is valid; only the kernel-side domain
+					// bitmap could not be projected. Failing the query would
+					// take DNS down for every new domain until entries expire,
+					// so degrade to routing this domain in userspace and let
+					// the projection retry once the map drains.
+					c.logDomainRoutingMapFull(cache)
+					return nil
+				}
 				return fmt.Errorf("BatchUpdateDomainRouting: %w", err)
 			}
 			return nil
@@ -4583,42 +4613,26 @@ func (c *ControlPlane) closeTail() error {
 	return stderrors.Join(errs...)
 }
 
+// releaseRetainedState releases the resources this generation still owns after
+// its datapath has been torn down.
+//
+// It deliberately does not nil out routingMatcher, outbounds, dnsController,
+// core, egressRuntime, sessionManager or the UDP dispatchers. SessionManager
+// lets established flows outlive the generation that created them, and those
+// flow goroutines keep reading exactly those fields. Clearing them races with
+// live readers and turns a reload into a nil dereference. Dropping the fields
+// buys nothing either: once the generation itself is unreachable, everything it
+// points at is collected with it.
 func (c *ControlPlane) releaseRetainedState() {
 	if c == nil {
 		return
 	}
 
-	c.deferFuncs = nil
-	c.controlPlaneGenerationState.releaseRetainedState()
-	c.controlPlaneDNSRuntime.releaseRetainedState()
 	if handoff, owned := c.takeDNSHandoffController(); owned && handoff != nil {
 		_ = handoff.Close()
 	}
-	c.muRealDomainSet.Lock()
-	c.realDomainSet = nil
-	c.muRealDomainSet.Unlock()
 	c.controlPlaneDatapathJanitor.releaseRetainedState()
-	c.wanInterface = nil
-	c.lanInterface = nil
-	c.udpUnorderedRunner = nil
-	c.udpOrderedDispatcher = nil
-	c.udpOrderedDispatcherShared = false
-	c.udpReplyDispatcher = nil
-	c.udpReplyDispatcherShared = false
-	c.failedQuicDcidCache = nil
-	c.listenerPublishMu.Lock()
-	c.listenerFiles = nil
-	c.listenerPublishMu.Unlock()
-	c.routingKernspaceSnapshot = nil
-	c.pendingDnsReloadCache = nil
 	c.ClearReloadDnsCacheSource()
-	c.sessionManagerMu.Lock()
-	c.sessionManager = nil
-	c.ownsSessionManager = false
-	c.sessionManagerBinding.Store(nil)
-	c.sessionManagerMu.Unlock()
-	c.egressRuntime = nil
-	c.core = nil
 }
 
 func (c *ControlPlane) Close() (err error) {

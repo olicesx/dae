@@ -11,19 +11,12 @@ import (
 	"github.com/daeuniverse/dae/control"
 )
 
-func TestDefaultSemanticRefactorFeaturesEnablesBothUDPDispatchers(t *testing.T) {
-	want := []control.SemanticRefactorFeature{
-		control.SemanticRefactorFeatureUDPOrderedDispatcher,
-		control.SemanticRefactorFeatureUDPReplyDispatcher,
-	}
-	got := defaultSemanticRefactorFeatures()
-	if len(got) != len(want) {
-		t.Fatalf("defaultSemanticRefactorFeatures() = %v, want %v", got, want)
-	}
-	for index := range want {
-		if got[index] != want[index] {
-			t.Fatalf("default feature[%d] = %q, want %q", index, got[index], want[index])
-		}
+// Migration paths stay opt-in. Adding one here means it carries production
+// traffic for every user by default, so it needs its own justification rather
+// than inheriting one from the migration it belongs to.
+func TestDefaultSemanticRefactorFeaturesAreOptIn(t *testing.T) {
+	if got := defaultSemanticRefactorFeatures(); len(got) != 0 {
+		t.Fatalf("defaultSemanticRefactorFeatures() = %v, want none enabled by default", got)
 	}
 }
 
@@ -37,8 +30,8 @@ func TestSemanticRefactorFeaturesFromValue(t *testing.T) {
 		enabled bool
 		wantErr bool
 	}{
-		{name: "unset", want: defaults, enabled: true},
-		{name: "empty", present: true, want: defaults, enabled: true},
+		{name: "unset", want: defaults},
+		{name: "empty", present: true, want: defaults},
 		{name: "disable none", value: "none", present: true},
 		{name: "one", value: "compiled-policy", present: true, want: []control.SemanticRefactorFeature{control.SemanticRefactorFeatureCompiledPolicy}, enabled: true},
 		{name: "udp ordered dispatcher", value: "udp-ordered-dispatcher", present: true, want: []control.SemanticRefactorFeature{control.SemanticRefactorFeatureUDPOrderedDispatcher}, enabled: true},
@@ -72,20 +65,25 @@ func TestSemanticRefactorFeaturesFromValue(t *testing.T) {
 func TestShouldUseStagedHotHandoff(t *testing.T) {
 	tests := []struct {
 		name                string
+		routingEpochEnabled bool
 		freshDatapathReload bool
 		listenerPresent     bool
 		want                bool
 	}{
-		{name: "same port reload", listenerPresent: true, want: true},
-		{name: "fresh datapath reload", freshDatapathReload: true, listenerPresent: true},
-		{name: "no listener"},
+		{name: "same port reload", routingEpochEnabled: true, listenerPresent: true, want: true},
+		{name: "fresh datapath reload", routingEpochEnabled: true, freshDatapathReload: true, listenerPresent: true},
+		{name: "no listener", routingEpochEnabled: true},
+		// The staged path overlaps two generations publishing routing state;
+		// without the epoch's prepared slot there is nothing keeping the kernel
+		// from reading a half-written rule set, so it must stay off.
+		{name: "routing epoch disabled", listenerPresent: true},
 	}
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			got := shouldUseStagedHotHandoff(tc.freshDatapathReload, tc.listenerPresent)
+			got := shouldUseStagedHotHandoff(tc.routingEpochEnabled, tc.freshDatapathReload, tc.listenerPresent)
 			if got != tc.want {
-				t.Fatalf("shouldUseStagedHotHandoff(%v, %v) = %v, want %v", tc.freshDatapathReload, tc.listenerPresent, got, tc.want)
+				t.Fatalf("shouldUseStagedHotHandoff(%v, %v, %v) = %v, want %v",
+					tc.routingEpochEnabled, tc.freshDatapathReload, tc.listenerPresent, got, tc.want)
 			}
 		})
 	}

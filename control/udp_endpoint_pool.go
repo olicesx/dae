@@ -1019,7 +1019,10 @@ func (ue *UdpEndpoint) startReadLoop() {
 
 	buf := pool.GetFullCap(consts.EthernetMtu)
 	defer func() {
-		pool.Put(buf)
+		// The read loop owns exactly one buffer at a time: buf is replaced only
+		// after its ownership has been transferred to a reply consumer, so this
+		// is the single release point for whichever buffer is still held.
+		putUdpEndpointReplyData(buf)
 		if runtime == nil {
 			if replyCh != nil {
 				close(replyCh)
@@ -1095,9 +1098,11 @@ func (ue *UdpEndpoint) startReadLoop() {
 		if runtime != nil {
 			if !ue.submitReply(reply) {
 				// submitReply returns false before transferring ownership when
-				// the dispatcher rejects the task. The read loop still owns the
-				// buffer in that case and must release it exactly once.
-				putUdpEndpointReplyData(reply.data)
+				// the dispatcher rejects the task, so the read loop still owns
+				// the buffer. reply.data aliases buf, so returning here lets the
+				// deferred pool.Put(buf) release it exactly once. Releasing it
+				// again through reply.data would put the same backing array into
+				// the pool twice and alias it across unrelated flows.
 				return
 			}
 			buf = pool.GetFullCap(consts.EthernetMtu)

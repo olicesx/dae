@@ -258,22 +258,6 @@ func (r *controlPlaneDNSRuntime) startPreparedDNSListenerWithWarmupTimeout(ctx c
 	return nil
 }
 
-func (r *controlPlaneDNSRuntime) releaseRetainedState() {
-	if r == nil {
-		return
-	}
-	r.dnsController = nil
-	r.dnsRouting = nil
-	r.dnsFixedDomainTtl = nil
-	r.dnsListener = nil
-	r.dnsListenerStopRegistered = false
-	r.delayDNSListenerStart = false
-	r.preparedDNSReuseHook = nil
-	r.preparedDNSStartHook = nil
-	r.dnsUpstreamsReady = nil
-	r.dnsUpstreamAvailable = nil
-	r.dnsUpstreamAvailableOnce = sync.Once{}
-}
 
 // RestorePreparedDNSRuntimeForRollback returns DNS resources transferred to a
 // prepared candidate back to the still-active previous generation.

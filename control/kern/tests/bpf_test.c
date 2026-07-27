@@ -46,6 +46,17 @@ struct {
 	__uint(max_entries, 1);
 } test_routing_cache_ctx_map SEC(".maps");
 
+// Scratch storage for writing conn_state_map entries without placing a
+// ~56-byte struct on the BPF stack, which would push multi-call setup
+// programs such as testsetup_wan_tcp_cached_outbound_survives_connectivity_change
+// past the 512-byte verifier limit on older (5.x) kernels.
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, __u32);
+	__type(value, struct conn_state);
+	__uint(max_entries, 1);
+} test_conn_state_scratch_map SEC(".maps");
+
 static __always_inline int
 setup_cached_routing_result_for_proto(__u32 saddr, __u32 daddr,
 				      __u16 sport, __u16 dport,
@@ -69,18 +80,26 @@ setup_cached_routing_result_for_proto(__u32 saddr, __u32 daddr,
 	ctx->result.outbound = outbound;
 	ctx->result.mark = mark;
 
-	// Scheme3: Store routing result in conn_state_map instead of routing_tuples_map
-	struct conn_state conn_state = {};
+	// Scheme3: Store routing result in conn_state_map instead of routing_tuples_map.
+	// Use a percpu scratch map value instead of a stack-local struct, otherwise
+	// deep call chains (setup -> do_tproxy_wan_egress -> ...) blow past the
+	// 512-byte stack limit on 5.x kernels.
+	struct conn_state *conn_state =
+		bpf_map_lookup_elem(&test_conn_state_scratch_map, &zero_key);
 
-	conn_state.is_wan_ingress_direction = false;
-	conn_state.state = TCP_STATE_ACTIVE;
-	conn_state.last_seen_ns = bpf_ktime_get_ns();
-	conn_state.meta.data.has_routing = 1;
-	conn_state.meta.data.outbound = outbound;
-	conn_state.meta.data.mark = mark;
-	conn_state.meta.data.must = 0;
+	if (!conn_state)
+		return TC_ACT_SHOT;
+	__builtin_memset(conn_state, 0, sizeof(*conn_state));
 
-	return bpf_map_update_elem(&conn_state_map, &ctx->key, &conn_state, BPF_ANY);
+	conn_state->is_wan_ingress_direction = false;
+	conn_state->state = TCP_STATE_ACTIVE;
+	conn_state->last_seen_ns = bpf_ktime_get_ns();
+	conn_state->meta.data.has_routing = 1;
+	conn_state->meta.data.outbound = outbound;
+	conn_state->meta.data.mark = mark;
+	conn_state->meta.data.must = 0;
+
+	return bpf_map_update_elem(&conn_state_map, &ctx->key, conn_state, BPF_ANY);
 }
 
 static __always_inline int

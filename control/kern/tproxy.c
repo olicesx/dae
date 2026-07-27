@@ -2331,9 +2331,10 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 	};
 
 	// Socket lookup before routing to detect local services (NAT loopback).
-	// TCP: only LISTEN sockets; skip SYN for CF back-to-source compat.
-	// UDP: any matching socket indicates local service.
-	if (pkt->l4proto == IPPROTO_TCP || pkt->l4proto == IPPROTO_UDP) {
+	// UDP only: any matching socket indicates a local service. TCP is not
+	// looked up here because every non-SYN TCP packet already returned above,
+	// so only SYNs reach this point and a SYN must go through routing.
+	if (pkt->l4proto == IPPROTO_UDP) {
 		struct bpf_sock_tuple tuple = { 0 };
 		__u32 tuple_size;
 		struct bpf_sock *sk;
@@ -2356,35 +2357,17 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 			tuple_size = sizeof(tuple.ipv6);
 		}
 
-		if (pkt->l4proto == IPPROTO_TCP) {
-			if (!(pkt->tcph.syn && !pkt->tcph.ack)) {
-				sk = bpf_skc_lookup_tcp(skb, &tuple, tuple_size,
-							PARAM.dae_netns_id, 0);
-				if (sk) {
-					if (!bpf_sock_is_dae_socket(sk) &&
-					    sk->state == BPF_TCP_LISTEN) {
-						bpf_sk_release(sk);
-#if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
-						bpf_printk("tcp(lan): local LISTEN socket found, pass through");
-#endif
-						return TC_ACT_OK;
-					}
-					bpf_sk_release(sk);
-				}
-			}
-		} else {
-			sk = bpf_sk_lookup_udp(skb, &tuple, tuple_size,
-					       PARAM.dae_netns_id, 0);
-			if (sk) {
-				if (!bpf_sock_is_dae_socket(sk)) {
-					bpf_sk_release(sk);
-#if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
-					bpf_printk("udp(lan): local socket found, pass through");
-#endif
-					return TC_ACT_OK;
-				}
+		sk = bpf_sk_lookup_udp(skb, &tuple, tuple_size,
+				       PARAM.dae_netns_id, 0);
+		if (sk) {
+			if (!bpf_sock_is_dae_socket(sk)) {
 				bpf_sk_release(sk);
+#if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
+				bpf_printk("udp(lan): local socket found, pass through");
+#endif
+				return TC_ACT_OK;
 			}
+			bpf_sk_release(sk);
 		}
 	}
 

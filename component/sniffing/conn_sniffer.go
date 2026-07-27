@@ -45,15 +45,17 @@ func (s *ConnSniffer) Read(p []byte) (n int, err error) {
 	return s.Sniffer.Read(p)
 }
 
-// CopyRelayRemainder streams the rest of the connection to dst, reading the
-// underlying conn directly. Callers must have drained the sniff buffer via
-// TakeRelaySegments/TakeRelayPrefix first. The record callback receives every
-// written chunk so relay traffic accounting stays exact; it may be nil.
+// CopyRelayRemainder streams the rest of the connection to dst by reading the
+// underlying conn directly, skipping the Sniffer.
 //
-// The signature must match control's relayContinuationSource — a mismatch is
-// not a compile error here, it just silently disables the relay fast path.
-func (s *ConnSniffer) CopyRelayRemainder(dst io.Writer, buf []byte, record func(int64)) (int64, error) {
-	return copyDirect(dst, s.Conn, buf, record)
+// It deliberately does NOT match control's relayContinuationSource signature,
+// so control's gather-write path keeps falling back to relayCopyLoop, which
+// reads through Sniffer.Read. Do not "align" it: reading s.Conn directly loses
+// Sniffer state (buffered bytes and dataError) that Read still owns, and doing
+// so breaks proxied TCP. Only bufioConn and prefixedConn, whose prefixes are
+// fully drained before the continuation runs, may implement that interface.
+func (s *ConnSniffer) CopyRelayRemainder(dst io.Writer, buf []byte) (int64, error) {
+	return copyDirect(dst, s.Conn, buf, nil)
 }
 
 func (s *ConnSniffer) TakeRelaySegments() [][]byte {

@@ -27,11 +27,14 @@ type relayPrefixSource interface {
 
 // The relay capability interfaces are satisfied structurally, so a signature
 // drift in an implementer is not a compile error on its own — it just makes
-// the type assertion fail and silently disables the relay fast path. These
-// assertions turn that drift into a build failure.
+// the type assertion fail and silently changes which relay path runs. These
+// assertions pin the intended set of implementers.
+//
+// sniffing.ConnSniffer is intentionally absent from relayContinuationSource:
+// its remainder must be read through Sniffer.Read, so it stays on
+// relayCopyLoop. See ConnSniffer.CopyRelayRemainder.
 var (
 	_ relaySegmentSource      = (*sniffing.ConnSniffer)(nil)
-	_ relayContinuationSource = (*sniffing.ConnSniffer)(nil)
 	_ relayPrefixSource       = (*sniffing.ConnSniffer)(nil)
 	_ relaySegmentSource      = (*bufioConn)(nil)
 	_ relayContinuationSource = (*bufioConn)(nil)

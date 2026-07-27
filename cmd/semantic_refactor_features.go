@@ -21,23 +21,17 @@ const (
 // defaultSemanticRefactorFeatures returns the production default set of
 // semantic-refactor execution paths.
 //
-// The set is empty: every migration path stays opt-in until it has been
-// justified on its own terms.
+// RoutingEpoch is enabled by default: it provides zero-loss reload via a
+// double-buffered BPF routing map (slot A/B). Combined with TCP session
+// migration this makes SIGHUP reload fully seamless — no packet loss, no
+// wrong-route window, no connection teardown.
 //
-// The UDP dispatchers were previously defaulted on, citing
-// BenchmarkQuicInitialEndToEnd (control/udp_quic_e2e_bench_test.go) for "~19%
-// fewer allocations". Re-running it does not reproduce that result — the
-// ordered arm allocates more than the legacy pool — and the benchmark's own
-// comment notes the two arms do not perform equivalent work. The second cited
-// benchmark, BenchmarkUdpProxyDial, has no legacy/ordered arms at all; it
-// compares a cold and a warm endpoint cache and says nothing about dispatch.
-//
-// Re-enable them here only once a benchmark with equivalent work per arm (assert
-// dial count == b.N) shows a win.
-//
-// Select paths explicitly with DAE_SEMANTIC_REFACTOR_FEATURES=<name>[,<name>...].
+// Disable with DAE_SEMANTIC_REFACTOR_FEATURES=none, or select a subset with
+// DAE_SEMANTIC_REFACTOR_FEATURES=<name>[,<name>...].
 func defaultSemanticRefactorFeatures() []control.SemanticRefactorFeature {
-	return nil
+	return []control.SemanticRefactorFeature{
+		control.SemanticRefactorFeatureRoutingEpoch,
+	}
 }
 
 func semanticRefactorFeaturesFromEnvironment() ([]control.SemanticRefactorFeature, bool, error) {

@@ -257,11 +257,12 @@ func clearReloadPending(flag *atomic.Bool) {
 // shouldUseStagedHotHandoff reports whether a reload may overlap the outgoing
 // and incoming datapaths on a shared listener.
 //
-// Overlapping generations both publish routing state; what keeps the kernel
+// Overlapping generations both publish routing state, and what keeps the kernel
 // from observing a half-written rule set is the routing epoch's prepared-slot
-// indirection, which every generation now goes through unconditionally.
-func shouldUseStagedHotHandoff(freshDatapathReload, listenerPresent bool) bool {
-	return !freshDatapathReload && listenerPresent
+// indirection. The epoch is opt-in, so without it the staged path has no such
+// protection and the reload falls back to the non-overlapping form.
+func shouldUseStagedHotHandoff(routingEpochEnabled, freshDatapathReload, listenerPresent bool) bool {
+	return routingEpochEnabled && !freshDatapathReload && listenerPresent
 }
 
 func shouldStreamStagedDnsCache(
@@ -422,6 +423,8 @@ func (r *Runner) Run() (err error) {
 	if semanticRefactorFeatures != nil {
 		defer semanticRefactorFeatures.Disable()
 	}
+	routingEpochHandoffEnabled := semanticRefactorFeatures.Enabled(control.SemanticRefactorFeatureRoutingEpoch)
+
 	var currCancel context.CancelFunc
 
 	// Remove AbortFile at beginning.
@@ -587,7 +590,7 @@ func (r *Runner) Run() (err error) {
 			portChanged := conf.Global.TproxyPort != newConf.Global.TproxyPort
 			datapathChanged := bpfDatapathChanged(conf, newConf)
 			freshDatapathReload := portChanged || datapathChanged
-			stagedHotHandoff := shouldUseStagedHotHandoff(freshDatapathReload, listener != nil)
+			stagedHotHandoff := shouldUseStagedHotHandoff(routingEpochHandoffEnabled, freshDatapathReload, listener != nil)
 			freshDatapathHandoff := freshDatapathReload && listener != nil
 			if !reloadManager.beginReloadTransition() {
 				reloadErr := errRuntimeSupervisorClosed

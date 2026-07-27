@@ -21,6 +21,13 @@ import (
 type SemanticRefactorFeature string
 
 const (
+	// SemanticRefactorFeatureRoutingEpoch lets BPF publication switch between
+	// prepared routing epoch slots during reload.
+	//
+	// It stays opt-in: making it unconditional broke proxied TCP in the kernel
+	// test (curl through the datapath got a mid-relay reset), so the slot-0
+	// overwrite path remains the default until that is understood.
+	SemanticRefactorFeatureRoutingEpoch SemanticRefactorFeature = "routing-epoch"
 	// SemanticRefactorFeatureUDPOrderedDispatcher lets ordered UDP ingress use
 	// the bounded generation-owned dispatcher instead of one convoy per flow.
 	SemanticRefactorFeatureUDPOrderedDispatcher SemanticRefactorFeature = "udp-ordered-dispatcher"
@@ -41,6 +48,7 @@ var (
 // SemanticRefactorFeatureSet is an immutable copy of the process-wide
 // migration gate state used by each control-plane generation.
 type SemanticRefactorFeatureSet struct {
+	RoutingEpoch         bool
 	UDPOrderedDispatcher bool
 	UDPReplyDispatcher   bool
 }
@@ -65,6 +73,8 @@ func (h *SemanticRefactorFeatureGateHandle) Enabled(feature SemanticRefactorFeat
 		return false
 	}
 	switch feature {
+	case SemanticRefactorFeatureRoutingEpoch:
+		return h.setting.features.RoutingEpoch
 	case SemanticRefactorFeatureUDPOrderedDispatcher:
 		return h.setting.features.UDPOrderedDispatcher
 	case SemanticRefactorFeatureUDPReplyDispatcher:
@@ -78,7 +88,9 @@ func (h *SemanticRefactorFeatureGateHandle) Enabled(feature SemanticRefactorFeat
 func ParseSemanticRefactorFeature(value string) (SemanticRefactorFeature, error) {
 	feature := SemanticRefactorFeature(value)
 	switch feature {
-	case SemanticRefactorFeatureUDPOrderedDispatcher, SemanticRefactorFeatureUDPReplyDispatcher:
+	case SemanticRefactorFeatureRoutingEpoch,
+		SemanticRefactorFeatureUDPOrderedDispatcher,
+		SemanticRefactorFeatureUDPReplyDispatcher:
 		return feature, nil
 	default:
 		return "", fmt.Errorf("unknown semantic refactor feature %q", value)
@@ -91,6 +103,8 @@ func EnableSemanticRefactorFeatures(features ...SemanticRefactorFeature) (*Seman
 	setting := &semanticRefactorFeatureGateSetting{}
 	for _, feature := range features {
 		switch feature {
+		case SemanticRefactorFeatureRoutingEpoch:
+			setting.features.RoutingEpoch = true
 		case SemanticRefactorFeatureUDPOrderedDispatcher:
 			setting.features.UDPOrderedDispatcher = true
 		case SemanticRefactorFeatureUDPReplyDispatcher:

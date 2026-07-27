@@ -83,6 +83,7 @@ func TestSemanticRefactorFeatureGateGenerationSnapshotSurvivesOwnerDisable(t *te
 
 func TestParseSemanticRefactorFeature(t *testing.T) {
 	for _, feature := range []SemanticRefactorFeature{
+		SemanticRefactorFeatureRoutingEpoch,
 		SemanticRefactorFeatureUDPOrderedDispatcher,
 		SemanticRefactorFeatureUDPReplyDispatcher,
 	} {
@@ -93,7 +94,7 @@ func TestParseSemanticRefactorFeature(t *testing.T) {
 	}
 	// Names of migration paths that have since been collapsed into the single
 	// production path must not silently parse into a no-op gate.
-	for _, retired := range []string{"compiled-policy", "routing-epoch", "dns-resolver", "unknown"} {
+	for _, retired := range []string{"compiled-policy", "dns-resolver", "unknown"} {
 		if _, err := ParseSemanticRefactorFeature(retired); err == nil {
 			t.Fatalf("ParseSemanticRefactorFeature(%q) error = nil, want rejection", retired)
 		}

@@ -39,8 +39,8 @@ func TestSemanticRefactorFeaturesFromValue(t *testing.T) {
 		{name: "unknown", value: "unknown", present: true, wantErr: true},
 		// Paths that have been collapsed into the single production path must
 		// fail loudly rather than being accepted and silently doing nothing.
+		{name: "routing epoch", value: "routing-epoch", present: true, want: []control.SemanticRefactorFeature{control.SemanticRefactorFeatureRoutingEpoch}, enabled: true},
 		{name: "retired compiled-policy", value: "compiled-policy", present: true, wantErr: true},
-		{name: "retired routing-epoch", value: "routing-epoch", present: true, wantErr: true},
 		{name: "retired dns-resolver", value: "dns-resolver", present: true, wantErr: true},
 		{name: "duplicate", value: "udp-reply-dispatcher,udp-reply-dispatcher", present: true, wantErr: true},
 		{name: "whitespace", value: "udp-ordered-dispatcher, udp-reply-dispatcher", present: true, wantErr: true},
@@ -67,20 +67,25 @@ func TestSemanticRefactorFeaturesFromValue(t *testing.T) {
 func TestShouldUseStagedHotHandoff(t *testing.T) {
 	tests := []struct {
 		name                string
+		routingEpochEnabled bool
 		freshDatapathReload bool
 		listenerPresent     bool
 		want                bool
 	}{
-		{name: "same port reload", listenerPresent: true, want: true},
-		{name: "fresh datapath reload", freshDatapathReload: true, listenerPresent: true},
-		{name: "no listener"},
+		{name: "same port reload", routingEpochEnabled: true, listenerPresent: true, want: true},
+		{name: "fresh datapath reload", routingEpochEnabled: true, freshDatapathReload: true, listenerPresent: true},
+		{name: "no listener", routingEpochEnabled: true},
+		// The staged path overlaps two generations publishing routing state;
+		// without the epoch's prepared slot there is nothing keeping the kernel
+		// from reading a half-written rule set, so it must stay off.
+		{name: "routing epoch disabled", listenerPresent: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := shouldUseStagedHotHandoff(tc.freshDatapathReload, tc.listenerPresent)
+			got := shouldUseStagedHotHandoff(tc.routingEpochEnabled, tc.freshDatapathReload, tc.listenerPresent)
 			if got != tc.want {
-				t.Fatalf("shouldUseStagedHotHandoff(%v, %v) = %v, want %v",
-					tc.freshDatapathReload, tc.listenerPresent, got, tc.want)
+				t.Fatalf("shouldUseStagedHotHandoff(%v, %v, %v) = %v, want %v",
+					tc.routingEpochEnabled, tc.freshDatapathReload, tc.listenerPresent, got, tc.want)
 			}
 		})
 	}

@@ -879,11 +879,13 @@ func newControlPlaneWithContextOptions(
 	if err != nil {
 		return nil, fmt.Errorf("create routing policy identity: %w", err)
 	}
-	if _, err = core.PrepareRoutingEpoch(policyIdentity.Epoch(), sharedBpfReload); err != nil {
-		return nil, fmt.Errorf("prepare routing epoch: %w", err)
-	}
-	if err = core.clearDomainRoutingSlot(core.RoutingEpochSlot()); err != nil {
-		return nil, fmt.Errorf("clear inactive domain routing epoch: %w", err)
+	if refactorFeatures.RoutingEpoch {
+		if _, err = core.PrepareRoutingEpoch(policyIdentity.Epoch(), sharedBpfReload); err != nil {
+			return nil, fmt.Errorf("prepare routing epoch: %w", err)
+		}
+		if err = core.clearDomainRoutingSlot(core.RoutingEpochSlot()); err != nil {
+			return nil, fmt.Errorf("clear inactive domain routing epoch: %w", err)
+		}
 	}
 	if log.IsLevelEnabled(logrus.DebugLevel) {
 		var debugBuilder strings.Builder
@@ -901,12 +903,16 @@ func newControlPlaneWithContextOptions(
 	kernspaceSnapshot := builder.KernspaceSnapshot()
 	if !buildOpts.delayDatapathCommit {
 		log.Infoln("Loading routing rules into kernel space (BPF)...")
-		lpmIndices, err := kernspaceSnapshot.BuildKernspaceForSlot(log, core.bpf.Load(), core.RoutingEpochSlot())
-		if err != nil {
+		var lpmIndices []uint32
+		if refactorFeatures.RoutingEpoch {
+			if lpmIndices, err = kernspaceSnapshot.BuildKernspaceForSlot(log, core.bpf.Load(), core.RoutingEpochSlot()); err != nil {
+				return nil, fmt.Errorf("routing kernspace snapshot: %w", err)
+			}
+			if err = core.StageRoutingEpoch(); err != nil {
+				return nil, fmt.Errorf("stage routing epoch: %w", err)
+			}
+		} else if lpmIndices, err = kernspaceSnapshot.BuildKernspace(log, core.bpf.Load()); err != nil {
 			return nil, fmt.Errorf("routing kernspace snapshot: %w", err)
-		}
-		if err = core.StageRoutingEpoch(); err != nil {
-			return nil, fmt.Errorf("stage routing epoch: %w", err)
 		}
 		core.lpmTrieIndices = lpmIndices
 	} else {
@@ -1078,15 +1084,31 @@ func newControlPlaneWithContextOptions(
 		if err = plane.commitInterfaceBindings(); err != nil {
 			return nil, err
 		}
-		if err = plane.replayDnsReloadCache(); err != nil {
-			return nil, fmt.Errorf("replay DNS reload cache: %w", err)
-		}
-		if err = core.PublishRoutingEpoch(); err != nil {
-			return nil, fmt.Errorf("publish routing epoch: %w", err)
+		if plane.semanticRefactorFeatures.RoutingEpoch {
+			if err = plane.replayDnsReloadCache(); err != nil {
+				return nil, fmt.Errorf("replay DNS reload cache: %w", err)
+			}
+			if err = core.PublishRoutingEpoch(); err != nil {
+				return nil, fmt.Errorf("publish routing epoch: %w", err)
+			}
+		} else {
+			skipDNSReloadReplay := plane.sharedBpfReload && plane.dnsRoutingUnchanged
+			if !skipDNSReloadReplay {
+				if bpf := core.bpf.Load(); bpf != nil {
+					if err = clearReloadDomainRoutingMap(bpf); err != nil {
+						return nil, fmt.Errorf("clearReloadDomainRoutingMap: %w", err)
+					}
+				}
+				if err = plane.replayDnsReloadCache(); err != nil {
+					return nil, fmt.Errorf("replay DNS reload cache: %w", err)
+				}
+			}
 		}
 		if err = core.commitBpfHookFlip(); err != nil {
-			if rollbackErr := core.RollbackRoutingEpoch(); rollbackErr != nil {
-				return nil, stderrors.Join(err, rollbackErr)
+			if plane.semanticRefactorFeatures.RoutingEpoch {
+				if rollbackErr := core.RollbackRoutingEpoch(); rollbackErr != nil {
+					return nil, stderrors.Join(err, rollbackErr)
+				}
 			}
 			return nil, err
 		}
@@ -2025,34 +2047,59 @@ func (c *ControlPlane) CommitPreparedDatapath() error {
 	}
 	if c.routingKernspaceSnapshot != nil {
 		c.log.Infoln("Loading routing rules into kernel space (BPF)...")
-		lpmIndices, err := c.routingKernspaceSnapshot.BuildKernspaceForSlot(
-			c.log,
-			c.core.bpf.Load(),
-			c.core.RoutingEpochSlot(),
+		var (
+			lpmIndices []uint32
+			err        error
 		)
+		if c.semanticRefactorFeatures.RoutingEpoch {
+			lpmIndices, err = c.routingKernspaceSnapshot.BuildKernspaceForSlot(
+				c.log,
+				c.core.bpf.Load(),
+				c.core.RoutingEpochSlot(),
+			)
+		} else {
+			lpmIndices, err = c.routingKernspaceSnapshot.BuildKernspace(c.log, c.core.bpf.Load())
+		}
 		if err != nil {
 			return fmt.Errorf("routing kernspace snapshot: %w", err)
 		}
 		c.core.lpmTrieIndices = lpmIndices
-		if err := c.core.StageRoutingEpoch(); err != nil {
-			return fmt.Errorf("stage routing epoch: %w", err)
+		if c.semanticRefactorFeatures.RoutingEpoch {
+			if err := c.core.StageRoutingEpoch(); err != nil {
+				return fmt.Errorf("stage routing epoch: %w", err)
+			}
 		}
 	}
-	refreshedDnsReloadCache, err := c.refreshDnsReloadCacheForCutover()
-	if err != nil {
-		return fmt.Errorf("refresh DNS reload cache for cutover: %w", err)
-	}
-	if err := c.replayDnsReloadCache(); err != nil {
-		return fmt.Errorf("replay DNS reload cache: %w", err)
-	}
-	if refreshedDnsReloadCache {
-		c.ClearReloadDnsCacheSource()
-	}
-	// Publishing the prepared slot is the atomic cutover: until this succeeds
-	// the kernel keeps routing through the previous slot, so a failure above
-	// leaves the old policy serving rather than a half-written new one.
-	if err := c.core.PublishRoutingEpoch(); err != nil {
-		return fmt.Errorf("publish routing epoch: %w", err)
+	if c.semanticRefactorFeatures.RoutingEpoch {
+		refreshedDnsReloadCache, err := c.refreshDnsReloadCacheForCutover()
+		if err != nil {
+			return fmt.Errorf("refresh DNS reload cache for cutover: %w", err)
+		}
+		if err := c.replayDnsReloadCache(); err != nil {
+			return fmt.Errorf("replay DNS reload cache: %w", err)
+		}
+		if refreshedDnsReloadCache {
+			c.ClearReloadDnsCacheSource()
+		}
+		// Publishing the prepared slot is the atomic cutover: until this
+		// succeeds the kernel keeps routing through the previous slot, so a
+		// failure above leaves the old policy serving rather than a
+		// half-written new one.
+		if err := c.core.PublishRoutingEpoch(); err != nil {
+			return fmt.Errorf("publish routing epoch: %w", err)
+		}
+	} else {
+		skipDNSReloadReplay := c.sharedBpfReload && c.dnsRoutingUnchanged
+		if !skipDNSReloadReplay {
+			if bpf := c.core.bpf.Load(); bpf != nil {
+				if err := clearReloadDomainRoutingMap(bpf); err != nil {
+					return fmt.Errorf("clearReloadDomainRoutingMap: %w", err)
+				}
+			}
+			if err := c.replayDnsReloadCache(); err != nil {
+				return fmt.Errorf("replay DNS reload cache: %w", err)
+			}
+		}
 	}
 	if prepareIsolatedDatapath {
 		// Isolated candidates can populate every policy map before their first
@@ -2064,8 +2111,10 @@ func (c *ControlPlane) CommitPreparedDatapath() error {
 	}
 	if !prepareIsolatedDatapath {
 		if err := c.core.commitBpfHookFlip(); err != nil {
-			if rollbackErr := c.core.RollbackRoutingEpoch(); rollbackErr != nil {
-				return stderrors.Join(err, rollbackErr)
+			if c.semanticRefactorFeatures.RoutingEpoch {
+				if rollbackErr := c.core.RollbackRoutingEpoch(); rollbackErr != nil {
+					return stderrors.Join(err, rollbackErr)
+				}
 			}
 			return err
 		}
@@ -2139,28 +2188,44 @@ func (c *ControlPlane) RestoreDatapathForReloadRollback() error {
 		return fmt.Errorf("restore interface bindings: %w", err)
 	}
 	if c.routingKernspaceSnapshot != nil {
-		lpmIndices, err := c.routingKernspaceSnapshot.BuildKernspaceForSlot(
-			c.log,
-			c.core.bpf.Load(),
-			c.core.RoutingEpochSlot(),
+		var (
+			lpmIndices []uint32
+			err        error
 		)
+		if c.semanticRefactorFeatures.RoutingEpoch {
+			lpmIndices, err = c.routingKernspaceSnapshot.BuildKernspaceForSlot(
+				c.log,
+				c.core.bpf.Load(),
+				c.core.RoutingEpochSlot(),
+			)
+		} else {
+			lpmIndices, err = c.routingKernspaceSnapshot.BuildKernspace(c.log, c.core.bpf.Load())
+		}
 		if err != nil {
 			return fmt.Errorf("restore routing kernspace: %w", err)
 		}
 		c.ReplaceLpmIndices(lpmIndices)
-		if err := c.core.StageRoutingEpoch(); err != nil {
-			return fmt.Errorf("restore routing epoch: %w", err)
+		if c.semanticRefactorFeatures.RoutingEpoch {
+			if err := c.core.StageRoutingEpoch(); err != nil {
+				return fmt.Errorf("restore routing epoch: %w", err)
+			}
 		}
 	}
-	if err := c.core.clearDomainRoutingSlot(c.core.RoutingEpochSlot()); err != nil {
-		return fmt.Errorf("restore clear domain routing slot: %w", err)
+	if c.semanticRefactorFeatures.RoutingEpoch {
+		if err := c.core.clearDomainRoutingSlot(c.core.RoutingEpochSlot()); err != nil {
+			return fmt.Errorf("restore clear domain routing slot: %w", err)
+		}
+	} else if err := clearReloadDomainRoutingMap(c.core.bpf.Load()); err != nil {
+		return fmt.Errorf("restore clearReloadDomainRoutingMap: %w", err)
 	}
 	c.pendingDnsReloadCache = c.CloneDnsCache()
 	if err := c.replayDnsReloadCache(); err != nil {
 		return fmt.Errorf("restore DNS reload cache: %w", err)
 	}
-	if err := c.core.PublishRoutingEpoch(); err != nil {
-		return fmt.Errorf("restore publish routing epoch: %w", err)
+	if c.semanticRefactorFeatures.RoutingEpoch {
+		if err := c.core.PublishRoutingEpoch(); err != nil {
+			return fmt.Errorf("restore publish routing epoch: %w", err)
+		}
 	}
 	c.core.activateBpfHookFlip()
 	return nil

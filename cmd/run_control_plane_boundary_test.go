@@ -637,8 +637,9 @@ func TestRunnerStagedWarmupFailureProcessHelper(t *testing.T) {
 		restoreDNSListenerFunc = previousRestoreDNSListener
 		withDaeNetnsRequiredFunc = previousWithDaeNetnsRequired
 	})
-	// The routing epoch is unconditional now, so no migration gate is needed.
-	t.Setenv(semanticRefactorFeaturesEnv, semanticRefactorDisableValue)
+	// Staged hot handoff is gated on the routing epoch, so this boundary only
+	// exists with that migration path enabled.
+	t.Setenv(semanticRefactorFeaturesEnv, string(control.SemanticRefactorFeatureRoutingEpoch))
 
 	var buildCalls atomic.Int32
 	installControlPlaneRuntimeBuilderForTest(t, func(
@@ -821,8 +822,9 @@ func TestRunnerLiveStageFailureProcessHelper(t *testing.T) {
 		withDaeNetnsRequiredFunc = previousWithDaeNetnsRequired
 		reloadFailureCompletionHook = previousReloadFailureCompletionHook
 	})
-	// The routing epoch is unconditional now, so no migration gate is needed.
-	t.Setenv(semanticRefactorFeaturesEnv, semanticRefactorDisableValue)
+	// Staged hot handoff is gated on the routing epoch, so this boundary only
+	// exists with that migration path enabled.
+	t.Setenv(semanticRefactorFeaturesEnv, string(control.SemanticRefactorFeatureRoutingEpoch))
 
 	var buildCalls atomic.Int32
 	restoreErr := stderrors.New("injected restore failure")

@@ -140,6 +140,21 @@ func (r *egressRuntime) acquireEgress(selected *dialer.Dialer, group *outbound.D
 	return &egressRuntimeLease{runtime: r, dialer: selected}, retainedGroup, true
 }
 
+// transferLease acquires an equivalent lease from this runtime for a dialer
+// that was previously referenced through oldLease. It returns nil if the
+// runtime is retiring or does not track the dialer, signalling that the
+// caller should drain or abort the flow instead of migrating it.
+func (r *egressRuntime) transferLease(oldLease *egressRuntimeLease) (*egressRuntimeLease, *outbound.DialerGroup) {
+	if r == nil || oldLease == nil || oldLease.dialer == nil {
+		return nil, nil
+	}
+	newLease, retainedGroup, ok := r.acquireEgress(oldLease.dialer, nil)
+	if !ok {
+		return nil, nil
+	}
+	return newLease, retainedGroup
+}
+
 func (r *egressRuntime) releaseOwner() error {
 	if r == nil {
 		return nil

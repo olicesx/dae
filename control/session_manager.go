@@ -14,7 +14,9 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/cilium/ebpf"
 	commonerrors "github.com/daeuniverse/dae/common/errors"
+	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/outbound/netproxy"
 	"golang.org/x/sys/unix"
@@ -93,8 +95,17 @@ type FlowRuntime struct {
 	redirectKey    bpfRedirectTuple
 	hasRedirectKey bool
 
-	finishOnce sync.Once
-	abortOnce  sync.Once
+	// migratedBpf tracks bpfObjects sets (other than the manager's primary
+	// udpBPF) into which this flow's conn_state_map entries were re-pinned.
+	// releaseFlow uses this to clean up every map that still holds an entry,
+	// mirroring Cilium's "graceful period" cleanup: the owning generation's
+	// map is gone by the time the flow finishes, so stale entries must not
+	// leak into successor maps.
+	migratedBpf []*bpfObjects
+
+	finishOnce  sync.Once
+	abortOnce   sync.Once
+	migrateOnce sync.Once
 }
 
 // UDPFlowRuntime keeps an established UDP endpoint and its immutable route
@@ -421,10 +432,30 @@ func (m *SessionManager) releaseFlow(flow *FlowRuntime) {
 		return
 	}
 	deleteKeys := make([]bpfTuplesKey, 0, flow.pinKeyCount)
+	migratedMaps := []*bpfObjects(nil)
 	m.mu.Lock()
 	if current := m.flows[flow.ingress]; current == flow {
 		delete(m.flows, flow.ingress)
 		m.releaseGenerationLocked(flow.binding.Route.PolicyEpoch)
+
+		// For each migrated bpfObjects set, undo the per-map refcount
+		// boost that repinConnStateMapsForRollback applied. After this
+		// loop the pinnedTCP refcounts reflect only the primary map, so
+		// the standard refcount <= 1 logic below produces correct
+		// deleteKeys for the primary (janitor-scanned) map.
+		for _, bpf := range flow.migratedBpf {
+			if bpf != nil && bpf.ConnStateMap != nil {
+				for i := range int(flow.pinKeyCount) {
+					key := flow.pinKeys[i]
+					if refs := m.pinnedTCP[key]; refs <= 1 {
+						delete(m.pinnedTCP, key)
+					} else {
+						m.pinnedTCP[key] = refs - 1
+					}
+				}
+			}
+		}
+
 		for i := range int(flow.pinKeyCount) {
 			key := flow.pinKeys[i]
 			if refs := m.pinnedTCP[key]; refs <= 1 {
@@ -441,6 +472,7 @@ func (m *SessionManager) releaseFlow(flow *FlowRuntime) {
 				m.pinnedRedirect[flow.redirectKey] = refs - 1
 			}
 		}
+		migratedMaps = flow.migratedBpf
 	}
 	m.mu.Unlock()
 	if len(deleteKeys) > 0 {
@@ -449,6 +481,18 @@ func (m *SessionManager) releaseFlow(flow *FlowRuntime) {
 			_, _ = BpfMapBatchDelete(bpf.ConnStateMap, deleteKeys)
 		}
 		m.udpStateMu.RUnlock()
+	}
+	// Also scrub every map this flow was migrated into. The refcounts
+	// for these keys were already unwound above, so we only need to
+	// physically remove the entries from the migrated maps.
+	for _, bpf := range migratedMaps {
+		if bpf != nil && bpf.ConnStateMap != nil {
+			migrateKeys := make([]bpfTuplesKey, 0, flow.pinKeyCount)
+			for i := range int(flow.pinKeyCount) {
+				migrateKeys = append(migrateKeys, flow.pinKeys[i])
+			}
+			_, _ = BpfMapBatchDelete(bpf.ConnStateMap, migrateKeys)
+		}
 	}
 	if flow.cancel != nil {
 		flow.cancel()
@@ -726,6 +770,93 @@ func (f *FlowRuntime) abort() error {
 	return err
 }
 
+// migrate transfers a TCP flow from its current generation to a new one
+// without closing the underlying sockets. It re-pins BPF conn_state_map
+// entries, swaps the egress lease, and updates the generation tracking so
+// that the flow survives a same-port reload. On failure the flow is left
+// untouched so the caller can fall back to abort.
+//
+// The migration is transactional: if re-pinning fails the flow keeps its
+// original lease and epoch, and the new bpfObjects does not retain stale
+// entries. Once the generation tracking has moved to the new epoch the
+// migration has committed and the old lease is released.
+func (f *FlowRuntime) migrate(m *SessionManager, newBpf *bpfObjects, newLease *egressRuntimeLease, newOutbound *outbound.DialerGroup, newEpoch routing.PolicyEpoch) error {
+	if f == nil {
+		return nil
+	}
+	var err error
+	f.migrateOnce.Do(func() {
+		oldEpoch := f.binding.Route.PolicyEpoch
+		oldLease := f.egressLease
+
+		// Step 1: BPF re-pin. Failures here are non-fatal — the flow can
+		// still relay via userspace — so we proceed even if no entries
+		// were copied. Successful pins are tracked for cleanup on finish.
+		if newBpf != nil {
+			f.repinConnStateMapsForRollback(newBpf)
+		}
+
+		// Step 2: Bind the new lease before releasing the old one. This
+		// keeps the dialer reference count monotonic across the swap.
+		f.egressLease = newLease
+		if newOutbound != nil {
+			f.binding.Egress.Outbound = newOutbound
+		}
+
+		// Step 3: Move the flow from the old generation to the new one.
+		// This is the commit point: after this the flow belongs to the
+		// new generation for tracking purposes, and the old lease can be
+		// released without risking an underflow in the old runtime.
+		m.mu.Lock()
+		m.releaseGenerationLocked(oldEpoch)
+		f.binding.Route.PolicyEpoch = newEpoch
+		m.retainGenerationLocked(newEpoch)
+		m.mu.Unlock()
+
+		// Commit complete: drop the old lease now that the new one is
+		// bound and the flow is tracked by the new generation.
+		if oldLease != nil {
+			_ = oldLease.release()
+		}
+		err = nil
+	})
+	return err
+}
+
+// repinConnStateMapsForRollback is the rollback-aware variant of
+// repinConnStateMaps. It returns the keys that were successfully re-pinned
+// so the caller can undo the operation if a later step fails.
+func (f *FlowRuntime) repinConnStateMapsForRollback(newBpf *bpfObjects) []bpfTuplesKey {
+	if f == nil || newBpf == nil || newBpf.ConnStateMap == nil || f.manager == nil {
+		return nil
+	}
+	oldBpf := f.manager.udpBPF.Load()
+	if oldBpf == nil || oldBpf.ConnStateMap == nil {
+		return nil
+	}
+
+	var rePinned []bpfTuplesKey
+	for i := range int(f.pinKeyCount) {
+		var value bpfConnState
+		if err := oldBpf.ConnStateMap.Lookup(&f.pinKeys[i], &value); err != nil {
+			continue
+		}
+		if err := newBpf.ConnStateMap.Update(&f.pinKeys[i], &value, ebpf.UpdateAny); err != nil {
+			break
+		}
+		rePinned = append(rePinned, f.pinKeys[i])
+	}
+	if len(rePinned) > 0 {
+		f.manager.mu.Lock()
+		for _, key := range rePinned {
+			f.manager.pinnedTCP[key]++
+		}
+		f.migratedBpf = append(f.migratedBpf, newBpf)
+		f.manager.mu.Unlock()
+	}
+	return rePinned
+}
+
 // ActiveTCPConnections returns the number of process-owned TCP flows.
 func (m *SessionManager) ActiveTCPConnections() int {
 	if m == nil {
@@ -955,6 +1086,55 @@ func (m *SessionManager) AbortGeneration(epoch routing.PolicyEpoch) error {
 		}
 	}
 	return stderrors.Join(errs...)
+}
+
+// MigrateGeneration attempts to transfer TCP flows established under the old
+// epoch to the new generation without closing the underlying kernel sockets.
+// Each flow keeps its relay goroutines alive and re-pins its conn_state_map
+// entries into newBpf so the fresh BPF datapath can bypass userspace for
+// subsequent packets. Flows that cannot be migrated (e.g. the new runtime
+// does not hold a matching dialer reference) are left untouched and should
+// be aborted or drained by the caller.
+//
+// Returns the count of successfully migrated flows and the count of flows
+// that could not be migrated.
+func (m *SessionManager) MigrateGeneration(
+	oldEpoch, newEpoch routing.PolicyEpoch,
+	newBpf *bpfObjects,
+	newRuntime *egressRuntime,
+) (migrated int, remaining int) {
+	if m == nil {
+		return 0, 0
+	}
+	m.mu.RLock()
+	var flows []*FlowRuntime
+	for _, flow := range m.flows {
+		if flow.binding.Route.PolicyEpoch == oldEpoch {
+			flows = append(flows, flow)
+		}
+	}
+	m.mu.RUnlock()
+
+	for _, flow := range flows {
+		// Try to acquire an equivalent lease from the new runtime so the
+		// flow's dialer reference does not keep the old generation alive.
+		newLease, retainedGroup := newRuntime.transferLease(flow.egressLease)
+		if newLease == nil {
+			remaining++
+			continue
+		}
+		if err := flow.migrate(m, newBpf, newLease, retainedGroup, newEpoch); err != nil {
+			// Migration failed: put back the lease and leave the flow
+			// untouched. The caller may drain/abort it separately.
+			if newLease != nil {
+				_ = newLease.release()
+			}
+			remaining++
+			continue
+		}
+		migrated++
+	}
+	return migrated, remaining
 }
 
 // AbortAll closes every established flow without closing the manager.

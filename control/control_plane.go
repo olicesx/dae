@@ -4407,8 +4407,35 @@ func (c *ControlPlane) abortConnections(abortManagedTCP bool) (err error) {
 	if abortManagedTCP {
 		manager, _ := c.controlPlaneSessionManager()
 		if manager != nil {
-			if abortErr := manager.AbortGeneration(c.PolicyEpoch()); abortErr != nil {
-				errs = append(errs, abortErr)
+			// Attempt to migrate surviving TCP flows to the peer
+			// generation before falling back to abort. This keeps
+			// established connections alive across a same-port reload
+			// when the new generation shares a dialer with the old one.
+			c.routingEpochPeerMu.RLock()
+			peer := c.routingEpochPeer
+			c.routingEpochPeerMu.RUnlock()
+			if peer != nil {
+				newBpf := peer.PeekBpf()
+				newEpoch := peer.PolicyEpoch()
+				migrated, remaining := manager.MigrateGeneration(
+					c.PolicyEpoch(), newEpoch, newBpf, peer.egressRuntime,
+				)
+				if migrated > 0 && c.log != nil {
+					c.log.Infof("[Reload] Migrated %d TCP flows to new generation; %d remaining",
+						migrated, remaining)
+				}
+				// Only abort the flows that could not be migrated.
+				if remaining > 0 {
+					if abortErr := manager.AbortGeneration(c.PolicyEpoch()); abortErr != nil {
+						errs = append(errs, abortErr)
+					}
+				}
+			} else {
+				// No peer generation (e.g. fresh start or shutdown):
+				// abort all flows immediately.
+				if abortErr := manager.AbortGeneration(c.PolicyEpoch()); abortErr != nil {
+					errs = append(errs, abortErr)
+				}
 			}
 		}
 	}

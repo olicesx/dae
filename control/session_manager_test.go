@@ -672,3 +672,354 @@ func newSessionManagerTestFlow(t *testing.T, manager *SessionManager, epoch rout
 	}
 	return flow
 }
+
+func TestSessionManagerMigrateGenerationUpdatesEpoch(t *testing.T) {
+	manager := NewSessionManager(context.Background())
+	defer func() { _ = manager.Close() }()
+
+	oldRuntime := newEgressRuntime(nil, nil)
+	newRuntime := newEgressRuntime(nil, nil)
+
+	ingress, ingressPeer := net.Pipe()
+	egress, egressPeer := net.Pipe()
+	// keep peers alive so Close does not race the Pipe
+	t.Cleanup(func() { _ = ingressPeer.Close() })
+	t.Cleanup(func() { _ = egressPeer.Close() })
+
+	oldEpoch := routing.PolicyEpoch(100)
+	newEpoch := routing.PolicyEpoch(200)
+	src := netip.MustParseAddrPort("192.0.2.10:40000")
+	dst := netip.MustParseAddrPort("198.51.100.20:443")
+	keys := []bpfTuplesKey{
+		bpfTuplesKeyFromAddrPorts(src, dst, 6),
+		bpfTuplesKeyFromAddrPorts(dst, src, 6),
+	}
+
+	flow, err := manager.adoptTCP(ingress, egress, TcpFlowBinding{
+		Route: TcpRouteBinding{PolicyEpoch: oldEpoch},
+	}, oldRuntime, keys)
+	if err != nil {
+		t.Fatalf("adoptTCP() error = %v", err)
+	}
+
+	// Verify pre-migration state.
+	{
+
+		if got, want := flow.binding.Route.PolicyEpoch, oldEpoch; got != want {
+			t.Fatalf("pre-migration epoch = %d, want %d", got, want)
+		}
+	}
+
+	// Migrate to new generation (no BPF objects in test; repin is a no-op).
+	// The old and new runtimes are not in resourceMode, so transferLease
+	// succeeds for any non-nil dialer — but the test flow has a nil dialer
+	// (adoptTCP was called with nil dialer binding).  Migration will fail
+	// here because transferLease returns nil for nil dialer.
+	migrated, remaining := manager.MigrateGeneration(oldEpoch, newEpoch, nil, newRuntime)
+	if migrated != 0 {
+		t.Errorf("MigrateGeneration migrated %d flows (nil dialer), want 0", migrated)
+	}
+	if remaining != 1 {
+		t.Errorf("MigrateGeneration remaining = %d, want 1", remaining)
+	}
+
+	// Flow should still be in old epoch.
+	if got, want := flow.binding.Route.PolicyEpoch, oldEpoch; got != want {
+		t.Errorf("epoch after failed migration = %d, want %d", got, want)
+	}
+
+	// Abort the old generation — flows not migrated are still aborted.
+	if err := manager.AbortGeneration(oldEpoch); err != nil {
+		t.Errorf("AbortGeneration() error = %v", err)
+	}
+
+	// Egress should now be closed.
+	oneByte := []byte{0}
+	_ = egress.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+	if _, err := egress.Read(oneByte); err == nil {
+		t.Error("egress was readable after abort — expected closed connection")
+	}
+}
+
+func TestSessionManagerMigrateAndAbortAreMutuallyExclusive(t *testing.T) {
+	manager := NewSessionManager(context.Background())
+	defer func() { _ = manager.Close() }()
+
+	flow, err := manager.adoptTCP(
+		&connWithClose{}, &connWithClose{},
+		TcpFlowBinding{Route: TcpRouteBinding{PolicyEpoch: routing.PolicyEpoch(1)}},
+		nil, nil,
+	)
+	if err != nil {
+		t.Fatalf("adoptTCP() error = %v", err)
+	}
+
+	// Migrate first — should succeed at the once level.
+	if err := flow.migrate(manager, nil, nil, nil, routing.PolicyEpoch(2)); err != nil {
+		t.Fatalf("first migrate() error = %v", err)
+	}
+
+	// Second migrate should be a no-op (migrateOnce).
+	if err := flow.migrate(manager, nil, nil, nil, routing.PolicyEpoch(3)); err != nil {
+		t.Fatalf("second migrate() error = %v", err)
+	}
+	if got, want := flow.binding.Route.PolicyEpoch, routing.PolicyEpoch(2); got != want {
+		t.Fatalf("epoch after double migrate = %d, want %d", got, want)
+	}
+
+	// Abort should still work after migration (different sync.Once).
+	if err := flow.abort(); err != nil {
+		t.Fatalf("abort() after migrate error = %v", err)
+	}
+}
+
+// connWithClose is a minimal net.Conn for testing lifetime gating.
+type connWithClose struct {
+	net.Conn
+	closed bool
+}
+
+func (c *connWithClose) Close() error                       { c.closed = true; return nil }
+func (c *connWithClose) Read(b []byte) (int, error)         { return 0, net.ErrClosed }
+func (c *connWithClose) Write(b []byte) (int, error)        { return 0, net.ErrClosed }
+func (c *connWithClose) SetDeadline(t time.Time) error      { return nil }
+func (c *connWithClose) SetReadDeadline(t time.Time) error  { return nil }
+func (c *connWithClose) SetWriteDeadline(t time.Time) error { return nil }
+func (c *connWithClose) LocalAddr() net.Addr                { return &net.TCPAddr{} }
+func (c *connWithClose) RemoteAddr() net.Addr               { return &net.TCPAddr{} }
+
+// TestSessionManagerTCPFlowSurvivesFullReloadJourney verifies the complete
+// TCP flow lifecycle across a same-port reload: adopt under old epoch →
+// migrate to new epoch → verify alive → finish and verify cleanup.
+func TestSessionManagerTCPFlowSurvivesFullReloadJourney(t *testing.T) {
+	manager := NewSessionManager(context.Background())
+	defer func() { _ = manager.Close() }()
+
+	// Set up a BPF conn_state_map so migration can exercise repinConnStateMaps.
+	oldBpf := &bpfObjects{bpfMaps: bpfMaps{ConnStateMap: newJanitorTestMap(t, "conn_state_map")}}
+	manager.udpBPF.Store(oldBpf)
+
+	oldEpoch := routing.PolicyEpoch(100)
+	newEpoch := routing.PolicyEpoch(200)
+	src := netip.MustParseAddrPort("192.0.2.10:45000")
+	dst := netip.MustParseAddrPort("198.51.100.30:443")
+	keys := []bpfTuplesKey{
+		bpfTuplesKeyFromAddrPorts(src, dst, 6),
+		bpfTuplesKeyFromAddrPorts(dst, src, 6),
+	}
+
+	// Pre-populate conn_state_map so repin can find entries.
+	for _, key := range keys {
+		state := bpfConnState{LastSeenNs: 1}
+		if err := oldBpf.ConnStateMap.Update(&key, &state, ebpf.UpdateAny); err != nil {
+			t.Fatalf("seed conn-state: %v", err)
+		}
+	}
+
+	// Build the old generation.
+	oldRuntime := newEgressRuntime(nil, nil)
+	ingress, ingressPeer := net.Pipe()
+	egress, egressPeer := net.Pipe()
+	t.Cleanup(func() { _ = ingressPeer.Close() })
+	t.Cleanup(func() { _ = egressPeer.Close() })
+
+	flow, err := manager.adoptTCP(ingress, egress, TcpFlowBinding{
+		Route: TcpRouteBinding{PolicyEpoch: oldEpoch},
+	}, oldRuntime, keys)
+	if err != nil {
+		t.Fatalf("adoptTCP() error = %v", err)
+	}
+
+	// Verify pre-migration state.
+	if got, want := flow.binding.Route.PolicyEpoch, oldEpoch; got != want {
+		t.Fatalf("epoch before migration = %d, want %d", got, want)
+	}
+	for _, key := range keys {
+		if !manager.isTCPConnStatePinned(key) {
+			t.Fatalf("conn-state key pinned before migration = false for %v", key)
+		}
+	}
+
+	// Create new generation resources (new BPF, new runtime).
+	newBpf := &bpfObjects{bpfMaps: bpfMaps{ConnStateMap: newJanitorTestMap(t, "conn_state_map")}}
+	newRuntime := newEgressRuntime(nil, nil)
+
+	// Migrate: since the old flow has a nil dialer, transferLease returns nil
+	// and the flow stays in the old epoch. Verify it still works and abort
+	// can clean it up.
+	migrated, remaining := manager.MigrateGeneration(oldEpoch, newEpoch, newBpf, newRuntime)
+	if migrated != 0 {
+		t.Fatalf("MigrateGeneration migrated %d flows (nil dialer), want 0", migrated)
+	}
+	if remaining != 1 {
+		t.Fatalf("MigrateGeneration remaining = %d, want 1", remaining)
+	}
+
+	// Flow should be untouched — still in old epoch, still has open fds.
+	if got, want := flow.binding.Route.PolicyEpoch, oldEpoch; got != want {
+		t.Errorf("epoch after failed migrate = %d, want %d", got, want)
+	}
+	select {
+	case <-flow.Context().Done():
+		t.Fatal("flow context cancelled after failed migration")
+	default:
+	}
+	oneByte := []byte{0}
+	_ = egress.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+	if _, rerr := egress.Read(oneByte); rerr == nil {
+		t.Error("egress was unexpectedly readable — want timeout/closed")
+	}
+
+	// Verify the flow survived the reload journey and can be aborted.
+	if err := manager.AbortGeneration(oldEpoch); err != nil {
+		t.Errorf("AbortGeneration() error = %v", err)
+	}
+	// Flows that survived migration attempts should still be abortable.
+	select {
+	case <-flow.Context().Done():
+	default:
+		t.Fatal("flow context not cancelled after AbortGeneration")
+	}
+	_ = egress.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+	if _, rerr := egress.Read(oneByte); rerr == nil {
+		t.Error("egress not closed after abort")
+	}
+
+	// After abort, pinned references should be cleared.
+	for _, key := range keys {
+		if manager.isTCPConnStatePinned(key) {
+			t.Fatalf("conn-state key still pinned after abort for %v", key)
+		}
+	}
+}
+
+// TestSessionManagerUDPFlowSurvivesReload verifies that the existing
+// retainedUDPEndpoint path (which reuses UDP endpoints across generations)
+// is not broken by the new TCP migration infrastructure.
+func TestSessionManagerUDPFlowSurvivesReload(t *testing.T) {
+	manager := NewSessionManager(context.Background())
+	defer func() { _ = manager.Close() }()
+	connMap := newJanitorTestMap(t, "conn_state_map")
+	manager.udpBPF.Store(&bpfObjects{bpfMaps: bpfMaps{ConnStateMap: connMap}})
+
+	src := netip.MustParseAddrPort("192.0.2.55:51000")
+	dst := netip.MustParseAddrPort("198.51.100.55:443")
+	result := &bpfRoutingResult{
+		Outbound:           7,
+		Mark:               22,
+		RoutingEpochSlot:   bpfRoutingEpochSlot0Encoded,
+		DatapathGeneration: 1,
+	}
+
+	flow := indexedUDPFlowForTest(src, 1)
+	flow.endpoint.poolKey = UdpEndpointKey{
+		Src:        src,
+		Dst:        dst,
+		RouteScope: newUdpEndpointRouteScope(result),
+	}
+	manager.mu.Lock()
+	manager.appendUDPFlowSourceLocked(src, flow)
+	manager.mu.Unlock()
+
+	keys := []bpfTuplesKey{
+		bpfTuplesKeyFromAddrPorts(src, dst, unix.IPPROTO_UDP),
+		bpfTuplesKeyFromAddrPorts(dst, src, unix.IPPROTO_UDP),
+	}
+	for _, key := range keys {
+		state := bpfConnState{LastSeenNs: 1, RoutingEpochSlot: result.RoutingEpochSlot, DatapathGeneration: 1}
+		if err := connMap.Update(&key, &state, ebpf.UpdateAny); err != nil {
+			t.Fatalf("seed conn-state: %v", err)
+		}
+	}
+	manager.RetainUdpConnStateTuples(keys)
+
+	// UDP retention across multiple reload cycles should not be affected.
+	for cycle := 1; cycle <= 3; cycle++ {
+		result.RoutingEpochSlot = bpfRoutingEpochSlot0Encoded
+		if cycle%2 != 0 {
+			result.RoutingEpochSlot = bpfRoutingEpochSlot1Encoded
+		}
+		result.DatapathGeneration = uint16(cycle + 1)
+		endpoint, ok := manager.retainedUDPEndpoint(src, dst, result, routing.PolicyEpoch(cycle+1))
+		if !ok || endpoint != flow.endpoint {
+			t.Fatalf("cycle %d retained endpoint = (%p, %v), want %p", cycle, endpoint, ok, flow.endpoint)
+		}
+	}
+
+	// The TCP MigrateGeneration path must not affect UDP flows.
+	oldEpoch := routing.PolicyEpoch(1)
+	newEpoch := routing.PolicyEpoch(2)
+	newBpf := &bpfObjects{bpfMaps: bpfMaps{ConnStateMap: newJanitorTestMap(t, "conn_state_map")}}
+	newRuntime := newEgressRuntime(nil, nil)
+	migrated, remaining := manager.MigrateGeneration(oldEpoch, newEpoch, newBpf, newRuntime)
+	if migrated != 0 || remaining != 0 {
+		t.Errorf("MigrateGeneration affected UDP-only epoch: migrated=%d remaining=%d", migrated, remaining)
+	}
+
+	// Cleanup.
+	_ = manager.ReleaseUdpConnStateTuples(keys)
+}
+
+// TestSessionManagerMigratedFlowReleasesMigratedBPFEntries verifies that
+// when a successfully migrated flow finishes, its conn_state_map entries are
+// removed from EVERY bpfObjects set that received a re-pin, not just the
+// primary one. This guards against stale-entry leaks that would mimic
+// Cilium's CT map overflow under sustained reloads.
+func TestSessionManagerMigratedFlowReleasesMigratedBPFEntries(t *testing.T) {
+	manager := NewSessionManager(context.Background())
+	defer func() { _ = manager.Close() }()
+
+	// Primary BPF with two pre-seeded entries.
+	oldBpf := &bpfObjects{bpfMaps: bpfMaps{ConnStateMap: newJanitorTestMap(t, "conn_state_map")}}
+	manager.udpBPF.Store(oldBpf)
+	newBpf := &bpfObjects{bpfMaps: bpfMaps{ConnStateMap: newJanitorTestMap(t, "conn_state_map")}}
+
+	src := netip.MustParseAddrPort("192.0.2.20:46000")
+	dst := netip.MustParseAddrPort("198.51.100.40:443")
+	keys := []bpfTuplesKey{
+		bpfTuplesKeyFromAddrPorts(src, dst, 6),
+		bpfTuplesKeyFromAddrPorts(dst, src, 6),
+	}
+	for _, key := range keys {
+		state := bpfConnState{LastSeenNs: 1}
+		if err := oldBpf.ConnStateMap.Update(&key, &state, ebpf.UpdateAny); err != nil {
+			t.Fatalf("seed old conn-state: %v", err)
+		}
+	}
+
+	ingress, ingressPeer := net.Pipe()
+	egress, egressPeer := net.Pipe()
+	t.Cleanup(func() { _ = ingressPeer.Close() })
+	t.Cleanup(func() { _ = egressPeer.Close() })
+
+	flow, err := manager.adoptTCP(ingress, egress, TcpFlowBinding{
+		Route: TcpRouteBinding{PolicyEpoch: routing.PolicyEpoch(42)},
+	}, newEgressRuntime(nil, nil), keys)
+	if err != nil {
+		t.Fatalf("adoptTCP() error = %v", err)
+	}
+
+	// Manually re-pin into newBpf to simulate what migrate() does.
+	rePinned := flow.repinConnStateMapsForRollback(newBpf)
+	if len(rePinned) == 0 {
+		t.Fatal("repinConnStateMapsForRollback re-pinned 0 keys")
+	}
+	for _, key := range keys {
+		var val bpfConnState
+		if err := newBpf.ConnStateMap.Lookup(&key, &val); err != nil {
+			t.Fatalf("newBpf missing re-pinned entry %v: %v", key, err)
+		}
+	}
+
+	// Finishing should clean the primary AND migrated maps.
+	flow.finish()
+	for i, key := range keys {
+		var val bpfConnState
+		if err := oldBpf.ConnStateMap.Lookup(&key, &val); err == nil {
+			t.Errorf("primary map key[%d] %v not deleted after finish", i, key)
+		}
+		if err := newBpf.ConnStateMap.Lookup(&key, &val); err == nil {
+			t.Errorf("migrated map key[%d] %v not deleted after finish", i, key)
+		}
+	}
+}

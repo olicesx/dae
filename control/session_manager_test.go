@@ -836,8 +836,9 @@ func TestSessionManagerTCPFlowSurvivesFullReloadJourney(t *testing.T) {
 	if got, want := flow.binding.Route.PolicyEpoch, oldEpoch; got != want {
 		t.Fatalf("epoch before migration = %d, want %d", got, want)
 	}
+	pinnedTCP := manager.snapshotPinnedTCP()
 	for _, key := range keys {
-		if !manager.isTCPConnStatePinned(key) {
+		if _, pinned := pinnedTCP[key]; !pinned {
 			t.Fatalf("conn-state key pinned before migration = false for %v", key)
 		}
 	}
@@ -888,8 +889,9 @@ func TestSessionManagerTCPFlowSurvivesFullReloadJourney(t *testing.T) {
 	}
 
 	// After abort, pinned references should be cleared.
+	pinnedTCP = manager.snapshotPinnedTCP()
 	for _, key := range keys {
-		if manager.isTCPConnStatePinned(key) {
+		if _, pinned := pinnedTCP[key]; pinned {
 			t.Fatalf("conn-state key still pinned after abort for %v", key)
 		}
 	}

@@ -33,7 +33,6 @@ var (
 
 type sessionGenerationState struct {
 	active int
-	idleCh chan struct{}
 }
 
 type controlPlaneSessionManagerBinding struct {
@@ -503,7 +502,7 @@ func (m *SessionManager) releaseFlow(flow *FlowRuntime) {
 func (m *SessionManager) retainGenerationLocked(epoch routing.PolicyEpoch) {
 	state := m.generations[epoch]
 	if state == nil {
-		state = &sessionGenerationState{idleCh: make(chan struct{})}
+		state = &sessionGenerationState{}
 		m.generations[epoch] = state
 	}
 	state.active++
@@ -516,7 +515,6 @@ func (m *SessionManager) releaseGenerationLocked(epoch routing.PolicyEpoch) {
 	}
 	state.active--
 	if state.active == 0 {
-		close(state.idleCh)
 		delete(m.generations, epoch)
 	}
 }
@@ -882,176 +880,6 @@ func (m *SessionManager) ActiveByGeneration(epoch routing.PolicyEpoch) int {
 	}
 	m.mu.RUnlock()
 	return n
-}
-
-// GenerationIdle returns a channel closed once the policy epoch owns no live
-// flows. The returned channel is already closed when the epoch is idle.
-func (m *SessionManager) GenerationIdle(epoch routing.PolicyEpoch) <-chan struct{} {
-	if m == nil {
-		return closedDrainIdleCh
-	}
-	m.mu.RLock()
-	state := m.generations[epoch]
-	if state == nil {
-		m.mu.RUnlock()
-		return closedDrainIdleCh
-	}
-	ch := state.idleCh
-	m.mu.RUnlock()
-	return ch
-}
-
-func (m *SessionManager) isTCPConnStatePinned(key bpfTuplesKey) bool {
-	if m == nil {
-		return false
-	}
-	m.mu.RLock()
-	refs := m.pinnedTCP[key]
-	m.mu.RUnlock()
-	return refs > 0
-}
-
-func (m *SessionManager) isRedirectTrackPinned(key bpfRedirectTuple) bool {
-	if m == nil {
-		return false
-	}
-	m.mu.RLock()
-	refs := m.pinnedRedirect[key]
-	m.mu.RUnlock()
-	return refs > 0
-}
-
-// RetainUdpConnStateTuples pins established UDP state against reload cleanup.
-func (m *SessionManager) RetainUdpConnStateTuples(keys []bpfTuplesKey) {
-	if m == nil || len(keys) == 0 {
-		return
-	}
-	m.mu.Lock()
-	m.udpStateMu.Lock()
-	for _, key := range keys {
-		m.pinnedUDP[key]++
-		m.pinnedRedirect[redirectTupleForFlow(key)]++
-	}
-	m.udpStateMu.Unlock()
-	m.mu.Unlock()
-}
-
-// TransferRetainedUdpConnStateTuplesFrom moves tuple ownership without
-// deleting the shared BPF entries between owners.
-func (m *SessionManager) TransferRetainedUdpConnStateTuplesFrom(previous udpConnStateOwner, keys []bpfTuplesKey) {
-	if m == nil || previous == nil || sameUdpConnStateOwner(m, previous) || len(keys) == 0 {
-		return
-	}
-	m.RetainUdpConnStateTuples(keys)
-	switch owner := previous.(type) {
-	case *SessionManager:
-		owner.forgetUdpConnStateTuples(keys)
-	case *controlPlaneCore:
-		if tracker := owner.getUdpConnStateTracker(); tracker != nil {
-			tracker.Forget(keys)
-		}
-	}
-}
-
-func (m *SessionManager) forgetUdpConnStateTuples(keys []bpfTuplesKey) {
-	if m == nil || len(keys) == 0 {
-		return
-	}
-	m.mu.Lock()
-	m.udpStateMu.Lock()
-	for _, key := range keys {
-		if refs := m.pinnedUDP[key]; refs <= 1 {
-			delete(m.pinnedUDP, key)
-		} else {
-			m.pinnedUDP[key] = refs - 1
-		}
-		redirectKey := redirectTupleForFlow(key)
-		if refs := m.pinnedRedirect[redirectKey]; refs <= 1 {
-			delete(m.pinnedRedirect, redirectKey)
-		} else {
-			m.pinnedRedirect[redirectKey] = refs - 1
-		}
-	}
-	m.udpStateMu.Unlock()
-	m.mu.Unlock()
-}
-
-// ReleaseUdpConnStateTuples drops tuple references and removes entries after
-// the final process-owned endpoint releases them.
-func (m *SessionManager) ReleaseUdpConnStateTuples(keys []bpfTuplesKey) error {
-	if m == nil || len(keys) == 0 {
-		return nil
-	}
-	m.mu.Lock()
-	m.udpStateMu.Lock()
-	deleteKeys := make([]bpfTuplesKey, 0, len(keys))
-	for _, key := range keys {
-		switch refs := m.pinnedUDP[key]; {
-		case refs > 1:
-			m.pinnedUDP[key] = refs - 1
-		case refs == 1:
-			delete(m.pinnedUDP, key)
-			deleteKeys = append(deleteKeys, key)
-		}
-		redirectKey := redirectTupleForFlow(key)
-		if refs := m.pinnedRedirect[redirectKey]; refs <= 1 {
-			delete(m.pinnedRedirect, redirectKey)
-		} else {
-			m.pinnedRedirect[redirectKey] = refs - 1
-		}
-	}
-	var err error
-	if bpf := m.udpBPF.Load(); bpf != nil && bpf.ConnStateMap != nil && len(deleteKeys) > 0 {
-		_, err = BpfMapBatchDelete(bpf.ConnStateMap, deleteKeys)
-	}
-	m.udpStateMu.Unlock()
-	m.mu.Unlock()
-	return err
-}
-
-func (m *SessionManager) isUDPConnStatePinned(key bpfTuplesKey) bool {
-	if m == nil {
-		return false
-	}
-	m.udpStateMu.RLock()
-	refs := m.pinnedUDP[key]
-	m.udpStateMu.RUnlock()
-	return refs > 0
-}
-
-// retireUnpinnedUDPConnState removes stale kernel routing attribution before
-// the active generation treats the packet as a new flow. The pin check and
-// deletion share one lock with endpoint retain/release, so a process-owned UDP
-// runtime can never lose its conn-state entry in this fallback path.
-func (m *SessionManager) retireUnpinnedUDPConnState(src, dst netip.AddrPort) (bool, error) {
-	if m == nil || !src.IsValid() || !dst.IsValid() {
-		return false, nil
-	}
-	keys := [2]bpfTuplesKey{
-		bpfTuplesKeyFromAddrPorts(src, dst, uint8(unix.IPPROTO_UDP)),
-		bpfTuplesKeyFromAddrPorts(dst, src, uint8(unix.IPPROTO_UDP)),
-	}
-
-	m.udpStateMu.Lock()
-	defer m.udpStateMu.Unlock()
-	for _, key := range keys {
-		if m.pinnedUDP[key] > 0 {
-			return false, nil
-		}
-	}
-	bpf := m.udpBPF.Load()
-	if bpf == nil || bpf.ConnStateMap == nil {
-		return true, nil
-	}
-	_, err := BpfMapBatchDelete(bpf.ConnStateMap, keys[:])
-	return true, err
-}
-
-func redirectTupleForFlow(key bpfTuplesKey) bpfRedirectTuple {
-	var redirect bpfRedirectTuple
-	copy(redirect.Sip.U6Addr8[:], key.Sip.U6Addr8[:])
-	copy(redirect.Dip.U6Addr8[:], key.Dip.U6Addr8[:])
-	return redirect
 }
 
 // AbortGeneration closes every flow established under one policy epoch.

@@ -405,8 +405,9 @@ func TestSessionManagerPinsFlowAndReleasesEgressRuntime(t *testing.T) {
 	if cleanupCalls != 0 {
 		t.Fatal("egress cleanup ran while flow was active")
 	}
+	pinnedTCP := manager.snapshotPinnedTCP()
 	for _, key := range keys {
-		if !manager.isTCPConnStatePinned(key) {
+		if _, pinned := pinnedTCP[key]; !pinned {
 			t.Fatalf("conn-state key %v is not pinned", key)
 		}
 	}
@@ -414,8 +415,9 @@ func TestSessionManagerPinsFlowAndReleasesEgressRuntime(t *testing.T) {
 	if cleanupCalls != 1 {
 		t.Fatalf("egress cleanup calls = %d, want 1", cleanupCalls)
 	}
+	pinnedTCP = manager.snapshotPinnedTCP()
 	for _, key := range keys {
-		if manager.isTCPConnStatePinned(key) {
+		if _, pinned := pinnedTCP[key]; pinned {
 			t.Fatalf("conn-state key %v remained pinned", key)
 		}
 	}

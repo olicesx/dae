@@ -566,9 +566,7 @@ func TestSessionManagerMixedFlowsSurviveSixtyFiveRoutingEpochReloads(t *testing.
 			t.Fatalf("cycle %d post-close flows = (epoch=%d, total=%d), want (0, 2)",
 				cycle, manager.ActiveByGeneration(epoch), manager.ActiveConnections())
 		}
-		select {
-		case <-manager.GenerationIdle(epoch):
-		default:
+		if manager.ActiveByGeneration(epoch) != 0 {
 			t.Fatalf("cycle %d generation remains flow-owned", cycle)
 		}
 		if manager.ActiveByGeneration(initialEpoch) != 2 {
@@ -724,9 +722,7 @@ func TestSessionManagerCloseMixedFlowsIsConcurrentExactlyOnce(t *testing.T) {
 	default:
 		t.Fatal("UDP flow context remains active after mixed close")
 	}
-	select {
-	case <-manager.GenerationIdle(generation.epoch):
-	default:
-		t.Fatal("generation idle signal remains open after mixed close")
+	if manager.ActiveByGeneration(generation.epoch) != 0 {
+		t.Fatal("generation remains flow-owned after mixed close")
 	}
 }

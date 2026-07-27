@@ -11,12 +11,12 @@ import (
 	"github.com/daeuniverse/dae/control"
 )
 
-// Migration paths stay opt-in. Adding one here means it carries production
-// traffic for every user by default, so it needs its own justification rather
-// than inheriting one from the migration it belongs to.
-func TestDefaultSemanticRefactorFeaturesAreOptIn(t *testing.T) {
-	if got := defaultSemanticRefactorFeatures(); len(got) != 0 {
-		t.Fatalf("defaultSemanticRefactorFeatures() = %v, want none enabled by default", got)
+// RoutingEpoch is enabled by default for zero-loss reload. Adding a feature
+// here means it carries production traffic for every user by default.
+func TestDefaultSemanticRefactorFeatures(t *testing.T) {
+	got := defaultSemanticRefactorFeatures()
+	if len(got) != 1 || got[0] != control.SemanticRefactorFeatureRoutingEpoch {
+		t.Fatalf("defaultSemanticRefactorFeatures() = %v, want [routing-epoch]", got)
 	}
 }
 
@@ -30,8 +30,8 @@ func TestSemanticRefactorFeaturesFromValue(t *testing.T) {
 		enabled bool
 		wantErr bool
 	}{
-		{name: "unset", want: defaults},
-		{name: "empty", present: true, want: defaults},
+		{name: "unset", want: defaults, enabled: true},
+		{name: "empty", present: true, want: defaults, enabled: true},
 		{name: "disable none", value: "none", present: true},
 		{name: "udp ordered dispatcher", value: "udp-ordered-dispatcher", present: true, want: []control.SemanticRefactorFeature{control.SemanticRefactorFeatureUDPOrderedDispatcher}, enabled: true},
 		{name: "udp reply dispatcher", value: "udp-reply-dispatcher", present: true, want: []control.SemanticRefactorFeature{control.SemanticRefactorFeatureUDPReplyDispatcher}, enabled: true},

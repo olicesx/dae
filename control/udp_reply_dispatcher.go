@@ -151,6 +151,7 @@ func (d *udpReplyDispatcher) acquireQueue(endpoint *UdpEndpoint) *udpReplyDispat
 	created := &udpReplyDispatchQueue{
 		endpoint: endpoint,
 		done:     make(chan struct{}),
+		tasks:    make([]udpReplyDispatchTask, 0, defaultUDPDispatcherTaskInitialCap),
 	}
 	actual, _ := d.queues.LoadOrStore(endpoint, created)
 	return actual.(*udpReplyDispatchQueue)

@@ -28,6 +28,11 @@ const (
 	// Preserve the base hot-worker budget while endpoint dials wait on proxy
 	// handshakes, without allowing unbounded dial goroutines.
 	defaultUDPOrderedDispatcherMaxCompensatingWorkers = defaultUDPOrderedDispatcherWorkerCap * 8
+	// Pre-allocate per-flow task queues so the first active turn of a fresh or
+	// idle-reaped queue does not grow the slice through repeated reallocations.
+	// The backing array is reused across turns (q.tasks[:0] on full drain); this
+	// only front-loads the common small-burst case for both dispatcher flavors.
+	defaultUDPDispatcherTaskInitialCap = 8
 )
 
 type udpOrderedDispatchTask struct {
@@ -218,7 +223,7 @@ func (d *udpOrderedDispatcher) acquireQueue(key UdpFlowKey) *udpOrderedDispatchQ
 	if value, ok := d.queues.Load(key); ok {
 		return value.(*udpOrderedDispatchQueue)
 	}
-	created := &udpOrderedDispatchQueue{key: key}
+	created := &udpOrderedDispatchQueue{key: key, tasks: make([]udpOrderedDispatchTask, 0, defaultUDPDispatcherTaskInitialCap)}
 	actual, _ := d.queues.LoadOrStore(key, created)
 	return actual.(*udpOrderedDispatchQueue)
 }

@@ -2980,7 +2980,10 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 		}
 
 		// If no responseWriter (internal UDP path), pack and send directly.
-		data, err := respMsg.Pack()
+		// Reuse the DNS response buffer pool; data is consumed synchronously by the send.
+		bufPtr := dnsResponseBufPool.Get().(*[]byte)
+		defer dnsResponseBufPool.Put(bufPtr)
+		data, err := respMsg.PackBuffer((*bufPtr)[:cap(*bufPtr)])
 		if err != nil {
 			return fmt.Errorf("pack DNS packet: %w", err)
 		}
@@ -3255,7 +3258,10 @@ func (c *DnsController) sendDnsErrorResponse_(
 	if req == nil || req.lConn == nil {
 		return nil
 	}
-	data, err := dnsMessage.Pack()
+	// Pack into a pooled DNS response buffer; data is consumed synchronously by the send.
+	bufPtr := dnsResponseBufPool.Get().(*[]byte)
+	defer dnsResponseBufPool.Put(bufPtr)
+	data, err := dnsMessage.PackBuffer((*bufPtr)[:cap(*bufPtr)])
 	if err != nil {
 		return fmt.Errorf("pack DNS packet: %w", err)
 	}
@@ -3288,7 +3294,10 @@ func (c *DnsController) sendDnsTruncatedResponse_(dnsMessage *dnsmessage.Msg, re
 	if req == nil || req.lConn == nil {
 		return nil
 	}
-	data, err := dnsMessage.Pack()
+	// Pack into a pooled DNS response buffer; data is consumed synchronously by the send.
+	bufPtr := dnsResponseBufPool.Get().(*[]byte)
+	defer dnsResponseBufPool.Put(bufPtr)
+	data, err := dnsMessage.PackBuffer((*bufPtr)[:cap(*bufPtr)])
 	if err != nil {
 		return fmt.Errorf("pack DNS packet: %w", err)
 	}
@@ -3563,7 +3572,10 @@ func (c *DnsController) dialSend(
 			}
 			return responseWriter.WriteMsg(respMsg)
 		}
-		data, err = respMsg.Pack()
+		// Pack into a pooled DNS response buffer; data is consumed synchronously by the send.
+		bufPtr := dnsResponseBufPool.Get().(*[]byte)
+		defer dnsResponseBufPool.Put(bufPtr)
+		data, err = respMsg.PackBuffer((*bufPtr)[:cap(*bufPtr)])
 		if err != nil {
 			return err
 		}

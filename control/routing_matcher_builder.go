@@ -146,10 +146,19 @@ func NewRoutingMatcherBuilderFromProgram(log *logrus.Logger, program *routing.No
 	if program == nil {
 		return nil, fmt.Errorf("routing program is nil")
 	}
+	ruleCap := len(program.Rules)
 	b = &RoutingMatcherBuilder{
 		log:                 log,
 		outboundName2Id:     outboundName2Id,
 		bpf:                 bpf,
+		// Pre-allocate the per-rule accumulator slices to the known rule count.
+		// Each routing rule emits at least one compiled predicate, so this is a
+		// safe lower bound that avoids the early append-growth reallocations on
+		// the (cold) build/reload path. simulatedDomainSet/simulatedLpmTries are
+		// left nil because their counts depend on rule type, not rule count.
+		rules:               make([]bpfMatchSet, 0, ruleCap),
+		compiledRules:       make([]compiledRoutingMatch, 0, ruleCap),
+		predicateGroups:     make([]routingMatcherPredicateGroupSpan, 0, ruleCap),
 		lpmDedup:            make(map[uint64]lpmDedupEntry),
 		referencedOutbounds: make(map[string]struct{}),
 	}

@@ -45,7 +45,11 @@ func ReassembleCryptos(offsets []*CryptoFrameOffset, newPayload []byte) (newOffs
 		offsets = append(offsets, offset)
 	}
 
-	if len(offsets) == 0 {
+	if len(offsets) <= 1 {
+		// With zero or one frame there is nothing to sort or merge; return as-is
+		// to skip the merged-slice allocation and the reflect-based sort.Slice
+		// swapper. This is the common case for a QUIC Initial whose ClientHello
+		// fits in a single CRYPTO frame.
 		return offsets, nil
 	}
 

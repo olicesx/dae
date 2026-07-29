@@ -90,6 +90,7 @@ func (s *Sniffer) reset(stream bool, r io.Reader, conn net.Conn, data []byte, ti
 	s.deadline = time.Now().Add(timeout)
 	s.data = nil
 	s.needMore = false
+	quicutils.ReleaseCryptoFrameOffsets(s.quicCryptos)
 	s.quicNextRead = 0
 	s.quicCryptos = nil
 	s.quicPlaintexts = nil
@@ -353,6 +354,7 @@ func (s *Sniffer) CompactPacketState() {
 		p.Put()
 	}
 	s.quicPlaintexts = nil
+	quicutils.ReleaseCryptoFrameOffsets(s.quicCryptos)
 	s.quicCryptos = nil
 	s.quicNextRead = 0
 	s.needMore = false
@@ -405,6 +407,8 @@ func (s *Sniffer) Close() (err error) {
 			p.Put()
 		}
 		s.quicPlaintexts = nil
+		quicutils.ReleaseCryptoFrameOffsets(s.quicCryptos)
+		s.quicCryptos = nil
 		s.readMu.Unlock()
 		// Recycle the struct only when no async reader goroutine is lingering.
 		// A lingering reader (timeout path with no deadline support) holds a

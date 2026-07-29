@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/fs"
 	"sort"
+	"sync"
 )
 
 var (
@@ -28,6 +29,42 @@ type CryptoFrameOffset struct {
 	UpperAppOffset int
 	// Offset of data in quic payload.
 	Data []byte
+}
+
+// cryptoFrameOffsetPool recycles *CryptoFrameOffset structs across QUIC
+// packets so each crypto frame does not allocate a new struct. Data is cleared
+// on release; the returned struct never carries stale plaintext slices.
+//
+// Lifetime invariant: a pooled struct's Data points into a plaintext PB buffer
+// owned by the sniffer's quicPlaintexts slice. The struct is released (Data set
+// to nil) when the sniffer drops its quicCryptos (CompactPacketState/Close) or
+// when ReassembleCryptos supersedes it during a merge. Releasing the struct does
+// not free the plaintext buffer (managed separately by the PB pool).
+var cryptoFrameOffsetPool = sync.Pool{
+	New: func() any { return &CryptoFrameOffset{} },
+}
+
+// AcquireCryptoFrameOffset returns a zeroed *CryptoFrameOffset from the pool.
+func AcquireCryptoFrameOffset() *CryptoFrameOffset {
+	return cryptoFrameOffsetPool.Get().(*CryptoFrameOffset)
+}
+
+// ReleaseCryptoFrameOffset returns one struct to the pool after clearing Data.
+func ReleaseCryptoFrameOffset(o *CryptoFrameOffset) {
+	if o == nil {
+		return
+	}
+	o.UpperAppOffset = 0
+	o.Data = nil
+	cryptoFrameOffsetPool.Put(o)
+}
+
+// ReleaseCryptoFrameOffsets returns a slice of structs to the pool. Callers
+// must not reference the structs or the slice afterwards.
+func ReleaseCryptoFrameOffsets(offsets []*CryptoFrameOffset) {
+	for _, o := range offsets {
+		ReleaseCryptoFrameOffset(o)
+	}
 }
 
 func ReassembleCryptos(offsets []*CryptoFrameOffset, newPayload []byte) (newOffsets []*CryptoFrameOffset, err error) {
@@ -71,10 +108,13 @@ func ReassembleCryptos(offsets []*CryptoFrameOffset, newPayload []byte) (newOffs
 				newData := make([]byte, next.UpperAppOffset+len(next.Data)-current.UpperAppOffset)
 				copy(newData, current.Data)
 				copy(newData[len(current.Data):], next.Data[currentEnd-next.UpperAppOffset:])
-				current = &CryptoFrameOffset{
-					UpperAppOffset: current.UpperAppOffset,
-					Data:           newData,
-				}
+				mergedOffset := current.UpperAppOffset
+				// current is superseded by the extended view; return it to
+				// the pool and acquire a fresh struct for the merged result.
+				ReleaseCryptoFrameOffset(current)
+				current = AcquireCryptoFrameOffset()
+				current.UpperAppOffset = mergedOffset
+				current.Data = newData
 			}
 		} else {
 			// Non-overlapping: save current and start new.
@@ -117,10 +157,10 @@ func ExtractCryptoFrameOffset(remainder []byte, transportOffset int) (offset *Cr
 			return nil, 0, fmt.Errorf("crypto frame data out of range: %w", ErrOutOfRange)
 		}
 
-		return &CryptoFrameOffset{
-			UpperAppOffset: int(offset),
-			Data:           remainder[nextField : nextField+int(length)],
-		}, nextField + int(length), nil
+		o := AcquireCryptoFrameOffset()
+		o.UpperAppOffset = int(offset)
+		o.Data = remainder[nextField : nextField+int(length)]
+		return o, nextField + int(length), nil
 	case Quic_FrameType_ConnectionClose, Quic_FrameType_ConnectionClose2:
 		return nil, 0, fmt.Errorf("connection closed: %w", fs.ErrClosed)
 	default:

@@ -58,8 +58,8 @@ gates:
 | 阶段 | 负责人 | 状态 |
 |------|--------|------|
 | Planning（drift-check + H7 CPU + H5 mem + plan） | Remy | ✅ 完成 |
-| Dev 实现（T1 池化 / T2 接口收敛 / T3 跨调用存活） | Dev | 待启动 |
-| QA 验证（gate 全过 + cpu_profile_review + interface_compat） | QA | 待启动 |
+| Dev 实现（T1 池化 / T2 接口收敛 / T3 跨调用存活） | Dev | ✅ 完成 |
+| QA 验证（gate 全过 + cpu_profile_review + interface_compat） | Ivy | ✅ PASS（qa-signoff-4.md） |
 
 ## Trace Log
 
@@ -74,6 +74,10 @@ gates:
 - [2026-07-29] T1 | Sniffer struct sync.Pool + readStreamOnceAsync 内联为单 goroutine + readResultCh 懒分配复用；readerLingering 标志守卫 pool 复用（超时残留 reader 不回收，避免 use-after-pool-put） | gates 全过（race count=3）；bench SniffTcp_TLS 18→14/HTTP 16→12/NotApplicable 14→10/QUIC 67→63/legacy_async 14→13 | commit 97d1c314 |
 - [2026-07-29] T3 | CryptoFrameOffset sync.Pool：ExtractCryptoFrameOffset + ReassembleCryptos 合并路径用池；CompactPacketState/Close/reset 释放 | QUIC race count=3 通过；QUICMultiPacket 154→145；ExtractCryptoFrameOffset flat 消除 | commit 3bed4bef |
 - [2026-07-29] T2 | 消除 Locator 装箱：findSniExtension 改绝对索引(base,length)省 Slice 调用 + LinearLocator.Reset 经 s.quicLocator 复用省 NewLinearLocator | TLS+QUIC race count=3 通过（SNI 逐位一致）；SniffTcp_TLS 14→13/QUIC 62→60/MultiPacket 145→142；BuiltinBytesLocator.Slice+LinearLocator.Slice+NewLinearLocator flat 全消除 | commit 1352dd85 |
+- [2026-07-29] orchestrator-L2 | 复核 Dev 自跑结果（tmp/sprint4-l2.sh）：EBPF/VET/BUILD/TEST/RACE 全 EXIT=0；control test 25.4s PASS；race count=2 sniffing PASS（T1 async 复用读语义安全，OQ-S4-1 闭环）；benchmark 复核 SniffTcp_TLS=13（基线18，与 Dev 报告一致）/ QUIC=60（基线67，一致）/ legacy_async_read=13（基线14，下降） | result=ok（全 gate 过，推进 QA） | — |
+- [2026-07-29] QA-gates | 独立补跑 ci_gate+manual_gate+H5/H7 决定性 gate（tmp/qa-sprint4-gates.sh）：make ebpf/ebpf-test/ebpf-sync-check EXIT=0；make dae 产出 stripped x86-64 ELF；dae validate example+empty EXIT=0（L8 chmod 0600）；interface_compat grep 确认 NewPacketSniffer(data,ttl)/NewStreamSniffer(conn,timeout) 签名不变、Locator 无外部调用方 | result=ok | — |
+- [2026-07-29] QA-H5/H7 | memprofile TLS：NewStreamSniffer/BuiltinBytesLocator.Slice/readStreamOnceAsync.func1 flat 全消除（residual readStreamOnceAsync 26% = bench bytes.Reader 强制 async 的 harness 偏差，L14）；memprofile QUIC：NewPacketSniffer/NewLinearLocator/LinearLocator.Slice/ExtractCryptoFrameOffset 全消除，ReassembleCryptos 2.26%→1.40%；cpu_profile：gcBgMarkWorker 27.26%→10.84%（-16pp H7 闭环复现），NewStreamSniffer 消除，mallocgc 14.20%→15.14%（噪声内 OQ-S4-4 marginally met） | verdict=PASS | — |
+- [2026-07-29] QA-signoff | 产出 docs/qa/qa-signoff-4.md（verdict=PASS）；无真实缺陷（不提 Issue）；新增 L14（cum%/flat% 分母陷阱 + bench async 偏差）写入 lessons-learned.md；H7 backlog proposed→applied；Sprint+1 候选：sniffHTTPHostHeader+bytes.Index CPU 优化 / bench conn deadline 化 | sprint-4 closed | — |
 
 ## Benchmark 基线（Dev 改动前对照，来自 runtime-context.md §H5）
 

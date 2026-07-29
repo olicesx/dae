@@ -1,15 +1,18 @@
 ---
 project: dae
-sprint: 1
-sprint_theme: "Semantic-preserving code slimming & runtime-overhead reduction / 语义不变的代码精简优化"
+sprint: 4
+sprint_theme: "Sniffing lifecycle refactor + CPU profile methodology (H7) / 嗅探生命周期重构 + CPU profile 方法论"
 content_language: bilingual
 content_language_source: inferred
 model_context_window: 1000000
 model_context_window_source: default
+schema_version: v5.0
 current_phase: planning
 branch: kdae
 last_updated: 2026-07-29
-sprint_current: 2
+sprint_current: 4
+constraint_policy: lifecycle_refactor_allowed
+sprint_latest_status: "Sprint 1-3 已完成并 commit；Sprint 1 已 v5.0 复核 PASS；Sprint 4 Planning 完成（首次解除语义等价约束，引入 H7 CPU profile）"
 ---
 
 # dae — PROJECT_BRIEF (Sprint 1)
@@ -281,3 +284,70 @@ dae/
 | [docs/sprint-3/drift-check.md](docs/sprint-3/drift-check.md) | 4 项 drift + Evals（H1/H2/H3 通过，H5 首次应用）+ H6 发现 |
 | [docs/sprint-3/runtime-context.md](docs/sprint-3/runtime-context.md) | 工具链基线 + H5 分类表（4 候选 flat%）+ F3 发现 |
 | [docs/sprint-3/progress.md](docs/sprint-3/progress.md) | Trace Log + gate 状态 + H5 应用证据（Dev/QA 填） |
+
+---
+
+# dae — PROJECT_BRIEF (Sprint 4 追加)
+
+> Sprint 4 **首次解除「语义等价」约束**（constraint_policy: lifecycle_refactor_allowed，用户显式解除）。**核心 = 把 Sprint 1-3 三次 deferred 的 sniffing lifecycle-boundary 候选纳入**（Sprint 2/3 hill-climbing 各记一次）+ **引入 H7 CPU profile 方法论**（bench/memprofile 之外的第三维度）。
+> ⚠️ Sprint 4 的 Goals/Non-Goals 取代 Sprint 1-3 的「语义不变」方向；以下为 Sprint 4 增量。详细文档见 [docs/sprint-4/](docs/sprint-4/)。
+
+## Sprint 4 目标 / Goals（取代 Sprint 1-3 的语义等价方向）
+
+- **T1（对象池化，TCP+UDP 双路径）**：`NewStreamSniffer`/`NewPacketSniffer` Sniffer struct + `readStreamOnceAsync` goroutine/channel 复用（mem flat 11.31%+16.04%+3.50%+17.71%；CPU cum 6.82%+9.49%+6.31%）。
+- **T2（接口收敛，依赖 T1）**：`BuiltinBytesLocator`/`LinearLocator` 装箱入 `Locator` 接口的分配消除（mem flat TLS 10.38% / QUIC 4.24%）。
+- **T3（跨调用存活，UDP）**：`ExtractCryptoFrameOffset`/`ReassembleCryptos` 的 `CryptoFrameOffset` 经 `s.quicCryptos` 跨调用复用（mem flat 3.11%+2.26%）。
+- **方法论**：应用 **H7（CPU profile 新维度）**——Producer 阶段跑 CPU profile 揭示「GC 主导 CPU（41-50%）→ alloc 与 CPU 热点收敛」；延续 H5（memprofile）。
+
+## Sprint 4 非目标 / Out-of-Scope
+
+> 注：Sprint 1 的「锁合并/重排、巨型文件拆分」两项 Non-Goals 已**被本 Sprint lifecycle 主题覆盖**（不再作为硬 Non-Goal）；本 Sprint 明确不做的如下：
+
+- ❌ CRYPTO inherent（hmac/sha256/hkdf/aes ≈ 57%）—— 算法本质。
+- ❌ deadline/context/timer inherent（≈ 24% TLS）—— 超时语义。
+- ❌ 测试瘦身 / 批量删测试。
+- ❌ 新协议 / 新 feature。
+- ❌ 行为/API/config 变更（嗅探结果 domain/err 逐位一致；仅生命周期/分配方式变）。
+- ❌ vendor / vmlinux-*.h / fork（quic-go、outbound）。
+- ❌ eBPF C（tproxy.c）。
+- ❌ net.SplitHostPort.func1（harness）、冷路径、test-only 函数。
+
+## Sprint 4 blast_radius / task_sizing
+
+| 项 | 值 |
+|----|----|
+| task_count | 3（T1/T3 layer1 并行，T2 layer2 依赖 T1） |
+| strong_coupling | 1（T2 接口收敛触碰 T1 池化后的 struct 形状） |
+| bug_reserve | 1（lifecycle 重构 race/语义风险高于前 3 Sprint） |
+| commit_budget | 4（dag_layers 2 + strong_coupling 1 + bug_reserve 1，hard_cap=10） |
+| topology | hybrid（layer1 并行 + layer2 串行） |
+
+## Sprint 4 验收标准 / Acceptance Criteria
+
+1. `go vet/build/test -tags=trace ./...` 通过
+2. `go test -race -tags=trace ./component/sniffing/...` 通过（T1/T2/T3 均涉及并发，race 必跑）
+3. `make ebpf-test` 本机 runs（PASS）+ `make ebpf` EXIT=0
+4. **memprofile_review（H5）**：T1/T2/T3 各 flat 下降；CRYPTO inherent 保持
+5. **cpu_profile_review（H7 新 gate）**：runtime.mallocgc + NewStreamSniffer cum% 不增（砍分配 → 降 GC CPU 收益闭环）
+6. **interface_compatibility_check（新 gate）**：grep 所有 Locator/NewStreamSniffer/NewPacketSniffer 外部调用方不破坏
+7. bench `allocs/op` 不回归；T1（Sniffer/async 池化）命中则 SniffTcp_* + async_read 显著降
+8. 嗅探行为不变（domain/err 逐位一致）；仅生命周期/分配方式变化
+
+## Sprint 4 第 7 节更新 / Phase Status（Sprint 4）
+
+| 时间 | 阶段 | 负责人 | 状态 |
+|------|------|--------|------|
+| 2026-07-29 | Sprint 4 Planning（drift-check + H7 CPU + H5 mem + plan） | Remy | ✅ 完成 |
+| 待定 | Sprint 4 Dev（T1 池化 / T2 接口收敛 / T3 跨调用存活） | Dev | 待启动 |
+| 待定 | Sprint 4 QA（gate + cpu_profile_review + interface_compat） | QA | 待启动 |
+
+> Sprint 1-3 已完成并 commit；Sprint 1 已 v5.0 复核 PASS（[docs/qa/qa-signoff-1.md](docs/qa/qa-signoff-1.md)）；Sprint 2/3 状态见其第 7 节。
+
+## Sprint 4 关键文档索引
+
+| 文档 | 用途 |
+|------|------|
+| [docs/sprint-4/plan.md](docs/sprint-4/plan.md) | task DAG（含 CPU+mem 双证据）/ verifiable_gates（+cpu_profile_review +interface_compat）/ task_sizing |
+| [docs/sprint-4/drift-check.md](docs/sprint-4/drift-check.md) | 4 项 drift + Evals（H1/H3/H5 通过，H6 首次应用，H7 新项）+ H6 应用 |
+| [docs/sprint-4/runtime-context.md](docs/sprint-4/runtime-context.md) | 工具链基线 + §H7 CPU profile top（GC 主导 41-50%）+ §H5 mem lifecycle 分类表 |
+| [docs/sprint-4/progress.md](docs/sprint-4/progress.md) | Trace Log + gate 状态 + H7 基线（Dev/QA 填） |

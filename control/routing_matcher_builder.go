@@ -148,9 +148,9 @@ func NewRoutingMatcherBuilderFromProgram(log *logrus.Logger, program *routing.No
 	}
 	ruleCap := len(program.Rules)
 	b = &RoutingMatcherBuilder{
-		log:                 log,
-		outboundName2Id:     outboundName2Id,
-		bpf:                 bpf,
+		log:             log,
+		outboundName2Id: outboundName2Id,
+		bpf:             bpf,
 		// Pre-allocate the per-rule accumulator slices to the known rule count.
 		// Each routing rule emits at least one compiled predicate, so this is a
 		// safe lower bound that avoids the early append-growth reallocations on

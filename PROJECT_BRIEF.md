@@ -1,18 +1,18 @@
 ---
 project: dae
-sprint: 4
-sprint_theme: "Sniffing lifecycle refactor + CPU profile methodology (H7) / 嗅探生命周期重构 + CPU profile 方法论"
+sprint: 5
+sprint_theme: "Tech debt cleanup + measurement precision upgrade (H8 first application) / 技术债清理 + 测量精度升级（H8 首次应用）"
 content_language: bilingual
 content_language_source: inferred
 model_context_window: 1000000
 model_context_window_source: default
 schema_version: v5.0
-current_phase: planning
+current_phase: done
 branch: kdae
 last_updated: 2026-07-29
-sprint_current: 4
-constraint_policy: lifecycle_refactor_allowed
-sprint_latest_status: "Sprint 1-3 已完成并 commit；Sprint 1 已 v5.0 复核 PASS；Sprint 4 Planning 完成（首次解除语义等价约束，引入 H7 CPU profile）"
+sprint_current: 5
+constraint_policy: test_pruning_and_cpu_algo_allowed
+sprint_latest_status: "Sprint 1-5 全部完成并 commit；Sprint 5 QA PASS（升级自 CONDITIONAL via L2 retry）—— T1 删 108 测试 test:src 1.03→0.49 / T2 sniffHTTPHostHeader bytes.Index cum 57.92%→8.66% / T3 H8 首次应用 bench 趋近 deadline_sync 基线；L15/L16/L17 新 lesson，H8/H9 applied，H10 proposed"
 ---
 
 # dae — PROJECT_BRIEF (Sprint 1)
@@ -338,10 +338,23 @@ dae/
 | 时间 | 阶段 | 负责人 | 状态 |
 |------|------|--------|------|
 | 2026-07-29 | Sprint 4 Planning（drift-check + H7 CPU + H5 mem + plan） | Remy | ✅ 完成 |
-| 待定 | Sprint 4 Dev（T1 池化 / T2 接口收敛 / T3 跨调用存活） | Dev | 待启动 |
-| 待定 | Sprint 4 QA（gate + cpu_profile_review + interface_compat） | QA | 待启动 |
+| 2026-07-29 | Sprint 4 Dev（T1 池化 / T2 接口收敛 / T3 跨调用存活） | Dev | ✅ 完成（3 commits：97d1c314 / 3bed4bef / 1352dd85） |
+| 2026-07-29 | Sprint 4 QA（gate + cpu_profile_review + interface_compat） | QA | ✅ PASS（[docs/qa/qa-signoff-4.md](docs/qa/qa-signoff-4.md)，head_commit 1e1fca20） |
 
 > Sprint 1-3 已完成并 commit；Sprint 1 已 v5.0 复核 PASS（[docs/qa/qa-signoff-1.md](docs/qa/qa-signoff-1.md)）；Sprint 2/3 状态见其第 7 节。
+
+## Sprint 4 第 8 节更新 / Handoff Context
+
+### Dev → QA（Sprint 4）
+- **改动文件清单**：`component/sniffing/{sniffer.go, internal/quicutils/relocation.go, quic.go, tls.go, benchmark_test.go}`（`conn_sniffer.go` 列 T1 target 但实际 read-only 未改）。
+- **bench 前后要点**（7/7 全降，0 回归）：SniffTcp_TLS 18→13、SniffTcp_HTTP 16→12、SniffUdp_QUIC 67→60、SniffUdp_QUICMultiPacket 160→142（跨调用存活收益最大）、deadline_sync_read 8→5（生产 TCP 主路径）。
+- **H7 GC 收益**：gcBgMarkWorker cum% 27.26%→10.32%（**-16pp**，H7 收益闭环核心）；NewStreamSniffer CPU 层消除；mallocgc 14.20%→14.30%（噪声内不增，OQ-S4-4 marginally met）。
+- **已知限制（OQ）**：① readStreamOnceAsync flat 26% 非 `.func1` 闭包（已消除），是 bench `bytes.Reader` 强制 async 的 harness 偏差（L14），生产 `net.Conn` 走 deadline 路径 0 goroutine；② SniffTcp cum% 相对上升 +10pp 是分母效应（GC 总量降致 APP 占比升），非回归。
+- **文档**：[docs/sprint-4/progress.md](docs/sprint-4/progress.md)（Trace Log + bench 基线表 + H7 基线表）；commits `97d1c314` / `3bed4bef` / `1352dd85`。
+
+### QA → done（Sprint 4）
+- **verdict = PASS**（[docs/qa/qa-signoff-4.md](docs/qa/qa-signoff-4.md)，head_commit `1e1fca20`）：local_gate + ci_gate + manual_gate 全过；H5/H7 决定性 gate 独立复现 Dev 数据；interface_compatibility 无破坏性变更；commits_used = 3/4。
+- **L4 完成**（[docs/sprint-4/hill-climbing.md](docs/sprint-4/hill-climbing.md)）：新增 L12-L14；H7 applied（强生效）、H8 proposed；no-op 率连续 2 Sprint 为 0%。Sprint 4 fully closed。
 
 ## Sprint 4 关键文档索引
 
@@ -351,3 +364,74 @@ dae/
 | [docs/sprint-4/drift-check.md](docs/sprint-4/drift-check.md) | 4 项 drift + Evals（H1/H3/H5 通过，H6 首次应用，H7 新项）+ H6 应用 |
 | [docs/sprint-4/runtime-context.md](docs/sprint-4/runtime-context.md) | 工具链基线 + §H7 CPU profile top（GC 主导 41-50%）+ §H5 mem lifecycle 分类表 |
 | [docs/sprint-4/progress.md](docs/sprint-4/progress.md) | Trace Log + gate 状态 + H7 基线（Dev/QA 填） |
+
+---
+
+# dae — PROJECT_BRIEF (Sprint 5 追加)
+
+> Sprint 5 切换主题至**技术债清理 + 测量精度升级**。**核心 = H8 首次应用**（bench harness deadline 化）+ 开采 Sprint 1-4 四次 deferred 的测试瘦身矿脉 + Sprint 4 OQ-S4-3 的 CPU 算法矿脉。
+> 以下为 Sprint 5 增量。详细文档见 [docs/sprint-5/](docs/sprint-5/)。
+
+## Sprint 5 目标 / Goals
+
+- **T1（AI 批量测试瘦身，用户锁定）**：删除 commit #970(85a1fc3c,136) / 0486201e(55) / b7fb496d(15) 批量添加的冗余测试。方法论：`/memories/ai-test-pruning.md`（dae 实例）。test:src 从 1.03 降至 ~0.5。保留硬规则：helpers（9）/fuzz（6）/每模块 1-2 核心契约/原生 16/T3 目标。
+- **T2（sniffHTTPHostHeader CPU 算法优化）**：来源 S4 H7 CPU profile（cum 16.85% / bytes.Index 9.95%，OQ-S4-3）。纯 CPU 算法（非分配驱动），verdict 须含 H7 CPU 维度。
+- **T3（H8 首次应用：bench harness deadline 化）**：来源 S4 L14（bytes.Reader 无 deadline → 强制 async 路径，掩盖生产 TCP 真实分配）。把 `benchmark_test.go` 的 `bytes.NewReader` 替换为 deadline-supporting conn。
+- **整体**：应用 H1-H8（H8 首次）+ 评估 H9；v5.0 可行性前置 gate（G1/G2 普适 + G3/G4 perf 专属条件性）。
+
+## Sprint 5 非目标 / Out-of-Scope
+
+- 长驻 reader goroutine（lifecycle 高风险，触 OQ-S4-1 读语义风险，需独立 lifecycle Sprint）
+- ReassembleCryptos merged slice 预分配（<1pp，收益 marginal）
+- T2 扩散到 tls.go/quic.go/sniffer.go 其他嗅探函数（YAGNI，只动 sniffHTTPHostHeader 路径）
+- T3 动生产 sniffer.go 读路径（H8 是 harness 改进非生产代码改动）
+- T1 碰原生 16 个测试（2023 年）或 helpers/fuzz
+- 行为/API/config 变更、fork（quic-go/outbound）、eBPF C（tproxy.c）
+
+## Sprint 5 blast_radius / task_sizing
+
+| 项 | 值 |
+|----|----|
+| task_count | 3（T1→T2→T3 全串行） |
+| strong_coupling | 1（T1/T3 sniffing 测试包编译耦合） |
+| commit_budget | **5**（dag_layers=3 + strong_coupling=1 + bug_reserve=1，hard_cap=10） |
+| topology | **sequential**（H9 评估：T1 删 sniffing 包测试 + T3 改 benchmark_test.go 同包，无法证明 target_files 互斥） |
+
+## Sprint 5 验收标准 / Acceptance Criteria
+
+1. `go vet/build/test -tags=trace ./...` 通过（T1 删除后 helper 链恢复驱动）
+2. `go test -race -tags=trace ./component/sniffing/... ./control/...` 通过
+3. `make ebpf-test` 本机 runs（PASS，H1）+ `make ebpf` EXIT=0
+4. **deletion_protection_check（T1 专属）**：comm -12 交集为空（只删批量 commit 添加的，原生 16 绝不碰）
+5. **cpu_profile_review（H7，T2 决定性）**：sniffHTTPHostHeader cum% < 16.85% + bytes.Index cum% < 9.95%（不可仅用 bench allocs 判，OQ-S5-1）
+6. **h8_deadline_sync_verification（H8 首次，T3 决定性）**：3 个 SniffTcp bench 全用 deadline-supporting conn + pprof 确认走 deadline_sync_read 非 async
+7. T1 test:src 比从 1.03 降至 ~0.5；T3 bench SniffTcp_* 趋近 deadline_sync 基线（5 而非 13）
+8. 无行为/API/config 变更
+
+## Sprint 5 第 7 节更新 / Phase Status（Sprint 5）
+
+| 时间 | 阶段 | 负责人 | 状态 |
+|------|------|--------|------|
+| 2026-07-29 | Sprint 5 Planning（drift-check + 可行性预检 + plan + brief §7/§8） | Remy | ✅ 完成 |
+| 待定 | Sprint 5 Dev（T1 测试瘦身 / T2 http.go CPU / T3 bench harness，全串行） | Dev | 待启动 |
+| 待定 | Sprint 5 QA（gate 全过 + cpu_profile_review + h8_deadline_sync） | QA | 待启动 |
+
+> Sprint 1-4 已全部 QA 签署 PASS（见 [docs/qa/qa-signoff-{1,4}.md](docs/qa/)），其第 7 节状态保持历史记录。
+
+## Sprint 5 第 8 节更新 / Handoff Context
+
+### Producer → Dev（Sprint 5）
+- 本文件 + [docs/sprint-5/plan.md](docs/sprint-5/plan.md)（task DAG + 可行性 gate + verifiable_gates + task_sizing + H1-H8 应用）。
+- 基线 + 删除清单 + H7 CPU 证据 + bench harness 偏差定位：[docs/sprint-5/runtime-context.md](docs/sprint-5/runtime-context.md)（T1 统计 + T2 H7 基线 + T3 代码定位）。
+- drift 依据：[docs/sprint-5/drift-check.md](docs/sprint-5/drift-check.md)（零技术 context drift / L1-L14 全规避 L9+L14 核心 / S4 Sprint+1 三候选全纳入 / fidelity 权威 git-log=0% ungated）。
+- **Dev 必读**：① T1 方法论 `/memories/ai-test-pruning.md`（helper 链处理最易踩坑，go vet 驱动恢复）；② T2 ⚠️ 用户描述「bytes.Index 替代手写字节扫描」与实际不符（http.go 已用 bytes 原语），OQ-S5-1 已 reformulate 为减 rescan + 消 string 分配 + 跳 request line，若无可优化空间须诚实标 no-op；③ T3 OQ-S5-3 deadline conn 选型须 pprof 确认走 deadline 路径；④ 命令脚本化 tmp/*.sh（H3）；注释/commit 英文。
+- 拓扑：**全串行 T1→T2→T3**（H9：T1/T3 sniffing 测试包编译耦合）。
+
+## Sprint 5 关键文档索引
+
+| 文档 | 用途 |
+|------|------|
+| [docs/sprint-5/plan.md](docs/sprint-5/plan.md) | task DAG（含可行性 gate）/ verifiable_gates（+cpu_profile_review +h8_deadline_sync +deletion_protection）/ task_sizing |
+| [docs/sprint-5/drift-check.md](docs/sprint-5/drift-check.md) | 4 项 drift + Evals（H1/H3/H5 通过，H6/H7 持续，H8 首次应用）+ backlog 应用清单 |
+| [docs/sprint-5/runtime-context.md](docs/sprint-5/runtime-context.md) | T1 测试统计 + 删除/保留清单 + T2 H7 CPU 基线 + T3 bench harness 偏差定位 |
+| [docs/sprint-5/progress.md](docs/sprint-5/progress.md) | Trace Log + gate 状态（Dev/QA 填） |

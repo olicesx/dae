@@ -72,7 +72,7 @@ type Sniffer struct {
 	// (recreated on timeout). readerLingering is set only on the timeout path
 	// where the reader goroutine may outlive Close; such sniffers are dropped
 	// instead of recycled to avoid use-after-pool-put of the bytes.Buffer.
-	readResultCh   chan readResult
+	readResultCh    chan readResult
 	readerLingering bool
 }
 

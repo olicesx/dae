@@ -1,7 +1,7 @@
 ---
 sprint: 4
 sprint_theme: "Sniffing lifecycle refactor + CPU profile methodology (H7)"
-phase: planning
+phase: done
 owner: Remy
 branch: kdae
 created: 2026-07-29
@@ -78,6 +78,7 @@ gates:
 - [2026-07-29] QA-gates | 独立补跑 ci_gate+manual_gate+H5/H7 决定性 gate（tmp/qa-sprint4-gates.sh）：make ebpf/ebpf-test/ebpf-sync-check EXIT=0；make dae 产出 stripped x86-64 ELF；dae validate example+empty EXIT=0（L8 chmod 0600）；interface_compat grep 确认 NewPacketSniffer(data,ttl)/NewStreamSniffer(conn,timeout) 签名不变、Locator 无外部调用方 | result=ok | — |
 - [2026-07-29] QA-H5/H7 | memprofile TLS：NewStreamSniffer/BuiltinBytesLocator.Slice/readStreamOnceAsync.func1 flat 全消除（residual readStreamOnceAsync 26% = bench bytes.Reader 强制 async 的 harness 偏差，L14）；memprofile QUIC：NewPacketSniffer/NewLinearLocator/LinearLocator.Slice/ExtractCryptoFrameOffset 全消除，ReassembleCryptos 2.26%→1.40%；cpu_profile：gcBgMarkWorker 27.26%→10.84%（-16pp H7 闭环复现），NewStreamSniffer 消除，mallocgc 14.20%→15.14%（噪声内 OQ-S4-4 marginally met） | verdict=PASS | — |
 - [2026-07-29] QA-signoff | 产出 docs/qa/qa-signoff-4.md（verdict=PASS）；无真实缺陷（不提 Issue）；新增 L14（cum%/flat% 分母陷阱 + bench async 偏差）写入 lessons-learned.md；H7 backlog proposed→applied；Sprint+1 候选：sniffHTTPHostHeader+bytes.Index CPU 优化 / bench conn deadline 化 | sprint-4 closed | — |
+- [2026-07-29] 收尾 | Producer 写 done.md + 更新 PROJECT_BRIEF §7/§8 + progress phase=done | sprint-4 fully closed | — |
 
 ## Benchmark 基线（Dev 改动前对照，来自 runtime-context.md §H5）
 

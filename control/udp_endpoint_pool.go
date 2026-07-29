@@ -1198,10 +1198,11 @@ func (ue *UdpEndpoint) isConnectionRefused(err error) bool {
 		}
 	}
 	// Slow path: string matching for proxy-protocol wrapped errors (e.g. SOCKS5 replies).
-	errStr := errStrLower(err)
-	return strings.Contains(errStr, "connection refused") ||
-		strings.Contains(errStr, "port unreachable") ||
-		strings.Contains(errStr, "host unreachable")
+	// containsFoldASCII is allocation-free and equivalent to ToLower+Contains.
+	errStr := err.Error()
+	return containsFoldASCII(errStr, "connection refused") ||
+		containsFoldASCII(errStr, "port unreachable") ||
+		containsFoldASCII(errStr, "host unreachable")
 }
 
 // handleProxyServerFailure is called when the proxy server refuses the connection.
@@ -1230,10 +1231,47 @@ func (ue *UdpEndpoint) handleProxyServerFailure() {
 	}
 }
 
-// errStrLower returns the lowercased error message. Used as a helper for
-// case-insensitive string matching in fallback error detection.
-func errStrLower(err error) string {
-	return strings.ToLower(err.Error())
+// containsFoldASCII reports whether s contains substr under ASCII
+// case-insensitive comparison. It is allocation-free on the ASCII path and is
+// byte-for-byte equivalent to strings.Contains(strings.ToLower(s), substr):
+//   - Pure-ASCII s: inline 'A'-'Z' folding matches strings.ToLower exactly.
+//   - Any non-ASCII byte in s: falls back to strings.ToLower+Contains to
+//     preserve full Unicode correctness (avoids divergence on chars like
+//     U+212A KELVIN SIGN whose Unicode lowercase is ASCII 'k'). Proxy and
+//     syscall error messages are ASCII in practice, so the fallback branch is
+//     effectively never hit in production but guarantees identical behavior.
+//
+// substr MUST be ASCII lowercase (true for all current call sites).
+func containsFoldASCII(s, substr string) bool {
+	if len(substr) == 0 {
+		return true
+	}
+	if len(substr) > len(s) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return strings.Contains(strings.ToLower(s), substr)
+		}
+	}
+	n := len(s) - len(substr)
+	for i := 0; i <= n; i++ {
+		match := true
+		for j := 0; j < len(substr); j++ {
+			c := s[i+j]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != substr[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
 }
 
 // selfRemoveFromPool performs a best-effort CAS delete of this endpoint from

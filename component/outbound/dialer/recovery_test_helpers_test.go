@@ -11,18 +11,6 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-func (d *Dialer) getRecoveryBackoffDuration(proto consts.L4ProtoStr) time.Duration {
-	return d.getRecoveryBackoffDurationByIndex(d.protoIdx(proto))
-}
-
-func (d *Dialer) resetStabilityCount(proto consts.L4ProtoStr) {
-	d.resetStabilityCountByIndex(d.protoIdx(proto))
-}
-
-func (d *Dialer) incrementBackoffLevel(proto consts.L4ProtoStr) {
-	d.incrementBackoffLevelByIndex(d.protoIdx(proto))
-}
-
 // newTestNetworkType returns a TCP/IPv4/DNS NetworkType used by dialer tests.
 // Recovered from the pruned connectivity_check_test.go (Sprint 5 T1).
 func newTestNetworkType() *NetworkType {

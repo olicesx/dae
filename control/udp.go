@@ -482,10 +482,6 @@ func sendPktWithCacheProvider(log *logrus.Logger, data []byte, from netip.AddrPo
 //   - from: source address of the packet (for logging/metadata only)
 //   - realTo: destination address where the packet should be sent
 //   - afp: optional cached Anyfrom socket for Symmetric NAT sessions
-func sendPkt(log *logrus.Logger, data []byte, from netip.AddrPort, realTo netip.AddrPort, afp **Anyfrom) (err error) {
-	return sendPktWithCacheProvider(log, data, from, realTo, soMarkFromDae.Load(), afp, nil)
-}
-
 func forwardUdpEndpointReplyToClient(log *logrus.Logger, ue *UdpEndpoint, data []byte, from netip.AddrPort, clientAddr netip.AddrPort, send udpEndpointReplySender, recordDownload func(int64)) error {
 	recordDownload = normalizeTrafficRecord(recordDownload)
 	var cacheSlot udpEndpointResponseConnSlot

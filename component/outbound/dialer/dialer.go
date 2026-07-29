@@ -751,12 +751,6 @@ func (d *Dialer) triggerRecoveryDetection(typ *NetworkType) {
 	d.ensureRecoveryManager().trigger(typ)
 }
 
-// confirmRecovery confirms recovery after backoff period.
-// It checks if the dialer is still healthy before confirming.
-func (d *Dialer) confirmRecovery(networkType *NetworkType, confirmSequence uint64) {
-	d.ensureRecoveryManager().confirm(networkType, confirmSequence)
-}
-
 // cancelPendingRecoveryConfirmation cancels any pending recovery confirmation timer for a specific protocol.
 // This is called when the dialer fails again during recovery observation period.
 func (d *Dialer) cancelPendingRecoveryConfirmation(proto consts.L4ProtoStr) {
@@ -774,10 +768,6 @@ func (d *Dialer) cancelPendingRecoveryConfirmationForType(typ *NetworkType) {
 
 func (d *Dialer) cancelPendingRecoveryConfirmationByIndex(protoIdx int, proto consts.L4ProtoStr) {
 	d.ensureRecoveryManager().cancelPendingConfirmationByIndex(protoIdx, proto)
-}
-
-func (d *Dialer) getRecoveryBackoffDurationByIndex(protoIdx int) time.Duration {
-	return d.ensureRecoveryManager().getRecoveryBackoffDurationByIndex(protoIdx)
 }
 
 // calculateBackoffDurationLocked calculates the backoff duration without acquiring a lock.

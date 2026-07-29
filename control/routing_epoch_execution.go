@@ -324,10 +324,6 @@ func (c *ControlPlane) acceptsRoutingEpochExecutionLocked() bool {
 	return c != nil && !c.rejectNewConnections.Load() && !c.routingEpochExecutionClosed.Load()
 }
 
-func (c *ControlPlane) acquireRoutingEpochExecutionLease() (func(), bool) {
-	return c.acquireRoutingEpochExecutionLeaseFor(nil)
-}
-
 func (c *ControlPlane) acquireRoutingEpochExecutionLeaseFor(result *bpfRoutingResult) (func(), bool) {
 	incomingConnectionOwnershipMu.Lock()
 	defer incomingConnectionOwnershipMu.Unlock()
@@ -354,10 +350,6 @@ func (c *ControlPlane) acquireIncomingConnectionLease(conn net.Conn) (*incomingC
 	}
 	c.inConnections.Store(conn, struct{}{})
 	return lease, true
-}
-
-func (l *incomingConnectionLease) transfer(owner *ControlPlane) bool {
-	return l.transferRoutingEpoch(owner, nil)
 }
 
 func (l *incomingConnectionLease) transferRoutingEpoch(owner *ControlPlane, result *bpfRoutingResult) bool {

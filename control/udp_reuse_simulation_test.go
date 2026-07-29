@@ -116,16 +116,6 @@ func (d *packetConnFactoryDialer) DialContext(context.Context, string, string) (
 	return d.factory(), nil
 }
 
-type failingPacketDialer struct {
-	err   error
-	calls atomic.Int32
-}
-
-func (d *failingPacketDialer) DialContext(context.Context, string, string) (netproxy.Conn, error) {
-	d.calls.Add(1)
-	return nil, d.err
-}
-
 type scriptedDialResult struct {
 	conn netproxy.Conn
 	err  error
@@ -170,27 +160,6 @@ func newFactoryProxyEndpointDialer(protocol, address string, factory func() netp
 	logger := logrus.New()
 	logger.SetOutput(io.Discard)
 	underlay := &packetConnFactoryDialer{factory: factory}
-	return componentdialer.NewDialer(
-		underlay,
-		&componentdialer.GlobalOption{
-			Log:           logger,
-			CheckInterval: time.Second,
-		},
-		componentdialer.InstanceOption{DisableCheck: true},
-		&componentdialer.Property{
-			Property: D.Property{
-				Name:     protocol,
-				Address:  address,
-				Protocol: protocol,
-			},
-		},
-	), underlay
-}
-
-func newFailingProxyEndpointDialer(protocol, address string, err error) (*componentdialer.Dialer, *failingPacketDialer) {
-	logger := logrus.New()
-	logger.SetOutput(io.Discard)
-	underlay := &failingPacketDialer{err: err}
 	return componentdialer.NewDialer(
 		underlay,
 		&componentdialer.GlobalOption{

@@ -289,13 +289,6 @@ func (d *udpOrderedDispatcher) acquireEndpointCreateAdmission() (release func(),
 	}, true
 }
 
-func (d *udpOrderedDispatcher) endpointCreateAdmissionState() (reserved, workers int) {
-	if d == nil {
-		return 0, 0
-	}
-	return len(d.compensationSlots), int(d.compensatingWorkerCount.Load())
-}
-
 func (d *udpOrderedDispatcher) reportEndpointCreateAdmissionSaturated() {
 	count := d.endpointCreateAdmissionRejects.Add(1)
 	if count&(count-1) != 0 {
@@ -499,20 +492,6 @@ func (d *udpOrderedDispatcher) queueCount() int {
 		return true
 	})
 	return count
-}
-
-func (d *udpOrderedDispatcher) pendingTaskCount() int64 {
-	if d == nil {
-		return 0
-	}
-	return d.pending.Load()
-}
-
-func (d *udpOrderedDispatcher) isClosed() bool {
-	if d == nil {
-		return true
-	}
-	return d.closed.Load()
 }
 
 func (d *udpOrderedDispatcher) runTask(task udpOrderedDispatchTask) {

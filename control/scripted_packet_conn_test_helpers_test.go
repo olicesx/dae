@@ -42,19 +42,6 @@ type scriptedPacketConn struct {
 	readCalls      atomic.Int32
 }
 
-type scriptedTransportPacketConn struct {
-	*scriptedPacketConn
-	transportDone chan struct{}
-}
-
-type scriptedPacketReceiverConn struct {
-	*scriptedPacketConn
-	receiverMu sync.Mutex
-	receiver   netproxy.PacketReceiveHandler
-	registered atomic.Int32
-	stopped    atomic.Int32
-}
-
 type scriptedDialer struct {
 	conns []netproxy.Conn
 	idx   atomic.Int32
@@ -93,39 +80,6 @@ func (c *scriptedPacketConn) ReadFrom(p []byte) (int, netip.AddrPort, error) {
 	}
 }
 
-func (c *scriptedPacketReceiverConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHandler) (func(), bool) {
-	if handler == nil {
-		return nil, false
-	}
-	c.receiverMu.Lock()
-	if c.receiver != nil {
-		c.receiverMu.Unlock()
-		return nil, false
-	}
-	c.receiver = handler
-	c.registered.Add(1)
-	c.receiverMu.Unlock()
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			c.receiverMu.Lock()
-			c.receiver = nil
-			c.stopped.Add(1)
-			c.receiverMu.Unlock()
-		})
-	}, true
-}
-
-func (c *scriptedPacketReceiverConn) deliver(packet *netproxy.ReceivedPacket) bool {
-	c.receiverMu.Lock()
-	receiver := c.receiver
-	c.receiverMu.Unlock()
-	if receiver == nil {
-		return false
-	}
-	return receiver(packet)
-}
-
 func (c *scriptedPacketConn) WriteTo(b []byte, _ string) (int, error) {
 	if c.writeStarted != nil {
 		c.writeStartOnce.Do(func() {
@@ -161,8 +115,4 @@ func (c *scriptedPacketConn) SetReadDeadline(_ time.Time) error {
 
 func (c *scriptedPacketConn) SetWriteDeadline(_ time.Time) error {
 	return nil
-}
-
-func (c *scriptedTransportPacketConn) TransportDone() <-chan struct{} {
-	return c.transportDone
 }

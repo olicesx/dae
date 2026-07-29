@@ -13,18 +13,6 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 )
 
-func (c *ControlPlane) isRealDomain(domain string) bool {
-	if known, real := c.lookupRealDomainCache(domain); known {
-		return real
-	}
-
-	v, _, _ := c.realDomainProbeS.Do(domain, func() (any, error) {
-		return c.probeAndUpdateRealDomain(domain), nil
-	})
-	isReal, _ := v.(bool)
-	return isReal
-}
-
 // newJanitorTestMap loads a real (unpinned) bpf map by spec for janitor tests.
 // Recovered from the pruned control_plane_janitor_test.go (Sprint 5 T1).
 // No build tag: callers span default and !dae_stub_ebpf builds; a tagless

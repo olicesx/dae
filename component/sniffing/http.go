@@ -13,7 +13,6 @@ import (
 var (
 	httpHeaderHost = []byte("host")
 	httpHeaderSep  = []byte{':'}
-	httpLineSep    = []byte("\r\n")
 )
 
 // httpMethods lists valid HTTP request methods as []byte so the method check

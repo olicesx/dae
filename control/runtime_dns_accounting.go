@@ -7,29 +7,12 @@ package control
 
 import (
 	"crypto/tls"
-	"io"
-	"net"
 	"net/netip"
 	"strings"
 
 	dnsmessage "github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
 )
-
-func writeRuntimeTrackedUDPAddrPort(conn *net.UDPConn, data []byte, addr netip.AddrPort, recordDownload func(int64)) error {
-	recordDownload = normalizeTrafficRecord(recordDownload)
-	n, err := conn.WriteToUDPAddrPort(data, addr)
-	if n > 0 {
-		recordDownload(int64(n))
-	}
-	if err != nil {
-		return err
-	}
-	if n != len(data) {
-		return io.ErrShortWrite
-	}
-	return nil
-}
 
 func sendRuntimeTrackedPkt(log *logrus.Logger, data []byte, from netip.AddrPort, to netip.AddrPort, soMark uint32, recordDownload func(int64)) error {
 	recordDownload = normalizeTrafficRecord(recordDownload)

@@ -607,43 +607,6 @@ func (ue *UdpEndpoint) releaseTrackedUdpConnState() {
 	}
 }
 
-func (ue *UdpEndpoint) adoptGeneration(owner udpConnStateOwner, tracker *controlPlaneDrainTracker) {
-	if ue == nil {
-		return
-	}
-
-	var oldRelease func()
-
-	ue.udpConnStateMu.Lock()
-	if ue.udpConnStateClosed || ue.dead.Load() {
-		ue.udpConnStateMu.Unlock()
-		return
-	}
-	if owner != nil {
-		if !sameUdpConnStateOwner(owner, ue.udpConnStateOwner) && len(ue.udpConnStateTuples) > 0 {
-			keys := make([]bpfTuplesKey, 0, len(ue.udpConnStateTuples))
-			for key := range ue.udpConnStateTuples {
-				keys = append(keys, key)
-			}
-			owner.TransferRetainedUdpConnStateTuplesFrom(ue.udpConnStateOwner, keys)
-		}
-		ue.udpConnStateOwner = owner
-	}
-	if tracker == nil || tracker == ue.drainTracker {
-		ue.udpConnStateMu.Unlock()
-		return
-	}
-	newRelease := tracker.Acquire()
-	oldRelease = ue.drainRelease
-	ue.drainTracker = tracker
-	ue.drainRelease = newRelease
-	ue.udpConnStateMu.Unlock()
-
-	if oldRelease != nil {
-		oldRelease()
-	}
-}
-
 func isProxyBackedDialer(d *dialer.Dialer) bool {
 	if d == nil {
 		return false
@@ -920,13 +883,6 @@ func (ue *UdpEndpoint) startTransportReceiver() bool {
 		}
 	}
 	return false
-}
-
-func (ue *UdpEndpoint) start() {
-	if ue.startTransportReceiver() {
-		return
-	}
-	ue.startReadLoop()
 }
 
 func (ue *UdpEndpoint) stopPacketReceiver() {

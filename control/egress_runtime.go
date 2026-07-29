@@ -102,11 +102,6 @@ type egressRuntimeLease struct {
 	once    sync.Once
 }
 
-func (r *egressRuntime) acquire() (*egressRuntimeLease, bool) {
-	lease, _, ok := r.acquireEgress(nil, nil)
-	return lease, ok
-}
-
 func (r *egressRuntime) acquireEgress(selected *dialer.Dialer, group *outbound.DialerGroup) (*egressRuntimeLease, *outbound.DialerGroup, bool) {
 	if r == nil {
 		return nil, group, true
@@ -350,13 +345,4 @@ func (r *egressRuntime) runActions(actions egressRuntimeActions) error {
 		r.log.WithError(err).Warn("Failed to release retired egress runtime")
 	}
 	return err
-}
-
-func (r *egressRuntime) activeReferences() int {
-	if r == nil {
-		return 0
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.refs
 }

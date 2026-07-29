@@ -1906,34 +1906,6 @@ func (c *ControlPlane) releaseCommittedDNSReloadState() {
 	c.ClearReloadDnsCacheSource()
 }
 
-func (c *ControlPlane) registerIncomingConnection(conn net.Conn) bool {
-	if c == nil || conn == nil {
-		return false
-	}
-	incomingConnectionOwnershipMu.Lock()
-	defer incomingConnectionOwnershipMu.Unlock()
-	if !c.acceptsRoutingEpochExecutionLocked() {
-		_ = conn.Close()
-		return false
-	}
-	c.inConnections.Store(conn, struct{}{})
-	if !c.acceptsRoutingEpochExecutionLocked() {
-		c.inConnections.Delete(conn)
-		_ = conn.Close()
-		return false
-	}
-	return true
-}
-
-func (c *ControlPlane) unregisterIncomingConnection(conn net.Conn) {
-	if c == nil || conn == nil {
-		return
-	}
-	incomingConnectionOwnershipMu.Lock()
-	defer incomingConnectionOwnershipMu.Unlock()
-	c.inConnections.Delete(conn)
-}
-
 // CommitPreparedDatapath applies deferred kernel/BPF mutations for a prepared
 // control plane. It is safe to call once; subsequent calls are no-ops.
 func (c *ControlPlane) CommitPreparedDatapath() error {
@@ -2516,13 +2488,6 @@ func buildDnsDialerSnapshotKeyForSnapshot(snapshot DnsRequestSnapshot, upstream 
 	}
 
 	return key, true
-}
-
-func buildDnsDialerSnapshotKey(req *udpRequest, upstream *dns.Upstream) (dnsDialerSnapshotKey, bool) {
-	if req == nil {
-		return dnsDialerSnapshotKey{}, false
-	}
-	return buildDnsDialerSnapshotKeyForSnapshot(dnsRequestSnapshotFromUDPRequest(req), upstream)
 }
 
 func (c *ControlPlane) loadDnsDialerSnapshot(key dnsDialerSnapshotKey, now time.Time) (*dialArgument, bool) {

@@ -192,18 +192,31 @@ type LinearLocator struct {
 }
 
 func NewLinearLocator(o []*CryptoFrameOffset) *LinearLocator {
+	l := &LinearLocator{}
+	l.Reset(o)
+	return l
+}
+
+// Reset reinitializes an existing *LinearLocator for a new set of crypto frame
+// offsets, avoiding the allocation that NewLinearLocator performs. Callers that
+// retain the locator across sniffing calls (e.g. a pooled Sniffer) should use
+// this instead of constructing a new locator each time.
+func (l *LinearLocator) Reset(o []*CryptoFrameOffset) {
+	l.left = 0
+	l.iOuter = 0
 	if len(o) == 0 {
-		return &LinearLocator{}
+		l.length = 0
+		l.baseData = nil
+		l.baseStart = 0
+		l.baseEnd = 0
+		l.o = nil
+		return
 	}
-	return &LinearLocator{
-		left:      0,
-		length:    o[len(o)-1].UpperAppOffset + len(o[len(o)-1].Data),
-		iOuter:    0,
-		baseData:  o[0].Data,
-		baseStart: o[0].UpperAppOffset,
-		baseEnd:   o[0].UpperAppOffset + len(o[0].Data),
-		o:         o,
-	}
+	l.length = o[len(o)-1].UpperAppOffset + len(o[len(o)-1].Data)
+	l.baseData = o[0].Data
+	l.baseStart = o[0].UpperAppOffset
+	l.baseEnd = o[0].UpperAppOffset + len(o[0].Data)
+	l.o = o
 }
 
 func (l *LinearLocator) relocate(i int) error {

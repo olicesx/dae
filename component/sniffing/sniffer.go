@@ -63,6 +63,9 @@ type Sniffer struct {
 	quicNextRead   int
 	quicCryptos    []*quicutils.CryptoFrameOffset
 	quicPlaintexts []pool.PB
+	// quicLocator is reused across SniffQuic calls to avoid allocating a new
+	// LinearLocator each time. It is Reset (not reallocated) on reuse.
+	quicLocator *quicutils.LinearLocator
 
 	// Async read reuse (stream path). readResultCh is allocated lazily on the
 	// first async read and reused across reads on the normal completion path

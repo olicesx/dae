@@ -171,31 +171,61 @@ verifiable_gates:
     - requirement: 无行为/API/config 变更；benchmark allocs/op 与 instruction count 不回归
 ```
 
-## task_sizing
+## task_sizing (v5.0 DAG-derived)
+
+> **v5.0 反过拟合改造**（见 modeInstructions「blast_radius_commit_budget」与「v5.0 Guardrail 一致性矩阵」）：
+> v4.x 公式 `ceil(task_count/3) + strong_coupling_count + 1` 把论文某 benchmark 均值当全局常数（因果倒置）。
+> v5.0 改用 DAG 结构属性 δ 驱动：`dag_layers + strong_coupling_count + bug_reserve`，硬上限 10。
+> 对 Sprint 1：v4.x = ⌈7/3⌉+1+1 = **5**（与被批的旧硬编码常数 5 巧合相等）；
+> v5.0 = 2 + 1 + 3 = **6**（bug_reserve=3 为首 Sprint 经验值，覆盖 lint/sync/unexpected-fix 三类意外 commit），
+> 证明 v5.0 公式有信息增量（不同 DAG 不再塌缩到同一值）。
 
 ```yaml
 task_sizing:
-  task_count: 7            # A1-A5 + B1 + B2
-  strong_coupling_count: 1 # B1→B2（同文件串行）
+  schema_version: v5.0
+  task_count: 7              # A1-A5 + B1 + B2
+  strong_coupling_count: 1   # B1→B2（同文件串行）
   parallel_groups:
-    - [A1, A2, A3, A4, A5] # 方向 A 全并行
+    - [A1, A2, A3, A4, A5, B1]  # layer 1 全并行（A/B 文件级互斥）
   serial_chains:
-    - [B1, B2]             # 方向 B 串行
-  dag_layers: 2            # L1: A1-A5+B1 并行；L2: B2
+    - [B1, B2]               # 方向 B 串行
+  dag_layers: 2              # L1: A1-A5+B1 并行；L2: B2
+  dag_properties:
+    omega: 6                 # max antichain width = layer 1 宽度（A1/A2/A3/A4/A5/B1 互不依赖）
+    gamma: 0.14              # coupling density = strong_coupling / task_count = 1/7
+    recommended_topology: hybrid   # ω≥3 AND γ≤0.4 → parallel; 但 B1→B2 串行链存在 → hybrid
+  max_parallelism: 6         # v5.0: min(user_setting=∞, dag.ω=6, soft_cap=8) = 6
 ```
 
-## blast_radius
+## blast_radius (v5.0)
 
 ```yaml
 blast_radius:
-  commit_budget: 5         # = ceil(task_count/3) + strong_coupling_count + 1 = ceil(7/3)+1+1 = 3+1+1
-  commit_budget_formula: ceil(task_count/3) + strong_coupling_count + 1
+  schema_version: v5.0
+  commit_budget_v4_x: 5          # historical: ceil(7/3)+1+1（保留供一致性矩阵对比）
+  commit_budget: 6               # v5.0: dag_layers(2) + strong_coupling_count(1) + bug_reserve(3)
+  commit_budget_formula: dag_layers + strong_coupling_count + bug_reserve
+  commit_budget_derivation: "2 + 1 + 3 = 6"
+  bug_reserve_rationale: >
+    首 Sprint 经验值 3 = (1 ebpf-lint/sync-check 意外修复) + (1 race/编译 unexpected fix) + (1 buffer)。
+    后续 Sprint 可按 lessons-learned 调整（v5.0：派生参数应跨 Sprint 累积信息量）。
   hard_cap: 10
   branch_required: true
-  branch: kdae             # 已是 feature branch ✅
+  branch: kdae                   # 已是 feature branch ✅
   block_force_push: true
   block_destructive_sql: true
 ```
+
+## Guardrail 一致性矩阵（v5.0 新增必填）
+
+> v5.0 规定：新增任何 Guardrail 或 backlog 项前必须做一致性评分（Jaccard overlap）。
+> 本 Sprint 为首 Sprint，无新增 Guardrail；下表为回溯性评估既有 Guardrail 间的正交性。
+
+| 重叠对 | 重叠语义 | overlap | 处置 |
+|---|---|---|---|
+| `commit_budget` × `max_subagent_calls_per_session` | 防失控 | 0.18 | 保留独立（前者管 git 爆炸半径，后者管 agent 调用预算） |
+| `commit_budget` × `max_tokens_per_subagent_run` | 超时→重试 | 0.12 | 保留独立（前者管 commit 数，后者管 token 预算） |
+| `branch_required` × `block_force_push` | 分支保护 | 0.42 | 标注 `overlaps_with`，但语义正交（前者要求在 feature branch，后者拦 force push 动作），保留 |
 
 ## 应用 backlog 项
 

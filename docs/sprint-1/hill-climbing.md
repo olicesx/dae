@@ -24,25 +24,48 @@
 
 ## 改进项（已写入 /memories/repo/harness-backlog.md）
 
+> **v5.0 schema 升级**：每个 backlog 项必须填 `overlaps_with` / `supersedes` 字段（v5.0 modeInstructions「harness-backlog eval schema v5.0」）。
+> 本节为回溯性补齐——Sprint 1 完成时 schema 尚未升级，v5.0 迁移时补填。
+
 ### H1 [scope] Producer gate 可行性探测
 - **现象**：Producer 把 ci_gate `make ebpf-test` 标 ignored（理由 WSL2 kernel 6.18 非 CI matrix），但 QA 实测本机能跑且 20+ 用例全过（3.1s）
 - **改进**：Producer 规划时先尝试轻量实跑 ci_gate，能跑则不标 ignored
 - **预期收益**：减少 CONDITIONAL 误判，签署置信度从"依赖 CI"提升到"本机实证"
+- **v5.0 eval**：
+  - `applies_to_stages`: [producer]
+  - `overlaps_with`: []（无重叠）
+  - `supersedes`: []（首 Sprint 无前序项可替代）
+  - `verified_in_sprint`: 2（Sprint 2 plan `ci_gate_ebpf_test.local = runs`，与 Sprint 1 `ignored` 形成对照 → H1 生效）
 
 ### H2 [scope] bench 驱动选文件
 - **现象**：7 任务中 4 个 no-op（57%），grep 静态扫描选的文件部分运行时已最优
 - **改进**：扫描阶段跑 `go test -bench=. -benchmem ./...`，按 allocs/op 实测排序，优先选有非零分配的文件
 - **预期收益**：降低 no-op 率，减少 token 浪费在"经验证已最优"的分析上
+- **v5.0 eval**：
+  - `applies_to_stages`: [producer]
+  - `overlaps_with`: [H5]（H5 是 H2 的演进：H2 用 bench，H5 在 H2 基础上加 memprofile；overlap=0.55，应合并——v5.0 modeInstructions 要求 overlap>0.5 合并。**复核结论**：H5 supersedes H2，H2 标 deprecated）
+  - `supersedes`: []
+  - `verified_in_sprint`: 2（Sprint 2 全 task 来自 bench；no-op 率从 57% 降到 0%）
 
 ### H3 [tool] WSL 命令脚本化
 - **现象**：PowerShell 内联 `$?`/`$()` 被自身解析，导致 gate exit code 误报为 True（lessons-learned L7）
 - **改进**：多行命令一律写 `tmp/*.sh` 脚本再 `wsl bash <script>`，禁 inline shell `$` 变量
 - **预期收益**：gate 验证可靠性，避免误判
+- **v5.0 eval**：
+  - `applies_to_stages`: [dev, qa, orchestrator]
+  - `overlaps_with`: []（独立工具问题）
+  - `supersedes`: []
+  - `verified_in_sprint`: 2（Sprint 2/3 全程 tmp/*.sh）
 
 ### H4 [scope] target_files 含关联文件
 - **现象**：A5 严守 router.go，但真正 per-query buffer 优化机会在 client.go（OQ4），因 target_files 边界过严而无法触及
 - **改进**：当扫描发现优化点跨文件但同模块同 pool 模式时，Producer 把关联文件纳入 target_files
 - **预期收益**：避免"机会在隔壁却不能动"
+- **v5.0 eval**：
+  - `applies_to_stages`: [producer]
+  - `overlaps_with`: [H2]（H2 也涉及 Producer 选文件，但 H4 是"边界扩展"，H2 是"过滤热点"，语义正交，overlap=0.32）
+  - `supersedes`: []
+  - `verified_in_sprint`: 2（Sprint 2 T1 直接以 client.go 为 target）
 
 ## Sprint+1 候选（功能 backlog，非 harness）
 

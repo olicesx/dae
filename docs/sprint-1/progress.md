@@ -8,10 +8,14 @@ created: 2026-07-29
 
 # === blast_radius（plan 锁定，执行期不得超）===
 blast_radius:
-  commit_budget: 5
-  commit_budget_formula: ceil(task_count/3) + strong_coupling_count + 1
+  schema_version: v5.0
+  commit_budget: 6               # v5.0: dag_layers(2) + strong_coupling_count(1) + bug_reserve(3)
+  commit_budget_v4_x: 5          # historical（保留供一致性矩阵对比）
+  commit_budget_formula: dag_layers + strong_coupling_count + bug_reserve
+  commit_budget_derivation: "2 + 1 + 3 = 6（v5.0 DAG-derived；v4.x 公式得 5 因与硬编码常数巧合相等已被 v5.0 弃用）"
   hard_cap: 10
   commits_used: 4     # A1(e2e78563) + A2(8e0c17df) + A4(aa7a0891) code + B1/B2 docs(80fba14a); A3/A5 no-op 无 commit
+  commits_headroom: 2 # v5.0 budget=6 - used=4 = 2（v4.x would be 1; v5.0 提供更合理余量）
   branch_required: true
   branch: kdae
   block_force_push: true

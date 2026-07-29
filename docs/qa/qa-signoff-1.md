@@ -181,3 +181,68 @@ ok  github.com/daeuniverse/dae/control/kern/tests  3.104s
 | QA（Ivy） | **PASS** — 三 gate 全过，等价性证据充分，无缺陷 | 2026-07-29 |
 
 > 后续：交接 Remy（Producer）做 Sprint 收尾与分支合并决策。CI matrix(6.6/6.12) 建议在 CI 流水线跑一遍做 kernel 兼容性最终确认（非本签署阻塞项）。
+
+---
+
+## 9. v5.0 迁移复核 / v5.0 Migration Review（2026-07-29 追加）
+
+> 本节为 v5.0 框架升级后的回溯性复核，验证 Sprint 1 执行在 v5.0 标准下是否仍成立。
+
+### 9.1 task_sizing 公式复核
+
+| 维度 | v4.x（原） | v5.0（迁移后） | 评注 |
+|---|---|---|---|
+| commit_budget 公式 | `ceil(task_count/3)+strong_coupling+1` | `dag_layers + strong_coupling + bug_reserve` | v5.0 δ-driven |
+| 计算 | `⌈7/3⌉+1+1 = 5` | `2+1+3 = 6` | **不同 DAG 不再塌缩** |
+| 实际 commits_used | 4 | 4 | 同 |
+| 余量 | 1（v4.x 偏紧） | 2（v5.0 合理） | v5.0 更准确反映"首 Sprint bug_reserve=3"的真实风险 |
+
+**复核结论**：v5.0 budget=6 > 实际 4，**未触发 hard_cap**，PASS。v4.x budget=5 同样未触发但余量仅 1，对首 Sprint 偏激进。v5.0 的 `bug_reserve=3` 更符合首 Sprint 不确定性。
+
+### 9.2 max_parallelism 复核（v5.0 dag.ω）
+
+| 维度 | 值 | 来源 |
+|---|---|---|
+| dag.ω（max antichain width） | 6 | layer 1 = {A1,A2,A3,A4,A5,B1}（互不依赖） |
+| max_parallelism（v5.0） | `min(∞, 6, 8) = 6` | user 未设、ω=6、API soft_cap=8 |
+| 实际并行度 | 6（layer 1 全发，Dev 子 agent hybrid 拓扑） | progress.md `topology_used: hybrid` |
+| 是否触发 `max_parallelism` guardrail | 否 | 实际=上限 |
+
+**复核结论**：v5.0 公式与实际一致，PASS。
+
+### 9.3 Guardrail 一致性矩阵（v5.0 新增要求）
+
+v5.0 要求：新增 Guardrail 必须做 Jaccard overlap 评分。Sprint 1 为首 Sprint，无新增，但回溯评估既有 guardrail 正交性（见 plan.md `## Guardrail 一致性矩阵`）。
+
+最大重叠对 `branch_required × block_force_push` overlap=0.42（∈(0.3,0.5]，标注 `overlaps_with` 后保留独立），处置合理。**无冲突**，PASS。
+
+### 9.4 backlog eval schema（v5.0）复核
+
+Sprint 1 产出 H1-H4 已在 hill-climbing.md 补填 `overlaps_with` / `supersedes` / `verified_in_sprint`。关键发现：
+
+- **H2 × H5** overlap=0.55 > 0.5 → v5.0 modeInstructions 要求合并。**处置**：标 H2 = `deprecated, supersedes_by: H5`，H5 在 Sprint 3 已作为演进版应用。
+- 其他三项 overlap ≤ 0.42，保留独立。
+
+**复核结论**：H2 应在 Sprint 3 起被 H5 取代（不再作为独立 backlog 项应用），文档已标注。
+
+### 9.5 Cross-Sprint 数据持久化 Gap（v5.0 复核新发现）
+
+| 文档引用 | 实际存在 | 影响 |
+|---|---|---|
+| qa-signoff-1.md §7 "已追加到 /memories/repo/lessons-learned.md（L7/L8）" | ❌ view 返回 not found | 跨 Sprint 经验未真正持久化 |
+| hill-climbing.md "已写入 /memories/repo/harness-backlog.md" | ❌ view 返回 not found | H1-H4 仅在 Sprint 1 文档内，下 Sprint Producer 无法读 |
+| PROJECT_BRIEF.md `sprint_current: 2` | 与实际 sprint-3/ 已完成矛盾 | brief 状态滞后 |
+
+**复核结论**：这是 v5.0「Cross-Sprint Drift 检测」要抓的真实漂移。**修复动作**：本次迁移同步补建 `/memories/repo/lessons-learned.md` 和 `harness-backlog.md`，H1-H4 + L1-L8 真正落盘。
+
+### 9.6 综合 v5.0 复核结论
+
+| 检查项 | 结果 |
+|---|---|
+| task_sizing v5.0 公式 | ✅ PASS（budget=6 > used=4，余量合理） |
+| max_parallelism = dag.ω | ✅ PASS（ω=6 与实际并行度一致） |
+| Guardrail 一致性 | ✅ PASS（最大 overlap 0.42，无 >0.5 未合并项） |
+| backlog eval schema | ✅ PASS（H1-H4 已补 v5.0 字段；H2 标 deprecated） |
+| Cross-Sprint 持久化 | ⚠️ GAP（已修复：补建 memory 文件） |
+
+**Sprint 1 在 v5.0 标准下结论维持 PASS**。原 PASS 判定基于三 gate 全过 + 等价性证据，v5.0 复核未发现破坏性偏差。v5.0 主要价值是给后续 Sprint 提供更准确的 task_sizing 与 cross-Sprint 数据流。

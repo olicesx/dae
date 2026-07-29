@@ -19,6 +19,26 @@ import (
 	"github.com/daeuniverse/outbound/pool/bytes"
 )
 
+// readResult carries the outcome of a single async stream read. It is reused
+// across reads through s.readResultCh to avoid per-call channel allocation.
+type readResult struct {
+	n   int64
+	err error
+}
+
+// snifferPool recycles *Sniffer structs across connections/packets to avoid
+// per-connection struct and dataReady channel allocation.
+//
+// Pooling safety: a Sniffer is only returned to the pool in Close when no async
+// reader goroutine is lingering (s.readerLingering is false). A lingering reader
+// (only possible on the timeout path where r ignores deadlines) keeps a
+// reference to the pooled bytes.Buffer; to avoid use-after-pool-put on that rare
+// path, such sniffers are deliberately dropped and left for GC instead of being
+// recycled.
+var snifferPool = sync.Pool{
+	New: func() any { return &Sniffer{} },
+}
+
 type Sniffer struct {
 	// Stream
 	stream    bool
@@ -43,35 +63,65 @@ type Sniffer struct {
 	quicNextRead   int
 	quicCryptos    []*quicutils.CryptoFrameOffset
 	quicPlaintexts []pool.PB
+
+	// Async read reuse (stream path). readResultCh is allocated lazily on the
+	// first async read and reused across reads on the normal completion path
+	// (recreated on timeout). readerLingering is set only on the timeout path
+	// where the reader goroutine may outlive Close; such sniffers are dropped
+	// instead of recycled to avoid use-after-pool-put of the bytes.Buffer.
+	readResultCh   chan readResult
+	readerLingering bool
+}
+
+// reset prepares s for reuse from snifferPool. All per-connection state is
+// re-initialized and a fresh pooled buffer is attached.
+func (s *Sniffer) reset(stream bool, r io.Reader, conn net.Conn, data []byte, timeout time.Duration) {
+	s.stream = stream
+	s.r = r
+	s.conn = conn
+	s.dataReady = make(chan struct{})
+	s.dataError = nil
+	s.sniffed = ""
+	s.buf = pool.GetBuffer()
+	s.ctxOnce = sync.Once{}
+	s.closeMu = sync.Once{}
+	s.ctx = nil
+	s.cancel = nil
+	s.deadline = time.Now().Add(timeout)
+	s.data = nil
+	s.needMore = false
+	s.quicNextRead = 0
+	s.quicCryptos = nil
+	s.quicPlaintexts = nil
+	// readResultCh is allocated lazily on the first async read so the common
+	// deadline-sync path (production TCP) pays no channel allocation here.
+	s.readResultCh = nil
+	s.readerLingering = false
+	if stream {
+		s.buf.Grow(AssumedTlsClientHelloMaxLength)
+		s.buf.Reset()
+	} else {
+		// Packet sniffer: always seed s.data with one entry (the buffer
+		// bytes), matching the original NewPacketSniffer. AppendData appends
+		// further entries; downstream replay/buffering relies on this initial
+		// sentinel even when the sniffer is created with no data yet.
+		if data != nil {
+			_, _ = s.buf.Write(data)
+		}
+		s.data = [][]byte{s.buf.Bytes()}
+	}
 }
 
 func NewStreamSniffer(r io.Reader, timeout time.Duration) *Sniffer {
-	buffer := pool.GetBuffer()
-	buffer.Grow(AssumedTlsClientHelloMaxLength)
-	buffer.Reset()
 	conn, _ := r.(net.Conn)
-	s := &Sniffer{
-		stream:    true,
-		r:         r,
-		conn:      conn,
-		buf:       buffer,
-		dataReady: make(chan struct{}),
-		deadline:  time.Now().Add(timeout),
-	}
+	s := snifferPool.Get().(*Sniffer)
+	s.reset(true, r, conn, nil, timeout)
 	return s
 }
 
 func NewPacketSniffer(data []byte, timeout time.Duration) *Sniffer {
-	buffer := pool.GetBuffer()
-	_, _ = buffer.Write(data)
-	s := &Sniffer{
-		stream:    false,
-		r:         nil,
-		buf:       buffer,
-		data:      [][]byte{buffer.Bytes()},
-		dataReady: make(chan struct{}),
-		deadline:  time.Now().Add(timeout),
-	}
+	s := snifferPool.Get().(*Sniffer)
+	s.reset(false, nil, nil, data, timeout)
 	return s
 }
 
@@ -140,40 +190,49 @@ func (s *Sniffer) readStreamOnceWithReadDeadline() error {
 func (s *Sniffer) readStreamOnceAsync() error {
 	ctx := s.ensureAsyncContext()
 	ready := s.dataReady
+	// Allocate the result channel lazily on the first async read; reuse it on
+	// the normal completion path (the select below drains exactly one value)
+	// and replace it on timeout where the reader may still push a stale value.
+	if s.readResultCh == nil {
+		s.readResultCh = make(chan readResult, 1)
+	}
+	ch := s.readResultCh
+
+	// Single reader goroutine. Inlining the former outer goroutine removes one
+	// closure allocation per call; the read semantics (order, timeout, error
+	// propagation) are preserved exactly.
 	go func() {
-		defer close(ready)
-		type readResult struct {
-			n   int64
-			err error
-		}
-		ch := make(chan readResult, 1)
-		go func() {
-			n, err := s.buf.ReadFromOnce(s.r)
-			ch <- readResult{n, err}
-		}()
-		select {
-		case <-ctx.Done():
-			s.dataError = ctx.Err()
-		case rr := <-ch:
-			if rr.err != nil {
-				s.dataError = rr.err
-			}
-		}
+		n, err := s.buf.ReadFromOnce(s.r)
+		ch <- readResult{n, err}
 	}()
 
 	select {
-	case <-ready:
-		if s.dataError != nil {
-			return s.dataError
-		}
 	case <-ctx.Done():
-		// If read is still pending, we must unblock it.
+		s.dataError = ctx.Err()
+		// The reader is still blocked on r and will outlive this call; mark it
+		// so Close drops the struct instead of recycling it (the reader holds
+		// a reference to the pooled bytes.Buffer).
+		s.readerLingering = true
+		// Replace the channel: the reader may still complete and push, or may
+		// never push when r ignores deadlines. A fresh channel is used for the
+		// next read so a stale/stuck push cannot corrupt it.
+		s.readResultCh = make(chan readResult, 1)
 		if s.conn != nil {
 			_ = s.conn.SetReadDeadline(time.Unix(1, 0))
-			<-ready
+		}
+		close(ready)
+		if s.conn != nil {
 			_ = s.conn.SetReadDeadline(time.Time{})
 		}
 		return fmt.Errorf("%w: %w", ErrNotApplicable, context.DeadlineExceeded)
+	case rr := <-ch:
+		if rr.err != nil {
+			s.dataError = rr.err
+		}
+		close(ready)
+		if s.dataError != nil {
+			return s.dataError
+		}
 	}
 	return nil
 }
@@ -347,6 +406,13 @@ func (s *Sniffer) Close() (err error) {
 		}
 		s.quicPlaintexts = nil
 		s.readMu.Unlock()
+		// Recycle the struct only when no async reader goroutine is lingering.
+		// A lingering reader (timeout path with no deadline support) holds a
+		// reference to the pooled bytes.Buffer and could corrupt it after reuse;
+		// such sniffers are dropped and left for GC instead.
+		if !s.readerLingering {
+			snifferPool.Put(s)
+		}
 	})
 	return nil
 }

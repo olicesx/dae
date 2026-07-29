@@ -23,6 +23,10 @@ func BenchmarkSniffer_SniffTcp_TLS(b *testing.B) {
 		if d != "www.google.com" {
 			b.Fatalf("domain = %q, want %q", d, "www.google.com")
 		}
+		// Close exercises the full construct->sniff->close lifecycle so the
+		// pool reuse path (production behavior) is measured, not just the
+		// allocation path.
+		_ = sniffer.Close()
 	}
 }
 
@@ -39,6 +43,7 @@ func BenchmarkSniffer_SniffTcp_HTTP(b *testing.B) {
 		if d != "benchmark.example.com" {
 			b.Fatalf("domain = %q, want %q", d, "benchmark.example.com")
 		}
+		_ = sniffer.Close()
 	}
 }
 
@@ -54,6 +59,7 @@ func BenchmarkSniffer_SniffUdp_QUIC(b *testing.B) {
 		if d == "" {
 			b.Fatal("empty domain")
 		}
+		_ = sniffer.Close()
 	}
 }
 
@@ -70,6 +76,7 @@ func BenchmarkSniffer_SniffUdp_QUICMultiPacket(b *testing.B) {
 		if err != nil {
 			b.Fatalf("sniff failed: %v", err)
 		}
+		_ = sniffer.Close()
 	}
 }
 
@@ -117,5 +124,6 @@ func BenchmarkSniffer_SniffTcp_NotApplicable(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		sniffer := NewStreamSniffer(bytes.NewReader(payload), 50*time.Millisecond)
 		_, _ = sniffer.SniffTcp()
+		_ = sniffer.Close()
 	}
 }

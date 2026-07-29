@@ -42,10 +42,10 @@ gates:
   go_test_race: pass   # control 28.0s
   benchmark_no_regression: pass   # 18 allocs/op 前后持平（errStrLower 在错误路径，bench noise 主导；memprofile_review 为决定性证据）
   memprofile_review: pass         # H5 决定性：strings.ToLower cum 32768→0，errStrLower/MakeNoZero(genSplit) 全消失
-  ci_gate_ebpf_test: pending      # QA 阶段（T1 无 .c 改动，回归安全）
+  ci_gate_ebpf_test: pass       # QA 实跑 8/8 PASS（3.224s，H1 持续；T1 无 .c 改动，回归安全）
   ci_gate_make_da_ebpf: pass      # EXIT=0（F1）
   ebpf_lint: na
-  ebpf_sync_check: pending        # QA 阶段（无 C 结构体改动）
+  ebpf_sync_check: pass         # QA 实跑 EXIT=0（无 C 结构体改动）
 ---
 
 # Sprint 3 Progress — 基于 H5 的内存优化（bench+memprofile 双验证）
@@ -58,7 +58,7 @@ gates:
 |------|--------|------|
 | Planning（drift-check + H5 memprofile 分类 + plan） | Remy | ✅ 完成 |
 | Dev 实现（T1 errStrLower + bulk inherent 文档化） | Dev | ✅ 完成 |
-| QA 验证（gate 全过 + memprofile 复核） | QA | ⏳ 待启动 |
+| QA 验证（gate 全过 + memprofile 复核） | QA | ✅ 完成（PASS，见 docs/qa/qa-signoff-3.md） |
 
 ## Trace Log
 
@@ -118,8 +118,8 @@ gates:
 | benchmark_no_regression | `go test -bench=UdpProxyDial -benchmem -benchtime=300ms` | PASS | 18 allocs/op 前后持平（符合预期） |
 | memprofile_review（H5 决定性） | `go test -bench -memprofile + pprof -top -sample_index=alloc_objects` | PASS | strings.ToLower cum 32768→0；详见 §H5 对比表 |
 | ci_gate_make_da_ebpf | `make ebpf` | EXIT=0 | 同 F1 |
-| ci_gate_ebpf_test | `make ebpf-test` | pending | QA 阶段（T1 无 .c 改动，回归安全） |
-| ebpf_sync_check | `make ebpf-sync-check` | pending | QA 阶段（无 C 结构体改动） |
+| ci_gate_ebpf_test | `make ebpf-test` | ✅ PASS（QA 实跑 3.224s，8/8） | H1 持续；T1 无 .c 改动，回归安全 |
+| ebpf_sync_check | `make ebpf-sync-check` | ✅ PASS（QA 实跑 EXIT=0） | progress 标 pending 由 QA 闭环 |
 
 ## Bulk inherent no-op 文档化（OQ-S3-2 闭环）
 

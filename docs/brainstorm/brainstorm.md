@@ -140,3 +140,66 @@
 | D6 | T1 不加 bench，靠 race+vet+L4 论证；Dev 可选加 lookupType bench（非硬 gate） | T1 |
 | D7 | commit_budget 遵循用户公式=2；hard_cap=10 留余量；全有效则文档化解锁 | blast_radius |
 | D8 | 沿用 Sprint 1 D1（分层分配）+ D4（每改必证等价） | 全 Sprint |
+
+---
+---
+
+# Sprint 3 结构化脑暴 — 基于 H5 的内存优化（bench + memprofile 双验证）
+
+> 主持人：Remy。6 角色，至少 2 次真正分歧。
+> 主题：延续 Sprint 1/2 内存优化。**核心区别 = 应用 H5**——Producer 规划阶段即用 memprofile 验证每个热点的生产相关性，从源头过滤 harness 噪声 task（Sprint 2 T2 是 Dev 阶段才发现 harness noise）。
+> 输入：[docs/sprint-3/drift-check.md](../sprint-3/drift-check.md)、[docs/sprint-3/runtime-context.md](../sprint-3/runtime-context.md) §H5 分类表、Sprint 2 hill-climbing（H5 来源 + sniffing lifecycle Sprint+1 候选）。
+> 约束：不改行为/API；不碰锁合并、文件拆分、测试瘦身、fork、eBPF C、冷路径、test-only 函数；**sniffing lifecycle/接口重构超语义等价边界→Sprint+1**（用户硬约束）。
+
+## 共识（基于 drift-check + H5 扫描）
+
+1. **H5 是本 Sprint 核心**：memprofile 区分生产 vs harness，harness 噪声热点**不得设 task**（硬约束）。
+2. **零漂移**：连续 3 Sprint 环境/工具链一致（drift-check §1）。
+3. **L9 方法论固化**：Sprint 2 T2 的事后 memprofile 发现（L9）→ Sprint 3 前置到 Producer 阶段（H5）。
+4. **延续 D1/D4/D8**：分层分配 + 每改必证等价。
+
+## 分歧 5 ❗ WriteToBufferFlush（60 allocs/3.6MB，最大热点）纳入与否
+
+**Milo**（性能）：这是全量扫描 allocs/op 与 B/op 双第一的热点（60 allocs/op, 3.6MB/op），每 TCP 嗅探连接 relay 都走 ConnSniffer.WriteTo，必须纳入，潜在收益最大。
+
+**Sage**（质量）：先等 memprofile。Sprint 2 T2 教训（L9）——bench allocs 可能全是 harness。3.6MB/op 配 60 allocs 太可疑，像是 bench 每轮重建大对象。
+
+> **裁决前 memprofile 揭示**：pprof 显示 `net.IPv4` flat **76.58%** + `net.(*sysListener).listenTCPProto` **19.15%** = **95.73% 是 bench 每轮 net.IPv4() 构造 + net.Listen 起 TCP listener**；生产 `(*ConnSniffer).WriteTo` cum 仅 2.29%（979B，io.CopyBuffer dst 增长，亦是 bench 的 bytes.Buffer dst）。
+
+> **裁决（Remy）**：**H5 过滤，不设 task**。最大热点 95%+ 为 bench 工件，生产 WriteTo flat=0。这是 H5 价值的标杆案例——**bench 表面最大 = harness 最重**。记为决策 D9（H5 过滤标杆）。改 bench harness 属 test-only（L2 YAGNI），本 Sprint 不动。
+
+## 分歧 6 ❗ 仅剩 errStrLower 一个 residual，Sprint 3 是否"过于薄" / 该不该诚实报告"无可优化真热点"
+
+**Remy**（制作）：H5 过滤后，4 候选里 D 过滤、B（QUIC 59% crypto + Sprint-2-exhausted）、C（SniffTcp lifecycle-boundary）排除，只剩 A 的 errStrLower（错误路径 strings.ToLower alloc）。Sprint 3 = 1 个小 task。这"薄"得近乎无 Sprint。是否该诚实报告"无可优化真热点"？
+
+**Milo**（性能）：反对轻易判无。errStrLower 是**真实生产 alloc**（ICMP-refused 处理，strings.ToLower 每次拷贝整个错误字符串），虽在错误路径非稳态，但消除它零成本零风险（零分配大小写不敏感匹配）。1 个真实有效 task 仍值得做。
+
+**Kira**（架构）：同意 Milo——errStrLower 语义保持可证（ASCII 错误消息大小写不敏感子串匹配，结果逐位一致）。但须诚实标注 bulk（context/timer/struct/map）inherent，不得为凑数改语义。
+
+**Sage**：H5 的正确结论不是"零 task"而是"1 个验证过的生产 task + 3 个有据排除"。这正是 H5 比纯 bench 驱动（Sprint 2 T2 事后才发现）更优的证据。
+
+**Ivy**（运维）：线上 UDP proxy 频繁遇到 unreachable peer 时，ICMP-refused 处理路径的 alloc 累积会加 GC 压力；errStrLower 消除对尾延迟场景有益。值得做。
+
+> **裁决（Remy）**：**设 T1 = errStrLower，不判"零真热点"**——
+> - errStrLower 是 H5 通过过滤的真实生产 residual（非 harness、非 crypto、非 lifecycle-boundary）。
+> - expected `effective_small`（零分配匹配，bench 是否下降取决于 bench 触发率，memprofile_review 为决定性 gate）。
+> - bulk inherent（context.WithTimeout ×2 / &UdpEndpoint{} / lifecycleProfile / registerEndpoint map）**Dev 须文档化**为 inherent no-op，不得改语义凑数。
+> - thin Sprint 是 H5 应用于已优化 2 Sprint 代码库的**正确预期**（非失败）；Sprint+1 建议改主题为 lifecycle refactor。
+> 记为决策 D10。
+
+## 分歧 7 ❗ sniffing lifecycle（C，三次确认超边界）是否破例纳入
+
+**Milo**：C（SniffTcp_TLS 18 allocs）主 allocs 是 NewStreamSniffer 11% + async-goroutine 19% = 30%，若池化 StreamSniffer 是大收益。Sprint 1/2/3 三次扫到都因"lifecycle"排除，是否本 Sprint 破例？
+
+**Kira/Sage**：坚决反对破例。① StreamSniffer 池化涉接口/生命周期调整（跨调用存活 s.quicCryptas 等），**超语义等价边界**（用户硬约束明确排除）；② 三次排除恰是强信号——该类优化需独立 Sprint（lifecycle refactor，非 semantic-preserving），不应在语义保持 Sprint 里硬塞；③ 破例会模糊 Sprint 主题边界，破坏 drift-check 的边界纪律。
+
+> **裁决（Remy）**：**不破例，C 排除**。三次跨 Sprint 数据点（Sprint 1 OQ / Sprint 2 hill-climbing Sprint+1 / Sprint 3 memprofile 复核）一致确认 sniffing lifecycle 超 semantic-preserving 边界。**记 Sprint+1 候选：建议 Sprint 4 改主题为"lifecycle refactor"**（明确非语义保持，独立 gate 设计）。记为决策 D11。
+
+## 决策汇总（Sprint 3 追加）
+
+| ID | 决策 | 影响 |
+|----|------|------|
+| D9 | H5 过滤标杆：WriteToBufferFlush（60/3.6MB）memprofile 证 95.73% harness → 不设 task；bench 表面最大≠生产最重 | 全 Sprint H5 纪律 |
+| D10 | T1=errStrLower（H5 通过的真实生产 residual），expected effective_small；bulk inherent 文档化不凑数；thin Sprint 是 H5 正确预期 | T1 |
+| D11 | sniffing lifecycle 不破例（三次超边界），记 Sprint+1 候选建议改主题 lifecycle refactor | scope 边界 |
+| D12 | 沿用 D1/D4/D8；H5 memprofile 须逐包跑（F3） | 全 Sprint |

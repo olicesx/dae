@@ -215,3 +215,69 @@ dae/
 | [docs/sprint-2/drift-check.md](docs/sprint-2/drift-check.md) | 4 项 drift 检查 + Evals 回归（H1/H2 命中） |
 | [docs/sprint-2/runtime-context.md](docs/sprint-2/runtime-context.md) | 工具链基线 + F1/F2 发现 + bench 基线表 |
 | [docs/sprint-2/progress.md](docs/sprint-2/progress.md) | Trace Log + gate 状态（Dev/QA 填） |
+
+---
+
+# dae — PROJECT_BRIEF (Sprint 3 追加)
+
+> Sprint 3 延续 Sprint 1/2 内存优化方向。**核心区别 = 应用 H5（bench + memprofile 双验证）**——Producer 规划阶段即用 memprofile 验证每个热点的生产相关性，从源头过滤 harness 噪声 task（Sprint 2 T2 是 Dev 阶段才发现）。
+> 以下为 Sprint 3 增量。详细文档见 [docs/sprint-3/](docs/sprint-3/)。
+
+## Sprint 3 目标 / Goals
+
+- **T1（H5 验证后的唯一生产 residual）**：消除 `UdpProxyDial cache=miss` create 路径中 `errStrLower` 的 `strings.ToLower` 冗余字符串分配（control/udp_endpoint_pool.go:1235，零分配大小写不敏感子串匹配），并文档化 bulk inherent allocs（context/timer/struct/map）。
+- **整体**：应用 H5——对全部 allocs/op>0 热点跑 memprofile 分类，harness 噪声不得设 task。
+
+## Sprint 3 非目标 / Out-of-Scope
+
+- **WriteToBufferFlush（60 allocs/3.6MB）**：H5 memprofile 证 95.73% harness（net.IPv4 76.58% + net.listenTCPProto 19.15%），生产 WriteTo flat=0 → **H5 过滤，不设 task**。
+- **Sniffer_SniffUdp_QUIC（67/160）**：59% crypto-inherent + 非密码学 Sprint-2-exhausted 或 lifecycle-boundary → 排除。
+- **Sniffer_SniffTcp_TLS/HTTP（18/16）+ async-read 变体**：主 allocs 为 sniffer-lifecycle 重构（Sprint 1/2/3 三次确认超语义等价边界）→ 排除，记 Sprint+1。
+- 锁合并/重排、巨型文件拆分、测试瘦身、行为/API/config 变更、fork、eBPF C、冷路径、test-only 函数。
+
+## Sprint 3 blast_radius / task_sizing
+
+| 项 | 值 |
+|----|----|
+| task_count | 1（T1，serial） |
+| strong_coupling | 0 |
+| commit_budget | 2（⌈1/3⌉+0+1，hard_cap=10） |
+| topology | serial（dag_layers=1） |
+| 预期 no-op 率 | T1 expected effective_small（errStrLower 真实消除）；bulk inherent 文档化非 task |
+
+## Sprint 3 验收标准 / Acceptance Criteria
+
+1. `go vet/build/test -tags=trace ./...` 通过
+2. `go test -race -tags=trace ./control/...` 通过（T1 涉及 udp_endpoint_pool）
+3. `make ebpf-test` 本机 **runs（PASS）** + `make ebpf` EXIT=0
+4. **memprofile_review（H5 决定性 gate）**：改后 memprofile 确认 `strings.ToLower`/`errStrLower` flat 消失；bulk inherent（context/timer/struct/map）flat 保持
+5. bench `allocs/op` 不回归（UdpProxyDial/cache=miss；errStrLower 命中则降，未命中允许持平——memprofile 为准）
+6. 无行为/API/config 变更；`isConnectionRefused` 返回值逐位一致
+
+## Sprint 3 第 7 节更新 / Phase Status（Sprint 3）
+
+| 时间 | 阶段 | 负责人 | 状态 |
+|------|------|--------|------|
+| 2026-07-29 | Sprint 3 Planning（drift-check + H5 memprofile 分类 + plan + 脑暴） | Remy | ✅ 完成 |
+| 待定 | Sprint 3 Dev（T1 errStrLower + bulk inherent 文档化） | Dev | 待启动 |
+| 待定 | Sprint 3 QA（gate + memprofile 复核） | QA | 待启动 |
+
+> Sprint 1 已 QA 签署 PASS（[docs/qa/qa-signoff-1.md](docs/qa/qa-signoff-1.md)）；Sprint 2 状态见其第 7 节。
+
+## Sprint 3 第 8 节更新 / Handoff Context
+
+### Producer → Dev（Sprint 3）
+- 本文件 + [docs/sprint-3/plan.md](docs/sprint-3/plan.md)（task DAG + memprofile flat% 证据 + gates + H5 验证）+ [docs/brainstorm/brainstorm.md](docs/brainstorm/brainstorm.md) Sprint 3 段（决策 D9-D12）。
+- H5 分类证据：[docs/sprint-3/runtime-context.md](docs/sprint-3/runtime-context.md) §H5 表（4 候选 flat% 逐项）。
+- drift 依据：[docs/sprint-3/drift-check.md](docs/sprint-3/drift-check.md)（零漂移 / L1-L9 全规避 L9 成核心 / fidelity 100% gated 脚本假阴性→H6）。
+- **Dev 必读**：control 包先 `make ebpf` 再带 `-tags=trace`（F1）；memprofile 须逐包跑（F3，-memprofile 不可跨包）；命令脚本化 tmp/*.sh（H3）；注释/commit 英文。
+- **T1 纪律**：只改 errStrLower（零分配大小写不敏感匹配）；bulk inherent（context/timer/struct/map）须文档化为 inherent no-op，**不得改语义凑数**。
+
+## Sprint 3 关键文档索引
+
+| 文档 | 用途 |
+|------|------|
+| [docs/sprint-3/plan.md](docs/sprint-3/plan.md) | task DAG（含 memprofile flat% 证据）/ verifiable_gates / task_sizing |
+| [docs/sprint-3/drift-check.md](docs/sprint-3/drift-check.md) | 4 项 drift + Evals（H1/H2/H3 通过，H5 首次应用）+ H6 发现 |
+| [docs/sprint-3/runtime-context.md](docs/sprint-3/runtime-context.md) | 工具链基线 + H5 分类表（4 候选 flat%）+ F3 发现 |
+| [docs/sprint-3/progress.md](docs/sprint-3/progress.md) | Trace Log + gate 状态 + H5 应用证据（Dev/QA 填） |

@@ -34,10 +34,10 @@ gates:
   go_test: pass
   go_test_race: pass
   benchmark_no_regression: pass   # T3 QUIC 69→67；Multi 无回归；T2 no-op 无 bench 改动
-  ci_gate_ebpf_test: pending      # QA 终验（H1：本机 runs 非 ignored）
+  ci_gate_ebpf_test: pass         # QA 实跑 8/8 PASS 3.177s（H1：本机 runs 非 ignored）
   ci_gate_make_da_ebpf: pass      # EXIT=0，F1 生成绑定
   ebpf_lint: na                   # 无 .c 改动
-  ebpf_sync_check: pending        # QA 终验（无 C 结构体改动，回归安全）
+  ebpf_sync_check: pass           # QA 确认（无 C 结构体改动，回归安全）
 ---
 
 # Sprint 2 Progress — 语义不变的代码精简（bench 驱动 + OQ4）

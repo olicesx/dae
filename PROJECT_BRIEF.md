@@ -9,6 +9,7 @@ model_context_window_source: default
 current_phase: planning
 branch: kdae
 last_updated: 2026-07-29
+sprint_current: 2
 ---
 
 # dae — PROJECT_BRIEF (Sprint 1)
@@ -151,3 +152,66 @@ dae/
 1. `make ebpf-test` 需真实 kernel，本机 WSL2 kernel 6.18 是否覆盖 CI matrix（6.6/6.12）？— 标 ci_gate ignored，本机跳过，依赖 CI。
 2. dns_control.go:38 的 `make([]byte, 1024)` 是否为 `dnsResponseBufPool` 的 New 函数体？— Dev 实现前需确认，避免重复池化。
 3. quic-go/outbound 为 fork 依赖，本 Sprint 不改 fork 代码；若优化触及 fork API，提 Issue 上游。
+
+---
+---
+
+# dae — PROJECT_BRIEF (Sprint 2 追加)
+
+> Sprint 2 延续 Sprint 1「语义不变的代码精简」方向。**核心区别 = H2 bench 驱动选文件**（降 Sprint 1 的 57% no-op 率）+ 纳入 OQ4（client.go）。
+> Sprint 1 章节（上）保持不变；以下为 Sprint 2 增量。详细文档见 [docs/sprint-2/](docs/sprint-2/)。
+
+## Sprint 2 目标 / Goals
+
+- **T1（OQ4，用户指定）**：daedns `client.go` per-query buffer 池化（sendStreamDNS/queryHTTPS/lookupType），复用 udpDNSBufPool。H4：target_files 扩展到 client.go（router.go 同模块关联文件）。
+- **T2（H2 bench 驱动）**：tcp relay copy 路径未池化分配消除（relayCopyBufferPool 已存在仍 8-9 allocs/op）。
+- **T3（H2 bench 驱动）**：sniffing QUIC 嗅探非密码学分配消除（69-160 allocs/op，先量化密码学占比）。
+
+## Sprint 2 非目标 / Out-of-Scope
+
+锁合并/重排（Sprint+3 候选）、巨型文件拆分、测试瘦身、行为/API/config 变更、fork（quic-go/outbound）、eBPF C（tproxy.c）、冷路径（CloneCacheForReload）、test-only 函数（DnsCache_Clone/FillInto*，L2）。
+
+## Sprint 2 blast_radius / task_sizing
+
+| 项 | 值 |
+|----|----|
+| task_count | 3（T1/T2/T3 全并行） |
+| strong_coupling | 0 |
+| commit_budget | 2（⌈3/3⌉+0+1，hard_cap=10） |
+| topology | parallel（dag_layers=1） |
+
+## Sprint 2 验收标准 / Acceptance Criteria
+
+1. `go vet/build/test -tags=trace ./...` 通过
+2. `go test -race -tags=trace ./component/daedns/... ./control/... ./component/sniffing/...` 通过（T1/T2/T3 Pool 改动）
+3. `make ebpf-test` 本机 **runs（PASS，H1：不再 ignored）** + `make ebpf` EXIT=0
+4. bench `allocs/op` 不回归；T2/T3 有效则下降；allocs=0 热点不得设 task（H2）
+5. 无行为/API/config 变更
+
+## Sprint 2 第 7 节更新 / Phase Status（Sprint 2）
+
+| 时间 | 阶段 | 负责人 | 状态 |
+|------|------|--------|------|
+| 2026-07-29 | Sprint 2 Planning（drift-check + bench 扫描 + plan + 脑暴） | Remy | ✅ 完成 |
+| 待定 | Sprint 2 Dev（T1/T2/T3 全并行） | Dev | 待启动 |
+| 待定 | Sprint 2 QA（gate + bench 非回归） | QA | 待启动 |
+
+> Sprint 1 已 QA 签署 PASS（见 [docs/qa/qa-signoff-1.md](docs/qa/qa-signoff-1.md)），Sprint 1 第 7 节状态保持历史记录。
+
+## Sprint 2 第 8 节更新 / Handoff Context
+
+### Producer → Dev（Sprint 2）
+- 本文件 + [docs/sprint-2/plan.md](docs/sprint-2/plan.md)（task DAG + target_files + gates + H1/H2 验证）+ [docs/brainstorm/brainstorm.md](docs/brainstorm/brainstorm.md) Sprint 2 段（决策 D5-D8）。
+- 基线 + bench 数据：[docs/sprint-2/runtime-context.md](docs/sprint-2/runtime-context.md)（含 F1/F2 必读发现 + bench 基线表）。
+- drift 依据：[docs/sprint-2/drift-check.md](docs/sprint-2/drift-check.md)（零 context drift / L1-L8 全规避 / fidelity 100% gated）。
+- **Dev 必读**：control 包操作先 `make ebpf` 再带 `-tags=trace`（F1）；命令脚本化 tmp/*.sh（H3）；注释/commit 英文。
+- T3 先量化密码学占比再动手（D5）；T1 不加 bench 靠 L4 论证（D6）。
+
+## Sprint 2 关键文档索引
+
+| 文档 | 用途 |
+|------|------|
+| [docs/sprint-2/plan.md](docs/sprint-2/plan.md) | task DAG / target_files / verifiable_gates / task_sizing |
+| [docs/sprint-2/drift-check.md](docs/sprint-2/drift-check.md) | 4 项 drift 检查 + Evals 回归（H1/H2 命中） |
+| [docs/sprint-2/runtime-context.md](docs/sprint-2/runtime-context.md) | 工具链基线 + F1/F2 发现 + bench 基线表 |
+| [docs/sprint-2/progress.md](docs/sprint-2/progress.md) | Trace Log + gate 状态（Dev/QA 填） |

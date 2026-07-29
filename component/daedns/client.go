@@ -250,7 +250,13 @@ func (r *Router) lookupType(ctx context.Context, upstream *componentdns.Upstream
 		},
 	}
 	msg.SetQuestion(dnsmessage.CanonicalName(host), qtype)
-	data, err := msg.Pack()
+	// Pack into the pooled buffer instead of allocating per query.
+	// r.exchange consumes data synchronously across every scheme
+	// (queryUDP writes inline; queryTCP/TLS/QUIC/HTTPS copy data before use),
+	// so recycling buf after exchange returns is safe.
+	poolBuf := udpDNSBufPool.Get().([]byte)
+	defer udpDNSBufPool.Put(poolBuf) //nolint:staticcheck
+	data, err := msg.PackBuffer(poolBuf[:cap(poolBuf)])
 	if err != nil {
 		return nil, err
 	}
@@ -544,31 +550,50 @@ func sendHTTPDNS(ctx context.Context, client *http.Client, target string, upstre
 	if contentType := resp.Header.Get("Content-Type"); contentType != "application/dns-message" {
 		return nil, fmt.Errorf("unexpected content-type: %v", contentType)
 	}
-	buf, err := io.ReadAll(io.LimitReader(resp.Body, 65535))
-	if err != nil {
+	// io.ReadAll(LimitReader(body, 65535)) is equivalent to ReadFull into a
+	// 64KiB buffer: short reads return io.ErrUnexpectedEOF with the partial
+	// payload, which we treat as success to match ReadAll semantics.
+	poolBuf := udpDNSBufPool.Get().([]byte)
+	defer udpDNSBufPool.Put(poolBuf) //nolint:staticcheck
+	n, err := io.ReadFull(io.LimitReader(resp.Body, 65535), poolBuf)
+	if err != nil && err != io.ErrUnexpectedEOF {
 		return nil, err
 	}
 	var msg dnsmessage.Msg
-	if err = msg.Unpack(buf); err != nil {
+	if err = msg.Unpack(poolBuf[:n]); err != nil {
 		return nil, err
 	}
 	return &msg, nil
 }
 
 func sendStreamDNS(stream io.ReadWriter, data []byte) (*dnsmessage.Msg, error) {
-	req := make([]byte, 2+len(data))
+	buf := udpDNSBufPool.Get().([]byte)
+	defer udpDNSBufPool.Put(buf) //nolint:staticcheck
+
+	// Frame the request (2-byte big-endian length prefix + payload) into the
+	// pooled buffer. Typical DNS queries fit comfortably; fall back to a one-off
+	// allocation only for the pathological >64KiB query.
+	var req []byte
+	if reqLen := 2 + len(data); reqLen <= cap(buf) {
+		req = buf[:reqLen]
+	} else {
+		req = make([]byte, reqLen)
+	}
 	binary.BigEndian.PutUint16(req[:2], uint16(len(data)))
 	copy(req[2:], data)
 	if _, err := stream.Write(req); err != nil {
 		return nil, fmt.Errorf("failed to write DNS request: %w", err)
 	}
 
-	lengthBuf := make([]byte, 2)
-	if _, err := io.ReadFull(stream, lengthBuf); err != nil {
+	// The 2-byte length prefix is read into a stack array to avoid per-call
+	// heap allocation; the response payload reuses the pooled buffer. respLen is
+	// a uint16 so it always fits within buf's 64KiB capacity.
+	var lengthBuf [2]byte
+	if _, err := io.ReadFull(stream, lengthBuf[:]); err != nil {
 		return nil, fmt.Errorf("failed to read DNS response length: %w", err)
 	}
-	respLen := int(binary.BigEndian.Uint16(lengthBuf))
-	respBuf := make([]byte, respLen)
+	respLen := int(binary.BigEndian.Uint16(lengthBuf[:]))
+	respBuf := buf[:respLen]
 	if _, err := io.ReadFull(stream, respBuf); err != nil {
 		return nil, fmt.Errorf("failed to read DNS response payload: %w", err)
 	}

@@ -24,7 +24,7 @@ topology_rationale: "T1 删 sniffing 包批量测试，T3 改 component/sniffing
 
 # === task DAG 摘要（Dev/QA 填 status）===
 tasks:
-  T1: {status: done, type: test_pruning, files: "deleted 108 / kept 90 + recovered 3 helper files + restored 3 bulk-infra files", expected: "test:src 1.03→~0.5", actual: "1.03→0.490", source: "ai-test-pruning.md + 用户锁定", commit: 0e673fe7}
+  T1: {status: done, type: test_pruning, files: "deleted 108 / kept 90 + recovered 3 helper files + restored 3 bulk-infra files", expected: "test:src 1.03→~0.5", actual: "1.03→0.490", source: "ai-test-pruning.md + 用户锁定", commit: 0e673fe7, l2_retry: "L2 retry: restored control/bpf_bug_verification_test.go (Makefile go:generate infra误删, L16 lesson)"}
   T2: {status: done, type: perf_cpu, files: [component/sniffing/http.go], source: "H7 CPU cum16.85%/bytes.Index9.95%", depends_on: [T1], expected: effective_small, actual: "Extended 126.5→80.91ns(-36%)/NoHost 57.66→32.82(-43%); bytes.Index cum 57.92%→8.66%", h7_gate: "PASS", commit: 1d1021eb}
   T3: {status: done, type: harness_improvement, files: [component/sniffing/benchmark_test.go], source: "L14 async 偏差 + H8 首次应用", depends_on: [T2], expected: "bench SniffTcp 趋近 deadline_sync 基线", actual: "HTTP 5/TLS 6/NotApplicable 3 allocs (was async ~12); pprof 确认 deadline-sync 路径", h8_gate: "PASS (grep-c=5>=3)", commit: d3e5c4a2}
 
@@ -32,7 +32,7 @@ tasks:
 completed_tasks: 3
 artifacts_changed_since_last_observe: ["T1: 108 test files deleted; 3 new helper files (control/{scripted_packet_conn,test_fixtures,dns_message}_test_helpers_test.go); edits to recovery_test_helpers/run_test_helpers/control_plane_real_domain_test_helpers; restored 3 bulk-infra files (udp_quic_initial_regression/udp_reuse_simulation/udp_sniffer_loss)", "T2: component/sniffing/http.go (sniffHTTPHostHeader IndexByte line split + request-line skip; SniffHttp bytes method check)", "T3: component/sniffing/benchmark_test.go (deadlineConn wrapping 3 SniffTcp benches)"]
 l2_verification_passed: "all pass (go build + go vet + go test clean across all packages)"
-commits_used: 3
+commits_used: 4
 
 # === verifiable_gates 状态（Dev/QA 填）===
 gates:
@@ -46,7 +46,7 @@ gates:
   cpu_profile_review: pass          # H7 T2 — bytes.Index cum 57.92%->8.66%; ns/op -36..-43%
   h8_deadline_sync_verification: pass  # H8 T3 — grep-c=5>=3; pprof confirms deadline-sync path; allocs 5/6/3
   memprofile_review: pass           # H5 T2 — remaining 1 alloc/op is inherent string return; NoHost 0-alloc
-  ci_gate_ebpf_test: pending
+  ci_gate_ebpf_test: pass           # L2 retry PASS — restored control/bpf_bug_verification_test.go (Makefile go:generate infra, was FAIL EXIT=2)
   ci_gate_make_ebpf: pending
   ebpf_lint: na
   ebpf_sync_check: pending
@@ -77,6 +77,9 @@ gates:
 - [2026-07-29] T1 dev | 删除保护验证 PASS（108 候选全在批量 commit，原生16零触碰）；helper 链深度恢复（L15 教训：用 `go test -run='^$'` 一次性 surface 全部 undefined 而非迭代 vet）：~570 行共享 infra 恢复到 3 个集中 helper 文件 + 恢复 3 个被非批量 corpus 复用的 bulk-infra 文件（误分类 oneshot）；drop connectivity_test.go（属 mock 生态）；验证三件套全过；test:src 1.03→0.490 | commit 0e673fe7 |
 - [2026-07-29] T2 dev | H5 前置 baseline 确认有空间（sniffHTTPHostHeader cum95.81% / bytes.Index cum57.92%）；实施 IndexByte 单字节行分割（替 2 字节 \r\n 搜索）+ 跳 request line + SniffHttp bytes method check（消 string(method) alloc）；H7 verdict PASS：bytes.Index cum 57.92%→8.66%，Extended -36%/NoHost -43%；H5 memprofile 旁证：剩余 1 alloc = Host string 返回 inherent（无 API 改动不可消），NoHost 0-alloc | commit 1d1021eb |
 - [2026-07-29] T3 dev | OQ-S5-3 选型：自定义 deadlineConn（包装 bytes.Reader + no-op SetReadDeadline 返 nil）成功——pprof 确认走 readStreamOnceWithReadDeadline（非 async）；bench allocs 降到生产代表值 HTTP 5/TLS 6/NotApplicable 3（原 async ~12）；h8 gate grep-c=5>=3 PASS；断言全过（语义不变）；预期非回归（bench 数字趋近 deadline-sync 基线）| commit d3e5c4a2 |
+- [2026-07-29] orchestrator-observe | Dev 产出验证 PASS：4 commits（0e673fe7/1d1021eb/d3e5c4a2/828afae5）+ diff scope 120 files/1265 ins/38824 del + 源码改动仅 component/sniffing/http.go（T2 target 完全匹配）+ benchmark_test.go(T3 target) + 108 测试删除(T1) + 3 helper 恢复文件 + sprint-5 docs；goal_drift 检测：0 out_of_scope（T1 删除全在批量 commit 范围，T2/T3 target_files 完全匹配，原生 16 零触碰） | result=ok |
+- [2026-07-29] orchestrator-L2 | 独立复核（tmp/sprint5-l2-core.sh + sprint5-l2-race.sh，规避 L7 PowerShell $? 陷阱）：go vet EXIT=0 / go build EXIT=0 / go test 全 19 包 ok 无 FAIL / go test -race sniffing+control ok 无 DATA RACE / h8_deadline_sync grep-c=5>=3 PASS / T2 http.go +45/-10 / T3 benchmark_test.go +43/-3（与 Dev 报告一致）；Dev 自跑的 cpu_profile/memprofile/bench gate 结果保留，QA 阶段独立补跑 ci_gate+manual_gate | result=ok（全 local_gate 过，推进 QA） |
+- [2026-07-29] T1 L2-retry | 修复 QA ISSUE-1（ci_gate_ebpf_test FAIL→PASS）：`git checkout 0e673fe7^ -- control/bpf_bug_verification_test.go` 恢复 Makefile ebpf-test target 行 136/151/166/181 的 go:generate 依赖（L16 盲区：build-tag 门控文件 go vet/test 不可见，仅 make ebpf-test 抓到断裂）；验证三件套全过（tmp/sprint5-l2-retry-ebpf.sh + sprint5-l2-retry-noregression.sh）：make ebpf-test EXIT=0 / go vet ./... clean / go test ./... 全 ok（control 1.707s）；附注：环境 bpf objects 生成文件曾缺失致 vet 误报 undefined:bpfObjects，make ebpf 重新生成后全过（与本次修复无关的环境状态） | result=ok | 待 commit |
 
 ## 开放问题追踪
 

@@ -113,11 +113,11 @@ require (
 )
 
 // Use optimized quic-go with B-tree node pooling + upstream cherry-picks on enhanced-with-fixes baseline.
-// Latest perf/datagram-pool: pooled receive-side datagram buffers + ReleaseDatagram API.
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260731110322-6e2cee47210c
+// Latest perf/datagram-pool: pooled datagram frames + buffers (parse/send/receive all allocation-free).
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260731120809-98773c40d8d2
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
 
 // Use the remote outbound fork containing the transport-owned packet delivery API.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260731112350-7919f8ccbbad
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260731120803-95858a050557

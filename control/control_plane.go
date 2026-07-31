@@ -747,10 +747,9 @@ func newControlPlaneWithContextOptions(
 				log.Debugln("\t<Empty>")
 			}
 		}
-		groupOption, err := ParseGroupOverrideOption(group, *global, log)
+		groupOption, err := parseGroupOverrideOptionWithRuntime(group, *global, log, option)
 		finalOption := option
 		if err == nil && groupOption != nil {
-			groupOption.TransportCacheNamespace = option.TransportCacheNamespace
 			newDialers := make([]*dialer.Dialer, 0)
 			for _, d := range dialers {
 				newDialer := d.CloneWithGlobalOptionContext(context.Background(), groupOption)
@@ -1097,9 +1096,37 @@ func ParseGroupOverrideOption(group config.Group, global config.Global, log *log
 	return nil, nil
 }
 
+func parseGroupOverrideOptionWithRuntime(
+	group config.Group,
+	global config.Global,
+	log *logrus.Logger,
+	runtimeSource *dialer.GlobalOption,
+) (*dialer.GlobalOption, error) {
+	option, err := ParseGroupOverrideOption(group, global, log)
+	if err != nil || option == nil {
+		return option, err
+	}
+	inheritGroupOptionRuntime(option, runtimeSource)
+	return option, nil
+}
+
+// inheritGroupOptionRuntime preserves dependencies that are assembled while
+// building the control plane rather than derived from config.Global. Group
+// health-check overrides rebuild GlobalOption from config, so dropping these
+// fields would make the cloned node dialers bypass dae's internal DNS router.
+func inheritGroupOptionRuntime(dst, src *dialer.GlobalOption) {
+	if dst == nil || src == nil {
+		return
+	}
+	dst.DaeDNS = src.DaeDNS
+	dst.TransportCacheNamespace = src.TransportCacheNamespace
+}
+
 // clearReloadDomainRoutingMap clears slot zero for callers that operate on a
 // fresh datapath. Shared reloads must use clearReloadDomainRoutingMapSlot so
 // they never erase the still-readable active plan.
+// IMPORTANT: Connection-state maps are preserved across in-process reload
+// (Scheme3 Embedded Design). Do NOT clear them here.
 func clearReloadDomainRoutingMap(bpf *bpfObjects) error {
 	return clearReloadDomainRoutingMapSlot(bpf, 0)
 }

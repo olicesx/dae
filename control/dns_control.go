@@ -2807,9 +2807,12 @@ func (c *DnsController) forwardWithFallback(
 	primaryDialArg *dialArgument,
 	data []byte,
 ) (respMsg *dnsmessage.Msg, usedDialArg *dialArgument, err error) {
-	// Per-attempt timeout derived from request context:
-	// preserves cancel propagation while avoiding timeout reuse between UDP/TCP tries.
-	primaryCtx, primaryCancel := context.WithTimeout(ctx, consts.DefaultDialTimeout)
+	// Per-attempt timeout: each attempt gets the full DefaultDialTimeout budget.
+	// WithoutCancel strips the parent (singleflight work context) deadline, which
+	// is shorter than DefaultDialTimeout; otherwise a UDP black-hole timeout would
+	// exhaust the parent context and the TCP fallback would start already expired.
+	attemptCtx := context.WithoutCancel(ctx)
+	primaryCtx, primaryCancel := context.WithTimeout(attemptCtx, consts.DefaultDialTimeout)
 	defer primaryCancel()
 
 	respMsg, err = c.forwardWithDialArg(primaryCtx, upstream, primaryDialArg, data)
@@ -2844,7 +2847,7 @@ func (c *DnsController) forwardWithFallback(
 		}).Debugln("DNS fallback to TCP after UDP failure")
 	}
 
-	fallbackCtx, fallbackCancel := context.WithTimeout(ctx, consts.DefaultDialTimeout)
+	fallbackCtx, fallbackCancel := context.WithTimeout(attemptCtx, consts.DefaultDialTimeout)
 	defer fallbackCancel()
 
 	respMsg, err = c.forwardWithDialArg(fallbackCtx, upstream, fallbackDialArg, data)

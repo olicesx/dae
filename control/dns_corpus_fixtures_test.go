@@ -482,6 +482,88 @@ func tcpUdpFallbackFixture() DnsCorpusFixture {
 	}
 }
 
+// tcpUdpBlackholeFallbackFixture pins UDP black-hole fallback: the UDP
+// attempt exhausts its full timeout budget without a response (silent packet
+// loss), and the same request must still succeed over TCP. The TCP fallback
+// gets a fresh per-attempt budget instead of inheriting the request context's
+// shorter deadline, which previously expired before the fallback could run.
+func tcpUdpBlackholeFallbackFixture() DnsCorpusFixture {
+	return DnsCorpusFixture{
+		Name:        "tcp_udp_blackhole_fallback",
+		Description: "UDP black hole (silent drop) still reaches TCP fallback",
+		BuildConfig: func() *config.Dns {
+			return &config.Dns{
+				Upstream: []config.KeyableString{
+					"fallback:tcp+udp://192.0.2.53:53",
+				},
+				Routing: config.DnsRouting{
+					Request:  config.DnsRequestRouting{Fallback: "fallback"},
+					Response: config.DnsResponseRouting{Fallback: "accept"},
+				},
+			}
+		},
+		BestDialerChooser: func(ctx context.Context, snapshot DnsRequestSnapshot, upstream *componentdns.Upstream) (*dialArgument, error) {
+			switch upstream.Scheme {
+			case componentdns.UpstreamScheme_TCP_UDP:
+				return &dialArgument{
+					l4proto:    consts.L4ProtoStr_UDP,
+					ipversion:  consts.IpVersionStr_4,
+					bestTarget: snapshot.RealDst,
+				}, nil
+			case componentdns.UpstreamScheme_TCP:
+				return &dialArgument{
+					l4proto:    consts.L4ProtoStr_TCP,
+					ipversion:  consts.IpVersionStr_4,
+					bestTarget: snapshot.RealDst,
+				}, nil
+			default:
+				return nil, stderrors.New("unexpected upstream scheme")
+			}
+		},
+		ForwarderFactory: func(upstream *componentdns.Upstream, dialArg dialArgument, _ *logrus.Logger) (DnsForwarder, error) {
+			switch dialArg.l4proto {
+			case consts.L4ProtoStr_UDP:
+				// Simulate a silent packet-loss black hole: block until the
+				// attempt budget expires, returning no response.
+				return &stubDnsForwarder{forward: func(ctx context.Context, _ []byte) (*dnsmessage.Msg, error) {
+					<-ctx.Done()
+					return nil, ctx.Err()
+				}}, nil
+			case consts.L4ProtoStr_TCP:
+				return &stubDnsForwarder{forward: func(ctx context.Context, _ []byte) (*dnsmessage.Msg, error) {
+					// Real transports fail immediately on an expired context;
+					// the fallback only succeeds with a fresh per-attempt budget.
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+					return dnsAResponseMsg("tcp-fallback.test.", "198.51.100.53"), nil
+				}}, nil
+			default:
+				return nil, stderrors.New("unexpected transport")
+			}
+		},
+		Cases: []DnsCorpusCase{
+			{
+				Name: "udp_blackhole_recovers_via_tcp",
+				Query: func() *dnsmessage.Msg {
+					return corpusDnsQuery(0x1006, "tcp-fallback.test.", dnsmessage.TypeA)
+				},
+				Expected: DnsCorpusExpected{
+					HasRcode:       true,
+					Rcode:          dnsmessage.RcodeSuccess,
+					HasAnswerCount: true,
+					AnswerCount:    1,
+					AnswerIPv4:     "198.51.100.53",
+					HasAnswerTTL:   true,
+					AnswerTTLMin:   1,
+					AnswerTTLMax:   60,
+					WireHex:        "1006818000010001000000000c7463702d66616c6c6261636b047465737400000100010c7463702d66616c6c6261636b04746573740000010001000000000004c6336435",
+				},
+			},
+		},
+	}
+}
+
 func dnsAAAAResponseMsg(name, address string) *dnsmessage.Msg {
 	return &dnsmessage.Msg{
 		MsgHdr: dnsmessage.MsgHdr{

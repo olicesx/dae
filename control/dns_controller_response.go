@@ -13,6 +13,10 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// writeCachedResponse sends a cached DNS response to the client.
+// OPTIMIZED: Uses pre-packed response with ID patching to avoid Pack() overhead.
+// For responseWriter path, uses Unpack/WriteMsg (slower but handles ID correctly).
+// For UDP path, patches the ID directly using buffer pool to avoid allocations.
 func (c *DnsController) writeCachedResponse(resp []byte, reqId uint16, req *udpRequest, responseWriter dnsmessage.ResponseWriter) error {
 	// Optimization: Patch ID directly in the packed buffer if possible.
 	// For UDP, we can use Write() directly. For TCP, we might need WriteMsg or manual length.
@@ -68,7 +72,6 @@ func (c *DnsController) writeCachedResponse(resp []byte, reqId uint16, req *udpR
 // sendDnsErrorResponse_ is the shared implementation for both sendRejectWithResponseWriter_
 // and sendRefusedWithResponseWriter_. It sets the common response fields, logs at trace
 // level, and sends the response via responseWriter or UDP.
-
 func (c *DnsController) sendDnsErrorResponse_(
 	dnsMessage *dnsmessage.Msg,
 	rcode int,
@@ -107,7 +110,6 @@ func (c *DnsController) sendDnsErrorResponse_(
 }
 
 // sendRefusedWithResponseWriter_ sends REFUSED response when overload protection is triggered.
-
 func (c *DnsController) sendRefusedWithResponseWriter_(dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
 	return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeRefused, "Refused due to concurrency limit", req, responseWriter)
 }
@@ -144,7 +146,6 @@ func (c *DnsController) sendDnsTruncatedResponse_(dnsMessage *dnsmessage.Msg, re
 }
 
 // sendRejectWithResponseWriter_ send empty answer.
-
 func (c *DnsController) sendRejectWithResponseWriter_(dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
 	return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeSuccess, "Reject", req, responseWriter)
 }
@@ -158,7 +159,6 @@ func (c *DnsController) sendRejectWithResponseWriter_(dnsMessage *dnsmessage.Msg
 // 2. Preferred response arrives (e.g., AAAA when prefer=6): Notify any waiting requests
 //
 // The function returns the response to use (preferred if arrived during wait, otherwise original).
-
 func (c *DnsController) applyPreferenceWait(respMsg *dnsmessage.Msg) *dnsmessage.Msg {
 	c.requireStore()
 	// Fast path: preference not enabled

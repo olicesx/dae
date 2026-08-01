@@ -234,10 +234,6 @@ func (ue *UdpEndpoint) startReadLoop() {
 	}
 }
 
-// replySender is the dedicated goroutine that drains the reply channel and
-// calls the handler (which invokes sendPkt). Running this off the read loop
-// avoids blocking the upstream protocol layer's ReceiveCh.
-
 func endpointTransportDoneChannel(ue *UdpEndpoint) <-chan struct{} {
 	if ue == nil {
 		return nil
@@ -333,6 +329,10 @@ func (bucket *udpEndpointTransportBucket) stopWatching() {
 	bucket.stopOnce.Do(func() { close(bucket.stop) })
 }
 
+// stopTransportWatchers cancels every transport lifecycle watcher owned by the
+// pool and waits for the watcher goroutines to exit. It is called after pooled
+// endpoints have been closed, so no endpoint remains eligible for retirement
+// from a reset generation.
 func (p *UdpEndpointPool) stopTransportWatchers() {
 	if p == nil {
 		return
@@ -360,6 +360,3 @@ func (p *UdpEndpointPool) stopTransportWatchers() {
 		<-wait
 	}
 }
-
-// Close stops the janitor goroutine and clears all pooled endpoints.
-// Non-singleton pools must be closed when no longer needed.

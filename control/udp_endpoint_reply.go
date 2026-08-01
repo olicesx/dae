@@ -80,10 +80,6 @@ func (runtime *udpEndpointReplyRuntime) stopReplyAdmissions() {
 	})
 }
 
-// sameUdpConnStateOwner compares owner identities without panicking when an
-// implementation contains a non-comparable value. Such values cannot provide
-// a stable equality identity and are treated as distinct owners.
-
 type udpEndpointResponseCacheEntry struct {
 	bindAddr netip.AddrPort
 	conn     *Anyfrom
@@ -100,8 +96,6 @@ func (p *udpConnStateTuplePairSnapshot) matches(src, dst netip.AddrPort) bool {
 	}
 	return p.src == src && p.dst == dst || p.src == dst && p.dst == src
 }
-
-// FlowBinding returns the immutable route and egress selections made when the endpoint was created.
 
 type udpEndpointResponseConnSlot interface {
 	Load() *Anyfrom
@@ -340,6 +334,12 @@ func (ue *UdpEndpoint) releaseCachedResponseConns() {
 	}
 }
 
+// udpEndpointReplyQueueSize is the buffer depth for the async reply dispatch
+// channel in UdpEndpoint.start(). This decouples the protocol-layer read loop
+// (which must drain the upstream ReceiveCh as fast as possible) from the
+// potentially slower sendPkt path (Anyfrom bind, tproxy write). The value is
+// generous enough to absorb burst game server ticks without dropping, while
+// still bounded to avoid unbounded memory under pathological conditions.
 const udpEndpointReplyQueueSize = 256
 
 type udpEndpointReply struct {
@@ -353,7 +353,6 @@ var udpEndpointReplyObjects = sync.Pool{
 
 // putUdpEndpointReplyData is a package-local seam for tests that need to observe
 // reply-buffer release without changing the production hot path.
-
 var putUdpEndpointReplyData = func(data pool.PB) {
 	data.Put()
 }
@@ -394,7 +393,6 @@ func releaseUdpEndpointReply(reply udpEndpointReply, release func()) {
 // transport-owned reader should remain registered. A full bounded queue drops
 // only the current packet and keeps the receiver alive; a closed dispatcher
 // requires the transport reader to unregister.
-
 func (ue *UdpEndpoint) submitReplyWithMode(reply udpEndpointReply, release func(), nonBlocking bool) (accepted, keepReceiver bool) {
 	if ue == nil || ue.replyRuntime == nil {
 		return false, false
@@ -485,6 +483,9 @@ func (ue *UdpEndpoint) stopReplyDispatcher() {
 	runtime.stopReplyAdmissions()
 }
 
+// replySender is the dedicated goroutine that drains the reply channel and
+// calls the handler (which invokes sendPkt). Running this off the read loop
+// avoids blocking the upstream protocol layer's ReceiveCh.
 func (ue *UdpEndpoint) replySender(replyCh <-chan *udpEndpointReply, stop chan<- struct{}, done chan<- struct{}) {
 	defer close(done)
 	batch := make([]*udpEndpointReply, 0, 8)
@@ -531,7 +532,3 @@ func (ue *UdpEndpoint) replySender(replyCh <-chan *udpEndpointReply, stop chan<-
 		}
 	}
 }
-
-// isConnectionRefused checks if the error indicates connection was refused.
-// Uses typed syscall matching first (handles kernel ICMP errors), then falls
-// back to string matching for wrapped errors from SOCKS5 and other proxy protocols.

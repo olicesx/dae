@@ -12,6 +12,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// bpfUpdateTask represents a BPF map update request.
 type bpfUpdateTask struct {
 	cache                *DnsCache
 	routeProjectionEpoch uint64
@@ -161,8 +162,6 @@ func bpfProjectionRetryDelay(attempt uint8) time.Duration {
 	return delay
 }
 
-// cacheEntry represents a DNS cache entry with its access time for LRU eviction.
-
 func (c *DnsController) reprojectCachedRoutes(rt *dnsControllerRuntimeState) {
 	if c == nil || c.dnsControllerStore == nil || rt == nil || rt.projectCacheRoute == nil {
 		return
@@ -200,6 +199,8 @@ func (c *DnsController) reprojectCachedRoutes(rt *dnsControllerRuntimeState) {
 	})
 }
 
+// startBpfUpdateWorker lazily starts the BPF update worker goroutine.
+// This is called on-demand when the first BPF update is needed.
 func (c *DnsController) startBpfUpdateWorker() {
 	c.requireStore()
 	c.bpfUpdateOnce.Do(func() {
@@ -223,7 +224,6 @@ func (c *DnsController) startBpfUpdateWorker() {
 
 // processBpfUpdateTask executes a single BPF map update task.
 // Returns true if the task was processed, false if it was nil/empty.
-
 func (c *DnsController) processBpfUpdateTask(task *bpfUpdateTask, draining bool) bool {
 	processed, _ := c.processBpfUpdateTaskInternal(task, draining, !draining)
 	return processed
@@ -333,7 +333,6 @@ func (c *DnsController) takeBpfProjectionRetryIntents() (tasks []*bpfUpdateTask,
 // reconcileCurrentBpfProjections recovers work coalesced by the bounded retry
 // queue. It walks the authoritative cache in place and never builds an
 // O(cache-size) task slice.
-
 func (c *DnsController) reconcileCurrentBpfProjections() (failed bool) {
 	if c == nil || c.bpfUpdateClosed.Load() {
 		return false
@@ -388,7 +387,6 @@ func (c *DnsController) reconcileCurrentBpfProjections() (failed bool) {
 // canceled during retirement, the worker would exit prematurely, permanently killing
 // BPF domain_routing_map updates (sync.Once prevents restart). The worker exits only
 // via bpfUpdateStop, which is closed during DnsController.Close().
-
 func (c *DnsController) bpfUpdateWorker() {
 	defer c.bpfUpdateWg.Done()
 	retries := newBpfProjectionRetryScheduler()
@@ -492,7 +490,6 @@ const bpfUpdateDrainBatch = 64
 // drainBpfUpdateTasks processes a bounded primary-task batch. Returning to the
 // worker select between batches prevents a sustained cache-write stream from
 // starving delayed retries or shutdown.
-
 func (c *DnsController) drainBpfUpdateTasks(draining bool) {
 	for range bpfUpdateDrainBatch {
 		select {
@@ -507,7 +504,6 @@ func (c *DnsController) drainBpfUpdateTasks(draining bool) {
 // triggerBpfUpdateIfNeeded enqueues a BPF update task if needed. It never
 // blocks cache readers; a full primary queue is handed to the bounded retry
 // scheduler when the cache still belongs to the current runtime.
-
 func (c *DnsController) triggerBpfUpdateIfNeeded(cache *DnsCache, now time.Time) {
 	c.triggerBpfUpdateIfNeededForRuntime(cache, now, c.runtime())
 }

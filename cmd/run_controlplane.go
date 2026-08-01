@@ -66,7 +66,6 @@ func newPreparedControlPlane(ctx context.Context, log *logrus.Logger, bpf any, d
 // normalization, subscription resolution, and reload safety checks. Keeping
 // the seam here lets failure tests exercise the real Runner preparation path
 // without replacing the default ControlPlane constructors.
-
 var buildControlPlaneRuntime = buildControlPlaneRuntimeDefault
 
 func buildControlPlaneRuntimeDefault(
@@ -174,7 +173,6 @@ func configureTransparentHugePages(log *logrus.Logger, disable bool) {
 // process exceed, so deriving a soft heap limit from it makes the Go GC run
 // back-to-back against a threshold that was never meant to be a hard bound.
 // The function is a no-op when no finite cgroup ceiling is configured.
-
 func configureGcMemoryLimit(log *logrus.Logger) {
 	if value, ok := os.LookupEnv("GOMEMLIMIT"); ok {
 		if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
@@ -197,10 +195,6 @@ func configureGcMemoryLimit(log *logrus.Logger) {
 			softLimit/1024/1024, limit/1024/1024)
 	}
 }
-
-// detectCgroupMemLimit returns the smallest finite memory.max applying to the
-// current cgroup. Parent ceilings still constrain children, so the complete
-// path is inspected instead of stopping at the first value.
 
 func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {
 	// Deep copy to prevent modification.

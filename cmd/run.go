@@ -1356,10 +1356,6 @@ loop:
 	return errors.Join(fatalRunErr, shutdownErr)
 }
 
-// buildRunShutdownHandoff preserves the historical fast-exit path: process
-// termination does not wait for reload transitions or retirement cleanup.
-// Graceful shutdown freezes the supervisor first so every generation has one
-// clear cleanup owner.
 func init() {
 	rootCmd.AddCommand(runCmd)
 }

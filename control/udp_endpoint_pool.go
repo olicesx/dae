@@ -382,14 +382,6 @@ func (p *UdpEndpointPool) endpointGenerationCurrent(ue *UdpEndpoint) bool {
 	return ue.dialerGeneration == ue.dialerGenerationRef.Load()
 }
 
-// endpointSurvivesDialerInvalidation reports whether an endpoint should remain
-// reusable after its dialer transitions to not alive.
-//
-// Control-plane health is an admission signal for new selections, not a hard
-// kill switch for live sessions. Once an endpoint has successfully forwarded at
-// least one packet, proactively retiring it based only on health probes causes
-// avoidable redials and session churn. Real failures are still surfaced by
-// WriteTo/ReadFrom errors, transport lifecycle end, or NAT timeout expiry.
 func (p *UdpEndpointPool) registerEndpoint(ue *UdpEndpoint) {
 	if udpEndpointIgnoresDialerHealth(ue) {
 		p.registerTransportEndpoint(ue)
@@ -548,10 +540,8 @@ func (p *UdpEndpointPool) Reset() {
 	p.stopTransportWatchers()
 }
 
-// stopTransportWatchers cancels every transport lifecycle watcher owned by the
-// pool and waits for the watcher goroutines to exit. It is called after pooled
-// endpoints have been closed, so no endpoint remains eligible for retirement
-// from a reset generation.
+// Close stops the janitor goroutine and clears all pooled endpoints.
+// Non-singleton pools must be closed when no longer needed.
 func (p *UdpEndpointPool) Close() {
 	if p == nil {
 		return

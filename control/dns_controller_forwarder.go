@@ -564,7 +564,3 @@ func (c *DnsController) dialSend(
 	}
 	return nil
 }
-
-// buildMinHeap constructs a min-heap from the cache entries slice.
-// The heap property: parent <= children (root is minimum, i.e., oldest access).
-// Time complexity: O(n)

@@ -304,7 +304,6 @@ func (c *DnsController) resolveForSingleflight(
 // Resolution Delay: wait briefly for preferred response type before responding.
 //
 // Renamed from HandleWithResponseWriter_ to internal to avoid recursion loop with SF.
-
 func (c *DnsController) handleWithResponseWriterInternal(ctx context.Context, dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter, upstreamIndex consts.DnsRequestOutboundIndex, upstream *dns.Upstream, responseCacheKey string, baseCacheKey string) (err error) {
 	if c.log.IsLevelEnabled(logrus.TraceLevel) && len(dnsMessage.Question) > 0 {
 		q := dnsMessage.Question[0]
@@ -430,11 +429,6 @@ func (c *DnsController) handleWithResponseWriter_(
 	return c.dialSend(ctx, req, data, dnsMessage.Id, upstream, needResp, responseWriter, responseCacheKey)
 }
 
-// writeCachedResponse sends a cached DNS response to the client.
-// OPTIMIZED: Uses pre-packed response with ID patching to avoid Pack() overhead.
-// For responseWriter path, uses Unpack/WriteMsg (slower but handles ID correctly).
-// For UDP path, patches the ID directly using buffer pool to avoid allocations.
-
 type dnsUpstreamResolution struct {
 	response      *dnsmessage.Msg
 	networkType   *dialer.NetworkType
@@ -445,7 +439,6 @@ type dnsUpstreamResolution struct {
 // resolveDNSUpstream obtains a DNS response without writing it to the client
 // or mutating the response cache. It owns response routing and recursive
 // upstream fallback so delivery can be shared by UDP, TCP, and singleflight.
-
 func (c *DnsController) resolveDNSUpstream(
 	ctx context.Context,
 	invokingDepth int,

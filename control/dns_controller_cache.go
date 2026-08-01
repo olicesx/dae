@@ -88,7 +88,6 @@ func (c *DnsController) CloneCacheForReload() map[string]*DnsCache {
 
 // RestoreReloadCache restores cache entries during reload and schedules their
 // BPF side effects through the regular asynchronous path.
-
 func (c *DnsController) RestoreReloadCache(entries map[string]*DnsCache, matchDomainBitmap func(string) []uint32, now time.Time) int {
 	count, _ := c.restoreReloadCache(entries, matchDomainBitmap, now, false)
 	return count
@@ -99,7 +98,6 @@ func (c *DnsController) RestoreReloadCache(entries map[string]*DnsCache, matchDo
 // inactive routing plan has a complete domain projection before it becomes
 // visible to packets. The runtime callback must not attempt to update this
 // controller's runtime while it is executing.
-
 func (c *DnsController) RestoreReloadCacheAndProject(entries map[string]*DnsCache, matchDomainBitmap func(string) []uint32, now time.Time) (int, error) {
 	return c.restoreReloadCache(entries, matchDomainBitmap, now, true)
 }
@@ -164,8 +162,7 @@ func (c *DnsController) restoreReloadCache(entries map[string]*DnsCache, matchDo
 	return count, nil
 }
 
-// bpfUpdateTask represents a BPF map update request.
-
+// cacheEntry represents a DNS cache entry with its access time for LRU eviction.
 type cacheEntry struct {
 	key        string
 	lastAccess int64
@@ -191,7 +188,6 @@ func dnsCacheBaseKey(cacheKey string) string {
 
 // responseCacheKey scopes a base cache key to the upstream that produced the
 // answer, so an as-is answer for one destination cannot be served for another.
-
 func (c *DnsController) responseCacheKey(baseKey string, req *udpRequest, upstreamIndex consts.DnsRequestOutboundIndex, upstream *dns.Upstream) string {
 	var scope string
 	switch upstreamIndex {
@@ -268,7 +264,6 @@ func aggregateDNSRemovalCandidate(caches []*DnsCache) *DnsCache {
 // remaining cache state for the same base key. Once scoped cache keys exist,
 // removing one scoped entry must not blindly delete IP-derived side effects
 // that are still backed by another live scoped entry.
-
 func (c *DnsController) orphanedDnsSideEffects(baseKey string, candidate *DnsCache) *DnsCache {
 	if candidate == nil {
 		return nil
@@ -493,9 +488,6 @@ func (c *DnsController) HasDnsKnowledge(baseKey string) bool {
 	return true
 }
 
-// startBpfUpdateWorker lazily starts the BPF update worker goroutine.
-// This is called on-demand when the first BPF update is needed.
-
 func (c *DnsController) onDnsCacheEvicted(cache *DnsCache) {
 	rt := c.runtime()
 	if cache == nil || rt == nil || rt.cacheRemoveCallback == nil {
@@ -609,7 +601,6 @@ func (c *DnsController) invokeCacheDeleteCallback(cacheKey string, cache *DnsCac
 }
 
 // evictDnsCacheLocked removes one cache entry while cacheProjectionMu is held.
-
 func (c *DnsController) evictDnsCacheLocked(cacheKey string, cache *DnsCache) bool {
 	if cache == nil || !c.compareAndDeleteDnsCache(cacheKey, cache) {
 		return false
@@ -625,7 +616,6 @@ func (c *DnsController) evictDnsCacheLocked(cacheKey string, cache *DnsCache) bo
 // bound rather than waiting for the periodic janitor. The normal at-capacity
 // case selects the oldest entry from a fixed sample so admission work does not
 // grow with cache cardinality.
-
 func (c *DnsController) enforceDnsCacheCapacityLocked(incomingKey string) {
 	_, _, maxCacheSize := c.currentOptimisticCacheConfig()
 	if maxCacheSize <= 0 {
@@ -785,7 +775,6 @@ func (c *DnsController) putLRUScratch(entries []cacheEntry) {
 // full sort (O(n log n)) or insertion sort (O(n²)) for better performance
 // with large caches. For typical cache sizes (<1000), the overhead is negligible.
 // For large caches (>5000), this is 10-100x faster than insertion sort.
-
 func (c *DnsController) evictLRUIfFull(maxCacheSize int) {
 	if maxCacheSize <= 0 {
 		return
@@ -873,7 +862,6 @@ func (c *DnsController) evictLRUIfFull(maxCacheSize int) {
 // IMPORTANT: This goroutine intentionally does NOT watch baseContext().Done().
 // See bpfUpdateWorker comment for the rationale — the same stale-context problem
 // applies here when the DnsController is reused across reload generations.
-
 func (c *DnsController) startDnsCacheJanitor() {
 	c.requireStore()
 	go func() {
@@ -899,7 +887,6 @@ func (c *DnsController) startDnsCacheJanitor() {
 // IMPORTANT: This goroutine intentionally does NOT watch baseContext().Done().
 // See bpfUpdateWorker comment for the rationale — the same stale-context problem
 // applies here when the DnsController is reused across reload generations.
-
 func (c *DnsController) startCacheEvictor() {
 	c.requireStore()
 	go func() {
@@ -966,7 +953,6 @@ func (c *DnsController) LookupDnsRespCache(cacheKey string, ignoreFixedTtl bool)
 // TTL is refreshed when difference exceeds ttlRefreshThresholdSeconds (15 seconds by default).
 // OPTIMISTIC CACHE (RFC 8767): Returns stale response while background refresh is in progress.
 // Falls back to an owned in-place TTL-aware pack if pre-packed response is not available.
-
 func (c *DnsController) LookupDnsRespCache_(msg *dnsmessage.Msg, cacheKey string, ignoreFixedTtl bool) (resp []byte, needRefresh bool) {
 	c.requireStore()
 	// Load cache directly without expiry check (to support optimistic cache)
@@ -1038,7 +1024,6 @@ func (c *DnsController) LookupDnsRespCache_(msg *dnsmessage.Msg, cacheKey string
 }
 
 // NormalizeAndCacheDnsResp_ handle DNS resp in place.
-
 func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg, responseCacheKey string) (err error) {
 	// Check healthy resp.
 	if !msg.Response || len(msg.Question) == 0 || msg.Rcode != dnsmessage.RcodeSuccess {
@@ -1092,7 +1077,6 @@ func (c *DnsController) updateDnsCache(msg *dnsmessage.Msg, responseCacheKey str
 // that exist in prev but not in next. This lets us remove stale domain-routing
 // side effects after replacing a cache entry without deleting IPs that are
 // still present in the refreshed cache.
-
 func staleDnsSideEffects(prev, next *DnsCache) *DnsCache {
 	if prev == nil {
 		return nil
@@ -1256,6 +1240,9 @@ func (c *DnsController) UpdateDnsCacheTtlWithKey(cacheKey string, host string, d
 	})
 }
 
+// buildMinHeap constructs a min-heap from the cache entries slice.
+// The heap property: parent <= children (root is minimum, i.e., oldest access).
+// Time complexity: O(n)
 func buildMinHeap(entries []cacheEntry) {
 	n := len(entries)
 	// Start from the last non-leaf node and heapify down
@@ -1267,7 +1254,6 @@ func buildMinHeap(entries []cacheEntry) {
 // heapifyMin restores the min-heap property for the subtree rooted at index i.
 // The heap size is limited to n elements.
 // Time complexity: O(log n)
-
 func heapifyMin(entries []cacheEntry, i, n int) {
 	for {
 		smallest := i

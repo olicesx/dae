@@ -32,6 +32,9 @@ func monotonicNowNano() uint64 {
 	return uint64(ts.Nano())
 }
 
+// detectCgroupMemLimit returns the smallest finite memory.max applying to the
+// current cgroup. Parent ceilings still constrain children, so the complete
+// path is inspected instead of stopping at the first value.
 func detectCgroupMemLimit() int64 {
 	data, err := os.ReadFile("/proc/self/cgroup")
 	if err != nil {
@@ -72,7 +75,6 @@ func detectCgroupMemLimitFrom(data []byte, root string) int64 {
 // memory.high is deliberately not consulted: it throttles reclaim rather than
 // capping the cgroup, so a process is allowed to sit above it. Feeding it to
 // SetMemoryLimit turns a soft systemd hint into a hard Go heap ceiling.
-
 func readCgroupMemoryCeiling(dir string) int64 {
 	return readCgroupMemoryValue(dir, "memory.max")
 }

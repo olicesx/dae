@@ -65,7 +65,6 @@ func (c *DnsController) currentOptimisticCacheConfig() (enabled bool, ttl int, m
 // and the current runtime/config across reloads. The old control plane publishes
 // the new facade as a handoff bridge so ActiveDnsController observes the
 // replacement runtime without a nil window during reload retirement.
-
 func (c *DnsController) ReuseForReload(option *DnsControllerOption, routing *dns.Dns) (*DnsController, error) {
 	if c == nil {
 		return nil, nil
@@ -163,14 +162,12 @@ func (c *DnsController) runtime() *dnsControllerRuntimeState {
 
 // TryUpdateRuntime updates generation-local DNS runtime state and reports
 // invalid behavior config via error.
-
 func (c *DnsController) TryUpdateRuntime(option *DnsControllerOption, routing *dns.Dns) error {
 	return c.updateRuntime(option, routing)
 }
 
 // UpdateRuntime preserves the historical panic-on-invalid-input API for
 // external callers. New internal code should use TryUpdateRuntime.
-
 func (c *DnsController) UpdateRuntime(option *DnsControllerOption, routing *dns.Dns) {
 	if err := c.TryUpdateRuntime(option, routing); err != nil {
 		panic(err)

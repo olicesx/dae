@@ -23,6 +23,9 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// sameUdpConnStateOwner compares owner identities without panicking when an
+// implementation contains a non-comparable value. Such values cannot provide
+// a stable equality identity and are treated as distinct owners.
 func sameUdpConnStateOwner(left, right udpConnStateOwner) bool {
 	if left == nil || right == nil {
 		return left == nil && right == nil
@@ -34,6 +37,7 @@ func sameUdpConnStateOwner(left, right udpConnStateOwner) bool {
 	return left == right
 }
 
+// FlowBinding returns the immutable route and egress selections made when the endpoint was created.
 func (ue *UdpEndpoint) FlowBinding() UdpFlowBinding {
 	if ue == nil || !ue.flowBindingSet {
 		return UdpFlowBinding{}
@@ -259,13 +263,9 @@ func (ue *UdpEndpoint) shouldRetireOnReadError(err error) bool {
 	return false
 }
 
-// udpEndpointReplyQueueSize is the buffer depth for the async reply dispatch
-// channel in UdpEndpoint.start(). This decouples the protocol-layer read loop
-// (which must drain the upstream ReceiveCh as fast as possible) from the
-// potentially slower sendPkt path (Anyfrom bind, tproxy write). The value is
-// generous enough to absorb burst game server ticks without dropping, while
-// still bounded to avoid unbounded memory under pathological conditions.
-
+// isConnectionRefused checks if the error indicates connection was refused.
+// Uses typed syscall matching first (handles kernel ICMP errors), then falls
+// back to string matching for wrapped errors from SOCKS5 and other proxy protocols.
 func (ue *UdpEndpoint) isConnectionRefused(err error) bool {
 	if err == nil {
 		return false
@@ -290,7 +290,6 @@ func (ue *UdpEndpoint) isConnectionRefused(err error) bool {
 
 // handleProxyServerFailure is called when the proxy server refuses the connection.
 // It invalidates the cached proxy IP so that subsequent connections can try a different IP.
-
 func (ue *UdpEndpoint) handleProxyServerFailure() {
 	if ue.Dialer == nil {
 		return
@@ -326,7 +325,6 @@ func (ue *UdpEndpoint) handleProxyServerFailure() {
 //     effectively never hit in production but guarantees identical behavior.
 //
 // substr MUST be ASCII lowercase (true for all current call sites).
-
 func containsFoldASCII(s, substr string) bool {
 	if len(substr) == 0 {
 		return true
@@ -363,7 +361,6 @@ func containsFoldASCII(s, substr string) bool {
 // its owning pool. It is called by the read loop on exit so that the dead entry
 // is evicted immediately — before any writer goroutine has a chance to observe
 // it and be forced through the slower dead-check recovery path.
-
 func (ue *UdpEndpoint) selfRemoveFromPool() {
 	if ue.poolRef == nil {
 		return
@@ -406,14 +403,12 @@ func (ue *UdpEndpoint) retire() {
 // dispatcher a handful of stalled flows would park every worker. A write that
 // hits the deadline errors out and retires the endpoint, which is the correct
 // outcome for a transport that has stopped draining.
-
 const udpEndpointWriteTimeout = 10 * time.Second
 
 // armWriteDeadline keeps a write deadline of [T/2, T] ahead of every write
 // while re-arming at most once per T/2 window. Transports that do not support
 // write deadlines return an error, which is deliberately ignored: they simply
 // keep their previous unbounded behaviour.
-
 func (ue *UdpEndpoint) armWriteDeadline(now time.Time) {
 	last := ue.writeDeadlineArmedAtNano.Load()
 	if now.UnixNano()-last < int64(udpEndpointWriteTimeout/2) {
@@ -513,7 +508,6 @@ func (ue *UdpEndpoint) Close() error {
 
 // RefreshTtl updates the expiration time. Uses throttling to reduce atomic
 // store overhead.
-
 func (ue *UdpEndpoint) RefreshTtl() {
 	ue.RefreshTtlWithTime(0)
 }
@@ -536,14 +530,12 @@ func (ue *UdpEndpoint) setNatTimeout(timeout time.Duration) {
 // protocol session, so an extra address-based guard here is redundant and can
 // incorrectly strand valid flows whose first reply address is rewritten by the
 // proxy layer.
-
 func (ue *UdpEndpoint) requiresInitialReplyGuard() bool {
 	return ue == nil || !isProxyBackedDialer(ue.Dialer)
 }
 
 // markReplied promotes the endpoint from probing to established state.
 // Once a reply has been observed, the normal sliding NAT timeout applies.
-
 func (ue *UdpEndpoint) markReplied(nowNano int64) {
 	if nowNano == 0 {
 		nowNano = time.Now().UnixNano()
@@ -634,7 +626,6 @@ func (ue *UdpEndpoint) setExpiry(deadlineNano int64, refreshCachedResponseConns 
 
 // RefreshTtlWithTime updates the expiration time using a pre-calculated
 // timestamp (Unix nanoseconds). If nowNano is 0, time.Now() is used.
-
 func (ue *UdpEndpoint) RefreshTtlWithTime(nowNano int64) {
 	timeout := ue.natTimeout()
 	if timeout <= 0 {
@@ -667,7 +658,6 @@ func (ue *UdpEndpoint) RefreshTtlWithTime(nowNano int64) {
 
 // UpdateNatTimeout updates the NAT timeout and refreshes TTL with the new timeout.
 // This allows the timeout to adapt to changing forwarding state (e.g., QUIC upgrade, fixed policy).
-
 func (ue *UdpEndpoint) UpdateNatTimeout(timeout time.Duration) {
 	if timeout <= 0 {
 		return
@@ -685,7 +675,6 @@ func (ue *UdpEndpoint) IsExpired(nowNano int64) bool {
 }
 
 // IsDead returns true if the endpoint's read loop has exited and should not be reused.
-
 func (ue *UdpEndpoint) IsDead() bool {
 	return ue.dead.Load()
 }
@@ -694,7 +683,6 @@ func (ue *UdpEndpoint) IsDead() bool {
 // one original destination. Unlike the short-lived cache accessor, a bound
 // result remains valid for the endpoint lifetime so ordinary flow packets do
 // not re-read the BPF handoff map after their initial policy evaluation.
-
 func (ue *UdpEndpoint) GetBoundRoutingResult(dst netip.AddrPort, l4proto uint8) (*bpfRoutingResult, bool) {
 	ue.routingMu.RLock()
 	defer ue.routingMu.RUnlock()
@@ -750,6 +738,14 @@ func (ue *UdpEndpoint) UpdateCachedRoutingResult(dst netip.AddrPort, l4proto uin
 // only populated when UDP routing depends on packet metadata that userspace
 // cannot safely infer from payload reuse alone.
 
+// endpointSurvivesDialerInvalidation reports whether an endpoint should remain
+// reusable after its dialer transitions to not alive.
+//
+// Control-plane health is an admission signal for new selections, not a hard
+// kill switch for live sessions. Once an endpoint has successfully forwarded at
+// least one packet, proactively retiring it based only on health probes causes
+// avoidable redials and session churn. Real failures are still surfaced by
+// WriteTo/ReadFrom errors, transport lifecycle end, or NAT timeout expiry.
 func (p *UdpEndpointPool) endpointSurvivesDialerInvalidation(ue *UdpEndpoint) bool {
 	return ue != nil && ue.survivesDialerHealthInvalidation()
 }
@@ -762,7 +758,6 @@ func (ue *UdpEndpoint) survivesDialerHealthInvalidation() bool {
 // probing. The initial-write handshake makes a health transition race-safe:
 // an in-flight first write either establishes the endpoint or fails and
 // retires it itself.
-
 func (ue *UdpEndpoint) retireIfUnforwardedForDialerHealth() bool {
 	if ue == nil || ue.dead.Load() || ue.survivesDialerHealthInvalidation() {
 		return false

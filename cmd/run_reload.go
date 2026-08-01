@@ -87,7 +87,6 @@ func clearReloadPending(flag *atomic.Bool) {
 // from observing a half-written rule set is the routing epoch's prepared-slot
 // indirection. The epoch is opt-in, so without it the staged path has no such
 // protection and the reload falls back to the non-overlapping form.
-
 func shouldUseStagedHotHandoff(routingEpochEnabled, freshDatapathReload, listenerPresent bool) bool {
 	return routingEpochEnabled && !freshDatapathReload && listenerPresent
 }
@@ -133,6 +132,10 @@ func remainingReloadRetirementBudget(startedAt time.Time, budget time.Duration) 
 	return remaining
 }
 
+// buildRunShutdownHandoff preserves the historical fast-exit path: process
+// termination does not wait for reload transitions or retirement cleanup.
+// Graceful shutdown freezes the supervisor first so every generation has one
+// clear cleanup owner.
 func buildRunShutdownHandoff(manager *reloadManager, supervisor *runtimeSupervisor, current *runtimeGeneration, fastExit bool) *signalShutdownStagedHandoff {
 	if fastExit {
 		return manager.buildShutdownHandoff()

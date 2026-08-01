@@ -22,7 +22,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bits-and-blooms/bloom/v3"
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/daeuniverse/dae/common"
@@ -42,7 +41,6 @@ import (
 	"github.com/daeuniverse/outbound/protocol/direct"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/sync/singleflight"
 	"golang.org/x/sys/unix"
 )
 
@@ -63,17 +61,9 @@ type ControlPlane struct {
 	ownsSessionManager    bool
 	sessionManagerBinding atomic.Pointer[controlPlaneSessionManagerBinding]
 	egressRuntime         *egressRuntime
-	udpEndpointAdmission  udpEndpointAdmissionGate
-	udpIngressAdmission   routingEpochIngressGate
 	drainTracker          *controlPlaneDrainTracker
-	routingEpochPeerMu    sync.RWMutex
-	routingEpochPeer      *ControlPlane
-	routingEpochSlot      atomic.Uint32
-	routingEpochSlotKnown atomic.Bool
-	// routingEpochExecutionClosed prevents a retiring generation from
-	// accepting work delegated by its staged reload peer.
-	routingEpochExecutionClosed atomic.Bool
 
+	controlPlaneRoutingEpochRuntime
 	controlPlaneDNSRuntime
 	dnsHandoffMu         sync.Mutex
 	dnsHandoffController atomic.Pointer[DnsController]
@@ -85,18 +75,7 @@ type ControlPlane struct {
 	ready     chan struct{}
 	readyOnce sync.Once
 
-	muRealDomainSet   sync.RWMutex
-	realDomainSet     *bloom.BloomFilter
-	realDomainNegSet  sync.Map // map[string]int64 (expiresAt unix nano)
-	dnsDialerSnapshot sync.Map // map[dnsDialerSnapshotKey]*dnsDialerSnapshotEntry
-	dnsDialerPenalty  sync.Map // map[dnsDialerPenaltyKey]*dnsDialerPenaltyEntry
-	tcpSniffNegMu     sync.RWMutex
-	tcpSniffNegSet    map[tcpSniffNegKey]tcpSniffNegEntry
-	realDomainProbeS  singleflight.Group
-	negJanitorStop    chan struct{}
-	negJanitorDone    chan struct{}
-	negJanitorOnce    sync.Once
-
+	controlPlaneRealDomainRuntime
 	controlPlaneDatapathJanitor
 
 	// Track last alert time to avoid spamming logs
@@ -107,21 +86,16 @@ type ControlPlane struct {
 	wanInterface []string
 	lanInterface []string
 
-	sniffingTimeout                time.Duration
-	tproxyPortProtect              bool
-	soMarkFromDae                  uint32
-	mptcp                          bool
-	udpRouteScopeSensitive         bool
-	udpOrderedDispatcher           *udpOrderedDispatcher
-	udpOrderedDispatcherShared     bool
-	udpReplyDispatcher             *udpReplyDispatcher
-	udpReplyDispatcherShared       bool
-	failedQuicDcidCache            *failedQuicDcidCache
+	sniffingTimeout        time.Duration
+	tproxyPortProtect      bool
+	soMarkFromDae          uint32
+	mptcp                  bool
+	udpRouteScopeSensitive bool
+	controlPlaneUDPRuntime
 	lastConnectionErrorLogTime     atomic.Int64
 	lastDnsFastPathErrorLogTime    atomic.Int64
 	lastDnsFastPathServfailLogTime atomic.Int64
-	listenerPublishMu              sync.Mutex
-	listenerFiles                  []*os.File
+	controlPlaneListenerRuntime
 	preparedDatapathCommit         bool
 	autoConfigKernelParameter      bool
 	routingKernspaceSnapshot       *routingKernspaceSnapshot
@@ -913,33 +887,31 @@ func newControlPlaneWithContextOptions(
 			routingMatcher:      routingMatcher,
 			bootstrapResolvers:  bootstrapResolvers,
 		},
-		controlPlaneDNSRuntime:      newControlPlaneDNSRuntime(buildOpts.delayDNSListenerStart),
-		controlPlaneDatapathJanitor: newControlPlaneDatapathJanitor(),
-		onceNetworkReady:            sync.Once{},
-		drainTracker:                newControlPlaneDrainTracker(),
-		ctx:                         cctx,
-		cancel:                      cancel,
-		ready:                       make(chan struct{}),
-		autoConfigKernelParameter:   global.AutoConfigKernelParameter,
-		routingKernspaceSnapshot:    kernspaceSnapshot,
-		preparedDatapathCommit:      buildOpts.delayDatapathCommit,
-		sharedBpfReload:             sharedBpfReload,
-		pendingDnsReloadCache:       dnsCache,
-		dnsRoutingUnchanged:         buildOpts.dnsRoutingUnchanged,
-		semanticRefactorFeatures:    refactorFeatures,
-		muRealDomainSet:             sync.RWMutex{},
-		realDomainSet:               bloom.NewWithEstimates(2048, 0.001),
-		tcpSniffNegSet:              make(map[tcpSniffNegKey]tcpSniffNegEntry),
-		negJanitorStop:              make(chan struct{}),
-		negJanitorDone:              make(chan struct{}),
-		lanInterface:                global.LanInterface,
-		wanInterface:                global.WanInterface,
-		sniffingTimeout:             sniffingTimeout,
-		tproxyPortProtect:           global.TproxyPortProtect,
-		soMarkFromDae:               global.SoMarkFromDae,
-		mptcp:                       global.Mptcp,
-		udpRouteScopeSensitive:      builder.UsesPacketMetadataRouting(),
-		failedQuicDcidCache:         newFailedQuicDcidCache(failedQuicDcidCacheMaxEntries),
+		controlPlaneDNSRuntime:        newControlPlaneDNSRuntime(buildOpts.delayDNSListenerStart),
+		controlPlaneDatapathJanitor:   newControlPlaneDatapathJanitor(),
+		onceNetworkReady:              sync.Once{},
+		drainTracker:                  newControlPlaneDrainTracker(),
+		ctx:                           cctx,
+		cancel:                        cancel,
+		ready:                         make(chan struct{}),
+		autoConfigKernelParameter:     global.AutoConfigKernelParameter,
+		routingKernspaceSnapshot:      kernspaceSnapshot,
+		preparedDatapathCommit:        buildOpts.delayDatapathCommit,
+		sharedBpfReload:               sharedBpfReload,
+		pendingDnsReloadCache:         dnsCache,
+		dnsRoutingUnchanged:           buildOpts.dnsRoutingUnchanged,
+		semanticRefactorFeatures:      refactorFeatures,
+		controlPlaneRealDomainRuntime: newControlPlaneRealDomainRuntime(),
+		lanInterface:                  global.LanInterface,
+		wanInterface:                  global.WanInterface,
+		sniffingTimeout:               sniffingTimeout,
+		tproxyPortProtect:             global.TproxyPortProtect,
+		soMarkFromDae:                 global.SoMarkFromDae,
+		mptcp:                         global.Mptcp,
+		udpRouteScopeSensitive:        builder.UsesPacketMetadataRouting(),
+		controlPlaneUDPRuntime: controlPlaneUDPRuntime{
+			failedQuicDcidCache: newFailedQuicDcidCache(failedQuicDcidCacheMaxEntries),
+		},
 	}
 	SetFailedQuicDcidCache(plane.failedQuicDcidCache)
 	SetAnyfromSoMark(global.SoMarkFromDae)

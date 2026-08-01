@@ -73,8 +73,10 @@ func TestSemanticRefactorFeatureGateGenerationSnapshotSurvivesOwnerDisable(t *te
 	}
 	plane := &ControlPlane{
 		semanticRefactorFeatures: features,
-		udpOrderedDispatcher:     ordered,
-		udpReplyDispatcher:       reply,
+		controlPlaneUDPRuntime: controlPlaneUDPRuntime{
+			udpOrderedDispatcher: ordered,
+			udpReplyDispatcher:   reply,
+		},
 	}
 	if err := plane.Close(); err != nil {
 		t.Fatalf("captured generation ControlPlane.Close() error = %v", err)

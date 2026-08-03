@@ -45,7 +45,10 @@ type Sniffer struct {
 	r         io.Reader
 	conn      net.Conn
 	dataReady chan struct{}
-	dataError error
+	// dataReadyOnce guarantees a single close of dataReady across all
+	// producers (async reader, AppendData, Sniff, Close).
+	dataReadyOnce sync.Once
+	dataError     error
 
 	// Common
 	sniffed  string
@@ -83,6 +86,7 @@ func (s *Sniffer) reset(stream bool, r io.Reader, conn net.Conn, data []byte, ti
 	s.r = r
 	s.conn = conn
 	s.dataReady = make(chan struct{})
+	s.dataReadyOnce = sync.Once{}
 	s.dataError = nil
 	s.sniffed = ""
 	s.buf = pool.GetBuffer()
@@ -177,10 +181,10 @@ func (s *Sniffer) readStreamOnceWithReadDeadline() error {
 
 	_, err := s.buf.ReadFromOnce(s.conn)
 	if err == nil {
-		close(s.dataReady)
+		s.closeDataReady()
 		return nil
 	}
-	close(s.dataReady)
+	s.closeDataReady()
 	s.dataError = err
 
 	var netErr net.Error
@@ -193,7 +197,6 @@ func (s *Sniffer) readStreamOnceWithReadDeadline() error {
 
 func (s *Sniffer) readStreamOnceAsync() error {
 	ctx := s.ensureAsyncContext()
-	ready := s.dataReady
 	// Allocate the result channel lazily on the first async read; reuse it on
 	// the normal completion path (the select below drains exactly one value)
 	// and replace it on timeout where the reader may still push a stale value.
@@ -224,7 +227,7 @@ func (s *Sniffer) readStreamOnceAsync() error {
 		if s.conn != nil {
 			_ = s.conn.SetReadDeadline(time.Unix(1, 0))
 		}
-		close(ready)
+		s.closeDataReady()
 		if s.conn != nil {
 			_ = s.conn.SetReadDeadline(time.Time{})
 		}
@@ -233,7 +236,7 @@ func (s *Sniffer) readStreamOnceAsync() error {
 		if rr.err != nil {
 			s.dataError = rr.err
 		}
-		close(ready)
+		s.closeDataReady()
 		if s.dataError != nil {
 			return s.dataError
 		}
@@ -264,7 +267,7 @@ func (s *Sniffer) SniffTcp() (d string, err error) {
 				return "", err
 			}
 		} else {
-			close(s.dataReady)
+			s.closeDataReady()
 		}
 
 		if s.buf.Len() == 0 {
@@ -301,7 +304,7 @@ func (s *Sniffer) SniffUdp() (d string, err error) {
 	select {
 	case <-s.dataReady:
 	default:
-		close(s.dataReady)
+		s.closeDataReady()
 	}
 
 	if s.buf.Len() == 0 {
@@ -379,6 +382,15 @@ func (s *Sniffer) Read(p []byte) (n int, err error) {
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 
+	if s.buf == nil {
+		// Closed while this reader was waiting on dataReady. The wait
+		// happens outside readMu, so a concurrent Close() can win the
+		// race: it holds the lock, returns the pooled buffer to the pool
+		// and nils s.buf before we get here. Reading a nil buffer would
+		// panic in (*bytes.Buffer).Len (nil pointer dereference).
+		return 0, net.ErrClosed
+	}
+
 	if s.dataError != nil {
 		n, _ = s.buf.Read(p)
 		return n, s.dataError
@@ -394,11 +406,21 @@ func (s *Sniffer) Read(p []byte) (n int, err error) {
 	return s.r.Read(p)
 }
 
+// closeDataReady closes s.dataReady exactly once across all producers
+// (async reader, AppendData, Sniff, Close). It is safe to call concurrently.
+func (s *Sniffer) closeDataReady() {
+	s.dataReadyOnce.Do(func() { close(s.dataReady) })
+}
+
 func (s *Sniffer) Close() (err error) {
 	s.closeMu.Do(func() {
 		if s.cancel != nil {
 			s.cancel()
 		}
+		// Wake any reader blocked on dataReady (e.g. a packet sniffer whose
+		// connection closed before any data arrived) so relayCopyLoop can
+		// observe ErrClosed and exit instead of leaking the goroutine.
+		s.closeDataReady()
 		// Hold readMu to synchronize with CompactPacketState which also
 		// touches s.buf and s.quicPlaintexts under the same lock.
 		s.readMu.Lock()

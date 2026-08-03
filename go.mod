@@ -114,7 +114,7 @@ require (
 
 // Use optimized quic-go with B-tree node pooling + upstream cherry-picks on enhanced-with-fixes baseline.
 // Latest perf/datagram-pool: pooled datagram frames + buffers (parse/send/receive all allocation-free).
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260801004137-cb5ac742406f
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260803000957-dff8aaa58e14
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config

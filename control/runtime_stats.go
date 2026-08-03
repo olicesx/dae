@@ -161,15 +161,6 @@ func (s *runtimeStats) record(upload uint64, download uint64) {
 // periodic goroutine is needed. An empty-window ticker previously woke up
 // ~4x/second on idle just to perform a no-op rotation.
 
-func (s *runtimeStats) roll(now time.Time) {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.rollLocked(now)
-}
-
 func (s *runtimeStats) snapshot(activeConnections int, udpSessions int, windowSec int, maxPoints int, now time.Time) RuntimeStatsSnapshot {
 	if s == nil {
 		return RuntimeStatsSnapshot{

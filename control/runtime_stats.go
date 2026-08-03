@@ -6,7 +6,6 @@
 package control
 
 import (
-	"context"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -48,8 +47,7 @@ type runtimeBucket struct {
 }
 
 type runtimeStats struct {
-	mu         sync.Mutex
-	rollerOnce sync.Once
+	mu sync.Mutex
 
 	currentBucketStartUnixNano atomic.Int64
 	currentUploadBytes         atomic.Uint64
@@ -158,28 +156,10 @@ func (s *runtimeStats) record(upload uint64, download uint64) {
 	}
 }
 
-func (s *runtimeStats) startRoller(ctx context.Context) {
-	if s == nil || ctx == nil {
-		return
-	}
-	s.rollerOnce.Do(func() {
-		s.roll(time.Now())
-		go func() {
-			ticker := time.NewTicker(runtimeBucketDuration)
-			defer ticker.Stop()
-
-			for {
-				select {
-				case now := <-ticker.C:
-					s.roll(now)
-				case <-ctx.Done():
-					s.roll(time.Now())
-					return
-				}
-			}
-		}()
-	})
-}
+// startRoller was removed: rollLocked is fully lazy. The bucket window only
+// advances when traffic is recorded or a snapshot is requested, so no
+// periodic goroutine is needed. An empty-window ticker previously woke up
+// ~4x/second on idle just to perform a no-op rotation.
 
 func (s *runtimeStats) roll(now time.Time) {
 	if s == nil {

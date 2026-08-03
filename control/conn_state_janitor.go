@@ -49,8 +49,13 @@ var (
 	// Precomputed to avoid repeated Htons() calls during janitor iterations.
 	dnsPortNetworkOrder = common.Htons(53)
 	// connStateJanitorPressureInterval is the fast-path scan interval used
-	// when connection-state maps are under pressure.
+	// while the connection-state maps are under pressure (overflow or high
+	// usage).
 	connStateJanitorPressureInterval = 1 * time.Second
+	// connStateJanitorMaxInterval caps the poll backoff when the maps are
+	// calm. Kernel overflow events still wake the janitor immediately, so
+	// the relaxed cadence only delays the periodic non-event cleanups.
+	connStateJanitorMaxInterval = 30 * time.Second
 	// connStateJanitorSteadyInterval is the default scan interval for steady
 	// state. This keeps cleanup prompt without paying a full-table cost every
 	// second when map pressure is low.
@@ -118,9 +123,15 @@ func (c *ControlPlane) startConnStateJanitor() {
 		return
 	}
 	go func() {
-		ticker := time.NewTicker(connStateJanitorPressureInterval)
+		interval := connStateJanitorPressureInterval
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		defer close(c.connStateJanitorDone)
+
+		// Overflow events from the kernel ringbuf wake the janitor
+		// immediately instead of waiting for the next poll round.
+		overflowEvent := make(chan struct{}, 4)
+		c.startEventRingbufReader(overflowEvent)
 
 		var (
 			lastConnCleanup      time.Time
@@ -131,68 +142,95 @@ func (c *ControlPlane) startConnStateJanitor() {
 			pressureState        connStateJanitorPressureState
 		)
 
+		runJanitorRound := func(now time.Time, overflowHint bool) {
+			bpf := c.currentBpf()
+
+			var udpOverflow, tcpOverflow uint64
+			overflowDelta := overflowHint
+			if bpf != nil && bpf.BpfStatsMap != nil {
+				udpOverflow, tcpOverflow = c.readMapOverflowCounters(bpf.BpfStatsMap)
+				if !overflowDelta {
+					overflowDelta = udpOverflow > pressureState.lastUdpOverflow ||
+						tcpOverflow > pressureState.lastTcpOverflow
+				}
+				pressureState.lastUdpOverflow = udpOverflow
+				pressureState.lastTcpOverflow = tcpOverflow
+			}
+			if overflowDelta {
+				pressureState.active = true
+				pressureState.belowThresholdRounds = 0
+			}
+
+			connCleanupInterval := connStateJanitorSteadyInterval
+			redirectCleanupInterval := redirectTrackJanitorSteadyInterval
+			if pressureState.active {
+				connCleanupInterval = connStateJanitorPressureInterval
+				redirectCleanupInterval = redirectTrackJanitorPressureInterval
+			}
+
+			cleaned := 0
+			mapEntries := 0
+			if lastRedirectCleanup.IsZero() || now.Sub(lastRedirectCleanup) >= redirectCleanupInterval {
+				cleaned += c.cleanupRedirectTrackMap()
+				lastRedirectCleanup = now
+			}
+			if lastCookiePidCleanup.IsZero() || now.Sub(lastCookiePidCleanup) >= redirectCleanupInterval {
+				cleaned += c.cleanupCookiePidMap()
+				lastCookiePidCleanup = now
+			}
+			routingHandoffInterval := routingHandoffSteadyInterval
+			if pressureState.active {
+				routingHandoffInterval = routingHandoffPressureInterval
+			}
+			if lastRoutingHandoff.IsZero() || now.Sub(lastRoutingHandoff) >= routingHandoffInterval {
+				cleaned += c.cleanupRoutingHandoffMap()
+				lastRoutingHandoff = now
+			}
+
+			if lastConnCleanup.IsZero() || now.Sub(lastConnCleanup) >= connCleanupInterval {
+				udpStats, tcpStats := c.cleanupConnStateMap(pressureState.active)
+				mapEntries = udpStats.entries + tcpStats.entries
+
+				maxUsagePercent := 0
+				if udpStats.maxEntries > 0 {
+					maxUsagePercent = (udpStats.entries + tcpStats.entries) * 100 / udpStats.maxEntries
+				}
+				pressureState = updateConnStateJanitorPressure(pressureState, overflowDelta, maxUsagePercent)
+				lastConnCleanup = now
+				cleaned += udpStats.deleted + tcpStats.deleted
+			}
+
+			if lastHealthCheck.IsZero() || now.Sub(lastHealthCheck) >= 5*time.Second {
+				c.checkBpfMapHealth(udpOverflow, tcpOverflow)
+				lastHealthCheck = now
+			}
+
+			// Back off the poll cadence only while the maps are empty and
+			// calm. Any live entries, cleanup activity, or overflow event
+			// keeps the fast cadence; the relaxed poll only covers a fully
+			// idle datapath (and serves as a fallback if ringbuf events are
+			// lost).
+			if pressureState.active || cleaned > 0 || overflowHint || mapEntries > 0 {
+				interval = connStateJanitorPressureInterval
+			} else if interval < connStateJanitorMaxInterval {
+				interval *= 2
+				if interval > connStateJanitorMaxInterval {
+					interval = connStateJanitorMaxInterval
+				}
+			}
+			ticker.Reset(interval)
+		}
+
 		for {
 			select {
 			case <-c.connStateJanitorStop:
 				return
 			case <-c.ctx.Done():
 				return
+			case <-overflowEvent:
+				runJanitorRound(time.Now(), true)
 			case now := <-ticker.C:
-				bpf := c.currentBpf()
-
-				var udpOverflow, tcpOverflow uint64
-				overflowDelta := false
-				if bpf != nil && bpf.BpfStatsMap != nil {
-					udpOverflow, tcpOverflow = c.readMapOverflowCounters(bpf.BpfStatsMap)
-					overflowDelta = udpOverflow > pressureState.lastUdpOverflow ||
-						tcpOverflow > pressureState.lastTcpOverflow
-					pressureState.lastUdpOverflow = udpOverflow
-					pressureState.lastTcpOverflow = tcpOverflow
-				}
-				if overflowDelta {
-					pressureState.active = true
-					pressureState.belowThresholdRounds = 0
-				}
-
-				connCleanupInterval := connStateJanitorSteadyInterval
-				redirectCleanupInterval := redirectTrackJanitorSteadyInterval
-				if pressureState.active {
-					connCleanupInterval = connStateJanitorPressureInterval
-					redirectCleanupInterval = redirectTrackJanitorPressureInterval
-				}
-
-				if lastRedirectCleanup.IsZero() || now.Sub(lastRedirectCleanup) >= redirectCleanupInterval {
-					c.cleanupRedirectTrackMap()
-					lastRedirectCleanup = now
-				}
-				if lastCookiePidCleanup.IsZero() || now.Sub(lastCookiePidCleanup) >= redirectCleanupInterval {
-					c.cleanupCookiePidMap()
-					lastCookiePidCleanup = now
-				}
-				routingHandoffInterval := routingHandoffSteadyInterval
-				if pressureState.active {
-					routingHandoffInterval = routingHandoffPressureInterval
-				}
-				if lastRoutingHandoff.IsZero() || now.Sub(lastRoutingHandoff) >= routingHandoffInterval {
-					c.cleanupRoutingHandoffMap()
-					lastRoutingHandoff = now
-				}
-
-				if lastConnCleanup.IsZero() || now.Sub(lastConnCleanup) >= connCleanupInterval {
-					udpStats, tcpStats := c.cleanupConnStateMap(pressureState.active)
-
-					maxUsagePercent := 0
-					if udpStats.maxEntries > 0 {
-						maxUsagePercent = (udpStats.entries + tcpStats.entries) * 100 / udpStats.maxEntries
-					}
-					pressureState = updateConnStateJanitorPressure(pressureState, overflowDelta, maxUsagePercent)
-					lastConnCleanup = now
-				}
-
-				if lastHealthCheck.IsZero() || now.Sub(lastHealthCheck) >= 5*time.Second {
-					c.checkBpfMapHealth(udpOverflow, tcpOverflow)
-					lastHealthCheck = now
-				}
+				runJanitorRound(now, false)
 			}
 		}
 	}()
@@ -207,6 +245,12 @@ func (c *ControlPlane) stopConnStateJanitor() {
 	c.connStateJanitorOnce.Do(func() {
 		if c.connStateJanitorStop != nil {
 			close(c.connStateJanitorStop)
+		}
+		// Wake the ringbuf reader goroutine blocked in ReadInto so the
+		// janitor (which waits on connStateJanitorDone) is not held up by a
+		// reader that never observes the stop signal on its own.
+		if r := c.connEventReader.Load(); r != nil {
+			_ = r.Close()
 		}
 		if c.connStateJanitorDone != nil {
 			timer := time.NewTimer(gracefulShutdownWaitTimeout)

@@ -277,8 +277,9 @@ func isGSOError(err error) bool {
 
 // AnyfromPool is a full-cone udp listener pool
 const (
-	anyfromPoolShardCount = 64
-	anyfromJanitorPeriod  = 500 * time.Millisecond
+	anyfromPoolShardCount   = 64
+	anyfromJanitorPeriod    = 500 * time.Millisecond
+	anyfromJanitorMaxPeriod = 30 * time.Second
 )
 
 type anyfromPoolShard struct {
@@ -493,7 +494,8 @@ func (p *AnyfromPool) shardForKey(key anyfromPoolKey) *anyfromPoolShard {
 func (p *AnyfromPool) startJanitor() {
 	p.janitorOnce.Do(func() {
 		go func() {
-			ticker := time.NewTicker(anyfromJanitorPeriod)
+			interval := anyfromJanitorPeriod
+			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 			defer close(p.janitorDone)
 
@@ -506,11 +508,14 @@ func (p *AnyfromPool) startJanitor() {
 					return
 				case now := <-ticker.C:
 					nowNano := now.UnixNano()
+					cleaned := 0
+					entriesSeen := 0
 					for i := range anyfromPoolShardCount {
 						shard := &p.shards[i]
 						// Collect expired connections under lock, close after release.
 						// This minimizes lock hold time even with many expired entries.
 						shard.mu.Lock()
+						entriesSeen += len(shard.pool)
 						toClose = toClose[:0] // reset without reallocating
 						for key, af := range shard.pool {
 							if af.IsPinned() {
@@ -526,7 +531,21 @@ func (p *AnyfromPool) startJanitor() {
 						for _, af := range toClose {
 							_ = af.Close()
 						}
+						cleaned += len(toClose)
 					}
+					// Back off only while the pool is completely empty, so an
+					// idle dae does not wake up to no-op scans. Any entries at
+					// all (pinned or fresh) keep the base cadence so their
+					// expiry is reaped promptly.
+					if cleaned > 0 || entriesSeen > 0 {
+						interval = anyfromJanitorPeriod
+					} else if interval < anyfromJanitorMaxPeriod {
+						interval *= 2
+						if interval > anyfromJanitorMaxPeriod {
+							interval = anyfromJanitorMaxPeriod
+						}
+					}
+					ticker.Reset(interval)
 				}
 			}
 		}()

@@ -915,7 +915,6 @@ func newControlPlaneWithContextOptions(
 	}
 	SetFailedQuicDcidCache(plane.failedQuicDcidCache)
 	SetAnyfromSoMark(global.SoMarkFromDae)
-	plane.runtimeStats.startRoller(cctx)
 	plane.deferFuncs = append(plane.deferFuncs, plane.closePublishedListenerFiles)
 	plane.startRealDomainNegJanitor()
 	if !buildOpts.delayDatapathCommit {

@@ -24,7 +24,8 @@ const (
 	// within 1-2 RTTs, so 5 seconds is sufficient even under poor network conditions.
 	PacketSnifferTtl = 5 * time.Second
 
-	packetSnifferJanitorInterval = 250 * time.Millisecond
+	packetSnifferJanitorInterval    = 250 * time.Millisecond
+	packetSnifferJanitorMaxInterval = 30 * time.Second
 
 	// udpSniffNoSniThreshold is the number of consecutive no-SNI sniff attempts before
 	// marking the DCID as failed and falling back to IP routing. Reduced to 4 to
@@ -317,9 +318,9 @@ func (c *failedQuicDcidCache) MarkFailed(key PacketSnifferKey, reason quicDcidFa
 	}
 }
 
-func (c *failedQuicDcidCache) CleanupExpired(now time.Time) {
+func (c *failedQuicDcidCache) CleanupExpired(now time.Time) (cleaned int) {
 	if c == nil {
-		return
+		return 0
 	}
 
 	nowNano := now.UnixNano()
@@ -330,6 +331,7 @@ func (c *failedQuicDcidCache) CleanupExpired(now time.Time) {
 		for key, entry := range shard.entries {
 			if entry.expiresAtUnixNano <= nowNano {
 				delete(shard.entries, key)
+				cleaned++
 			}
 		}
 		liveEntries := len(shard.entries)
@@ -338,6 +340,7 @@ func (c *failedQuicDcidCache) CleanupExpired(now time.Time) {
 		}
 		shard.mu.Unlock()
 	}
+	return cleaned
 }
 
 func (c *failedQuicDcidCache) Clear() {
@@ -803,7 +806,8 @@ func (p *PacketSnifferPool) GetOrCreate(key PacketSnifferKey, createOption *Pack
 func (p *PacketSnifferPool) startJanitor() {
 	p.janitorOnce.Do(func() {
 		go func() {
-			ticker := time.NewTicker(packetSnifferJanitorInterval)
+			interval := packetSnifferJanitorInterval
+			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 			defer close(p.janitorDone)
 			// janitorMinScanItems is the minimum number of items to check per cycle.
@@ -820,9 +824,10 @@ func (p *PacketSnifferPool) startJanitor() {
 				case <-p.janitorStop:
 					return
 				case now := <-ticker.C:
+					cleaned := 0
 					if now.Sub(lastFailedCacheCleanup) >= failedQuicDcidCleanupInterval {
 						if cache := getFailedQuicDcidCache(); cache != nil {
-							cache.CleanupExpired(now)
+							cleaned += cache.CleanupExpired(now)
 						}
 						lastFailedCacheCleanup = now
 					}
@@ -859,6 +864,20 @@ func (p *PacketSnifferPool) startJanitor() {
 						}
 						return true
 					})
+					cleaned += expiredFound
+					// Back off only while the pool is completely empty, so an
+					// idle dae does not wake up to no-op scans. Any entries at
+					// all (fresh or expired) keep the base cadence so their
+					// expiry is reaped promptly.
+					if cleaned > 0 || totalScanned > 0 {
+						interval = packetSnifferJanitorInterval
+					} else if interval < packetSnifferJanitorMaxInterval {
+						interval *= 2
+						if interval > packetSnifferJanitorMaxInterval {
+							interval = packetSnifferJanitorMaxInterval
+						}
+					}
+					ticker.Reset(interval)
 				}
 			}
 		}()

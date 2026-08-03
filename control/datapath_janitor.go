@@ -8,6 +8,8 @@ package control
 import (
 	"sync"
 	"sync/atomic"
+
+	"github.com/cilium/ebpf/ringbuf"
 )
 
 type controlPlaneDatapathJanitor struct {
@@ -17,6 +19,10 @@ type controlPlaneDatapathJanitor struct {
 	connStateJanitorStarted atomic.Bool
 	connStateCleanupMu      sync.Mutex
 	connStateScratch        *connStateJanitorScratch
+	// connEventReader is the ringbuf reader consuming kernel events for the
+	// conn state janitor. Stored atomically so the stop path can Close it to
+	// wake a goroutine blocked in ReadInto.
+	connEventReader atomic.Pointer[ringbuf.Reader]
 }
 
 type connStateJanitorScratch struct {

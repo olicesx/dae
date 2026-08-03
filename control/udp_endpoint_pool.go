@@ -34,6 +34,7 @@ var (
 const (
 	udpEndpointCreateShardCount      = 64
 	udpEndpointJanitorInterval       = 250 * time.Millisecond
+	udpEndpointJanitorMaxInterval    = 30 * time.Second
 	udpEndpointPendingReplyPeerLimit = 8
 	udpEndpointReplyCacheSlots       = 4
 )
@@ -895,7 +896,8 @@ func (p *UdpEndpointPool) shardFor(key UdpEndpointKey) *udpEndpointPoolShard {
 func (p *UdpEndpointPool) startJanitor() {
 	p.janitorOnce.Do(func() {
 		go func() {
-			ticker := time.NewTicker(udpEndpointJanitorInterval)
+			interval := udpEndpointJanitorInterval
+			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 			defer close(p.janitorDone)
 
@@ -907,9 +909,12 @@ func (p *UdpEndpointPool) startJanitor() {
 					return
 				case now := <-ticker.C:
 					nowNano := now.UnixNano()
+					cleaned := 0
+					entriesSeen := 0
 					for i := range udpEndpointCreateShardCount {
 						shard := &p.shards[i]
 						shard.mu.Lock()
+						entriesSeen += len(shard.pool)
 						toClose = toClose[:0]
 						for key, ue := range shard.pool {
 							if ue.IsExpired(nowNano) || (!p.endpointGenerationCurrent(ue) && !p.endpointSurvivesDialerInvalidation(ue)) {
@@ -921,7 +926,21 @@ func (p *UdpEndpointPool) startJanitor() {
 						for _, ue := range toClose {
 							_ = ue.Close()
 						}
+						cleaned += len(toClose)
 					}
+					// Back off only while the pool is completely empty, so an
+					// idle dae does not wake up to no-op scans. Any entries at
+					// all keep the base cadence so their expiry is reaped
+					// promptly.
+					if cleaned > 0 || entriesSeen > 0 {
+						interval = udpEndpointJanitorInterval
+					} else if interval < udpEndpointJanitorMaxInterval {
+						interval *= 2
+						if interval > udpEndpointJanitorMaxInterval {
+							interval = udpEndpointJanitorMaxInterval
+						}
+					}
+					ticker.Reset(interval)
 				}
 			}
 		}()

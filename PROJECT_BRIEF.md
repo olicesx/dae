@@ -1,18 +1,18 @@
 ---
 project: dae
-sprint: 7
-sprint_theme: "Harness completion (H10 + H12 applied) / harness 完备化"
+sprint: 8
+sprint_theme: "Architecture refactor: control_plane.go split / 架构重构：control_plane.go 拆分"
 content_language: bilingual
 content_language_source: inferred
 model_context_window: 1000000
 model_context_window_source: default
 schema_version: v5.0
 current_phase: done
-branch: kdee
+branch: kdae
 last_updated: 2026-08-05
-sprint_current: 7
-constraint_policy: harness_hardening_allowed
-sprint_latest_status: "Sprint 1-7 全部 fully closed。Sprint 7 PASS（首次 harness 主题 Sprint，CEO 直接编排）：T1 H10 应用（deletion_protection 扫 Makefile+workflows+scripts）+ T2 H12 应用（fork 跨仓库验证 advisory/strict 双模式）；T2 首次实证 H12 价值——捕获 fork quic-go @ dff8aaa5 自身测试 4 处失败（含 panic）；0 源码改动，全 gate pass；L21 新 lesson（fork deps GOPROXY 必要性）。"
+sprint_current: 8
+constraint_policy: architecture_refactor_allowed
+sprint_latest_status: "Sprint 1-8 全部 fully closed。Sprint 8 PASS（首次架构重构 Sprint，CEO 委派 kixpower-dev）：control_plane.go 4315 → 3334（-23%），拆 4 子系统文件（parse/dns/datapath/dialtarget，42 函数移动），0 逻辑改动；三通道语义验证（136=136 函数集合 / body diff 只机械副产品 / 0-981 numstat）+ 全 gate pass（vet/build/test/race/ebpf-test/make dae validate）；0 新 hard lesson。Sprint 7 PASS：H10+H12 harness 首次应用，T2 捕获 fork quic-go 4 处测试失败。"
 ---
 
 # dae — PROJECT_BRIEF (Sprint 1)
@@ -553,3 +553,82 @@ dae/
 | [docs/sprint-6/drift-check.md](docs/sprint-6/drift-check.md) | §0 既成事实基线（23 游离 commit）+ 4 项 drift |
 | [docs/sprint-6/progress.md](docs/sprint-6/progress.md) | Trace Log + L2 Verification（l2_verified_sha=149b3ce9）|
 | [docs/sprint-6/hill-climbing.md](docs/sprint-6/hill-climbing.md) | L4 报告 + L19/L20 + H11/H12 |
+---
+---
+
+# dae — PROJECT_BRIEF (Sprint 8 追加)
+
+> Sprint 8 是**首次架构重构 Sprint**（architecture_refactor_allowed）。CEO 委派 kixpower-dev 做实现，主对话做三通道独立验证 + QA。详细文档见 [docs/sprint-8/](docs/sprint-8/)。
+
+## Sprint 8 目标 / Goals
+
+- **T1**：拆 control/control_plane.go（4315 行）到 4 个子系统文件（同 package control，机械性 mv，不改逻辑/签名/API）
+  - control_plane_parse.go（Parse* 配置函数，4 个）
+  - control_plane_dns.go（DNS reload cache + handoff controller，18 个）
+  - control_plane_datapath.go（datapath commit/reload + listener publish，11 个）
+  - control_plane_dialtarget.go（dial target + real domain probe，9 个）
+
+## Sprint 8 非目标 / Out-of-Scope
+
+- ❌ 任何函数逻辑/签名改动（哪怕一个字符）
+- ❌ 任何类型/字段/方法重命名
+- ❌ 跨包移动（package control 边界不变）
+- ❌ control_plane_core.go（1311 行，留 Sprint 9）
+- ❌ dns.go / udp.go / dns_controller_cache.go（留后续 Sprint）
+- ❌ eBPF C / config 语言 / fork 代码改动
+
+## Sprint 8 blast_radius / task_sizing
+
+| 项 | 值 |
+|----|----|
+| task_count | 1（T1 内部顺序：parse → dns → dialtarget → datapath，最小先验证） |
+| commit_budget | 5（hard_cap=10） |
+| topology | sequential（都改 control_plane.go，强耦合） |
+| forbidden_files | control/**.go（除 5 个 target）/ component/** / kern/**.c / go.mod |
+
+## Sprint 8 验收标准 / Acceptance Criteria
+
+1. `go vet/build/test -tags=$(cat .build_tags) ./control/... ./component/...` 通过
+2. `go test -race -tags=$(cat .build_tags) -short ./control/...` 通过（ControlPlane 涉并发）
+3. `make ebpf-test` 23 用例全过 + `make dae` EXIT=0 + `./dae validate` EXIT=0
+4. **三通道语义验证**（architecture_refactor 专属）：
+   - 函数集合一致（原 136 = 新 5 文件合并 136）
+   - body diff 只机械副产品（license/package/import 重复）
+   - control_plane.go numstat = 0 add / N del（纯删除）
+5. 0 逻辑改动（diff 应只显示 mv）
+
+## Sprint 8 实际产出
+
+| 文件 | 行数 | 函数数 |
+|------|------|--------|
+| control/control_plane.go | 4315 → **3334**（-981，-23%） | — |
+| control/control_plane_parse.go | 85 | 4 |
+| control/control_plane_dns.go | 307 | 18 |
+| control/control_plane_datapath.go | 396 | 11 |
+| control/control_plane_dialtarget.go | 259 | 9 |
+
+**42 个函数移动，0 逻辑改动**（git numstat: `0 981` for control_plane.go）。
+
+## Sprint 8 第 7 节更新 / Phase Status
+
+| 时间 | 阶段 | 负责人 | 状态 |
+|------|------|--------|------|
+| 2026-08-05 | Sprint 8 Planning（CEO 决断 scope + 派发 dev） | CEO direct | ✅ 完成 |
+| 2026-08-05 | Sprint 8 Dev（T1 拆分） | kixpower-dev | ✅ 完成（4 新文件 + control_plane.go 瘦身） |
+| 2026-08-05 | Sprint 8 QA（三通道验证 + 全 gate + race + e2e） | CEO direct | ✅ PASS（[docs/sprint-8/done.md](docs/sprint-8/done.md)） |
+
+## Sprint 8 关键发现
+
+- **三通道语义验证首次系统化应用**：gate 通过 ≠ 语义不变。三通道（函数集合 136=136 / body diff 只机械副产品 / numstat 0-981）补足语义维度，比单靠 gate 强得多
+- **dev 子代理可靠性 > prompt 准确性**：dev 发现并纠正 prompt typo（SharesActiveDnsController → ...With），实际读代码纠错，不盲目执行
+- **L7 复利实证**：dev 子代理独立"重新发现"PowerShell `$?` 陷阱，改用脚本文件。L7/H3 是真实反复出现的 failure mode，外部 agent 也会踩
+
+## Sprint 8 关键文档索引
+
+| 文档 | 用途 |
+|------|------|
+| [docs/sprint-8/plan.md](docs/sprint-8/plan.md) | constraint_policy + task DAG + gates + risks |
+| [docs/sprint-8/progress.md](docs/sprint-8/progress.md) | dev Trace Log（每簇提取细节 + 问题处理） |
+| [docs/sprint-8/done.md](docs/sprint-8/done.md) | 三通道验证证据 + 全 gate 结果 |
+| [docs/sprint-8/hill-climbing.md](docs/sprint-8/hill-climbing.md) | L4 报告 + 三通道实证 + 矿脉评估 + Sprint 9 候选 |
+| [docs/sprint-8/runtime-context.md](docs/sprint-8/runtime-context.md) | WSL 环境 + 三通道验证命令索引 |

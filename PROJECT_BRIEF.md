@@ -1,7 +1,7 @@
 ---
 project: dae
-sprint: 8
-sprint_theme: "Architecture refactor: control_plane.go split / 架构重构：control_plane.go 拆分"
+sprint: 9
+sprint_theme: "Architecture refactor: control_plane_core.go split / 架构重构：control_plane_core.go 拆分"
 content_language: bilingual
 content_language_source: inferred
 model_context_window: 1000000
@@ -10,9 +10,9 @@ schema_version: v5.0
 current_phase: done
 branch: kdae
 last_updated: 2026-08-05
-sprint_current: 8
+sprint_current: 9
 constraint_policy: architecture_refactor_allowed
-sprint_latest_status: "Sprint 1-8 全部 fully closed。Sprint 8 PASS（首次架构重构 Sprint，CEO 委派 kixpower-dev）：control_plane.go 4315 → 3334（-23%），拆 4 子系统文件（parse/dns/datapath/dialtarget，42 函数移动），0 逻辑改动；三通道语义验证（136=136 函数集合 / body diff 只机械副产品 / 0-981 numstat）+ 全 gate pass（vet/build/test/race/ebpf-test/make dae validate）；0 新 hard lesson。Sprint 7 PASS：H10+H12 harness 首次应用，T2 捕获 fork quic-go 4 处测试失败。"
+sprint_latest_status: "Sprint 1-9 全部 fully closed。Sprint 9 PASS（Sprint 8 模式复用，CEO 委派 kixpower-dev）：control_plane_core.go 1409 → 625（-56%），拆 2 子系统文件（bind/routing，21 函数移动），0 逻辑改动；三通道语义验证（44=44 函数 / body diff 只机械副产品 / 0-784 numstat）+ 全 gate pass；control_plane 系列拆分完成（S8+S9 共 -2009 行提取到 6 新文件，单文件最大 4315→644，-85%）。Sprint 8 PASS：control_plane.go 拆 4 簇 42 函数。"
 ---
 
 # dae — PROJECT_BRIEF (Sprint 1)
@@ -632,3 +632,75 @@ dae/
 | [docs/sprint-8/done.md](docs/sprint-8/done.md) | 三通道验证证据 + 全 gate 结果 |
 | [docs/sprint-8/hill-climbing.md](docs/sprint-8/hill-climbing.md) | L4 报告 + 三通道实证 + 矿脉评估 + Sprint 9 候选 |
 | [docs/sprint-8/runtime-context.md](docs/sprint-8/runtime-context.md) | WSL 环境 + 三通道验证命令索引 |
+---
+---
+
+# dae — PROJECT_BRIEF (Sprint 9 追加)
+
+> Sprint 9 是 Sprint 8 架构重构模式的首次复用：CEO 委派 kixpower-dev 做实现，主对话三通道独立验证 + QA。详细文档见 [docs/sprint-9/](docs/sprint-9/)。
+
+## Sprint 9 目标 / Goals
+
+- **T1**：拆 control/control_plane_core.go（1409 行）到 2 个子系统文件（同 package control，机械性 mv，不改逻辑/签名/API）
+  - control_plane_core_bind.go（接口绑定 + qdisc 工具，14 函数）
+  - control_plane_core_routing.go（domain routing + udp conn state + tc filter 工具，7 函数）
+
+## Sprint 9 非目标 / Out-of-Scope
+
+- ❌ 任何函数逻辑/签名改动
+- ❌ 任何类型/字段/方法重命名
+- ❌ 跨包移动
+- ❌ dns.go / dns_controller_cache.go（留 Sprint 10 候选，需先评估内聚性）
+- ❌ eBPF C / config 语言 / fork 代码改动
+
+## Sprint 9 blast_radius / task_sizing
+
+| 项 | 值 |
+|----|----|
+| task_count | 1（T1 内部顺序：routing 先验证 → bind） |
+| commit_budget | 5（hard_cap=10） |
+| topology | sequential（都改 control_plane_core.go，强耦合） |
+| forbidden_files | control/**.go（除 3 个 target）/ component/** / kern/** / go.mod |
+
+## Sprint 9 验收标准 / Acceptance Criteria
+
+1. `go vet/build/test -tags=$(cat .build_tags) ./control/... ./component/...` 通过
+2. `go test -race -tags=$(cat .build_tags) -short ./control/...` 通过
+3. `make ebpf-test` 23 用例全过 + `make dae` EXIT=0 + `./dae validate` EXIT=0
+4. **三通道语义验证**：函数集合 44=44 / body diff 只机械副产品 / numstat 0/N
+5. 0 逻辑改动
+
+## Sprint 9 实际产出
+
+| 文件 | 行数 | 函数数 |
+|------|------|--------|
+| control/control_plane_core.go | 1409 → **625**（-784，-56%） | 23 保留 |
+| control/control_plane_core_bind.go | 644 | 14 |
+| control/control_plane_core_routing.go | 170 | 7 |
+
+**21 个函数移动，0 逻辑改动**（git numstat: `0 784` for control_plane_core.go）。
+
+## Sprint 9 第 7 节更新 / Phase Status
+
+| 时间 | 阶段 | 负责人 | 状态 |
+|------|------|--------|------|
+| 2026-08-05 | Sprint 9 Planning（CEO 决断 scope + 派发 dev） | CEO direct | ✅ 完成 |
+| 2026-08-05 | Sprint 9 Dev（T1 拆分） | kixpower-dev | ✅ 完成（2 新文件 + control_plane_core.go 瘦身；off-by-one 被 go build 捕获修复） |
+| 2026-08-05 | Sprint 9 QA（三通道验证 + 全 gate + race + e2e） | CEO direct | ✅ PASS |
+
+## Sprint 9 关键发现
+
+- **Sprint 8 模式首次复用**：dev Python 脚本 + 三通道验证 + 全 gate 流水线 0 摩擦复用，边际成本递减
+- **control_plane 系列拆分完成**：S8 + S9 共 -2009 行提取到 6 新文件，单文件最大 4315 → 644（**-85%**）
+- **机械提取工具边界检测陷阱模式化（L22 候选）**：S8 import 误报（参数名匹配包名）+ S9 off-by-one（import `)` 误包含）都是边界检测陷阱，go build 即时捕获。拆分流水线已成熟
+- **三通道验证 cross-validated**：S8 + S9 两次不同 scope 都通过同套验证，证明验证方法可靠（非过拟合）
+
+## Sprint 9 关键文档索引
+
+| 文档 | 用途 |
+|------|------|
+| [docs/sprint-9/plan.md](docs/sprint-9/plan.md) | constraint_policy + task DAG + gates + risks |
+| [docs/sprint-9/progress.md](docs/sprint-9/progress.md) | dev Trace Log（含 off-by-one 修复记录） |
+| [docs/sprint-9/done.md](docs/sprint-9/done.md) | 三通道验证证据 + 全 gate 结果 |
+| [docs/sprint-9/hill-climbing.md](docs/sprint-9/hill-climbing.md) | L4 报告 + L22 候选 + control_plane 系列总结 + Sprint 10 候选 |
+| [docs/sprint-9/runtime-context.md](docs/sprint-9/runtime-context.md) | WSL 环境 + 三通道命令索引 |

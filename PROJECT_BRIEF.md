@@ -1,18 +1,18 @@
 ---
 project: dae
-sprint: 5
-sprint_theme: "Tech debt cleanup + measurement precision upgrade (H8 first application) / 技术债清理 + 测量精度升级（H8 首次应用）"
+sprint: 7
+sprint_theme: "Harness completion (H10 + H12 applied) / harness 完备化"
 content_language: bilingual
 content_language_source: inferred
 model_context_window: 1000000
 model_context_window_source: default
 schema_version: v5.0
 current_phase: done
-branch: kdae
-last_updated: 2026-08-04
-sprint_current: 6
-constraint_policy: stability_hardening_allowed
-sprint_latest_status: "Sprint 1-6 全部 fully closed。Sprint 6 PASS（首次验证型 Sprint stability_hardening_allowed）：T1 对 23 游离 commit（巨型文件拆分+5 bug fix+fork bump，59 files/+8608/-7018）补齐权威验证，10/10 gate pass（race/ebpf/bench/make dae validate），0 回归，commits_used=1（149b3ce9 docs only）；L19/L20 新 lesson，H11/H12 proposed。Sprint 5 PASS：T1 删 108 测试 / T2 sniffHTTPHostHeader -36..-43% / T3 H8 首次应用。"
+branch: kdee
+last_updated: 2026-08-05
+sprint_current: 7
+constraint_policy: harness_hardening_allowed
+sprint_latest_status: "Sprint 1-7 全部 fully closed。Sprint 7 PASS（首次 harness 主题 Sprint，CEO 直接编排）：T1 H10 应用（deletion_protection 扫 Makefile+workflows+scripts）+ T2 H12 应用（fork 跨仓库验证 advisory/strict 双模式）；T2 首次实证 H12 价值——捕获 fork quic-go @ dff8aaa5 自身测试 4 处失败（含 panic）；0 源码改动，全 gate pass；L21 新 lesson（fork deps GOPROXY 必要性）。"
 ---
 
 # dae — PROJECT_BRIEF (Sprint 1)
@@ -362,6 +362,68 @@ dae/
 |------|------|
 | [docs/sprint-4/plan.md](docs/sprint-4/plan.md) | task DAG（含 CPU+mem 双证据）/ verifiable_gates（+cpu_profile_review +interface_compat）/ task_sizing |
 | [docs/sprint-4/drift-check.md](docs/sprint-4/drift-check.md) | 4 项 drift + Evals（H1/H3/H5 通过，H6 首次应用，H7 新项）+ H6 应用 |
+---
+---
+
+# dae — PROJECT_BRIEF (Sprint 7 追加)
+
+> Sprint 7 是**首次 harness 主题 Sprint**（harness_hardening_allowed）。CEO 直接编排（用户授权"你自己决断"），跳过 /kixpower-new 的 Producer 阶段，保留 dev + QA 自验。详细文档见 [docs/sprint-7/](docs/sprint-7/)。
+> Sprint 5/6 详细状态见各自 [docs/sprint-5/](docs/sprint-5/done.md) / [docs/sprint-6/](docs/sprint-6/done.md)。
+
+## Sprint 7 目标 / Goals
+
+- **T1（H10 应用）**：deletion_protection gate 增强 —— 写 `scripts/deletion-protection-scan.sh`，扫 Makefile + `.github/workflows/*.yml` + `scripts/*.{sh,pl,py}` 引用，防止 Sprint 5 ISSUE-1 类（bpf_bug_verification_test.go 被误删）重蹈
+- **T2（H12 应用，用户关切 OQ-S6-3）**：fork 依赖跨仓库验证 harness —— 写 `scripts/fork-cross-repo-test.sh`，解析 dae `go.mod` replace，对每个 fork commit 跑 fork 自己的 `go test`
+
+## Sprint 7 非目标 / Out-of-Scope
+
+- ❌ 源码逻辑改动（任何 .go 业务代码）
+- ❌ eBPF C 改动 / config 语言变更
+- ❌ fork（quic-go/outbound）代码改动（fork bug 留 fork 维护者）
+- ❌ 巨型文件拆分（留 Sprint 8 独立架构重构 Sprint）
+- ❌ H11（CRLF 污染检查，本 Sprint 未触发条件）
+
+## Sprint 7 blast_radius / task_sizing
+
+| 项 | 值 |
+|----|----|
+| task_count | 2（T1/T2 并行，独立文件域，0 物理重叠） |
+| strong_coupling | 0 |
+| commit_budget | 3（hard_cap=10） |
+| topology | parallel（dag_layers=1） |
+| forbidden_files | `control/**.go` / `component/**.go` / `control/kern/**.c` / `go.mod` / `go.sum` |
+
+## Sprint 7 验收标准 / Acceptance Criteria
+
+1. `go vet ./...` / `go build -tags=$(cat .build_tags) ./...` / `go test -short ./control/... ./component/...` 通过
+2. `ebpf_lint` 0 style 问题（tproxy.c / bpf_test.c / trace.c）
+3. **T1 红绿**：ISSUE-1 案例 → 4 hits + exit 1；不存在文件 → 0 hits + exit 0
+4. **T2 dry-run**：正确解析 quic-go@dff8aaa58e14 + outbound@c5b8ecc17ecc
+5. **T2 advisory 全量**：跑完 exit 0（fork bug 不阻塞）
+6. 0 源码改动（T1/T2 是新增脚本）
+
+## Sprint 7 第 7 节更新 / Phase Status（Sprint 7）
+
+| 时间 | 阶段 | 负责人 | 状态 |
+|------|------|--------|------|
+| 2026-08-05 | Sprint 7 Planning（CEO 决断主题/scope/DAG） | CEO direct | ✅ 完成 |
+| 2026-08-05 | Sprint 7 Dev（T1 + T2 实现） | CEO direct | ✅ 完成（2 脚本） |
+| 2026-08-05 | Sprint 7 QA（gate + T1 红绿 + T2 dry-run/full） | CEO direct | ✅ PASS（[docs/sprint-7/done.md](docs/sprint-7/done.md)） |
+
+## Sprint 7 关键发现 / Key Findings
+
+- **T2 首次实证 H12 价值**：fork quic-go @ dff8aaa5 在自身测试套件中有 4 处失败（含 1 panic `failed to parse short header`），dae 正在用此 commit 但 dae gate 全过 —— fork bug 在 dae 测试盲区。详见 OQ-S7-1
+- **L21 新 lesson**：fork deps 下载需 GOPROXY（golang.org 直连超时），同 Sprint 6 L18a 模式（github.com → gh-proxy）
+- **T1 自引用陷阱**：首版 T1 扫到自身注释里的文件名，5 hits（应 4）。修复 = 扫描循环跳过 `$(basename "$0")`
+
+## Sprint 7 关键文档索引
+
+| 文档 | 用途 |
+|------|------|
+| [docs/sprint-7/plan.md](docs/sprint-7/plan.md) | task DAG T1/T2 + gates + OQ-S7-1 |
+| [docs/sprint-7/done.md](docs/sprint-7/done.md) | 验证结果（全 gate pass + T2 关键发现） |
+| [docs/sprint-7/hill-climbing.md](docs/sprint-7/hill-climbing.md) | L4 报告 + L21 + H10/H12 应用证据 + Sprint+1 候选 |
+| [docs/sprint-7/runtime-context.md](docs/sprint-7/runtime-context.md) | WSL + fork 仓库基线 + 关键命令索引 |
 | [docs/sprint-4/runtime-context.md](docs/sprint-4/runtime-context.md) | 工具链基线 + §H7 CPU profile top（GC 主导 41-50%）+ §H5 mem lifecycle 分类表 |
 | [docs/sprint-4/progress.md](docs/sprint-4/progress.md) | Trace Log + gate 状态 + H7 基线（Dev/QA 填） |
 

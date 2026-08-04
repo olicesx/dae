@@ -467,6 +467,10 @@ func (c *DnsController) dialSend(
 	responseWriter dnsmessage.ResponseWriter,
 	responseCacheKey string,
 ) (err error) {
+	// Keep a reference to the original request bytes: data is later
+	// overwritten with the packed response, but the client's EDNS0 size
+	// must be read from the request when truncating oversized replies.
+	dnsRequestData := data
 	resolution, err := c.resolveDNSUpstream(ctx, 0, req, data, upstream)
 	if err != nil {
 		return err
@@ -537,6 +541,31 @@ func (c *DnsController) dialSend(
 		if err != nil {
 			return err
 		}
+
+		// Truncate oversized UDP responses with the TC bit set (RFC 1035) so the
+		// client retries over TCP. Without this the client receives a
+		// "noerror, 0 answer, tc=0" reply and believes the name has no
+		// addresses. The cache must keep the FULL response (a later TCP client
+		// query needs all answers), so a deep copy is taken before truncating.
+		limit := dnsDefaultUDPSize
+		if len(data) > limit {
+			var reqMsg dnsmessage.Msg
+			if err = reqMsg.Unpack(dnsRequestData); err == nil {
+				limit = dnsUDPResponseSizeLimit(&reqMsg)
+			}
+			if len(data) > limit {
+				fullResp := *respMsg
+				fullResp.Answer = append([]dnsmessage.RR(nil), respMsg.Answer...)
+				fullResp.Extra = append([]dnsmessage.RR(nil), respMsg.Extra...)
+				respMsg.Truncate(limit)
+				data, err = respMsg.PackBuffer((*bufPtr)[:cap(*bufPtr)])
+				if err != nil {
+					return err
+				}
+				respMsg = &fullResp
+			}
+		}
+
 		if err = sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.replySoMark(), req.downloadRecorder()); err != nil {
 			return err
 		}

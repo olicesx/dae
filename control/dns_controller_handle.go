@@ -174,7 +174,7 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 				go c.backgroundRefresh(responseCacheKey, dnsMessage, req, upstreamIndex, upstream)
 			}
 
-			if err = c.writeCachedResponse(resp, dnsMessage.Id, req, responseWriter); err != nil {
+			if err = c.writeCachedResponse(resp, dnsMessage.Id, req, responseWriter, dnsMessage); err != nil {
 				return err
 			}
 			// Log cache hit with dest addr for CI compatibility.
@@ -218,7 +218,7 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 		// This avoids another Pack() call which is common in high-concurrency scenarios.
 		if responseCacheKey != "" {
 			if resp, _ := c.LookupDnsRespCache_(dnsMessage, responseCacheKey, false); resp != nil {
-				if err = c.writeCachedResponse(resp, dnsMessage.Id, req, responseWriter); err != nil {
+				if err = c.writeCachedResponse(resp, dnsMessage.Id, req, responseWriter, dnsMessage); err != nil {
 					return err
 				}
 				return nil
@@ -393,7 +393,7 @@ func (c *DnsController) handleWithResponseWriter_(
 		}
 
 		if needResp {
-			if err = c.writeCachedResponse(resp, dnsMessage.Id, req, responseWriter); err != nil {
+			if err = c.writeCachedResponse(resp, dnsMessage.Id, req, responseWriter, dnsMessage); err != nil {
 				return err
 			}
 		}

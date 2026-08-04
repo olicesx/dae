@@ -13,11 +13,54 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// dnsDefaultUDPSize is the classic DNS-over-UDP response size limit
+// (RFC 1035 section 4.2.1) applied when the client does not advertise
+// EDNS0. Responses larger than the limit must be truncated with the TC
+// bit set so the client retries over TCP instead of silently dropping
+// the answers (which manifests as "noerror, 0 answer, tc=0").
+const dnsDefaultUDPSize = 512
+
+// dnsUDPResponseSizeLimit returns the maximum UDP response size allowed
+// for a client request: its EDNS0 advertised size (RFC 6891) when
+// present, otherwise the classic 512-byte limit. Values below 512 are
+// clamped up per RFC 6891 section 6.2.5.
+func dnsUDPResponseSizeLimit(req *dnsmessage.Msg) int {
+	limit := dnsDefaultUDPSize
+	if opt := req.IsEdns0(); opt != nil {
+		if s := int(opt.UDPSize()); s > limit {
+			limit = s
+		}
+	}
+	return limit
+}
+
+// truncateDNSResponse returns packed unchanged if it fits within limit;
+// otherwise it returns a truncated repack with the TC bit set (RFC 1035
+// section 4.2.1) so the client retries over TCP. On unpack/pack failure the
+// original bytes are returned unchanged.
+func truncateDNSResponse(packed []byte, limit int) []byte {
+	if len(packed) <= limit {
+		return packed
+	}
+	var msg dnsmessage.Msg
+	if err := msg.Unpack(packed); err != nil {
+		return packed
+	}
+	msg.Truncate(limit)
+	if data, err := msg.Pack(); err == nil {
+		return data
+	}
+	return packed
+}
+
 // writeCachedResponse sends a cached DNS response to the client.
 // OPTIMIZED: Uses pre-packed response with ID patching to avoid Pack() overhead.
 // For responseWriter path, uses Unpack/WriteMsg (slower but handles ID correctly).
 // For UDP path, patches the ID directly using buffer pool to avoid allocations.
-func (c *DnsController) writeCachedResponse(resp []byte, reqId uint16, req *udpRequest, responseWriter dnsmessage.ResponseWriter) error {
+// If the packed response exceeds the client's UDP size limit (512 or EDNS0),
+// it is truncated with the TC bit set (rare path: only large answers pay the
+// Unpack/Truncate cost).
+func (c *DnsController) writeCachedResponse(resp []byte, reqId uint16, req *udpRequest, responseWriter dnsmessage.ResponseWriter, reqMsg *dnsmessage.Msg) error {
 	// Optimization: Patch ID directly in the packed buffer if possible.
 	// For UDP, we can use Write() directly. For TCP, we might need WriteMsg or manual length.
 	// However, most responseWriters here are either UDP or wrappers that handle message framing.
@@ -47,6 +90,16 @@ func (c *DnsController) writeCachedResponse(resp []byte, reqId uint16, req *udpR
 		copy(patchedResp, resp)
 		binary.BigEndian.PutUint16(patchedResp[0:2], reqId)
 
+		// Truncate oversized UDP responses with the TC bit set so the client
+		// retries over TCP (RFC 1035). Without this the client receives a
+		// "noerror, 0 answer, tc=0" reply and believes the name has no
+		// addresses. Only large answers pay the Unpack/Truncate cost.
+		limit := dnsDefaultUDPSize
+		if reqMsg != nil {
+			limit = dnsUDPResponseSizeLimit(reqMsg)
+		}
+		patchedResp = truncateDNSResponse(patchedResp, limit)
+
 		// Transparent DNS replies must preserve the original DNS server tuple.
 		// sendPkt also carries the DNS port-conflict raw fallback for host-local
 		// clients where binding the source address may fail transiently.
@@ -62,6 +115,12 @@ func (c *DnsController) writeCachedResponse(resp []byte, reqId uint16, req *udpR
 	if len(resp) >= 2 {
 		binary.BigEndian.PutUint16(patchedResp[0:2], reqId)
 	}
+
+	limit := dnsDefaultUDPSize
+	if reqMsg != nil {
+		limit = dnsUDPResponseSizeLimit(reqMsg)
+	}
+	patchedResp = truncateDNSResponse(patchedResp, limit)
 
 	if err := sendRuntimeTrackedPkt(c.log, patchedResp, req.realDst, req.realSrc, req.replySoMark(), req.downloadRecorder()); err != nil {
 		return fmt.Errorf("failed to write oversized cached DNS resp: %w", err)

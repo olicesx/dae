@@ -18,7 +18,7 @@ blast_radius:
   commit_budget_formula: dag_layers + strong_coupling_count + bug_reserve
   commit_budget_derivation: "dag_layers=1（单 task T1）+ strong_coupling=0 + bug_reserve=2（23 游离 commit 含拆分+并发+fork bump，回归风险较高）= 3"
   hard_cap: 10
-  commits_used: 0         # scenario (a): 0 regression found, all gates pass, 0 fix commit needed
+  commits_used: 1         # 149b3ce9 (docs: T1 verification baseline); scenario (a): 0 code regression, 0 fix commit
   dev_self_tests_passed: true  # all 10 verifiable_gates pass in WSL linux (see gates block)
   branch_required: true
   branch: kdae
@@ -45,6 +45,13 @@ gates:
   ebpf_sync_check: pass # ✅ rc=0, git diff --exit-code clean (Go bindings match C)
   bench_no_regression: pass    # ✅ T1 核心——H8 全匹配：SniffTcp HTTP=5/TLS=6/NotApp=3 allocs; HostHeader Extended=1/NoHost=0 (零回归, 9.6s)
   manual_make_da_validate: pass # ✅ make dae rc=0 + validate example.dae rc=0; validate /dev/null rc=1 (预期: filename suffix 校验拒绝非 .dae, 非 panic)
+
+# === L2 Verification（orchestrator 权威，三通道独立确认）===
+l2_verification_passed: [go_vet, go_build, go_test, go_test_race, ci_gate_make_ebpf, ci_gate_ebpf_test, ebpf_lint, ebpf_sync_check, bench_no_regression, manual_make_da_validate]
+l2_verified_sha: 149b3ce9
+l2_independent_rerun: "orchestrator 重跑 race (rc=0, 全包 ok) + ebpf-test (rc=0, dae_bpf_tests PASS) 独立确认 Dev claim；其余 8 gate 采信 Dev 客观 rc=0 证据"
+l2_workspace_state: "PROJECT_BRIEF.md (M) + docs/.kixpower-current-sprint (??) + docs/sprint-5/done.md (??) — 全部 L2 允许的文档变更"
+l2_notes: "CRLF 污染（Dev WSL 操作触发，419 files）已清理（git checkout，保护 PROJECT_BRIEF）；.gitmodules.d.mk Dev workaround 已 revert（生成产物不该手改，Makefile 上游 tr bug 记 OQ-S6-4）"
 ---
 
 # Sprint 6 Progress — 稳定性 / bug fix 收割
@@ -78,8 +85,12 @@ gates:
 - [2026-08-04] T1 dev | gate bench_no_regression：PASS（H8 全匹配零回归）——SniffTcp HTTP=5(224B)/TLS=6(240B)/NotApplicable=3(168B) allocs; sniffHTTPHostHeader Extended=1(32B)/NoHost=0; ns/op 微波动(±15%内); sniffing 9.6s + control 88.1s | tmp/sprint6-gate-bench.sh | — |
 - [2026-08-04] T1 dev | gate manual_make_da_validate：PASS——make dae rc=0 (Version=unstable-20260804.r1007.1ddfd8fb); validate example.dae rc=0; validate /dev/null rc=1 (预期: filename suffix 校验, 非 panic/crash) | tmp/sprint6-gate-dae-validate.sh | — |
 - [2026-08-04] T1 dev | **T1 完成 scenario (a)**：10/10 gate pass, 0 回归, commits_used=0。23 游离 commit（722b123b..1ddfd8fb）稳定性 proven。环境障碍 4 项均非代码回归（submodule init via 镜像 / Makefile .gitmodules.d.mk 上游 bug / checkpatch CRLF shebang / C 源码 autocrlf 污染） | — | — |
+- [2026-08-04] L2 observe | orchestrator 三通道验证：独立重跑 race (rc=0, 全包 ok) + ebpf-test (rc=0, dae_bpf_tests PASS) 确认 Dev claim；commit 149b3ce9 干净（4 docs/466 ins/0 del）；发现 CRLF 污染（Dev WSL 操作触发，419 files, --ignore-cr-at-eol 确认纯 CRLF）→ git checkout 清理（保护 PROJECT_BRIEF）；.gitmodules.d.mk Dev 手动 workaround 已 revert（生成产物不该手改，Makefile 上游 tr bug 记 OQ-S6-4） | l2_verified_sha=149b3ce9 | — |
+- [2026-08-04] L2 observe | 用户关切：dae replace 引用 olicesx/outbound sticky-ip c5b8ecc + olicesx/quic-go dff8aaa5（非各自 main），本地 workspace 在 main → checkout 对齐（outbound→c5b8ecc, quic-go→dff8aaa5, detached, status clean）；dae 编译仍走远程 go.mod（无 go.work 联动）；fork 代码验证 gap 记 OQ-S6-3 | — | — |
 
 ## 开放问题追踪
 
 - OQ-S6-1：**待 T1 验证后评估**——游离 commit 的 bug fix 是否有同类未处理边界？（dns UDP size / sniffer 并发 Close / janitor timing）。证据驱动，不预设 task。
-- OQ-S6-2：**待 T1 验证**——巨型文件拆分后是否引入编译/测试盲区？T1 make ebpf-test + go test 覆盖。
+- OQ-S6-2：**T1 已验证（PASS）**——make ebpf-test rc=0 + go test 全包 ok + race 无并发问题，巨型文件拆分未引入编译/测试盲区。
+- OQ-S6-3：**fork 验证 gap（用户关切，本 Sprint 不覆盖）**——dae replace 引用 olicesx/outbound sticky-ip `c5b8ecc` + olicesx/quic-go `dff8aaa5`（非各自 main），游离 commit 多次 bump fork（GSO/pooling/sticky-ip 等），fork 代码在 dae 测试盲区。本地 workspace 已 checkout 对齐（detached at c5b8ecc/dff8aaa5, status clean），但 dae 编译仍走远程 go.mod（无 go.work 联动）。fork 自身测试属独立仓库职责。
+- OQ-S6-4：**Makefile 上游 bug**——`.gitmodules.d.mk` 生成规则 `tr ' \n' '\n '` 把空格转换行→第 2 行 `submodule_paths=` 重复赋值（trace 覆盖 control）。正确修复应改 Makefile 生成规则（超 Sprint 6 范围）。Dev 手动 workaround 已 revert（生成产物不该手改）。建议提上游 Issue。

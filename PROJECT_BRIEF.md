@@ -9,10 +9,10 @@ model_context_window_source: default
 schema_version: v5.0
 current_phase: done
 branch: kdae
-last_updated: 2026-07-29
-sprint_current: 5
-constraint_policy: test_pruning_and_cpu_algo_allowed
-sprint_latest_status: "Sprint 1-5 全部完成并 commit；Sprint 5 QA PASS（升级自 CONDITIONAL via L2 retry）—— T1 删 108 测试 test:src 1.03→0.49 / T2 sniffHTTPHostHeader bytes.Index cum 57.92%→8.66% / T3 H8 首次应用 bench 趋近 deadline_sync 基线；L15/L16/L17 新 lesson，H8/H9 applied，H10 proposed"
+last_updated: 2026-08-04
+sprint_current: 6
+constraint_policy: stability_hardening_allowed
+sprint_latest_status: "Sprint 1-6 全部 fully closed。Sprint 6 PASS（首次验证型 Sprint stability_hardening_allowed）：T1 对 23 游离 commit（巨型文件拆分+5 bug fix+fork bump，59 files/+8608/-7018）补齐权威验证，10/10 gate pass（race/ebpf/bench/make dae validate），0 回归，commits_used=1（149b3ce9 docs only）；L19/L20 新 lesson，H11/H12 proposed。Sprint 5 PASS：T1 删 108 测试 / T2 sniffHTTPHostHeader -36..-43% / T3 H8 首次应用。"
 ---
 
 # dae — PROJECT_BRIEF (Sprint 1)
@@ -413,8 +413,8 @@ dae/
 | 时间 | 阶段 | 负责人 | 状态 |
 |------|------|--------|------|
 | 2026-07-29 | Sprint 5 Planning（drift-check + 可行性预检 + plan + brief §7/§8） | Remy | ✅ 完成 |
-| 待定 | Sprint 5 Dev（T1 测试瘦身 / T2 http.go CPU / T3 bench harness，全串行） | Dev | 待启动 |
-| 待定 | Sprint 5 QA（gate 全过 + cpu_profile_review + h8_deadline_sync） | QA | 待启动 |
+| 2026-07-29 | Sprint 5 Dev（T1 测试瘦身 / T2 http.go CPU / T3 bench harness，全串行） | Dev | ✅ 完成（4 commits：`0e673fe7` / `1d1021eb` / `d3e5c4a2` / `828afae5`） |
+| 2026-07-29 | Sprint 5 QA（gate + cpu_profile_review + h8_deadline_sync + L2 retry） | QA | ✅ PASS（升级自 CONDITIONAL via L2 retry，[docs/qa/qa-signoff-5.md](docs/qa/qa-signoff-5.md)，head_commit `722b123b`） |
 
 > Sprint 1-4 已全部 QA 签署 PASS（见 [docs/qa/qa-signoff-{1,4}.md](docs/qa/)），其第 7 节状态保持历史记录。
 
@@ -427,11 +427,67 @@ dae/
 - **Dev 必读**：① T1 方法论 `/memories/ai-test-pruning.md`（helper 链处理最易踩坑，go vet 驱动恢复）；② T2 ⚠️ 用户描述「bytes.Index 替代手写字节扫描」与实际不符（http.go 已用 bytes 原语），OQ-S5-1 已 reformulate 为减 rescan + 消 string 分配 + 跳 request line，若无可优化空间须诚实标 no-op；③ T3 OQ-S5-3 deadline conn 选型须 pprof 确认走 deadline 路径；④ 命令脚本化 tmp/*.sh（H3）；注释/commit 英文。
 - 拓扑：**全串行 T1→T2→T3**（H9：T1/T3 sniffing 测试包编译耦合）。
 
+### Dev → QA（Sprint 5）
+- **改动文件清单**：108 测试删除 + 3 新集中 helper 文件（`control/{scripted_packet_conn,test_fixtures,dns_message}_test_helpers_test.go`）+ 3 恢复 bulk-infra 文件（udp_quic_initial_regression/udp_reuse_simulation/udp_sniffer_loss）+ `component/sniffing/http.go`(+45/-10) + `component/sniffing/benchmark_test.go`(+43/-3) + 恢复 `control/bpf_bug_verification_test.go`。
+- **bench 前后要点**：T2 Extended -36% / NoHost -43% / bytes.Index cum 57.92%→8.66%；T3 HTTP ~12→5 / TLS ~12→6 / NotApplicable ~12→3（H8 收益闭环，非回归）。
+- **H7 verdict**：PASS（bytes.Index cum 大降 + ns/op 绝对下降；GC 极低 2.12% 确认 CPU 算法非 alloc 驱动）。
+- **已知限制（OQ）**：OQ-S5-1（T2 premise reformulate，闭环）/ OQ-S5-2（T1 helper 链 ~5 层，闭环）/ OQ-S5-3（T3 deadlineConn 选型，闭环）。
+- **文档**：[docs/sprint-5/progress.md](docs/sprint-5/progress.md)（Trace Log + bench 基线）；commits `0e673fe7` / `1d1021eb` / `d3e5c4a2` / `828afae5`。
+
+### QA → done（Sprint 5）
+- **verdict = PASS**（升级自 CONDITIONAL，[docs/qa/qa-signoff-5.md](docs/qa/qa-signoff-5.md)，head_commit `722b123b`）：local_gate + ci_gate + manual_gate 全过（L2 retry 修复 ISSUE-1 后）；H5/H7/H8 决定性 gate 独立复现 Dev 数据。
+- **L2 retry**：ISSUE-1（T1 误删 Makefile 引用的 `bpf_bug_verification_test.go`）→ commit `722b123b` 恢复 → `make ebpf-test` EXIT=0。commits_used 最终 = 5/5（bug_reserve 正确覆盖）。
+- **L4 完成**（[docs/sprint-5/hill-climbing.md](docs/sprint-5/hill-climbing.md)）：新增 L15-L17；H8/H9 applied，H10 proposed；no-op 率连续 3 Sprint 为 0%。**Sprint 5 fully closed。** 见 [docs/sprint-5/done.md](docs/sprint-5/done.md)。
+
 ## Sprint 5 关键文档索引
 
 | 文档 | 用途 |
 |------|------|
 | [docs/sprint-5/plan.md](docs/sprint-5/plan.md) | task DAG（含可行性 gate）/ verifiable_gates（+cpu_profile_review +h8_deadline_sync +deletion_protection）/ task_sizing |
 | [docs/sprint-5/drift-check.md](docs/sprint-5/drift-check.md) | 4 项 drift + Evals（H1/H3/H5 通过，H6/H7 持续，H8 首次应用）+ backlog 应用清单 |
-| [docs/sprint-5/runtime-context.md](docs/sprint-5/runtime-context.md) | T1 测试统计 + 删除/保留清单 + T2 H7 CPU 基线 + T3 bench harness 偏差定位 |
+| [docs/sprint-5/runtime-context.md](docs/sprint-5/runtime-context.md) | T1 测试统计 + 删除/保留清单 + T2 H7 CPU 庺线 + T3 bench harness 偏差定位 |
 | [docs/sprint-5/progress.md](docs/sprint-5/progress.md) | Trace Log + gate 状态（Dev/QA 填） |
+
+---
+
+# dae — PROJECT_BRIEF (Sprint 6 追加)
+
+> Sprint 6 是**首次验证型 Sprint**（stability_hardening_allowed）。对 Sprint 5 之后的 23 个游离 commit（未编排工作）补齐权威验证基线。详细文档见 [docs/sprint-6/](docs/sprint-6/)。
+
+## Sprint 6 目标 / Goals
+
+- **T1（权威验证基线）**：23 个游离 commit（722b123b..1ddfd8fb）含巨型文件拆分 + 5 bug fix + perf + fork bump，补齐 race/ebpf/bench 权威验证。scenario (a) 全过=基线确认 / (b) 发现回归=捕获修复。
+
+## Sprint 6 非目标 / Out-of-Scope
+
+- 新协议 / 新 feature；巨型文件拆分（已被游离 commit 做了，不重做）；eBPF C 改动（tproxy.c）；config 语言变更；fork（quic-go/outbound）改动；语义等价重构（非稳定性主题）。
+
+## Sprint 6 第 7 节 / Phase Status（Sprint 6）
+
+| 时间 | 阶段 | 负责人 | 状态 |
+|------|------|--------|------|
+| 2026-08-04 | Sprint 6 Planning（drift-check + 23 游离 commit 分析 + plan） | Remy | ✅ 完成 |
+| 2026-08-04 | Sprint 6 Dev（T1 权威验证 + 回归修复） | Dev | ✅ 完成（10/10 gate pass, 0 回归, commit 149b3ce9 docs only） |
+| 2026-08-04 | Sprint 6 QA（gate 复核 + bench H8 抽检） | Ivy | ✅ PASS（[docs/qa/qa-signoff-6.md](docs/qa/qa-signoff-6.md)，head_commit 149b3ce9） |
+
+> Sprint 1-5 已全部 fully closed（见各自 done.md）。
+
+## Sprint 6 第 8 节 / Handoff Context
+
+### Dev → QA（Sprint 6）
+- **改动文件**：0 源码改动（commit 149b3ce9 纯 docs：docs/sprint-6/{plan,progress,drift-check,runtime-context}.md, 466 ins）。
+- **gate 结果**：10/10 pass（race rc=0 50.5s / ebpf-test rc=0 13.8s, 23 用例 / bench H8 全匹配 SniffTcp HTTP=5/TLS=6/NotApp=3 / ebpf-lint+sync rc=0 / make dae validate rc=0）。
+- **已知限制**：4 项环境障碍（submodule init / Makefile .gitmodules.d.mk 上游 bug OQ-S6-4 / checkpatch CRLF / C 源码 autocrlf）均非代码回归。
+
+### QA → done（Sprint 6）
+- **verdict = PASS**（[docs/qa/qa-signoff-6.md](docs/qa/qa-signoff-6.md)，head_commit `149b3ce9`）：local_gate 4/4 + ci_gate 4/4 + manual_gate 3/3；scenario (a) 命中；commits_used=1/3。
+- **L4 完成**（[docs/sprint-6/hill-climbing.md](docs/sprint-6/hill-climbing.md)）：新增 L19（WSL CRLF 污染清理）/ L20（commits 计数）；H11（CRLF 检查）/ H12（fork 验证 harness）proposed；首次验证型 Sprint + 首次零代码 commit。**Sprint 6 fully closed。** 见 [docs/sprint-6/done.md](docs/sprint-6/done.md)。
+
+## Sprint 6 关键文档索引
+
+| 文档 | 用途 |
+|------|------|
+| [docs/sprint-6/plan.md](docs/sprint-6/plan.md) | task DAG T1 + verifiable_gates + constraint_policy(stability_hardening_allowed) |
+| [docs/sprint-6/drift-check.md](docs/sprint-6/drift-check.md) | §0 既成事实基线（23 游离 commit）+ 4 项 drift |
+| [docs/sprint-6/progress.md](docs/sprint-6/progress.md) | Trace Log + L2 Verification（l2_verified_sha=149b3ce9）|
+| [docs/sprint-6/hill-climbing.md](docs/sprint-6/hill-climbing.md) | L4 报告 + L19/L20 + H11/H12 |

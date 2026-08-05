@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 const relayBufSize = 32 << 10 // 32 KB, matches control.relayCopyBufferSize
@@ -75,7 +77,19 @@ func (s *ConnSniffer) TakeRelayPrefix() []byte {
 	if s.Sniffer == nil {
 		return nil
 	}
-	<-s.dataReady
+	// Relay runs strictly after sniffing completed synchronously in
+	// handleConn, so dataReady is normally already closed here and the
+	// receive below returns immediately. If it is NOT closed (abnormal
+	// sniff state), waiting would block the relay direction forever and
+	// leak the whole relayCore (observed: 522 leaked relayCores after a
+	// reconnect storm, ~2k goroutines). Skip the wait, log the abnormal
+	// state once for root-cause diagnostics, and let relay proceed with
+	// whatever is already buffered.
+	select {
+	case <-s.dataReady:
+	default:
+		logrus.Warn("TakeRelayPrefix: dataReady not closed (abnormal sniff state); skipping wait to avoid relay deadlock")
+	}
 
 	s.readMu.Lock()
 	defer s.readMu.Unlock()

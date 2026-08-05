@@ -33,51 +33,54 @@ func (m *mockRetirementPlane) AbortPendingConnections() error {
 
 func (m *mockRetirementPlane) StopRoutingEpochExecution() { m.stopRoutingCalls++ }
 
-// TestRetireDrainIdleAbortsResidual guards against leaking relay goroutines on
-// reload: the drain tracker only counts routing-epoch/ingress leases, which can
-// be released before the guarded relay goroutines finish. Half-open relays
-// block in Read forever, so even a "drained" generation can own stuck relays;
-// retirement must close residual flows explicitly via AbortConnections.
-func TestRetireDrainIdleAbortsResidual(t *testing.T) {
+// TestRetireDrainIdlePreservesConnections guards the zero-downtime reload
+// guarantee: when the old control plane drains its routing-epoch leases
+// normally (idle path), retirement must NOT call AbortConnections — that
+// would kill active relay flows and break hot-reload connectivity.
+func TestRetireDrainIdlePreservesConnections(t *testing.T) {
 	plane := &mockRetirementPlane{activeSessions: 0, idleCh: make(chan struct{})}
 	retireControlPlaneConnections(logrus.New(), context.Background(), plane, false, false, time.Second)
-	if plane.abortConnectionsCalls != 1 {
-		t.Fatalf("drain-idle retirement must call AbortConnections to close residual flows, got %d calls", plane.abortConnectionsCalls)
+	if plane.abortConnectionsCalls != 0 {
+		t.Fatalf("drain-idle retirement must NOT call AbortConnections (would kill active flows), got %d calls", plane.abortConnectionsCalls)
+	}
+	if plane.abortPendingCalls != 0 {
+		t.Fatalf("drain-idle retirement must NOT call AbortPendingConnections, got %d calls", plane.abortPendingCalls)
 	}
 	if plane.stopRoutingCalls != 1 {
 		t.Fatalf("expected StopRoutingEpochExecution, got %d", plane.stopRoutingCalls)
 	}
 }
 
-// TestRetireDrainCanceledAbortsResidual covers the retirement-canceled path:
-// pending work is aborted and residual flows are still closed.
-func TestRetireDrainCanceledAbortsResidual(t *testing.T) {
+// TestRetireDrainCanceledAbortsPending covers the retirement-canceled path:
+// only pending work is aborted; active connections are preserved.
+func TestRetireDrainCanceledAbortsPending(t *testing.T) {
 	plane := &mockRetirementPlane{activeSessions: 1, idleCh: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // canceled immediately
+	cancel()
 	retireControlPlaneConnections(logrus.New(), ctx, plane, false, false, time.Second)
 	if plane.abortPendingCalls != 1 {
 		t.Fatalf("canceled retirement must abort pending connections, got %d", plane.abortPendingCalls)
 	}
-	if plane.abortConnectionsCalls != 1 {
-		t.Fatalf("canceled retirement must also call AbortConnections for residual flows, got %d", plane.abortConnectionsCalls)
+	if plane.abortConnectionsCalls != 0 {
+		t.Fatalf("canceled retirement must NOT call AbortConnections (would kill active flows), got %d", plane.abortConnectionsCalls)
 	}
 }
 
-// TestRetireDrainTimeoutAbortsResidual covers the drain-timeout path: pending
-// work is aborted and residual flows are still closed so stuck relays exit.
-func TestRetireDrainTimeoutAbortsResidual(t *testing.T) {
-	plane := &mockRetirementPlane{activeSessions: 1, idleCh: make(chan struct{})} // never closes
+// TestRetireDrainTimeoutAbortsPending covers the drain-timeout path:
+// only pending work is aborted; active connections are preserved.
+func TestRetireDrainTimeoutAbortsPending(t *testing.T) {
+	plane := &mockRetirementPlane{activeSessions: 1, idleCh: make(chan struct{})}
 	retireControlPlaneConnections(logrus.New(), context.Background(), plane, false, false, 50*time.Millisecond)
 	if plane.abortPendingCalls != 1 {
 		t.Fatalf("timeout retirement must abort pending connections, got %d", plane.abortPendingCalls)
 	}
-	if plane.abortConnectionsCalls != 1 {
-		t.Fatalf("timeout retirement must also call AbortConnections for residual flows, got %d", plane.abortConnectionsCalls)
+	if plane.abortConnectionsCalls != 0 {
+		t.Fatalf("timeout retirement must NOT call AbortConnections (would kill active flows), got %d", plane.abortConnectionsCalls)
 	}
 }
 
-// TestRetireAbortPathKeepsBehavior guards the immediate-abort path.
+// TestRetireAbortPathKeepsBehavior guards the immediate-abort path (used
+// during full shutdown, not reload): AbortConnections is expected here.
 func TestRetireAbortPathKeepsBehavior(t *testing.T) {
 	plane := &mockRetirementPlane{activeSessions: 1, idleCh: make(chan struct{})}
 	retireControlPlaneConnections(logrus.New(), context.Background(), plane, true, false, time.Second)

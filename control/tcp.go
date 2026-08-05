@@ -639,7 +639,7 @@ func (c *bufioConn) CopyRelayRemainder(dst io.Writer, buf []byte, record func(in
 		return 0, nil
 	}
 	if c.reader == nil {
-		return relayCopyDirect(dst, c.Conn, buf, record)
+		return relayCopyDirect(dst, c.Conn, buf, record, nil)
 	}
 
 	// Once buffered bytes are drained we can resume directly on the underlying
@@ -649,16 +649,16 @@ func (c *bufioConn) CopyRelayRemainder(dst io.Writer, buf []byte, record func(in
 			if dstTCP, ok := unwrapRelayTCPConn(dstConn); ok {
 				if srcTCP, ok := unwrapRelayTCPConn(c.Conn); ok {
 					if record != nil {
-						return relaySpliceCopyExact(context.Background(), dstTCP, srcTCP, record)
+						return relaySpliceCopyExact(context.Background(), dstTCP, srcTCP, record, nil)
 					}
 					return io.Copy(dstTCP, srcTCP)
 				}
 			}
 		}
-		return relayCopyDirect(dst, c.Conn, buf, record)
+		return relayCopyDirect(dst, c.Conn, buf, record, nil)
 	}
 
-	return relayCopyDirect(dst, c.reader, buf, record)
+	return relayCopyDirect(dst, c.reader, buf, record, nil)
 }
 
 func (c *bufioConn) Read(b []byte) (int, error) {

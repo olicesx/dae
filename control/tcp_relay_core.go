@@ -9,12 +9,23 @@ import (
 	"context"
 	stderrors "errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
 )
 
-const relayHalfCloseTimeout = 10 * time.Second
+const (
+	relayHalfCloseTimeout = 10 * time.Second
+	// relayIdleTimeout bounds how long a relay may sit with zero traffic in
+	// both directions before it is force-closed. A half-open peer (vanished
+	// without FIN/RST) otherwise parks the directional read forever and the
+	// relay leaks. Any traffic in either direction refreshes lastActive, so
+	// long-lived but active connections (SSH, gaming) are never touched.
+	relayIdleTimeout = 5 * time.Minute
+	// relayIdleCheckInterval is the watchdog cadence for idle reclamation.
+	relayIdleCheckInterval = 30 * time.Second
+)
 
 type relayCore struct {
 	left  netproxy.Conn
@@ -22,8 +33,14 @@ type relayCore struct {
 
 	copyEngine       relayCopyEngine
 	halfCloseTimeout time.Duration
+	idleTimeout      time.Duration
+	idleCheckPeriod  time.Duration
 	leftRecord       func(int64)
 	rightRecord      func(int64)
+
+	// lastActiveNano is the last time either direction read or wrote data.
+	// Guarded by atomic; updated by the copy engines via onActive.
+	lastActiveNano atomic.Int64
 }
 
 type relayDirection struct {
@@ -44,6 +61,8 @@ func newRelayCore(lConn, rConn netproxy.Conn, engine relayCopyEngine, leftRecord
 		right:            rConn,
 		copyEngine:       engine,
 		halfCloseTimeout: relayHalfCloseTimeout,
+		idleTimeout:      relayIdleTimeout,
+		idleCheckPeriod:  relayIdleCheckInterval,
 		leftRecord:       leftRecord,
 		rightRecord:      rightRecord,
 	}
@@ -81,8 +100,45 @@ func (c *relayCore) run(ctx context.Context) error {
 		}
 	}()
 
+	// Idle watchdog: half-open peers (vanished without FIN/RST) never return
+	// from their directional read, so without a bound the relay goroutine pair
+	// leaks. Any traffic in either direction refreshes lastActiveNano; only a
+	// fully idle relay is reclaimed.
+	c.lastActiveNano.Store(time.Now().UnixNano())
+	idleTimeout := c.idleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = relayIdleTimeout
+	}
+	checkPeriod := c.idleCheckPeriod
+	if checkPeriod <= 0 {
+		checkPeriod = relayIdleCheckInterval
+	}
+	go func() {
+		ticker := time.NewTicker(checkPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-watchDone:
+				return
+			case <-ticker.C:
+				if time.Since(time.Unix(0, c.lastActiveNano.Load())) > idleTimeout {
+					// Idle beyond the bound: reclaim the relay. forceClose
+					// unblocks both directional reads via deadline + Close.
+					cancel()
+					forceClose()
+					return
+				}
+			}
+		}
+	}()
+
 	runDirection := func(dir relayDirection) {
-		_, err := c.copyEngine.Copy(ctx, dir.dst, dir.src, dir.record)
+		onActive := func(_ int64) {
+			c.lastActiveNano.Store(time.Now().UnixNano())
+		}
+		_, err := c.copyEngine.Copy(ctx, dir.dst, dir.src, dir.record, onActive)
 
 		if wc, ok := dir.dst.(WriteCloser); ok {
 			_ = wc.CloseWrite()

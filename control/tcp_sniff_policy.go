@@ -88,7 +88,7 @@ func (c *prefixedConn) TakeRelaySegments() [][]byte {
 }
 
 func (c *prefixedConn) CopyRelayRemainder(dst io.Writer, buf []byte, record func(int64)) (int64, error) {
-	return relayCopyDirect(dst, c.Conn, buf, record)
+	return relayCopyDirect(dst, c.Conn, buf, record, nil)
 }
 
 // TakeRelayPrefix returns the remaining prefetched bytes and marks them as

@@ -49,6 +49,7 @@ func TestResolveForSingleflightRechecksCache(t *testing.T) {
 	}
 	if response == nil {
 		t.Fatal("resolveForSingleflight() returned no DNS response")
+		return
 	}
 	if response.Id != query.Id {
 		t.Fatalf("response ID = %d, want %d", response.Id, query.Id)

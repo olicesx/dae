@@ -27,6 +27,7 @@ func TestDnsControllerOptionCarriesRuntimeTunables(t *testing.T) {
 	option := plane.dnsControllerOption()
 	if option == nil {
 		t.Fatal("dnsControllerOption() = nil")
+		return
 	}
 
 	for _, tc := range []struct {

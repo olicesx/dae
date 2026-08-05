@@ -503,6 +503,7 @@ func dnsAnswerIPv6(t *testing.T, msg *dnsmessage.Msg) string {
 	t.Helper()
 	if msg == nil {
 		t.Fatalf("nil response message")
+		return ""
 	}
 	if len(msg.Answer) == 0 {
 		t.Fatalf("no answer records")

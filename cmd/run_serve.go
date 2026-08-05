@@ -103,6 +103,16 @@ func retireControlPlaneConnections(
 				log.WithError(err).Warnln("[Reload] Failed to abort pending connections")
 			}
 		}
+		// The drain tracker only counts routing-epoch / ingress leases, which
+		// can be released before the relay goroutines they guard actually
+		// finish. Half-open relays (peer vanished without FIN/RST) block in
+		// Read forever, so a "drained" generation can still own stuck relay
+		// goroutines. Close residual flows explicitly: flow.abort() closes the
+		// underlying conns, which unblocks pending reads so the goroutines
+		// exit instead of leaking across every reload.
+		if err := c.AbortConnections(); err != nil {
+			log.WithError(err).Warnln("[Reload] Failed to abort residual flows after drain")
+		}
 	}
 	// Seal generation admission on every retirement path and wait for any lease
 	// acquired before abort/drain committed to closing the owner.

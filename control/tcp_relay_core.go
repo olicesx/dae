@@ -80,13 +80,23 @@ func (c *relayCore) run(ctx context.Context) error {
 	results := make(chan relayResult, 2)
 	var forceCloseOnce sync.Once
 
+	// nudgeReads repeatedly pokes SetReadDeadline on both conns. quic-go
+	// (hy2/tuic) may not synchronously unblock a Read after a single
+	// SetReadDeadline + Close: the blocked goroutine can remain parked in
+	// an internal channel receive. Repeatedly advancing the deadline gives
+	// the runtime additional wake-up opportunities without harming already-
+	// closed conns (SetReadDeadline on a closed conn returns an error we
+	// ignore). TCP conns unblock on the very first nudge, so the loop is
+	// a no-op for them thereafter.
+	nudgeReads := func() {
+		past := time.Unix(1, 0)
+		_ = c.left.SetReadDeadline(past)
+		_ = c.right.SetReadDeadline(past)
+	}
+
 	forceClose := func() {
 		forceCloseOnce.Do(func() {
-			past := time.Unix(1, 0)
-			// Ignore errors: connections may already be closed or deadline operations
-			// may fail on certain connection types. The goal is to unblock pending reads.
-			_ = c.left.SetReadDeadline(past)
-			_ = c.right.SetReadDeadline(past)
+			nudgeReads()
 			_ = c.left.Close()
 			_ = c.right.Close()
 		})
@@ -104,6 +114,16 @@ func (c *relayCore) run(ctx context.Context) error {
 	// from their directional read, so without a bound the relay goroutine pair
 	// leaks. Any traffic in either direction refreshes lastActiveNano; only a
 	// fully idle relay is reclaimed.
+	//
+	// The watchdog deliberately ignores ctx cancellation: when a control-plane
+	// reload retires a generation, ctx is canceled and the ctx-watcher above
+	// calls forceClose. But for QUIC streams (hy2/tuic), SetReadDeadline and
+	// even Close/CancelRead may not synchronously unblock a pending Read in
+	// quic-go. If the watchdog also exited on ctx.Done, no one would remain to
+	// reap the relay once the QUIC Read eventually returns. By staying alive
+	// on its own idle timer, the watchdog guarantees that even a stuck relay
+	// is force-closed again once it goes idle, and that run() does not return
+	// until both directions have actually finished.
 	c.lastActiveNano.Store(time.Now().UnixNano())
 	idleTimeout := c.idleTimeout
 	if idleTimeout <= 0 {
@@ -114,15 +134,28 @@ func (c *relayCore) run(ctx context.Context) error {
 		checkPeriod = relayIdleCheckInterval
 	}
 	go func() {
+		ctxCanceled := false
 		ticker := time.NewTicker(checkPeriod)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
-				return
 			case <-watchDone:
 				return
+			case <-ctx.Done():
+				// ctx was canceled (e.g. reload retired the generation).
+				// forceClose was already called by the ctx-watcher, but for
+				// QUIC streams the blocked Read may not have woken up yet.
+				// Switch to nudge mode: keep poking SetReadDeadline until the
+				// relay finishes (watchDone), giving quic-go repeated chances
+				// to unblock the parked goroutine.
+				ctxCanceled = true
 			case <-ticker.C:
+				if ctxCanceled {
+					// Keep nudging after cancellation — quic-go may need
+					// multiple deadline pokes to unblock a parked Read.
+					nudgeReads()
+					continue
+				}
 				if time.Since(time.Unix(0, c.lastActiveNano.Load())) > idleTimeout {
 					// Idle beyond the bound: reclaim the relay. forceClose
 					// unblocks both directional reads via deadline + Close.

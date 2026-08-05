@@ -129,3 +129,66 @@ func TestRelayIdleWatchdogCoexistsWithHalfClose(t *testing.T) {
 		t.Fatal("relay not reclaimed")
 	}
 }
+
+// delayedReleaseMockConn simulates a QUIC stream Read that does not unblock
+// immediately on Close/SetReadDeadline, but eventually returns after a delay.
+// This mirrors the real-world quic-go behavior where CancelRead may take a
+// tick or two to propagate to the blocked goroutine.
+type delayedReleaseMockConn struct {
+	closed       atomic.Bool
+	closeCh      chan struct{}
+	releaseDelay time.Duration
+}
+
+func newDelayedReleaseMockConn(delay time.Duration) *delayedReleaseMockConn {
+	return &delayedReleaseMockConn{closeCh: make(chan struct{}), releaseDelay: delay}
+}
+
+func (m *delayedReleaseMockConn) Read(b []byte) (int, error) {
+	<-m.closeCh
+	time.Sleep(m.releaseDelay)
+	return 0, net.ErrClosed
+}
+func (m *delayedReleaseMockConn) Write(b []byte) (int, error) { return len(b), nil }
+func (m *delayedReleaseMockConn) ReadFrom(p []byte) (int, netip.AddrPort, error) {
+	return 0, netip.AddrPort{}, io.EOF
+}
+func (m *delayedReleaseMockConn) WriteTo(p []byte, addr string) (int, error) { return len(p), nil }
+func (m *delayedReleaseMockConn) Close() error {
+	if m.closed.CompareAndSwap(false, true) {
+		close(m.closeCh)
+	}
+	return nil
+}
+func (m *delayedReleaseMockConn) SetDeadline(t time.Time) error      { return nil }
+func (m *delayedReleaseMockConn) SetReadDeadline(t time.Time) error  { return nil }
+func (m *delayedReleaseMockConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// TestRelayWatchdogSurvivesCtxCancel verifies that the watchdog keeps the
+// relay alive after ctx cancellation (e.g. reload) and eventually reclaims
+// it when the QUIC-like delayed Read finally returns.
+func TestRelayWatchdogSurvivesCtxCancel(t *testing.T) {
+	// Conn whose Read releases 200ms after Close (simulating quic-go delay).
+	l := newDelayedReleaseMockConn(200 * time.Millisecond)
+	r := newDelayedReleaseMockConn(200 * time.Millisecond)
+	rc := newRelayCore(l, r, defaultRelayCopyEngine{}, nil, nil)
+	rc.idleTimeout = 5 * time.Second // long idle; we test ctx-cancel, not idle
+	rc.idleCheckPeriod = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() { done <- rc.run(ctx) }()
+
+	// Cancel ctx (simulating reload) after a brief warm-up.
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+		// Success: the watchdog nudged forceClose, the delayed Reads
+		// eventually returned, and run() finished cleanly.
+	case <-time.After(5 * time.Second):
+		t.Fatal("relay leaked: run() did not return after ctx cancel + delayed Read release")
+	}
+}

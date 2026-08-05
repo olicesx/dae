@@ -459,7 +459,13 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 		}
 		return n, err
 	}
-	if n != len(b) {
+	// UDP datagrams are atomic: a successful WriteTo either wrote the whole
+	// encapsulated datagram or returned an error. Some protocol dialers
+	// (e.g. shadowsocks AEAD, vmess) legitimately return the encapsulated
+	// packet size (len(b) + overhead) rather than the payload length, so only
+	// a short write (n < len(b)) is a real failure. Treating n > len(b) as a
+	// short write would retire healthy endpoints and drop packets.
+	if n < len(b) {
 		ue.retire()
 		return n, fmt.Errorf("%w: udp endpoint wrote %d/%d bytes to %s", io.ErrShortWrite, n, len(b), addr)
 	}

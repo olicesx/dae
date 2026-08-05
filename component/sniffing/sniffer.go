@@ -281,7 +281,14 @@ func (s *Sniffer) SniffTcp() (d string, err error) {
 		)
 		if errors.Is(err, ErrNeedMore) {
 			oerr = err
+			// The previous dataReady was already closed by readStreamOnce
+			// when the round's data arrived. A fresh channel is needed for
+			// the next round, and its Once must be reset too: without it,
+			// the consumed Once would never close the fresh channel and
+			// TakeRelayPrefix would log an abnormal-sniff-state warning on
+			// every connection that needed more than one read round.
 			s.dataReady = make(chan struct{})
+			s.dataReadyOnce = sync.Once{}
 			continue
 		}
 		return d, err

@@ -120,4 +120,4 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260803
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
 
 // Use the remote outbound fork containing the transport-owned packet delivery API.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260803032050-c5b8ecc17ecc
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260805023007-cf3826f3d6f4

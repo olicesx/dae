@@ -24,7 +24,9 @@ const (
 	// routingEpochActiveSlotCacheTTL bounds how long readActiveRoutingEpochSlot
 	// reuses a cached active slot. The slot only changes on publish/rollback,
 	// so a stale cache is correct except inside a reload cut-over window, where
-	// a short delay in the old generation noticing the new slot is acceptable.
+	// the retiring generation may keep consulting/writing the shared endpoint
+	// pool for up to TTL; such writes carry slot/generation stamps and are
+	// filtered downstream by routingEpochExecutionMatches.
 	routingEpochActiveSlotCacheTTL = 50 * time.Millisecond
 )
 
@@ -123,7 +125,8 @@ func (c *controlPlaneCore) readActiveRoutingEpochSlot() (uint32, error) {
 		return 0, nil
 	}
 	if c.routingEpochActiveSlotCachedValid.Load() {
-		if now := time.Now().UnixNano(); now-c.routingEpochActiveSlotCachedAt.Load() < int64(routingEpochActiveSlotCacheTTL) {
+		// delta >= 0 guards against wall-clock rollback (NTP step) widening the stale window.
+		if delta := time.Now().UnixNano() - c.routingEpochActiveSlotCachedAt.Load(); delta >= 0 && delta < int64(routingEpochActiveSlotCacheTTL) {
 			return c.routingEpochActiveSlotCached.Load(), nil
 		}
 	}

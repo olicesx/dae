@@ -144,8 +144,15 @@ type controlPlaneCore struct {
 	routingEpochStaged        bool
 	routingEpochStagedSlot    uint32
 	routingEpochStagedEpoch   uint64
-	lpmTrieIndices            []uint32
-	bpfOwned                  bool
+	// routingEpochActiveSlotCache short-circuits readActiveRoutingEpochSlot.
+	// The active slot only changes on PublishRoutingEpoch/RollbackRoutingEpoch,
+	// so the per-packet eBPF lookup on the UDP hot path is pure waste
+	// (measured ~15% CPU under saturated UDP ingress).
+	routingEpochActiveSlotCachedAt    atomic.Int64
+	routingEpochActiveSlotCached      atomic.Uint32
+	routingEpochActiveSlotCachedValid atomic.Bool
+	lpmTrieIndices                    []uint32
+	bpfOwned                          bool
 }
 
 func newControlPlaneCore(log *logrus.Logger,

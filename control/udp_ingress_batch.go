@@ -16,7 +16,10 @@ import (
 )
 
 const (
-	defaultUDPIngressBatchSize = 8
+	// defaultUDPIngressBatchSize is the recvmmsg batch width per read loop.
+	// 32 balances syscall amortization against per-socket buffer footprint
+	// (32 x MTU ≈ 48KB per listener; 4 listeners ≈ 192KB total).
+	defaultUDPIngressBatchSize = 32
 	udpIngressOobSize          = 120
 )
 

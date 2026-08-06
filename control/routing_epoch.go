@@ -21,6 +21,11 @@ const (
 	routingEpochCleanupMaxAttempts       = 5
 	routingEpochCleanupInitialRetryDelay = 25 * time.Millisecond
 	routingEpochCleanupMaximumRetryDelay = 200 * time.Millisecond
+	// routingEpochActiveSlotCacheTTL bounds how long readActiveRoutingEpochSlot
+	// reuses a cached active slot. The slot only changes on publish/rollback,
+	// so a stale cache is correct except inside a reload cut-over window, where
+	// a short delay in the old generation noticing the new slot is acceptable.
+	routingEpochActiveSlotCacheTTL = 50 * time.Millisecond
 )
 
 type (
@@ -117,6 +122,11 @@ func (c *controlPlaneCore) readActiveRoutingEpochSlot() (uint32, error) {
 	if c == nil {
 		return 0, nil
 	}
+	if c.routingEpochActiveSlotCachedValid.Load() {
+		if now := time.Now().UnixNano(); now-c.routingEpochActiveSlotCachedAt.Load() < int64(routingEpochActiveSlotCacheTTL) {
+			return c.routingEpochActiveSlotCached.Load(), nil
+		}
+	}
 	bpf := c.PeekBpf()
 	if !c.hasRoutingEpochMaps(bpf) {
 		return 0, nil
@@ -128,6 +138,9 @@ func (c *controlPlaneCore) readActiveRoutingEpochSlot() (uint32, error) {
 	if !validRoutingEpochSlot(slot) {
 		return 0, fmt.Errorf("active routing epoch slot %d is invalid", slot)
 	}
+	c.routingEpochActiveSlotCached.Store(slot)
+	c.routingEpochActiveSlotCachedAt.Store(time.Now().UnixNano())
+	c.routingEpochActiveSlotCachedValid.Store(true)
 	return slot, nil
 }
 
@@ -236,6 +249,7 @@ func (c *controlPlaneCore) PublishRoutingEpoch() error {
 	if err := bpf.ActiveRoutingEpochMap.Update(uint32(0), slot, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("publish routing epoch slot %d: %w", slot, err)
 	}
+	c.routingEpochActiveSlotCachedValid.Store(false)
 	return nil
 }
 
@@ -262,6 +276,7 @@ func (c *controlPlaneCore) RollbackRoutingEpoch() error {
 	if err := bpf.ActiveRoutingEpochMap.Update(uint32(0), previous, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("rollback routing epoch slot %d: %w", previous, err)
 	}
+	c.routingEpochActiveSlotCachedValid.Store(false)
 	return nil
 }
 

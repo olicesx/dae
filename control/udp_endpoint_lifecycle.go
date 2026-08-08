@@ -410,6 +410,15 @@ const udpEndpointWriteTimeout = 10 * time.Second
 // write deadlines return an error, which is deliberately ignored: they simply
 // keep their previous unbounded behaviour.
 func (ue *UdpEndpoint) armWriteDeadline(now time.Time) {
+	// QUIC-backed transports (hysteria2/tuic) expose a transport-lifecycle
+	// channel: connection death is signalled via TransportDone and retired by
+	// the pool watcher. Their datagram send queue fills under backpressure,
+	// which is a normal congestion signal rather than a dead peer — arming a
+	// write deadline here tears the session down on a merely-full queue where
+	// xray/sing-box simply delay the write and keep the connection alive.
+	if endpointTransportDoneChannel(ue) != nil {
+		return
+	}
 	last := ue.writeDeadlineArmedAtNano.Load()
 	if now.UnixNano()-last < int64(udpEndpointWriteTimeout/2) {
 		return

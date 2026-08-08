@@ -95,3 +95,65 @@ func TestUdpEndpointWriteToRetiresOnError(t *testing.T) {
 		t.Fatal("endpoint must be retired on write error")
 	}
 }
+
+// deadlineRecordingPacketConn records whether SetWriteDeadline was called and
+// optionally implements TransportLifecycle (a QUIC-backed transport).
+type deadlineRecordingPacketConn struct {
+	writeToFn              func(p []byte, addr string) (int, error)
+	setWriteDeadlineCalled bool
+	transportDone          <-chan struct{}
+}
+
+func (c *deadlineRecordingPacketConn) Read(b []byte) (int, error)  { return 0, io.EOF }
+func (c *deadlineRecordingPacketConn) Write(b []byte) (int, error) { return len(b), nil }
+func (c *deadlineRecordingPacketConn) ReadFrom(p []byte) (int, netip.AddrPort, error) {
+	return 0, netip.AddrPort{}, io.EOF
+}
+func (c *deadlineRecordingPacketConn) WriteTo(p []byte, addr string) (int, error) {
+	if c.writeToFn != nil {
+		return c.writeToFn(p, addr)
+	}
+	return len(p), nil
+}
+func (c *deadlineRecordingPacketConn) Close() error                      { return nil }
+func (c *deadlineRecordingPacketConn) SetDeadline(t time.Time) error     { return nil }
+func (c *deadlineRecordingPacketConn) SetReadDeadline(t time.Time) error { return nil }
+func (c *deadlineRecordingPacketConn) SetWriteDeadline(t time.Time) error {
+	c.setWriteDeadlineCalled = true
+	return nil
+}
+func (c *deadlineRecordingPacketConn) TransportDone() <-chan struct{} { return c.transportDone }
+
+// A QUIC-backed transport (TransportLifecycle implemented, non-nil channel)
+// must NOT arm a write deadline: datagram send-queue backpressure is a normal
+// congestion signal, not a dead peer (xray/sing-box treat it the same way),
+// and connection death is handled by the transport lifecycle watcher.
+func TestArmWriteDeadlineSkipsTransportLifecycleConn(t *testing.T) {
+	conn := &deadlineRecordingPacketConn{transportDone: make(chan struct{})}
+	ue := newTestEndpoint(conn)
+
+	ue.armWriteDeadline(time.Now())
+
+	if conn.setWriteDeadlineCalled {
+		t.Fatal("armWriteDeadline must not call SetWriteDeadline on a TransportLifecycle conn")
+	}
+	if ue.writeDeadlineArmedAtNano.Load() != 0 {
+		t.Fatal("writeDeadlineArmedAtNano must not be armed for a TransportLifecycle conn")
+	}
+}
+
+// Transports without a transport-lifecycle channel keep the legacy
+// write-deadline behaviour for dead-peer detection.
+func TestArmWriteDeadlineStillArmsPlainConn(t *testing.T) {
+	conn := &deadlineRecordingPacketConn{}
+	ue := newTestEndpoint(conn)
+
+	ue.armWriteDeadline(time.Now())
+
+	if !conn.setWriteDeadlineCalled {
+		t.Fatal("armWriteDeadline must keep arming plain (non-lifecycle) conns")
+	}
+	if ue.writeDeadlineArmedAtNano.Load() == 0 {
+		t.Fatal("writeDeadlineArmedAtNano should be armed for a plain conn")
+	}
+}

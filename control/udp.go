@@ -89,8 +89,12 @@ var (
 	// Most DNS queries complete within seconds, and long-lived connections
 	// (like QUIC) can use longer timeouts via QuicNatTimeout.
 	DefaultNatTimeout = 30 * time.Second
-	// QuicNatTimeout is 2 minutes for QUIC long-lived connections.
-	QuicNatTimeout = 2 * time.Minute
+	// QuicNatTimeout bounds long-lived UDP sessions (QUIC, proxy-backed game
+	// flows). 5 minutes absorbs loading screens and menu phases that exceed
+	// the 2-minute value; sessions still idle longer are reaped by the pool
+	// janitor, and the eBPF conn-state backstop (UDP_CONN_STATE_TIMEOUT_NS)
+	// must stay aligned with this constant.
+	QuicNatTimeout = 5 * time.Minute
 )
 
 const (

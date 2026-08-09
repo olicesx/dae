@@ -1816,7 +1816,7 @@ udp_wan_egress_handoff_mandatory(const struct tuples *tuples,
 
 // mark_udp_seen: update/create UDP conn state with optional routing metadata.
 // Expired entries are pruned on lookup. Map overflow increments bpf_stats_map.
-#define UDP_CONN_STATE_TIMEOUT_NS 120000000000ULL        // 120-second backstop; userspace endpoint teardown is the primary owner
+#define UDP_CONN_STATE_TIMEOUT_NS 300000000000ULL        // 300-second backstop, aligned with QuicNatTimeout; userspace endpoint teardown is the primary owner
 #define UDP_CONN_STATE_UPDATE_INTERVAL_NS 1000000000ULL  // 1 second
 
 static __always_inline bool

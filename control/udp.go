@@ -547,6 +547,10 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 	ue.TrackUdpConnStateTuplePair(src, realDst)
 	_, err := ue.WriteTo(data, realDst.String())
 	if err != nil {
+		if isUdpEndpointWriteTolerated(err) {
+			// Transient write failure: drop the datagram, keep the session.
+			return true, nil
+		}
 		if lifecycle, lifecycleOK := newUdpSessionLifecycleContext(ue, ""); lifecycleOK && c.shouldPenalizeUdpEndpointWriteError(err) {
 			lifecycle.reportUnavailable(fmt.Errorf("retained UDP endpoint write failed: %w", err))
 		}
@@ -822,6 +826,10 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 					if lifecycle, ok := newUdpSessionLifecycleContext(ue, ""); ok {
 						lifecycle.reportTrafficSuccess()
 					}
+					return nil
+				}
+				if isUdpEndpointWriteTolerated(err) {
+					// Transient write failure: drop the datagram, keep the session.
 					return nil
 				}
 				if c.log.IsLevelEnabled(logrus.DebugLevel) {
@@ -1186,6 +1194,11 @@ getNew:
 	for packetIndex < len(payloads) {
 		_, err = ue.WriteTo(payloads[packetIndex], dialTarget)
 		if err != nil {
+			if isUdpEndpointWriteTolerated(err) {
+				// Transient write failure: drop this datagram, keep the session.
+				packetIndex++
+				continue
+			}
 			if c.log.IsLevelEnabled(logrus.DebugLevel) {
 				c.log.WithFields(logrus.Fields{
 					"to":      realDst.String(),

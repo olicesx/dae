@@ -405,6 +405,25 @@ func (ue *UdpEndpoint) retire() {
 // outcome for a transport that has stopped draining.
 const udpEndpointWriteTimeout = 10 * time.Second
 
+// writeSoftErrorThreshold bounds consecutive tolerated transport write errors
+// before the endpoint retires. A genuinely dead transport is still surfaced by
+// the read loop (EOF/error), so the threshold only guards a write-only flow
+// against lingering on a transport that accepts no writes.
+const writeSoftErrorThreshold = 3
+
+// udpEndpointWriteToleratedError wraps a transient transport write error that
+// the endpoint absorbed without retiring. Callers must drop the datagram and
+// keep the session alive instead of removing/redialing it.
+type udpEndpointWriteToleratedError struct{ err error }
+
+func (e *udpEndpointWriteToleratedError) Error() string { return e.err.Error() }
+func (e *udpEndpointWriteToleratedError) Unwrap() error { return e.err }
+
+func isUdpEndpointWriteTolerated(err error) bool {
+	var tolerated *udpEndpointWriteToleratedError
+	return stderrors.As(err, &tolerated)
+}
+
 // armWriteDeadline keeps a write deadline of [T/2, T] ahead of every write
 // while re-arming at most once per T/2 window. Transports that do not support
 // write deadlines return an error, which is deliberately ignored: they simply
@@ -462,12 +481,24 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	// for performance. Write errors will mark the endpoint dead for cleanup.
 	n, err := ue.conn.WriteTo(b, addr)
 	if err != nil {
-		ue.retire()
+		// Connection-refused is a hard failure: evict the bad upstream now.
 		if ue.isConnectionRefused(err) {
+			ue.retire()
 			ue.handleProxyServerFailure()
+			return n, err
 		}
+		// Tolerate transient write errors up to a threshold so brief transport
+		// backpressure does not retire a healthy long-lived session. A closed
+		// conn and a genuinely dead transport are still retired promptly: the
+		// former by this threshold, the latter by the read loop (EOF/error).
+		if ue.writeSoftErrorCount.Add(1) <= writeSoftErrorThreshold &&
+			!stderrors.Is(err, net.ErrClosed) {
+			return n, &udpEndpointWriteToleratedError{err: err}
+		}
+		ue.retire()
 		return n, err
 	}
+	ue.writeSoftErrorCount.Store(0)
 	// UDP datagrams are atomic: a successful WriteTo either wrote the whole
 	// encapsulated datagram or returned an error. Some protocol dialers
 	// (e.g. shadowsocks AEAD, vmess) legitimately return the encapsulated

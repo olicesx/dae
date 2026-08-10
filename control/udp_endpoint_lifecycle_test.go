@@ -78,8 +78,46 @@ func TestUdpEndpointWriteToRetiresOnRealShortWrite(t *testing.T) {
 	}
 }
 
-// A write error must retire the endpoint and surface the error.
-func TestUdpEndpointWriteToRetiresOnError(t *testing.T) {
+// Transient write errors are tolerated up to writeSoftErrorThreshold: the
+// endpoint survives and callers can identify the dropped datagram via
+// isUdpEndpointWriteTolerated. A successful write resets the counter.
+func TestUdpEndpointWriteToToleratesTransientErrors(t *testing.T) {
+	sentinel := errors.New("boom")
+	var calls int
+	mock := &mockPacketConn{
+		writeToFn: func(p []byte, addr string) (int, error) {
+			calls++
+			if calls <= writeSoftErrorThreshold {
+				return 0, sentinel
+			}
+			return len(p), nil
+		},
+	}
+	ue := newTestEndpoint(mock)
+	for i := 1; i <= writeSoftErrorThreshold; i++ {
+		_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("attempt %d: expected sentinel error, got: %v", i, err)
+		}
+		if !isUdpEndpointWriteTolerated(err) {
+			t.Fatalf("attempt %d: expected tolerated error, got: %v", i, err)
+		}
+		if ue.dead.Load() {
+			t.Fatalf("attempt %d: endpoint must survive tolerated errors", i)
+		}
+	}
+	// After the transient window a write succeeds and resets the counter.
+	if _, err := ue.WriteTo([]byte("ok"), "1.2.3.4:53"); err != nil {
+		t.Fatalf("expected success, got: %v", err)
+	}
+	if got := ue.writeSoftErrorCount.Load(); got != 0 {
+		t.Fatalf("expected write soft error counter reset, got %d", got)
+	}
+}
+
+// A write error beyond the tolerated threshold must retire the endpoint and
+// surface the underlying error (not the tolerated wrapper).
+func TestUdpEndpointWriteToRetiresOnPersistentError(t *testing.T) {
 	sentinel := errors.New("boom")
 	mock := &mockPacketConn{
 		writeToFn: func(p []byte, addr string) (int, error) {
@@ -87,12 +125,17 @@ func TestUdpEndpointWriteToRetiresOnError(t *testing.T) {
 		},
 	}
 	ue := newTestEndpoint(mock)
+	for i := 0; i < writeSoftErrorThreshold; i++ {
+		if _, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53"); !isUdpEndpointWriteTolerated(err) {
+			t.Fatalf("attempt %d: expected tolerated error, got: %v", i+1, err)
+		}
+	}
 	_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("expected sentinel error, got: %v", err)
 	}
 	if !ue.dead.Load() {
-		t.Fatal("endpoint must be retired on write error")
+		t.Fatal("endpoint must be retired after the tolerated threshold is exceeded")
 	}
 }
 

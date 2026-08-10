@@ -133,6 +133,10 @@ type UdpEndpoint struct {
 	failed atomic.Bool
 
 	softErrorCount int
+	// writeSoftErrorCount tracks consecutive tolerated transport write errors.
+	// Unlike softErrorCount (read-side auth/replay noise), this counts every
+	// transient write failure so a dead write-only transport still retires.
+	writeSoftErrorCount atomic.Int32
 
 	// poolRef and poolKey allow hard-failure paths to self-remove from the pool
 	// immediately. Soft read-loop exits intentionally keep the endpoint cached so

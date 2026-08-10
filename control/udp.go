@@ -1063,9 +1063,11 @@ getNew:
 	// target key is unchanged (non-QUIC existing flow, no domain upgrade).
 	// On any retry the endpoint was removed, so we always call GetOrCreate.
 	if retry == 0 && ueExists && ueKey == foundUeKey {
-		// Update NAT timeout based on current forwarding state
-		// This allows the timeout to adapt to changes (e.g., domain sniffed, policy change)
-		ue.UpdateNatTimeout(natTimeout)
+		// Update NAT timeout based on current forwarding state.
+		// Keep the proxy-backed floor: without it every fast-path packet
+		// would shrink a hy2 endpoint to DefaultNatTimeout (30s), expiring
+		// long-lived game sessions during brief quiet phases.
+		ue.UpdateNatTimeout(effectiveUdpEndpointNatTimeout(ue.Dialer, natTimeout))
 		isNew = false
 	} else {
 		connStateOwner := udpConnStateOwner(c.core)

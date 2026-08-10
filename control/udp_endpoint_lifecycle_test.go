@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/olicesx/quic-go"
 )
 
 // mockPacketConn is a minimal netproxy.PacketConn whose WriteTo result is
@@ -112,6 +113,26 @@ func TestUdpEndpointWriteToToleratesTransientErrors(t *testing.T) {
 	}
 	if got := ue.writeSoftErrorCount.Load(); got != 0 {
 		t.Fatalf("expected write soft error counter reset, got %d", got)
+	}
+}
+
+// A datagram send-queue timeout signals a stalled transport, not a transient
+// error: it must retire immediately. Counting it toward the tolerated
+// threshold is unsafe — a later enqueue (which is not a peer ACK) would reset
+// the counter and let a half-dead transport dodge retirement forever.
+func TestUdpEndpointWriteToRetiresOnDatagramQueueTimeout(t *testing.T) {
+	mock := &mockPacketConn{
+		writeToFn: func(p []byte, addr string) (int, error) {
+			return 0, quic.ErrDatagramQueueFullTimeout
+		},
+	}
+	ue := newTestEndpoint(mock)
+	_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
+	if !errors.Is(err, quic.ErrDatagramQueueFullTimeout) {
+		t.Fatalf("expected datagram queue timeout error, got: %v", err)
+	}
+	if !ue.dead.Load() {
+		t.Fatal("endpoint must retire on a datagram send-queue timeout")
 	}
 }
 

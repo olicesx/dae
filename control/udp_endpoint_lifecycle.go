@@ -20,6 +20,7 @@ import (
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/common/errors"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
+	"github.com/olicesx/quic-go"
 	"github.com/sirupsen/logrus"
 )
 
@@ -485,6 +486,15 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 		if ue.isConnectionRefused(err) {
 			ue.retire()
 			ue.handleProxyServerFailure()
+			return n, err
+		}
+		// A datagram send-queue timeout is a stalled transport, not a transient
+		// error: the queue stayed full for the whole wait. Retire immediately —
+		// the soft-error counter is reset by any enqueue (which is not a peer
+		// ACK), so a half-dead transport could otherwise dodge the threshold
+		// forever by the occasional enqueue that never reaches the peer.
+		if stderrors.Is(err, quic.ErrDatagramQueueFullTimeout) {
+			ue.retire()
 			return n, err
 		}
 		// Tolerate transient write errors up to a threshold so brief transport

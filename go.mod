@@ -114,9 +114,9 @@ require (
 
 // Use optimized quic-go with B-tree node pooling + upstream cherry-picks on enhanced-with-fixes baseline.
 // Latest perf/datagram-pool: pooled datagram frames + buffers (parse/send/receive all allocation-free).
-// Pinned to da9a149 (256 send / 512 receive datagram queues) to match the outbound fork; the earlier
-// dff8 pin silently kept 32/128 queues and nullified the larger-queue game-UDP change.
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260808081100-da9a149ee3b3
+// Pinned to 6850280a (256 send / 512 receive datagram queues + bounded Add: a full send queue times out
+// after 30s and surfaces ErrDatagramQueueFullTimeout instead of parking callers forever).
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260810035541-6850280a0b76
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config

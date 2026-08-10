@@ -1,12 +1,13 @@
 package control
 
 import (
-	"errors"
+	stderrors "errors"
 	"io"
 	"net/netip"
 	"testing"
 	"time"
 
+	daeerrors "github.com/daeuniverse/dae/common/errors"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/olicesx/quic-go"
 )
@@ -71,7 +72,7 @@ func TestUdpEndpointWriteToRetiresOnRealShortWrite(t *testing.T) {
 	}
 	ue := newTestEndpoint(mock)
 	_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
-	if err == nil || !errors.Is(err, io.ErrShortWrite) {
+	if err == nil || !stderrors.Is(err, io.ErrShortWrite) {
 		t.Fatalf("expected io.ErrShortWrite, got: %v", err)
 	}
 	if !ue.dead.Load() {
@@ -83,7 +84,7 @@ func TestUdpEndpointWriteToRetiresOnRealShortWrite(t *testing.T) {
 // endpoint survives and callers can identify the dropped datagram via
 // isUdpEndpointWriteTolerated. A successful write resets the counter.
 func TestUdpEndpointWriteToToleratesTransientErrors(t *testing.T) {
-	sentinel := errors.New("boom")
+	sentinel := stderrors.New("boom")
 	var calls int
 	mock := &mockPacketConn{
 		writeToFn: func(p []byte, addr string) (int, error) {
@@ -97,7 +98,7 @@ func TestUdpEndpointWriteToToleratesTransientErrors(t *testing.T) {
 	ue := newTestEndpoint(mock)
 	for i := 1; i <= writeSoftErrorThreshold; i++ {
 		_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
-		if !errors.Is(err, sentinel) {
+		if !stderrors.Is(err, sentinel) {
 			t.Fatalf("attempt %d: expected sentinel error, got: %v", i, err)
 		}
 		if !isUdpEndpointWriteTolerated(err) {
@@ -128,7 +129,7 @@ func TestUdpEndpointWriteToRetiresOnDatagramQueueTimeout(t *testing.T) {
 	}
 	ue := newTestEndpoint(mock)
 	_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
-	if !errors.Is(err, quic.ErrDatagramQueueFullTimeout) {
+	if !stderrors.Is(err, quic.ErrDatagramQueueFullTimeout) {
 		t.Fatalf("expected datagram queue timeout error, got: %v", err)
 	}
 	if !ue.dead.Load() {
@@ -139,7 +140,7 @@ func TestUdpEndpointWriteToRetiresOnDatagramQueueTimeout(t *testing.T) {
 // A write error beyond the tolerated threshold must retire the endpoint and
 // surface the underlying error (not the tolerated wrapper).
 func TestUdpEndpointWriteToRetiresOnPersistentError(t *testing.T) {
-	sentinel := errors.New("boom")
+	sentinel := stderrors.New("boom")
 	mock := &mockPacketConn{
 		writeToFn: func(p []byte, addr string) (int, error) {
 			return 0, sentinel
@@ -152,11 +153,74 @@ func TestUdpEndpointWriteToRetiresOnPersistentError(t *testing.T) {
 		}
 	}
 	_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
-	if !errors.Is(err, sentinel) {
+	if !stderrors.Is(err, sentinel) {
 		t.Fatalf("expected sentinel error, got: %v", err)
 	}
 	if !ue.dead.Load() {
 		t.Fatal("endpoint must be retired after the tolerated threshold is exceeded")
+	}
+}
+
+// A session that was established (hasReply) but whose client has been silent
+// for udpEndpointSendStaleTimeout must be rebuilt on the next write: the pause
+// means a new round is starting and the remote (e.g. a game server) may have
+// reaped the old session. Retiring now lets the next GetOrCreate dial a fresh
+// hy2 session with a new forwarding source port.
+func TestUdpEndpointWriteToRebuildsStaleSession(t *testing.T) {
+	mock := &mockPacketConn{}
+	ue := newTestEndpoint(mock)
+	ue.hasReply.Store(true)
+	ue.lastSendNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
+
+	_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
+	if !stderrors.Is(err, daeerrors.ErrClosedConnection) {
+		t.Fatalf("expected ErrClosedConnection on stale session, got: %v", err)
+	}
+	if !ue.dead.Load() {
+		t.Fatal("endpoint must be retired when the client session is stale")
+	}
+}
+
+// An established session whose client sent recently must NOT be rebuilt: this
+// keeps normal gameplay (sub-second heartbeats) on the same hy2 session. After
+// a successful write the lastSendNano is refreshed.
+func TestUdpEndpointWriteToKeepsFreshSession(t *testing.T) {
+	mock := &mockPacketConn{}
+	ue := newTestEndpoint(mock)
+	ue.hasReply.Store(true)
+	ue.lastSendNano.Store(time.Now().UnixNano())
+
+	n, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
+	if err != nil {
+		t.Fatalf("expected success on fresh session, got: %v", err)
+	}
+	if n != len("hello world") {
+		t.Fatalf("expected %d bytes written, got %d", len("hello world"), n)
+	}
+	if ue.dead.Load() {
+		t.Fatal("fresh session must not be retired")
+	}
+	if ue.lastSendNano.Load() < time.Now().Add(-time.Second).UnixNano() {
+		t.Fatal("lastSendNano must be refreshed after a successful write")
+	}
+}
+
+// A probing endpoint (never replied) is not subject to stale-session rebuild:
+// the reply guard is only meaningful once the session has been established.
+func TestUdpEndpointWriteToProbingNotRebuilt(t *testing.T) {
+	mock := &mockPacketConn{}
+	ue := newTestEndpoint(mock)
+	// hasReply stays false; lastSendNano is irrelevant.
+
+	n, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
+	if err != nil {
+		t.Fatalf("expected success while probing, got: %v", err)
+	}
+	if n != len("hello world") {
+		t.Fatalf("expected %d bytes written, got %d", len("hello world"), n)
+	}
+	if ue.dead.Load() {
+		t.Fatal("probing endpoint must not be retired")
 	}
 }
 
@@ -190,8 +254,8 @@ func (c *deadlineRecordingPacketConn) TransportDone() <-chan struct{} { return c
 
 // A QUIC-backed transport (TransportLifecycle implemented, non-nil channel)
 // must NOT arm a write deadline: datagram send-queue backpressure is a normal
-// congestion signal, not a dead peer (xray/sing-box treat it the same way),
-// and connection death is handled by the transport lifecycle watcher.
+// congestion signal, not a dead peer, and connection death is handled by the
+// transport lifecycle watcher.
 func TestArmWriteDeadlineSkipsTransportLifecycleConn(t *testing.T) {
 	conn := &deadlineRecordingPacketConn{transportDone: make(chan struct{})}
 	ue := newTestEndpoint(conn)

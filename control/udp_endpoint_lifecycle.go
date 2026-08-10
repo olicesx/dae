@@ -412,6 +412,19 @@ const udpEndpointWriteTimeout = 10 * time.Second
 // against lingering on a transport that accepts no writes.
 const writeSoftErrorThreshold = 3
 
+// udpEndpointSendStaleTimeout is how long an established endpoint may go
+// without any client send before the next write rebuilds it. A pause this
+// long means the client is starting a new round after an inter-round silence
+// (e.g. between two game matches). Proxy transports (hy2) multiplex many UDP
+// sessions over one QUIC connection and reuse a single forwarding source port
+// per session: when the remote peer reaped the session during the pause, the
+// old source port is no longer recognized and new-round packets are silently
+// ignored. Rebuilding the endpoint allocates a fresh hy2 session and therefore
+// a fresh forwarding port, which the peer treats as a new client. Active
+// gameplay sends heartbeats every tens of milliseconds, so 5s of client
+// silence is a safe "new round" signal and never fires mid-round.
+const udpEndpointSendStaleTimeout = 5 * time.Second
+
 // udpEndpointWriteToleratedError wraps a transient transport write error that
 // the endpoint absorbed without retiring. Callers must drop the datagram and
 // keep the session alive instead of removing/redialing it.
@@ -435,7 +448,7 @@ func (ue *UdpEndpoint) armWriteDeadline(now time.Time) {
 	// the pool watcher. Their datagram send queue fills under backpressure,
 	// which is a normal congestion signal rather than a dead peer — arming a
 	// write deadline here tears the session down on a merely-full queue where
-	// xray/sing-box simply delay the write and keep the connection alive.
+	// a proxy would simply delay the write and keep the connection alive.
 	if endpointTransportDoneChannel(ue) != nil {
 		return
 	}
@@ -474,6 +487,27 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 
 	// Refresh TTL on write to keep endpoint alive for active connections
 	ue.RefreshTtl()
+
+	// A session that was established (hasReply) but whose client has been
+	// silent for udpEndpointSendStaleTimeout is presumed to be starting a new
+	// round after an inter-round pause. The remote (e.g. a game server) may
+	// have reaped the old session, so rebuilding the endpoint yields a fresh
+	// hy2 session with a new forwarding source port that the peer recognizes
+	// as a new client. Without this, dae keeps writing to the same hy2 session
+	// whose source port the peer no longer answers, and the next round never
+	// starts. This check runs before the write refreshes lastSendNano, so it
+	// only fires on the first packet after the silence.
+	if ue.hasReply.Load() {
+		if last := ue.lastSendNano.Load(); last != 0 {
+			if time.Now().UnixNano()-last >= int64(udpEndpointSendStaleTimeout) {
+				ue.retire()
+				// ErrClosedConnection is classified as a normal UDP endpoint
+				// closure, so the retry removes the stale endpoint and dials a
+				// fresh hy2 session without penalizing the underlying dialer.
+				return 0, fmt.Errorf("%w: client silent for %s, rebuilding session", errors.ErrClosedConnection, udpEndpointSendStaleTimeout)
+			}
+		}
+	}
 
 	ue.armWriteDeadline(time.Now())
 
@@ -520,6 +554,7 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 		return n, fmt.Errorf("%w: udp endpoint wrote %d/%d bytes to %s", io.ErrShortWrite, n, len(b), addr)
 	}
 	ue.hasSent.Store(true)
+	ue.lastSendNano.Store(time.Now().UnixNano())
 	return n, nil
 }
 

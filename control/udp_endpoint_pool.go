@@ -70,6 +70,16 @@ type UdpEndpoint struct {
 	// Before this flips true, the endpoint is still probing and must not
 	// use the normal sliding NAT lifetime.
 	hasReply atomic.Bool
+	// lastSendNano records the last time the client successfully sent a
+	// packet through this endpoint. A session that was established
+	// (hasReply) but whose client went silent for udpEndpointSendStaleTimeout
+	// is presumed to be starting a new round after an inter-round pause:
+	// the remote (e.g. a game server) may have reaped the old session, so the
+	// old hy2 forwarding source port is no longer recognized. Rebuilding the
+	// endpoint allocates a fresh hy2 session with a new forwarding port the
+	// peer treats as a new client. Because active gameplay sends heartbeats
+	// far more often than the timeout, this never fires mid-round.
+	lastSendNano atomic.Int64
 	// hasSent indicates the endpoint has already forwarded at least one client
 	// packet successfully. Once a flow reaches this point, control-plane health
 	// probes should not tear it down proactively; only data-plane errors,

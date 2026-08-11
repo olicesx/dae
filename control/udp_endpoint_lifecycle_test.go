@@ -171,6 +171,7 @@ func TestUdpEndpointWriteToRebuildsStaleSession(t *testing.T) {
 	ue := newTestEndpoint(mock)
 	ue.hasReply.Store(true)
 	ue.lastSendNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
+	ue.lastReplyNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
 
 	_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
 	if !stderrors.Is(err, daeerrors.ErrClosedConnection) {
@@ -189,6 +190,7 @@ func TestUdpEndpointWriteToKeepsFreshSession(t *testing.T) {
 	ue := newTestEndpoint(mock)
 	ue.hasReply.Store(true)
 	ue.lastSendNano.Store(time.Now().UnixNano())
+	ue.lastReplyNano.Store(time.Now().UnixNano())
 
 	n, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
 	if err != nil {
@@ -202,6 +204,29 @@ func TestUdpEndpointWriteToKeepsFreshSession(t *testing.T) {
 	}
 	if ue.lastSendNano.Load() < time.Now().Add(-time.Second).UnixNano() {
 		t.Fatal("lastSendNano must be refreshed after a successful write")
+	}
+}
+
+// A client that paused briefly but whose server is still replying must NOT be
+// rebuilt: the session is mid-round and only the client side is silent. This
+// is what keeps a live game from being kicked when the player hits a loading
+// or idle stretch.
+func TestUdpEndpointWriteToKeepsSessionWhileServerReplyFresh(t *testing.T) {
+	mock := &mockPacketConn{}
+	ue := newTestEndpoint(mock)
+	ue.hasReply.Store(true)
+	ue.lastSendNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
+	ue.lastReplyNano.Store(time.Now().UnixNano())
+
+	n, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
+	if err != nil {
+		t.Fatalf("expected success while upstream still replies, got: %v", err)
+	}
+	if n != len("hello world") {
+		t.Fatalf("expected %d bytes written, got %d", len("hello world"), n)
+	}
+	if ue.dead.Load() {
+		t.Fatal("endpoint must not be retired while the upstream is still replying")
 	}
 }
 

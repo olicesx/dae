@@ -488,23 +488,32 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	// Refresh TTL on write to keep endpoint alive for active connections
 	ue.RefreshTtl()
 
-	// A session that was established (hasReply) but whose client has been
-	// silent for udpEndpointSendStaleTimeout is presumed to be starting a new
-	// round after an inter-round pause. The remote (e.g. a game server) may
-	// have reaped the old session, so rebuilding the endpoint yields a fresh
-	// hy2 session with a new forwarding source port that the peer recognizes
-	// as a new client. Without this, dae keeps writing to the same hy2 session
-	// whose source port the peer no longer answers, and the next round never
-	// starts. This check runs before the write refreshes lastSendNano, so it
-	// only fires on the first packet after the silence.
+	// A session that was established (hasReply) but whose both directions
+	// went silent for udpEndpointSendStaleTimeout is presumed to be starting
+	// a new round after an inter-round pause. The remote (e.g. a game server)
+	// may have reaped the old session, so rebuilding the endpoint yields a
+	// fresh hy2 session with a new forwarding source port that the peer
+	// recognizes as a new client. Without this, dae keeps writing to the same
+	// hy2 session whose source port the peer no longer answers, and the next
+	// round never starts. The check uses the newer of the client-send and
+	// upstream-reply timestamps, so active gameplay — where the server keeps
+	// replying even if the client briefly pauses — never rebuilds mid-round.
+	// This runs before the write refreshes lastSendNano, firing only on the
+	// first packet after the silence.
 	if ue.hasReply.Load() {
-		if last := ue.lastSendNano.Load(); last != 0 {
+		lastSend := ue.lastSendNano.Load()
+		lastReply := ue.lastReplyNano.Load()
+		last := lastSend
+		if lastReply > last {
+			last = lastReply
+		}
+		if last != 0 {
 			if time.Now().UnixNano()-last >= int64(udpEndpointSendStaleTimeout) {
 				ue.retire()
 				// ErrClosedConnection is classified as a normal UDP endpoint
 				// closure, so the retry removes the stale endpoint and dials a
 				// fresh hy2 session without penalizing the underlying dialer.
-				return 0, fmt.Errorf("%w: client silent for %s, rebuilding session", errors.ErrClosedConnection, udpEndpointSendStaleTimeout)
+				return 0, fmt.Errorf("%w: both directions silent for %s, rebuilding session", errors.ErrClosedConnection, udpEndpointSendStaleTimeout)
 			}
 		}
 	}
@@ -631,6 +640,7 @@ func (ue *UdpEndpoint) markReplied(nowNano int64) {
 	if nowNano == 0 {
 		nowNano = time.Now().UnixNano()
 	}
+	ue.lastReplyNano.Store(nowNano)
 	if !ue.hasReply.Swap(true) {
 		ue.clearPendingReplyPeers()
 		ue.lastRefreshNano.Store(nowNano)

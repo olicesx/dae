@@ -181,8 +181,29 @@ func (d *Dialer) snapshotLatencyForPolicy(
 	typ *NetworkType,
 	policy consts.DialerSelectionPolicy,
 ) (rawLatency time.Duration, hasLatency bool) {
+	// Data-UDP has no latency probe of its own: real proxied UDP traffic only
+	// flips the alive flag and never records a delay, so its collection always
+	// reports hasLatency=false and node selection fell back to configuration
+	// order / add_latency only (see daeuniverse/dae#1072).
+	//
+	// Reuse the DNS-UDP health domain of the same dialer as a proxy signal:
+	// both domains traverse the very same upstream proxy channel (only the
+	// final destination differs by a few ms), so the DNS-UDP probe delay
+	// faithfully represents the channel quality seen by data-UDP. Only the
+	// latency is borrowed; the data-UDP alive state remains driven exclusively
+	// by real UDP traffic, preserving the deliberate isolation between the two
+	// health domains.
+	latencyType := typ
+	if typ.L4Proto == consts.L4ProtoStr_UDP && typ.EffectiveUdpHealthDomain() == UdpHealthDomainData {
+		latencyType = &NetworkType{
+			L4Proto:         consts.L4ProtoStr_UDP,
+			IpVersion:       typ.IpVersion,
+			IsDns:           true,
+			UdpHealthDomain: UdpHealthDomainDns,
+		}
+	}
 	d.collectionFineMu.RLock()
-	collection := d.mustGetCollection(typ)
+	collection := d.mustGetCollection(latencyType)
 	switch policy {
 	case consts.DialerSelectionPolicy_MinLastLatency:
 		rawLatency, hasLatency = collection.Latencies10.LastLatency()
@@ -195,7 +216,15 @@ func (d *Dialer) snapshotLatencyForPolicy(
 	d.collectionFineMu.RUnlock()
 
 	if hasLatency {
-		rawLatency += d.getBackoffPenaltyForType(typ)
+		penalty := d.getBackoffPenaltyForType(typ)
+		if latencyType != typ {
+			// A borrowed latency inherits the DNS domain's backoff penalty as
+			// well: when the DNS probe is failing, the channel is likely
+			// degraded for data-UDP too, and the penalty compensates for the
+			// otherwise stale success samples.
+			penalty = max(penalty, d.getBackoffPenaltyForType(latencyType))
+		}
+		rawLatency += penalty
 	}
 	return rawLatency, hasLatency
 }

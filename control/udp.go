@@ -586,7 +586,12 @@ func currentPolicyUDPRoutingResult(stale *bpfRoutingResult) *bpfRoutingResult {
 }
 
 func (c *ControlPlane) prepareUnownedUDPCurrentPolicyFallback(src, dst netip.AddrPort, stale *bpfRoutingResult) (*bpfRoutingResult, bool, error) {
-	if c == nil || !c.isPublishedActiveControlPlane() || !c.ownsActiveRoutingEpoch() {
+	// Any generation that still admits work may re-route stale-attribution
+	// packets. During a staged reload the retiring listener's in-flight
+	// packets would otherwise be dropped once the cut-over moves the active
+	// epoch away, even though this generation's outbound runtime is still
+	// alive until Close. Closed generations keep the conservative drop path.
+	if c == nil || !c.acceptsRoutingEpochExecutionLocked() {
 		return nil, false, nil
 	}
 	manager, _ := c.controlPlaneSessionManager()

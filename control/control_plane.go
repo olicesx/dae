@@ -93,6 +93,7 @@ type ControlPlane struct {
 	lastConnectionErrorLogTime     atomic.Int64
 	lastDnsFastPathErrorLogTime    atomic.Int64
 	lastDnsFastPathServfailLogTime atomic.Int64
+	lastHandlePktEpochWarnTime     atomic.Int64
 	controlPlaneListenerRuntime
 	preparedDatapathCommit         bool
 	autoConfigKernelParameter      bool
@@ -210,6 +211,7 @@ var (
 	// also rejects expired handoff entries on read.
 	routingHandoffSteadyInterval = 5 * time.Second
 	dnsFastPathErrorLogInterval  = 5 * time.Second
+	handlePktEpochWarnInterval   = 5 * time.Second
 
 	// Test seams: injected in tests to avoid external DNS dependency.
 	resolveIp46ForBootstrap       = netutils.ResolveIp46
@@ -2052,6 +2054,21 @@ func (c *ControlPlane) allowDnsFastPathErrorLog(now time.Time) bool {
 	}
 }
 
+// allowHandlePktEpochWarn rate-limits the expected reload-window warning for
+// UDP packets whose stale routing-epoch attribution has no execution owner.
+func (c *ControlPlane) allowHandlePktEpochWarn(now time.Time) bool {
+	nowNano := now.UnixNano()
+	for {
+		last := c.lastHandlePktEpochWarnTime.Load()
+		if nowNano-last < int64(handlePktEpochWarnInterval) {
+			return false
+		}
+		if c.lastHandlePktEpochWarnTime.CompareAndSwap(last, nowNano) {
+			return true
+		}
+	}
+}
+
 func (c *ControlPlane) allowDnsFastPathServfailLog(now time.Time) bool {
 	nowNano := now.UnixNano()
 	for {
@@ -2687,7 +2704,15 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				}
 
 				if e := c.handlePkt(udpConn, data, convergeSrc, realDst, routingResult, flowDecision, false); e != nil {
-					c.log.Warnln("handlePkt:", e)
+					// Rate-limit the expected reload-window routing-epoch
+					// ownership loss; other handlePkt errors still log always.
+					if stderrors.Is(e, errRoutingEpochOwnerUnavailable) {
+						if c.log.IsLevelEnabled(logrus.WarnLevel) && c.allowHandlePktEpochWarn(time.Now()) {
+							c.log.Warnln("handlePkt:", e)
+						}
+					} else {
+						c.log.Warnln("handlePkt:", e)
+					}
 					return
 				}
 

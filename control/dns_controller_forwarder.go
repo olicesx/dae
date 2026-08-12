@@ -138,7 +138,6 @@ func (c *DnsController) evictIdleDnsForwarders(now time.Time) {
 
 	nowNano := now.UnixNano()
 	idleNano := c.dnsForwarderIdleTTL.Nanoseconds()
-	var toClose []DnsForwarder
 
 	c.dnsForwarderCache.Range(func(key, value any) bool {
 		k, ok := key.(dnsForwarderKey)
@@ -151,7 +150,9 @@ func (c *DnsController) evictIdleDnsForwarders(now time.Time) {
 		if !ok {
 			if forwarder := c.extractDnsForwarder(value); forwarder != nil {
 				if c.dnsForwarderCache.CompareAndDelete(k, value) {
-					toClose = append(toClose, forwarder)
+					if err := forwarder.Close(); err != nil && c.log != nil {
+						c.log.WithError(err).Debugln("failed to close idle dns forwarder")
+					}
 				}
 			} else {
 				c.dnsForwarderCache.Delete(k)
@@ -167,20 +168,16 @@ func (c *DnsController) evictIdleDnsForwarders(now time.Time) {
 			return true
 		}
 
+		// retire() marks the entry retired and defers Close until in-flight
+		// work finishes, closing the TOCTOU where a query grabbed the entry
+		// between the scan and this Close.
 		if c.dnsForwarderCache.CompareAndDelete(k, entry) {
-			toClose = append(toClose, entry.forwarder)
+			if err := entry.retire(); err != nil && c.log != nil {
+				c.log.WithError(err).Debugln("failed to retire idle dns forwarder")
+			}
 		}
 		return true
 	})
-
-	for _, forwarder := range toClose {
-		if forwarder == nil {
-			continue
-		}
-		if err := forwarder.Close(); err != nil && c.log != nil {
-			c.log.WithError(err).Debugln("failed to close idle dns forwarder")
-		}
-	}
 }
 
 func (c *DnsController) reportDnsForwardFailure(dialArg *dialArgument, err error) {

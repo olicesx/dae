@@ -213,10 +213,12 @@ func (d *DoH) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, err
 	if err == nil {
 		return msg, nil
 	}
-	if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+	if ctx.Err() != nil {
 		return nil, err
 	}
-
+	// Retry on a fresh client: idle-connection eviction and underlying tunnel
+	// churn can close a connection the forwarder itself still owns. replaceClient
+	// returns nil when the forwarder is closed, preserving net.ErrClosed.
 	client = d.replaceClient(client)
 	if client == nil {
 		return nil, net.ErrClosed

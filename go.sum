@@ -229,8 +229,8 @@ github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac h1:0h5zys3uIyKGGt6Lo
 github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac/go.mod h1:4soZNh0zW0LtYGdQ416i0jO0EIqMGcbtaspRS4BDvRQ=
 github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260813093322-fce519ab84d9 h1:D3BdCmpig41mGQ/asn4VGTglEqMtKRyjtX0c5j7HdqI=
 github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260813093322-fce519ab84d9/go.mod h1:3ETt0E3HOniN7D4zfK6x41qlo//fae5xFpBIni8nv+I=
-github.com/olicesx/quic-go v0.0.0-20260813091948-5a257ebe053e h1:i7gw/r7VcK2GjoeoHEmwhoZR4YKnVFpl01O2yPKhGfQ=
-github.com/olicesx/quic-go v0.0.0-20260813091948-5a257ebe053e/go.mod h1:4i75wxoxXaebP2bt5TFzSx9zf3+M7g8NQJ8PZIaIuIQ=
+github.com/olicesx/quic-go v0.0.0-20260813101526-8c89c2a8831a h1:+CSArdMIjhGCgYSdwqL5diQnbnKr/Bp2XDKSGCXI7IA=
+github.com/olicesx/quic-go v0.0.0-20260813101526-8c89c2a8831a/go.mod h1:4i75wxoxXaebP2bt5TFzSx9zf3+M7g8NQJ8PZIaIuIQ=
 github.com/onsi/ginkgo v1.6.0/go.mod h1:lLunBs/Ym6LB5Z9jYTR76FiuTmxDTDusOGeTQH+WWjE=
 github.com/onsi/ginkgo v1.12.1/go.mod h1:zj2OWP4+oCPe1qIXoGWkgMRwljMUYCdkwsT2108oapk=
 github.com/onsi/ginkgo v1.16.5 h1:8xi0RTUf59SOSfEtZMvwTvXYMzG4gV23XVHOZiXNtnE=

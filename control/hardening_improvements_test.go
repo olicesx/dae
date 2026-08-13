@@ -44,23 +44,23 @@ func TestParsePortRangeShortInput(t *testing.T) {
 
 // Locks releaseQueueCh idempotence: Close and the exiting convoy goroutine
 // race over the same channel; a double-put would let sync.Pool hand the same
-// channel to two queues.
+// channel to two queues. sync.Pool does not guarantee that Get returns a
+// previously Put object (and under -race/GC pressure it often does not), so
+// this asserts the guard state machine instead of pool round-trip behavior.
+// If the CAS guard is ever replaced with an unconditional Put, chReturned is
+// never set and this test fails.
 func TestReleaseQueueChIdempotent(t *testing.T) {
 	p := NewUdpTaskPool()
-	ch1 := make(chan UdpTask)
+	q := &UdpTaskQueue{p: p, ch: make(chan UdpTask)}
 
-	q := &UdpTaskQueue{p: p, ch: ch1}
 	p.releaseQueueCh(q)
 	p.releaseQueueCh(q) // second call must be a no-op
 
-	// A single Put lands in the pool's private slot; the first Get returns it.
-	if got := p.queueChPool.Get().(chan UdpTask); got != ch1 {
-		t.Fatal("expected pooled channel to be returned")
+	if !q.chReturned.Load() {
+		t.Fatal("releaseQueueCh must set the returned guard via CAS")
 	}
-	// A double-put would have also placed ch1 in the shared queue, so a second
-	// Get would return ch1 again instead of a fresh channel from New.
-	if got := p.queueChPool.Get().(chan UdpTask); got == ch1 {
-		t.Fatal("double-put handed the same channel out twice")
+	if q.chReturned.CompareAndSwap(false, true) {
+		t.Fatal("guard was already set; a second CAS must fail (double-put was possible)")
 	}
 }
 

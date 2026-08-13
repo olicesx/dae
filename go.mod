@@ -113,10 +113,11 @@ require (
 )
 
 // Use optimized quic-go with B-tree node pooling + upstream cherry-picks on enhanced-with-fixes baseline.
-// Latest perf/datagram-pool: pooled datagram frames + buffers (parse/send/receive all allocation-free).
-// Pinned to 6850280a (256 send / 512 receive datagram queues + bounded Add: a full send queue times out
-// after 30s and surfaces ErrDatagramQueueFullTimeout instead of parking callers forever).
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260810035541-6850280a0b76
+// Latest perf/datagram-pool: GC-stable bounded channel pools for STREAM and
+// DATAGRAM frames (sync.Pool was cleared on every GC cycle, causing an
+// allocation spiral that showed up as 80% GC CPU in production), plus bounded
+// Add on a full send queue (30s timeout -> ErrDatagramQueueFullTimeout).
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260813091948-5a257ebe053e
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config

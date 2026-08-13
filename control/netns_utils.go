@@ -369,8 +369,9 @@ func (ns *DaeNetns) tryCreateNetkit() (err error) {
 	_ = DeleteLink(HostVethName)
 
 	// Try to create Netkit device
-	// Configure scrub=NONE to preserve skb->mark across netkit boundary (safe optimization).
-	// Note: bpf_redirect_peer() is intentionally disabled in C code to avoid CVE-2025-37959.
+	// Configure scrub=NONE to preserve skb->mark across the netkit boundary.
+	// bpf_redirect_peer() is only enabled on kernels containing the
+	// CVE-2025-37959 fix (checked by the loader at BPF load time).
 	ns.log.Debugf("Creating Netkit device pair: %s <-> %s", HostVethName, NsVethName)
 	if err := createNetkitDevice(ns.log, HostVethName, NsVethName, DaeVethTxQLen, true); err != nil {
 		ns.log.Infof("createNetkitDevice failed: %v", err)

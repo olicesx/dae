@@ -21,9 +21,9 @@ type NetkitConfig struct {
 	PeerName string
 	TxQLen   int
 	// ScrubNone controls whether to disable skb->mark scrubbing.
-	// NOTE: bpf_redirect_peer() is currently DISABLED in C code due to kernel panic issues.
-	// This configuration is preserved for potential future re-enabling.
-	// When true, skb->mark is preserved across netkit boundaries.
+	// When true, skb->mark is preserved across netkit boundaries, which is
+	// required for bpf_redirect_peer(). The loader only enables
+	// bpf_redirect_peer() on kernels containing the CVE-2025-37959 fix.
 	// This requires kernel support (Linux 6.6+ with CONFIG_NETKIT).
 	ScrubNone bool
 }
@@ -35,8 +35,8 @@ type NetkitConfig struct {
 // 3. It provides better error handling
 // 4. It works on systems where ip command doesn't support netkit
 //
-// It supports configuring scrub behavior when the kernel supports it.
-// NOTE: bpf_redirect_peer() optimization is currently DISABLED in C code.
+// It supports configuring scrub behavior when the kernel supports it
+// (scrub=NONE is required for bpf_redirect_peer()).
 func createNetkitDeviceViaNetlink(log *logrus.Logger, cfg *NetkitConfig) error {
 	log.Debug("Attempting to create Netkit device via netlink API")
 
@@ -57,9 +57,8 @@ func createNetkitDeviceViaNetlink(log *logrus.Logger, cfg *NetkitConfig) error {
 		PeerPolicy: netlink.NETKIT_POLICY_FORWARD,
 	}
 
-	// Configure scrub behavior
-	// NOTE: bpf_redirect_peer() optimization is currently DISABLED in C code.
-	// Scrub configuration is preserved for potential future re-enabling.
+	// Configure scrub behavior (scrub=NONE is required for bpf_redirect_peer(),
+	// which the loader only enables on CVE-2025-37959-fixed kernels).
 	if cfg.ScrubNone {
 		netkit.Scrub = netlink.NETKIT_SCRUB_NONE
 		netkit.PeerScrub = netlink.NETKIT_SCRUB_NONE

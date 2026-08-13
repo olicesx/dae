@@ -119,16 +119,16 @@ func checkIpNetkitSupport() bool {
 // It prefers the netlink API method (doesn't require iproute2 6.7.0+),
 // and falls back to the ip command method if needed.
 //
-// NOTE: bpf_redirect_peer() optimization is currently DISABLED in C code.
-// The enableRedirectPeer parameter is preserved for potential future re-enabling.
+// enableRedirectPeer requests scrub=NONE, which is required for
+// bpf_redirect_peer(); the loader only actually enables it on kernels with
+// the CVE-2025-37959 fix (or the DAE_ALLOW_REDIRECT_PEER=1 override).
 func createNetkitDevice(log *logrus.Logger, name, peerName string, txQLen int, enableRedirectPeer bool) error {
 	log.Debug("Attempting to create Netkit device")
 
 	// Determine if we should try to use scrub=NONE
-	// NOTE: Scrub configuration is preserved for potential future re-enabling
 	scrubNone := enableRedirectPeer && checkNetkitScrubSupport(log)
 	if scrubNone {
-		log.Debug("Configuring netkit scrub=NONE (bpf_redirect_peer() is disabled in C code)")
+		log.Debug("Configuring netkit scrub=NONE (required for bpf_redirect_peer())")
 	} else if enableRedirectPeer {
 		log.Debug("bpf_redirect_peer requested but kernel doesn't support scrub; using default scrub")
 	}
@@ -176,9 +176,7 @@ func createNetkitDevice(log *logrus.Logger, name, peerName string, txQLen int, e
 }
 
 // checkNetkitDeviceCanUseRedirectPeer checks if an existing netkit device
-// is configured with scrub=NONE.
-// NOTE: bpf_redirect_peer() is currently DISABLED in C code due to kernel panic issues.
-// This function is preserved for potential future re-enabling.
+// is configured with scrub=NONE, the prerequisite for bpf_redirect_peer().
 func checkNetkitDeviceCanUseRedirectPeer(log *logrus.Logger, ifname string) bool {
 	scrubNone, err := checkExistingNetkitScrubConfig(log, ifname)
 	if err != nil {

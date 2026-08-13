@@ -1629,7 +1629,9 @@ static __always_inline __u32 get_dae0_ifindex(void)
 static __always_inline int redirect_to_control_plane_ingress(void)
 {
 	__u32 ifindex = get_dae0_ifindex();
-	// bpf_redirect_peer requires kernel >= 6.8 (CVE-2025-37959 fix).
+	// bpf_redirect_peer requires the CVE-2025-37959 fix (mainline >= 6.14.7
+	// or official stable backports); the loader only sets
+	// PARAM.use_redirect_peer on kernels known to contain it.
 	if (PARAM.use_redirect_peer)
 		return bpf_redirect_peer(ifindex, 0);
 	return bpf_redirect(ifindex, 0);

@@ -25,7 +25,8 @@ var errBpfObjectsUnavailable = errors.New("eBPF objects are unavailable in this 
 
 // bpfDaeParam corresponds to C struct dae_param in tproxy.c
 // use_redirect_peer enables bpf_redirect_peer() optimization for TC ingress.
-// Only safe with: (1) netkit device + scrub=NONE, (2) kernel >= 6.8 (CVE-2025-37959 fix).
+// Only safe with: (1) netkit device + scrub=NONE, (2) a kernel containing the
+// CVE-2025-37959 fix (mainline >= 6.14.7 or official stable backports).
 // When enabled, provides ~50% throughput improvement by bypassing CPU backlog.
 type bpfDaeParam struct {
 	_                    structs.HostLayout

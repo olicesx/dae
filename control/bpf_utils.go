@@ -530,7 +530,9 @@ retryLoadBpf:
 
 	// bpf_redirect_peer() is only safe under specific conditions:
 	// 1. Netkit device with scrub=NONE (preserves skb->mark across netns boundary)
-	// 2. Kernel >= 6.8 (fixes CVE-2025-37959 skb metadata leak)
+	// 2. A kernel containing the CVE-2025-37959 fix (mainline >= 6.14.7 or
+	//    official stable backports 6.1.139/6.6.91/6.12.29); distro backports
+	//    can be opted in with DAE_ALLOW_REDIRECT_PEER=1
 	// 3. TC ingress direction ONLY (egress must use bpf_redirect())
 	//
 	// When enabled, provides ~50% throughput improvement by bypassing CPU backlog.
@@ -541,12 +543,15 @@ retryLoadBpf:
 		switch {
 		case err != nil:
 			log.Warnf("Failed to get kernel version: %v; bpf_redirect_peer() disabled", err)
-		case kernelVersion.Less(consts.RedirectPeerSafeVersion):
-			log.Debugf("Kernel %v < %v (CVE-2025-37959 fix); bpf_redirect_peer() disabled",
-				kernelVersion, consts.RedirectPeerSafeVersion)
-		default:
+		case consts.IsRedirectPeerSafeKernel(kernelVersion):
 			useRedirectPeer = 1
 			log.Infof("Safely enabled bpf_redirect_peer() (kernel %v, netkit+scrub=NONE)", kernelVersion)
+		case os.Getenv("DAE_ALLOW_REDIRECT_PEER") == "1":
+			useRedirectPeer = 1
+			log.Warnf("Enabling bpf_redirect_peer() via DAE_ALLOW_REDIRECT_PEER on kernel %v; make sure the kernel contains the CVE-2025-37959 backport", kernelVersion)
+		default:
+			log.Debugf("Kernel %v lacks a known CVE-2025-37959 fix; bpf_redirect_peer() disabled (set DAE_ALLOW_REDIRECT_PEER=1 to override)",
+				kernelVersion)
 		}
 	}
 

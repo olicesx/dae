@@ -121,6 +121,7 @@ func (c *ControlPlane) projectDnsReloadCacheStream(
 	if c == nil || source == nil || c.core == nil {
 		return 0, nil
 	}
+	start := time.Now()
 	count := 0
 	err := source(func(cacheKey string, cache *DnsCache) error {
 		if cache == nil {
@@ -149,7 +150,13 @@ func (c *ControlPlane) projectDnsReloadCacheStream(
 		count++
 		return nil
 	})
-	return count, err
+	if err != nil {
+		return count, err
+	}
+	if count > 0 && c.log != nil {
+		c.log.Infof("Projected %d DNS cache entries from previous control plane in %v", count, time.Since(start))
+	}
+	return count, nil
 }
 
 // refreshDnsReloadCacheForCutover replaces the early preparation snapshot
@@ -171,12 +178,8 @@ func (c *ControlPlane) refreshDnsReloadCacheForCutover() (bool, error) {
 		// cache. The stream itself retains no map or wrapper copies.
 		c.pendingDnsReloadCache = nil
 		reuseBitmap := streamSourceHash != ([32]byte{}) && streamSourceHash == c.PolicyIdentity().Hash()
-		count, err := c.projectDnsReloadCacheStream(streamSource, reuseBitmap)
-		if err != nil {
+		if _, err := c.projectDnsReloadCacheStream(streamSource, reuseBitmap); err != nil {
 			return false, err
-		}
-		if count > 0 && c.log != nil {
-			c.log.Infof("Projected %d DNS cache entries from previous control plane", count)
 		}
 		return true, nil
 	}

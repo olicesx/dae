@@ -166,6 +166,7 @@ func (c *ControlPlane) replayDnsReloadCache() error {
 	if c == nil || c.dnsController == nil || c.pendingDnsReloadCache == nil {
 		return nil
 	}
+	start := time.Now()
 	count, err := c.dnsController.RestoreReloadCacheAndProject(
 		c.pendingDnsReloadCache,
 		c.routingMatcher.domainMatcher.MatchDomainBitmap,
@@ -175,7 +176,7 @@ func (c *ControlPlane) replayDnsReloadCache() error {
 		return err
 	}
 	if count > 0 {
-		c.log.Infof("Restored %d DNS cache entries from previous control plane", count)
+		c.log.Infof("Restored %d DNS cache entries from previous control plane in %v", count, time.Since(start))
 	}
 	c.pendingDnsReloadCache = nil
 	return nil

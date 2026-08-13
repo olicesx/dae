@@ -15,12 +15,27 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// maxUDPRawPayloadLength bounds the UDP payload of the raw fallback path:
+// 65535 (max IPv4 total length) - 20 (IPv4 header) - 8 (UDP header) = 65507.
+// The 16-bit UDP length field would wrap for larger payloads.
+const maxUDPRawPayloadLength = 65507
+
+func validateUDPRawPayloadLength(n int) error {
+	if n > maxUDPRawPayloadLength {
+		return fmt.Errorf("raw UDP fallback payload too large: %d bytes (max %d)", n, maxUDPRawPayloadLength)
+	}
+	return nil
+}
+
 func sendUDPv4RawDirect(data []byte, from, realTo netip.AddrPort, soMark uint32) error {
 	if !from.IsValid() || !realTo.IsValid() {
 		return fmt.Errorf("invalid addr: from=%v to=%v", from, realTo)
 	}
 	if (!from.Addr().Is4() && !from.Addr().Is4In6()) || (!realTo.Addr().Is4() && !realTo.Addr().Is4In6()) {
 		return fmt.Errorf("raw UDPv4 fallback requires IPv4 endpoints: from=%v to=%v", from, realTo)
+	}
+	if err := validateUDPRawPayloadLength(len(data)); err != nil {
+		return err
 	}
 
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.IPPROTO_UDP)
@@ -72,6 +87,9 @@ func sendUDPv6RawDirect(data []byte, from, realTo netip.AddrPort, soMark uint32)
 	}
 	if !from.Addr().Is6() || from.Addr().Is4In6() || !realTo.Addr().Is6() || realTo.Addr().Is4In6() {
 		return fmt.Errorf("raw UDPv6 fallback requires pure IPv6 endpoints: from=%v to=%v", from, realTo)
+	}
+	if err := validateUDPRawPayloadLength(len(data)); err != nil {
+		return err
 	}
 
 	fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.IPPROTO_UDP)

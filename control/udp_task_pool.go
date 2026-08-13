@@ -47,6 +47,7 @@ type UdpTaskQueue struct {
 	// 1-byte fields
 	overflowLen  atomic.Int32 // track overflow length for lock-free idle check
 	overflowMode bool
+	chReturned   atomic.Bool // guards queueChPool.Put so Close and convoy cannot double-put
 
 	key UdpFlowKey
 }
@@ -207,13 +208,13 @@ func (q *UdpTaskQueue) convoy() {
 
 			// Try to delete from pool using CAS-like semantics via sync.Map
 			if q.p.tryDeleteQueue(q.key, q) {
-				q.p.queueChPool.Put(q.ch)
+				q.p.releaseQueueCh(q)
 				return
 			}
 			// Check if mapping still points to current queue.
 			// If not, this convoy is stale and must exit to prevent goroutine leak.
 			if v, ok := q.p.queues.Load(q.key); !ok || v.(*UdpTaskQueue) != q {
-				q.p.queueChPool.Put(q.ch)
+				q.p.releaseQueueCh(q)
 				return
 			}
 
@@ -328,10 +329,20 @@ func (p *UdpTaskPool) Close() {
 		if q, ok := p.queues.LoadAndDelete(key); ok {
 			queue := q.(*UdpTaskQueue)
 			queue.close()
-			p.queueChPool.Put(queue.ch)
+			p.releaseQueueCh(queue)
 		}
 		return true
 	})
+}
+
+// releaseQueueCh returns the queue channel to the pool exactly once. Close
+// and the exiting convoy goroutine race over the same channel; the CAS makes
+// double-put impossible (a double-put would let sync.Pool hand the same
+// channel to two different queues, silently cross-mixing flows).
+func (p *UdpTaskPool) releaseQueueCh(q *UdpTaskQueue) {
+	if q.chReturned.CompareAndSwap(false, true) {
+		p.queueChPool.Put(q.ch)
+	}
 }
 
 // close signals the convoy goroutine to exit by setting refs to a sentinel value

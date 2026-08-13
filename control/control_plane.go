@@ -94,6 +94,7 @@ type ControlPlane struct {
 	lastDnsFastPathErrorLogTime    atomic.Int64
 	lastDnsFastPathServfailLogTime atomic.Int64
 	lastHandlePktEpochWarnTime     atomic.Int64
+	tcpConnPanicCount              atomic.Uint64
 	controlPlaneListenerRuntime
 	preparedDatapathCommit         bool
 	autoConfigKernelParameter      bool
@@ -2491,6 +2492,15 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				return
 			}
 			go func(lconn net.Conn) {
+				// Direct-dispatch goroutines get the same panic isolation as
+				// dispatcher tasks: one bad packet or connection must not take
+				// down the whole dae process.
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						_ = lconn.Close()
+						reportUDPDispatcherPanic("tcp_conn", "serve", &c.tcpConnPanicCount, recovered)
+					}
+				}()
 				ownership, ok := c.acquireIncomingConnectionLease(lconn)
 				if !ok {
 					return
@@ -2738,16 +2748,15 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			// Direct goroutine dispatch remains only for narrow low-latency
 			// exceptions where queue handoff is less valuable than minimal overhead
 			// (DNS, SIP/RTP, STUN).
-			discardTask := func() {
-				c.udpIngressAdmission.release()
-				pktBuf.Put()
-			}
 			if flowDecision.DispatchStrategy() == StrategyDirectGoroutine {
 				// DNS, VoIP, and other low-latency exception traffic bypasses the
 				// ordered per-flow queue and runs immediately.
 				go task()
-			} else if !c.submitOrderedUDPIngress(flowDecision.Key, task, discardTask) {
-				discardTask()
+			} else if !c.submitOrderedUDPIngress(flowDecision.Key, task, pktBuf, &c.udpIngressAdmission) {
+				// Rejected: the dispatcher does not own the buffer or the
+				// admission, so release both inline (old discardTask closure).
+				c.udpIngressAdmission.release()
+				pktBuf.Put()
 			}
 			// if d := time.Since(t); d > 100*time.Millisecond {
 			// 	logrus.Println(d)

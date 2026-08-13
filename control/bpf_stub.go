@@ -424,6 +424,9 @@ func (r bpfPortRange) Encode() (b [16]byte) {
 }
 
 func ParsePortRange(b []byte) (portStart, portEnd uint16) {
+	if len(b) < 4 {
+		return 0, 0
+	}
 	portStart = binary.LittleEndian.Uint16(b[:2])
 	portEnd = binary.LittleEndian.Uint16(b[2:])
 	return portStart, portEnd

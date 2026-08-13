@@ -2308,8 +2308,14 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 					goto block;
 				}
 
-				// Update conn state timestamp for this fast path packet
-				udp_state->last_seen_ns = bpf_ktime_get_ns();
+				// Update conn state timestamp for this fast path packet,
+				// rate-limited to match the slow-path lazy refresh (1s
+				// interval): the per-packet write caused cross-CPU cacheline
+				// contention on high-PPS single flows.
+				__u64 now_ns = bpf_ktime_get_ns();
+
+				if (now_ns - udp_state->last_seen_ns > UDP_CONN_STATE_UPDATE_INTERVAL_NS)
+					udp_state->last_seen_ns = now_ns;
 				pkt->datapath_generation = udp_state->datapath_generation;
 				return redirect_lan_packet_to_control_plane(
 					skb, link_h_len, pkt, udp_state->meta.raw,

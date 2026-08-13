@@ -488,6 +488,11 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	// Refresh TTL on write to keep endpoint alive for active connections
 	ue.RefreshTtl()
 
+	// Single wall-clock sample shared by the stale-session check and the write
+	// deadline arming below; the post-write timestamp is sampled separately so
+	// lastSendNano reflects the actual send completion.
+	now := time.Now()
+
 	// A session that was established (hasReply) but whose both directions
 	// went silent for udpEndpointSendStaleTimeout is presumed to be starting
 	// a new round after an inter-round pause. The remote (e.g. a game server)
@@ -508,7 +513,7 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 			last = lastReply
 		}
 		if last != 0 {
-			if time.Now().UnixNano()-last >= int64(udpEndpointSendStaleTimeout) {
+			if now.UnixNano()-last >= int64(udpEndpointSendStaleTimeout) {
 				ue.retire()
 				// ErrClosedConnection is classified as a normal UDP endpoint
 				// closure, so the retry removes the stale endpoint and dials a
@@ -518,7 +523,7 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 		}
 	}
 
-	ue.armWriteDeadline(time.Now())
+	ue.armWriteDeadline(now)
 
 	// Check again - endpoint may have died.
 	// The underlying conn.WriteTo is thread-safe; we accept a small race window

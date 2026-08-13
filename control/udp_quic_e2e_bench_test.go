@@ -210,8 +210,8 @@ func runQuicInitialEndToEndBenchmark(b *testing.B, producers int, ordered bool) 
 			settle()
 		}
 		discard := settle
-		if !cp.submitOrderedUDPIngress(decision.Key, run, discard) {
-			settle()
+		if !cp.submitOrderedUDPIngress(decision.Key, run, nil, nil) {
+			discard()
 			b.Errorf("submitOrderedUDPIngress rejected QUIC Initial under bounded load")
 		}
 	})

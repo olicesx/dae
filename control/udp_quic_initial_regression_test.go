@@ -485,7 +485,7 @@ func TestQuicInitial_FlowsThroughBothNewDispatchers(t *testing.T) {
 			t.Errorf("handlePkt through ordered dispatcher: %v", err)
 		}
 	}
-	if !cp.submitOrderedUDPIngress(flowDecision.Key, task, nil) {
+	if !cp.submitOrderedUDPIngress(flowDecision.Key, task, nil, nil) {
 		t.Fatal("submitOrderedUDPIngress rejected QUIC Initial task")
 	}
 

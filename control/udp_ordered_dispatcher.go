@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/daeuniverse/outbound/pool"
 	"github.com/sirupsen/logrus"
 )
 
@@ -37,7 +38,12 @@ const (
 
 type udpOrderedDispatchTask struct {
 	run     UdpTask
-	discard UdpTask
+	discard UdpTask // optional custom discard (kept for tests and future callers)
+	// Owned resources released by the built-in discard path. Carrying the
+	// buffer and admission gate in the task removes the per-packet discard
+	// closure allocation from the ingress hot path.
+	data      pool.PB
+	admission *routingEpochIngressGate
 }
 
 type udpOrderedDispatchQueue struct {
@@ -170,7 +176,18 @@ func normalizeUDPOrderedDispatcherWorkers(workers int) int {
 }
 
 func (d *udpOrderedDispatcher) submit(key UdpFlowKey, run, discard UdpTask) bool {
-	if d == nil || run == nil {
+	return d.submitTask(key, udpOrderedDispatchTask{run: run, discard: discard})
+}
+
+// submitOwned queues a task whose packet buffer and ingress admission are
+// owned by the dispatcher. On rejection the caller still owns them and must
+// release them itself.
+func (d *udpOrderedDispatcher) submitOwned(key UdpFlowKey, run UdpTask, data pool.PB, admission *routingEpochIngressGate) bool {
+	return d.submitTask(key, udpOrderedDispatchTask{run: run, data: data, admission: admission})
+}
+
+func (d *udpOrderedDispatcher) submitTask(key UdpFlowKey, task udpOrderedDispatchTask) bool {
+	if d == nil || task.run == nil {
 		return false
 	}
 
@@ -192,7 +209,7 @@ func (d *udpOrderedDispatcher) submit(key UdpFlowKey, run, discard UdpTask) bool
 			q.mu.Unlock()
 			return false
 		}
-		q.tasks = append(q.tasks, udpOrderedDispatchTask{run: run, discard: discard})
+		q.tasks = append(q.tasks, task)
 		q.idleSince = time.Time{}
 		shouldWake := !q.running && !q.ready
 		if shouldWake {
@@ -289,9 +306,15 @@ func (d *udpOrderedDispatcher) acquireEndpointCreateAdmission() (release func(),
 	}, true
 }
 
+// shouldReportEveryPow2 returns true on the 1st, 2nd, 4th, ... occurrence so
+// recurring panics or saturation events log at exponentially decreasing rates.
+func shouldReportEveryPow2(count uint64) bool {
+	return count&(count-1) == 0
+}
+
 func (d *udpOrderedDispatcher) reportEndpointCreateAdmissionSaturated() {
 	count := d.endpointCreateAdmissionRejects.Add(1)
-	if count&(count-1) != 0 {
+	if !shouldReportEveryPow2(count) {
 		return
 	}
 	logrus.WithFields(logrus.Fields{
@@ -504,20 +527,27 @@ func (d *udpOrderedDispatcher) runTask(task udpOrderedDispatchTask) {
 }
 
 func (d *udpOrderedDispatcher) discardTask(task udpOrderedDispatchTask) {
-	if task.discard == nil {
-		return
+	if task.discard != nil {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				reportUDPDispatcherPanic("ordered", "discard", &d.panicCount, recovered)
+			}
+		}()
+		task.discard()
 	}
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			reportUDPDispatcherPanic("ordered", "discard", &d.panicCount, recovered)
-		}
-	}()
-	task.discard()
+	// Release the task-owned resources. Order matches the old discard closure:
+	// admission first, then the packet buffer.
+	if task.admission != nil {
+		task.admission.release()
+	}
+	if task.data != nil {
+		task.data.Put()
+	}
 }
 
 func reportUDPDispatcherPanic(dispatcher, taskKind string, panicCount *atomic.Uint64, recovered any) {
 	count := panicCount.Add(1)
-	if count&(count-1) != 0 {
+	if !shouldReportEveryPow2(count) {
 		return
 	}
 	logrus.WithFields(logrus.Fields{

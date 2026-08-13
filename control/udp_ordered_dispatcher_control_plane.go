@@ -5,9 +5,13 @@
 
 package control
 
-func (c *ControlPlane) submitOrderedUDPIngress(key UdpFlowKey, run, discard UdpTask) bool {
+import (
+	"github.com/daeuniverse/outbound/pool"
+)
+
+func (c *ControlPlane) submitOrderedUDPIngress(key UdpFlowKey, run UdpTask, data pool.PB, admission *routingEpochIngressGate) bool {
 	if c != nil && c.udpOrderedDispatcher != nil {
-		return c.udpOrderedDispatcher.submit(key, run, discard)
+		return c.udpOrderedDispatcher.submitOwned(key, run, data, admission)
 	}
 	return DefaultUdpTaskPool.EmitTask(key, run)
 }

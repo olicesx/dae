@@ -52,9 +52,29 @@ handlePktOwned          cum 55.62%
 → **每包一次 UDP 写 syscall 是最大单项热点**（10.66M 包 = 10.66M 次写 syscall；
 WSL2 hv 使单次 syscall ~2-3μs，放大效应明显，但真实内核上同样存在且可优化）。
 
-## 2. 结论与决策
+## 3. 批写实施（2026-08-15，已完成）
 
-1. **070201f7（SetReadBuffer 8MiB）已 revert（23bc22c9）**：两个场景均无实测收益
+### 实现
+- **outbound a3b54a6**：`netproxy.PacketBatchWriter` 接口 + `BatchItem`；
+  `direct.directPacketConn.WriteBatch`（x/net ipv4/ipv6 `WriteBatch` = sendmmsg，
+  connected 与 FullCone 两种形态）；`socks5.PktConn.WriteBatch`（SOCKS5 UDP 头逐包
+  封装，底层无批写能力时逐包回退）。单测：connected/FullCone 批量投递、封装字节、
+  回退。
+- **dae ac556546**：`udpWriteBatchAggregator`（每 endpoint 一个，32 包或 1ms 窗触发
+  flush）；`UdpEndpoint.WriteTo` 聚合路径（copy 后立即返回，flush 错误走提取出的
+  `handleWriteError`（原同步路径语义不变）；oversized 包回退直写；Close 时排空）。
+  仅当 conn 实现 `PacketBatchWriter` 时启用，全部既有测试保持同步路径不受影响。
+  单测 6 例全绿（满批/timer/缓冲复用/oversized/closed/错误分类）。
+
+### WSL2 验证局限（重要）
+- **WSL2 微基准：单包 write 11.2μs、批 8 10.2μs/包、批 32 11.1μs/包**——每包
+  UDP send 成本 ~11μs 为 hypervisor 主导，sendmmsg 无法在 WSL2 体现收益。
+- **e2e 不可靠**：sender 饱和速率漂移 8.5→17 Gbps（环境噪声），且批写后同步 flush
+  在慢 sendmmsg（~363μs/批）下阻塞 worker，WSL2 上吞吐反而更差——**均为环境效应**。
+- **真实内核预期**：sendto ~0.5-1μs → sendmmsg 批 32 ~0.2μs/包（syscall 边界摊薄），
+  写路径 ~5x；真实内核上的收益与回归（同步 flush 阻塞率）**必须在真实内核复测**。
+
+## 4. 结论与决策1. **070201f7（SetReadBuffer 8MiB）已 revert（23bc22c9）**：两个场景均无实测收益
    （NAT 路径不经 dae；socks 路径 8MiB 无效）。防御性设置不构成提交理由。
 2. **下一步优化方向（按 pprof 证据排序）**：
    a. **出站 UDP 批写（sendmmsg/SendMsgs）**：socks5/direct 出站路径每包一次 write →

@@ -3478,9 +3478,9 @@ int BPF_PROG(tcp_offload_sent_account, struct sock *sk, struct sk_buff *skb,
 	}
 
 	v = bpf_map_lookup_elem(&tcp_offload_sent, &key);
-	if (v)
+	if (v) {
 		__sync_fetch_and_add(v, len);
-	else {
+	} else {
 		__u64 init = len;
 
 		bpf_map_update_elem(&tcp_offload_sent, &key, &init, BPF_ANY);

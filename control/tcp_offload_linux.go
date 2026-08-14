@@ -145,7 +145,7 @@ func (c *ControlPlane) tryOffloadTCPRelay(ctx context.Context, left, right netpr
 		}
 		return false, "", err
 	}
-	defer session.Close()
+	defer func() { _ = session.Close() }()
 
 	if c.log != nil && c.log.IsLevelEnabled(logrus.DebugLevel) {
 		c.log.Debugf("TCP relay eBPF offload: %v <-> %v", session.left.RemoteAddr(), session.right.RemoteAddr())
@@ -403,7 +403,7 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 	if err != nil {
 		return 0, 0, fmt.Errorf("epoll_create1: %w", err)
 	}
-	defer unix.Close(epfd)
+	defer func() { _ = unix.Close(epfd) }()
 
 	fds := []struct {
 		fd    int
@@ -577,9 +577,9 @@ func (s *tcpRelayOffloadSession) relayPassData(index int32, lastProgress *time.T
 	defer relayCopyBufferPool.Put(bufPtr)
 
 	_ = src.SetReadDeadline(time.Now().Add(relayPassWriteTimeout))
-	defer src.SetReadDeadline(time.Time{})
+	defer func() { _ = src.SetReadDeadline(time.Time{}) }()
 	_ = dst.SetWriteDeadline(time.Now().Add(relayPassWriteTimeout))
-	defer dst.SetWriteDeadline(time.Time{})
+	defer func() { _ = dst.SetWriteDeadline(time.Time{}) }()
 	n, err := src.Read(buf)
 	if err != nil && errors.Is(err, os.ErrDeadlineExceeded) {
 		return false, nil // transiently empty; level-triggered epoll re-reports

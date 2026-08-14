@@ -48,7 +48,11 @@ type udpConnStateOwner interface {
 }
 
 type UdpEndpoint struct {
-	conn          netproxy.PacketConn
+	conn netproxy.PacketConn
+	// writeBatch, when non-nil, aggregates outgoing datagrams and flushes
+	// them through the transport's batched writer (netproxy.PacketBatchWriter,
+	// e.g. sendmmsg on direct UDP). See udp_write_batch.go.
+	writeBatch    *udpWriteBatchAggregator
 	expiresAtNano atomic.Int64
 	handler       UdpHandler
 	// NatTimeout is guarded by natTimeoutMu after endpoint creation.
@@ -703,6 +707,9 @@ dialSuccess:
 			createOption.DrainTracker,
 			udpEndpointReplyQueueSize,
 		),
+	}
+	if _, ok := packetConn.(netproxy.PacketBatchWriter); ok {
+		ue.writeBatch = newUDPWriteBatchAggregator(ue)
 	}
 	ue.setFlowBinding(dialOption.Binding)
 	if createOption.sessionManager != nil {

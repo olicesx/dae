@@ -525,36 +525,31 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 
 	ue.armWriteDeadline(now)
 
+	if ue.writeBatch != nil {
+		// Aggregated path: copy into the batch buffer and return immediately;
+		// the flush (batched syscall) happens when the batch fills or after
+		// udpWriteBatchWindow. Write errors are classified asynchronously by
+		// handleWriteError with the same retirement policy as below, so the
+		// caller still sees a successful submission for accepted datagrams.
+		if err := ue.writeBatch.Append(b, addr); err != nil {
+			if !stderrors.Is(err, errUDPWriteBatchOversized) {
+				// Aggregator closed: propagate like a closed conn.
+				return 0, err
+			}
+			// Oversized datagram: fall through to the direct path.
+		} else {
+			ue.hasSent.Store(true)
+			ue.lastSendNano.Store(time.Now().UnixNano())
+			return len(b), nil
+		}
+	}
+
 	// Check again - endpoint may have died.
 	// The underlying conn.WriteTo is thread-safe; we accept a small race window
 	// for performance. Write errors will mark the endpoint dead for cleanup.
 	n, err := ue.conn.WriteTo(b, addr)
 	if err != nil {
-		// Connection-refused is a hard failure: evict the bad upstream now.
-		if ue.isConnectionRefused(err) {
-			ue.retire()
-			ue.handleProxyServerFailure()
-			return n, err
-		}
-		// A datagram send-queue timeout is a stalled transport, not a transient
-		// error: the queue stayed full for the whole wait. Retire immediately —
-		// the soft-error counter is reset by any enqueue (which is not a peer
-		// ACK), so a half-dead transport could otherwise dodge the threshold
-		// forever by the occasional enqueue that never reaches the peer.
-		if stderrors.Is(err, quic.ErrDatagramQueueFullTimeout) {
-			ue.retire()
-			return n, err
-		}
-		// Tolerate transient write errors up to a threshold so brief transport
-		// backpressure does not retire a healthy long-lived session. A closed
-		// conn and a genuinely dead transport are still retired promptly: the
-		// former by this threshold, the latter by the read loop (EOF/error).
-		if ue.writeSoftErrorCount.Add(1) <= writeSoftErrorThreshold &&
-			!stderrors.Is(err, net.ErrClosed) {
-			return n, &udpEndpointWriteToleratedError{err: err}
-		}
-		ue.retire()
-		return n, err
+		return n, ue.handleWriteError(err)
 	}
 	ue.writeSoftErrorCount.Store(0)
 	// UDP datagrams are atomic: a successful WriteTo either wrote the whole
@@ -570,6 +565,39 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	ue.hasSent.Store(true)
 	ue.lastSendNano.Store(time.Now().UnixNano())
 	return n, nil
+}
+
+// handleWriteError applies the endpoint's write-error policy shared by the
+// synchronous WriteTo path and the asynchronous batched-flush path: hard
+// failures retire the endpoint immediately, transient errors are tolerated
+// up to a threshold. Returns the error to propagate (nil is never returned;
+// tolerated errors are wrapped).
+func (ue *UdpEndpoint) handleWriteError(err error) error {
+	// Connection-refused is a hard failure: evict the bad upstream now.
+	if ue.isConnectionRefused(err) {
+		ue.retire()
+		ue.handleProxyServerFailure()
+		return err
+	}
+	// A datagram send-queue timeout is a stalled transport, not a transient
+	// error: the queue stayed full for the whole wait. Retire immediately —
+	// the soft-error counter is reset by any enqueue (which is not a peer
+	// ACK), so a half-dead transport could otherwise dodge the threshold
+	// forever by the occasional enqueue that never reaches the peer.
+	if stderrors.Is(err, quic.ErrDatagramQueueFullTimeout) {
+		ue.retire()
+		return err
+	}
+	// Tolerate transient write errors up to a threshold so brief transport
+	// backpressure does not retire a healthy long-lived session. A closed
+	// conn and a genuinely dead transport are still retired promptly: the
+	// former by this threshold, the latter by the read loop (EOF/error).
+	if ue.writeSoftErrorCount.Add(1) <= writeSoftErrorThreshold &&
+		!stderrors.Is(err, net.ErrClosed) {
+		return &udpEndpointWriteToleratedError{err: err}
+	}
+	ue.retire()
+	return err
 }
 
 func (ue *UdpEndpoint) Close() error {
@@ -592,6 +620,10 @@ func (ue *UdpEndpoint) Close() error {
 		ue.releaseTrackedUdpConnState()
 
 		// conn is nil for negatively-cached failure entries; guard against panic.
+		if ue.writeBatch != nil {
+			// Drain any buffered datagrams before the conn closes.
+			ue.writeBatch.Close()
+		}
 		if ue.conn != nil {
 			ue.closeErr = ue.conn.Close()
 		}

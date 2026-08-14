@@ -26,7 +26,26 @@ var (
 	UdpTaskPoolAgingTime = 100 * time.Millisecond
 )
 
-type UdpTask = func()
+// UdpTask is the unit of per-flow UDP work. It used to be a plain func
+// closure; it is an interface so hot paths can submit pooled owned
+// structures (see udpIngressTask) instead of allocating an escaping closure
+// per packet. udpTaskFunc keeps func literals usable for tests and benches.
+type UdpTask interface {
+	Run()
+}
+
+// udpTaskFunc adapts a func literal to UdpTask.
+type udpTaskFunc func()
+
+func (f udpTaskFunc) Run() { f() }
+
+// udpTaskFuncOrNil adapts an optional func literal; nil stays nil.
+func udpTaskFuncOrNil(f func()) UdpTask {
+	if f == nil {
+		return nil
+	}
+	return udpTaskFunc(f)
+}
 
 // UdpTaskQueue makes sure packets with the same UDP flow key are sent in order.
 // Field order optimized for memory alignment (Go best practice).
@@ -163,7 +182,7 @@ func (q *UdpTaskQueue) convoy() {
 		drainedAny := false
 		for {
 			if task, ok := q.popReadyTask(); ok {
-				task()
+				task.Run()
 				drainedAny = true
 				continue
 			}
@@ -176,12 +195,12 @@ func (q *UdpTaskQueue) convoy() {
 
 		select {
 		case task := <-q.ch:
-			task()
+			task.Run()
 			// Drain follow-up tasks that arrived while we were running the
 			// first one, then re-arm the timer once.
 			for {
 				if task, ok := q.popReadyTask(); ok {
-					task()
+					task.Run()
 					continue
 				}
 				break

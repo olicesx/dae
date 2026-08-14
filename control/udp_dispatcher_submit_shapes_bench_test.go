@@ -36,7 +36,7 @@ func BenchmarkUDPOrderedSubmitShapes(b *testing.B) {
 	b.Run("submit_owned", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			if !d.submitOwned(key, run, nil, &admission) {
+			if !d.submitOwned(key, udpTaskFunc(run), nil, &admission) {
 				admission.release()
 			}
 		}

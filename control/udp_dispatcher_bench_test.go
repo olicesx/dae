@@ -38,7 +38,7 @@ func BenchmarkUDPReplyDispatcherSubmitDrain(b *testing.B) {
 			for i := range endpoints {
 				endpoints[i] = &UdpEndpoint{}
 			}
-			runBoundedUDPDispatcherBenchmark(b, tc.producers, func(workerID, localOp int, task UdpTask) bool {
+			runBoundedUDPDispatcherBenchmark(b, tc.producers, func(workerID, localOp int, task func()) bool {
 				ep := endpoints[((localOp%len(endpoints))*tc.producers+workerID)%len(endpoints)]
 				return dispatcher.submit(ep, task, nil)
 			})
@@ -78,9 +78,9 @@ func benchLegacyUDPPoolSubmitDrain(flows, producers int) func(*testing.B) {
 		b.Cleanup(func() { pool.Close() })
 
 		keys := udpDispatcherBenchmarkKeys(flows)
-		runBoundedUDPDispatcherBenchmark(b, producers, func(workerID, localOp int, task UdpTask) bool {
+		runBoundedUDPDispatcherBenchmark(b, producers, func(workerID, localOp int, task func()) bool {
 			key := keys[udpDispatcherBenchmarkKeyIndex(localOp, workerID, producers, len(keys))]
-			return pool.EmitTask(key, task)
+			return pool.EmitTask(key, udpTaskFunc(task))
 		})
 	}
 }
@@ -94,7 +94,7 @@ func benchNewUDPOrderedDispatcherSubmitDrain(flows, producers int) func(*testing
 		})
 
 		keys := udpDispatcherBenchmarkKeys(flows)
-		runBoundedUDPDispatcherBenchmark(b, producers, func(workerID, localOp int, task UdpTask) bool {
+		runBoundedUDPDispatcherBenchmark(b, producers, func(workerID, localOp int, task func()) bool {
 			key := keys[udpDispatcherBenchmarkKeyIndex(localOp, workerID, producers, len(keys))]
 			return d.submit(key, task, nil)
 		})
@@ -112,7 +112,7 @@ func udpDispatcherBenchmarkKeys(flows int) []UdpFlowKey {
 	return keys
 }
 
-func runBoundedUDPDispatcherBenchmark(b *testing.B, producers int, submit func(workerID, localOp int, task UdpTask) bool) {
+func runBoundedUDPDispatcherBenchmark(b *testing.B, producers int, submit func(workerID, localOp int, task func()) bool) {
 	permits := make(chan struct{}, udpDispatcherBenchmarkMaxInFlight)
 	for range udpDispatcherBenchmarkMaxInFlight {
 		permits <- struct{}{}

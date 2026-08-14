@@ -175,8 +175,14 @@ func normalizeUDPOrderedDispatcherWorkers(workers int) int {
 	return workers
 }
 
-func (d *udpOrderedDispatcher) submit(key UdpFlowKey, run, discard UdpTask) bool {
-	return d.submitTask(key, udpOrderedDispatchTask{run: run, discard: discard})
+func (d *udpOrderedDispatcher) submit(key UdpFlowKey, run, discard func()) bool {
+	if run == nil {
+		return false
+	}
+	return d.submitTask(key, udpOrderedDispatchTask{
+		run:     udpTaskFunc(run),
+		discard: udpTaskFuncOrNil(discard),
+	})
 }
 
 // submitOwned queues a task whose packet buffer and ingress admission are
@@ -523,7 +529,7 @@ func (d *udpOrderedDispatcher) runTask(task udpOrderedDispatchTask) {
 			reportUDPDispatcherPanic("ordered", "run", &d.panicCount, recovered)
 		}
 	}()
-	task.run()
+	task.run.Run()
 }
 
 func (d *udpOrderedDispatcher) discardTask(task udpOrderedDispatchTask) {
@@ -533,7 +539,7 @@ func (d *udpOrderedDispatcher) discardTask(task udpOrderedDispatchTask) {
 				reportUDPDispatcherPanic("ordered", "discard", &d.panicCount, recovered)
 			}
 		}()
-		task.discard()
+		task.discard.Run()
 	}
 	// Release the task-owned resources. Order matches the old discard closure:
 	// admission first, then the packet buffer.

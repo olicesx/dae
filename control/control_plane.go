@@ -2535,212 +2535,18 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				pktBuf.Put()
 				return
 			}
-			task := func() {
-				data := pktBuf
-
-				defer data.Put()
-				defer c.udpIngressAdmission.release()
-				var routingResult *bpfRoutingResult
-				var freshRoutingResult *bpfRoutingResult
-
-				// DNS ingress fast path: valid DNS packets to port 53 do not need
-				// UdpEndpoint state tracking on ingress. Keep userspace handling to
-				// reduce hot-path overhead, but best-effort preserve tuple metadata
-				// for rules matching (pname/mac/dscp).
-				if realDst.Port() == 53 {
-					// Only self-directed traffic to the local DNS listener should be
-					// short-circuited here. External LAN clients targeting a LAN-bound
-					// listener have already entered the ingress/TProxy userspace path
-					// and still need fast-path DNS handling.
-					if c.dnsListener != nil {
-						listenAddr := c.dnsListener.Addr()
-						if shouldSkipDNSFastPathForLocalListenerTraffic(listenAddr, convergeSrc, realDst) {
-							if c.log.IsLevelEnabled(logrus.TraceLevel) {
-								c.log.WithFields(logrus.Fields{
-									"src":        convergeSrc.String(),
-									"dst":        realDst.String(),
-									"listenAddr": listenAddr,
-								}).Trace("Skipping DNS fast path for local traffic to our own DNS listener")
-							}
-							return
-						}
-					}
-
-					if dnsMessage, _ := ChooseNatTimeout(data, true); dnsMessage != nil {
-						dnsRoutingResult := &bpfRoutingResult{
-							Outbound: uint8(consts.OutboundControlPlaneRouting),
-						}
-						if rr, retrieveErr := c.core.RetrieveRoutingResult(convergeSrc, realDst, unix.IPPROTO_UDP); retrieveErr == nil {
-							dnsRoutingResult = rr
-						} else if !stderrors.Is(retrieveErr, ebpf.ErrKeyNotExist) && c.log.IsLevelEnabled(logrus.DebugLevel) {
-							c.log.WithFields(logrus.Fields{
-								"src": convergeSrc.String(),
-								"dst": realDst.String(),
-							}).WithError(retrieveErr).Debug("UDP routing tuple lookup failed for DNS ingress fast path; fallback to minimal routing metadata")
-						}
-						handler, release, ownerErr := c.acquireRoutingEpochExecutionOwner(dnsRoutingResult)
-						if ownerErr != nil {
-							c.log.WithError(ownerErr).Warn("DNS ingress routing epoch owner is unavailable")
-							return
-						}
-						if release != nil {
-							defer release()
-						}
-						if dnsRoutingResult.Mark == 0 {
-							dnsRoutingResult.Mark = handler.soMarkFromDae
-						}
-						req := &udpRequest{
-							realSrc:       convergeSrc,
-							realDst:       realDst,
-							src:           convergeSrc,
-							lConn:         udpConn,
-							routingResult: dnsRoutingResult,
-						}
-
-						dnsController := handler.ActiveDnsController()
-						if dnsController == nil {
-							return
-						}
-						if e := dnsController.Handle_(handler.dnsRequestContext(handler.ctx, dnsController), dnsMessage, req); e != nil {
-							if stderrors.Is(e, ErrDNSQueryConcurrencyLimitExceeded) {
-								if handler.log.IsLevelEnabled(logrus.DebugLevel) {
-									handler.log.WithFields(logrus.Fields{
-										"src": convergeSrc.String(),
-										"dst": realDst.String(),
-									}).Debug("DNS query concurrency limit exceeded in fast path")
-								}
-								return
-							}
-							if stderrors.Is(e, ErrDNSTruncated) {
-								if handler.log.IsLevelEnabled(logrus.DebugLevel) {
-									handler.log.WithFields(logrus.Fields{
-										"src":      convergeSrc.String(),
-										"dst":      realDst.String(),
-										"question": dnsMessage.Question,
-									}).Debug("DNS ingress fast path got truncated UDP response; returning TC=1 to client")
-								}
-								if sendErr := dnsController.sendDnsTruncatedResponse_(dnsMessage, req, nil); sendErr != nil {
-									if handler.log.IsLevelEnabled(logrus.WarnLevel) && handler.allowDnsFastPathServfailLog(time.Now()) {
-										handler.log.WithError(stderrors.Join(e, sendErr)).WithFields(logrus.Fields{
-											"src": convergeSrc.String(),
-											"dst": realDst.String(),
-										}).Warn("Failed to send truncated DNS response in DNS fast path")
-									}
-								}
-								return
-							}
-							if handler.log.IsLevelEnabled(logrus.WarnLevel) && handler.allowDnsFastPathErrorLog(time.Now()) {
-								handler.log.WithFields(logrus.Fields{
-									"src":      convergeSrc.String(),
-									"dst":      realDst.String(),
-									"question": dnsMessage.Question,
-									"error":    e.Error(),
-								}).Warn("DNS ingress fast path failed; sending SERVFAIL response")
-							}
-							if sendErr := dnsController.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeServerFailure, "ServeFail (dns ingress fast path)", req, nil); sendErr != nil {
-								if handler.log.IsLevelEnabled(logrus.WarnLevel) && handler.allowDnsFastPathServfailLog(time.Now()) {
-									handler.log.WithError(stderrors.Join(e, sendErr)).WithFields(logrus.Fields{
-										"src": convergeSrc.String(),
-										"dst": realDst.String(),
-									}).Warn("Failed to send SERVFAIL response in DNS fast path")
-								}
-								return
-							}
-						} else if handler.log.IsLevelEnabled(logrus.TraceLevel) {
-							// Success logging for DNS fast path (trace level only)
-							handler.log.WithFields(logrus.Fields{
-								"src":      convergeSrc.String(),
-								"dst":      realDst.String(),
-								"question": dnsMessage.Question,
-							}).Trace("DNS ingress fast path handled successfully")
-						}
-						return
-					}
-				}
-
-				if !c.udpRouteScopeSensitive && c.ownsActiveRoutingEpoch() {
-					if ue, ok := DefaultUdpEndpointPool.Get(flowDecision.CachedRoutingEndpointKey()); ok {
-						if bound, bindingHit := ue.GetBoundRoutingResult(realDst, unix.IPPROTO_UDP); bindingHit {
-							routingResult = bound
-						}
-					}
-					if routingResult == nil {
-						if fallbackKey, ok := flowDecision.CachedRoutingFallbackKey(); ok {
-							if ue, ok := DefaultUdpEndpointPool.Get(fallbackKey); ok {
-								if bound, bindingHit := ue.GetBoundRoutingResult(realDst, unix.IPPROTO_UDP); bindingHit {
-									routingResult = bound
-								}
-							}
-						}
-					}
-				}
-
-				if routingResult == nil {
-					rr, retrieveErr := c.core.RetrieveRoutingResult(convergeSrc, realDst, unix.IPPROTO_UDP)
-					if retrieveErr != nil {
-						switch {
-						case stderrors.Is(retrieveErr, ebpf.ErrKeyNotExist):
-							// Keep behavior consistent with TCP path: missing tuple can happen
-							// in short race windows; fallback to userspace routing instead of
-							// dropping the packet.
-							routingResult = &bpfRoutingResult{
-								Outbound: uint8(consts.OutboundControlPlaneRouting),
-							}
-							if c.log.IsLevelEnabled(logrus.DebugLevel) {
-								c.log.WithFields(logrus.Fields{
-									"src": convergeSrc.String(),
-									"dst": realDst.String(),
-								}).WithError(retrieveErr).Debug("UDP routing tuple missing; fallback to userspace routing")
-							}
-						case realDst.Port() == 53:
-							// DNS should never be silently dropped due to transient eBPF lookup
-							// failures. Fall back to userspace routing to preserve availability.
-							routingResult = &bpfRoutingResult{
-								Outbound: uint8(consts.OutboundControlPlaneRouting),
-							}
-							c.log.WithFields(logrus.Fields{
-								"src": convergeSrc.String(),
-								"dst": realDst.String(),
-							}).WithError(retrieveErr).Warn("UDP routing tuple lookup failed for DNS; fallback to userspace routing")
-						default:
-							c.log.Warnf("No AddrPort presented: %v", retrieveErr)
-							return
-						}
-					} else {
-						routingResult = rr
-						rrCopy := *routingResult
-						freshRoutingResult = &rrCopy
-					}
-				}
-
-				if e := c.handlePkt(udpConn, data, convergeSrc, realDst, routingResult, flowDecision, false); e != nil {
-					// Rate-limit the expected reload-window routing-epoch
-					// ownership loss; other handlePkt errors still log always.
-					if stderrors.Is(e, errRoutingEpochOwnerUnavailable) {
-						if c.log.IsLevelEnabled(logrus.WarnLevel) && c.allowHandlePktEpochWarn(time.Now()) {
-							c.log.Warnln("handlePkt:", e)
-						}
-					} else {
-						c.log.Warnln("handlePkt:", e)
-					}
-					return
-				}
-
-				if !c.udpRouteScopeSensitive && c.ownsActiveRoutingEpoch() && freshRoutingResult != nil {
-					updatedCache := false
-					if ue, ok := DefaultUdpEndpointPool.Get(flowDecision.CachedRoutingEndpointKey()); ok {
-						ue.UpdateCachedRoutingResult(realDst, unix.IPPROTO_UDP, freshRoutingResult)
-						updatedCache = true
-					}
-					if !updatedCache {
-						if fallbackKey, ok := flowDecision.CachedRoutingFallbackKey(); ok {
-							if ue, ok := DefaultUdpEndpointPool.Get(fallbackKey); ok {
-								ue.UpdateCachedRoutingResult(realDst, unix.IPPROTO_UDP, freshRoutingResult)
-							}
-						}
-					}
-				}
-			}
+			// Pooled owned task: captures the per-packet locals by value (they
+			// never change after submission) instead of allocating an escaping
+			// closure per packet. Run() releases the buffer, the admission
+			// gate, and returns the task to the pool on every path.
+			task := udpIngressTaskPool.Get().(*udpIngressTask)
+			task.c = c
+			task.lConn = udpConn
+			task.pktBuf = pktBuf
+			task.admission = &c.udpIngressAdmission
+			task.realDst = realDst
+			task.convergeSrc = convergeSrc
+			task.flowDecision = flowDecision
 
 			// Session FIFO now takes precedence for generic UDP forwarding.
 			// Ordered ingress keeps same-flow packets in the order they were read
@@ -2751,12 +2557,14 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			if flowDecision.DispatchStrategy() == StrategyDirectGoroutine {
 				// DNS, VoIP, and other low-latency exception traffic bypasses the
 				// ordered per-flow queue and runs immediately.
-				go task()
+				go task.Run()
 			} else if !c.submitOrderedUDPIngress(flowDecision.Key, task, pktBuf, &c.udpIngressAdmission) {
 				// Rejected: the dispatcher does not own the buffer or the
-				// admission, so release both inline (old discardTask closure).
+				// admission, so release both inline and return the task to the
+				// pool (it was never queued, so Run() will not run).
 				c.udpIngressAdmission.release()
 				pktBuf.Put()
+				udpIngressTaskPool.Put(task)
 			}
 			// if d := time.Since(t); d > 100*time.Millisecond {
 			// 	logrus.Println(d)

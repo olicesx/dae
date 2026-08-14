@@ -231,6 +231,8 @@ github.com/olicesx/outbound v0.0.0-20260813180730-0aef6187f9e5 h1:6HI/DVaLfk21dh
 github.com/olicesx/outbound v0.0.0-20260813180730-0aef6187f9e5/go.mod h1:Q0Oe63zHg7/1qwW3muV3kNgj/Cy/AqFE8Grm0SwLzPA=
 github.com/olicesx/outbound v0.0.0-20260814021516-734c8440e93c h1:FJNK9UjPL5cTQkr9clqp1HWyXcW+Iot8SitJkB5V6CU=
 github.com/olicesx/outbound v0.0.0-20260814021516-734c8440e93c/go.mod h1:Q0Oe63zHg7/1qwW3muV3kNgj/Cy/AqFE8Grm0SwLzPA=
+github.com/olicesx/outbound v0.0.0-20260814030158-e17dcb4a612d h1:YHIX8t/HalUoLuZE3jjegt/Q3ZJ0ZBWcmzj8F28ZEzY=
+github.com/olicesx/outbound v0.0.0-20260814030158-e17dcb4a612d/go.mod h1:tOFDMvr6vQEdhT/lyh/BHd1cAMn8ZUFenNNjJVjd/5Q=
 github.com/olicesx/quic-go v0.0.0-20260813175631-e7385cedff21 h1:8C0gRoN+Ld/gwI5SSmMWBRQRr95H6Cla4+cfdcDE6wk=
 github.com/olicesx/quic-go v0.0.0-20260813175631-e7385cedff21/go.mod h1:4i75wxoxXaebP2bt5TFzSx9zf3+M7g8NQJ8PZIaIuIQ=
 github.com/olicesx/quic-go v0.0.0-20260814021242-ca082f24ea90 h1:pWoI+RVngSsXqR7jY8wdHmHdBbg0vTyzHvzPNPp2J4o=

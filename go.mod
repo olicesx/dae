@@ -8,7 +8,7 @@ require (
 	github.com/bits-and-blooms/bloom/v3 v3.7.1
 	github.com/cilium/ebpf v0.20.0
 	github.com/daeuniverse/dae-config-dist/go/dae_config v0.0.0-20230604120805-1c27619b592d
-	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260814021516-734c8440e93c
+	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260814030158-e17dcb4a612d
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/json-iterator/go v1.1.12
 	github.com/mholt/archives v0.1.5
@@ -123,4 +123,4 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260814
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
 
 // Use the remote outbound fork containing the transport-owned packet delivery API.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-20260814021516-734c8440e93c
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-20260814030158-e17dcb4a612d

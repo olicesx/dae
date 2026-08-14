@@ -74,7 +74,25 @@ WSL2 hv 使单次 syscall ~2-3μs，放大效应明显，但真实内核上同�
 - **真实内核预期**：sendto ~0.5-1μs → sendmmsg 批 32 ~0.2μs/包（syscall 边界摊薄），
   写路径 ~5x；真实内核上的收益与回归（同步 flush 阻塞率）**必须在真实内核复测**。
 
-## 4. 结论与决策1. **070201f7（SetReadBuffer 8MiB）已 revert（23bc22c9）**：两个场景均无实测收益
+### 分配画像（2026-08-15，socks 路径饱和负载 heap profile）
+
+| 热点 | alloc_objects | alloc_space | 归属/处置 |
+|---|---|---|---|
+| `Serve.func4.1`（读循环） | 21.6%（每包 ~1.6 次） | 24.3% | task 闭包（control_plane.go:2538）+ `freshRoutingResult` 拷贝（2712）——第二波候选 |
+| `parseInetAddr`（x/net 读路径） | 17.9%（每包 1 次） | 4.9% | x/net recvmmsg 固有（unpack 每包解析源地址），无法从 dae 侧消除 |
+| `pool.Put` | 16.3% | 3.1% | interface 装箱（bounded channel 的 any 参数）——池类型为敏感决策（pool 摇摆教训），不改 |
+| `AddrPort.String` | 7.7% | 1.5% | 每包 String 化（flow key/日志路径）——待定位调用点 |
+| `direct.WriteBatch`（批写） | 4.7% | 5.8% | **已优化（outbound 942b5a4）**：scratch 池化，批 32 分配 4085B/65 → 242B/32（-94%） |
+| `pool.init.0.func1` | 3.9% | 44.3% | 池预热（一次性），非每包 |
+
+> 结论：每包分配大头在**读路径**（x/net parseInetAddr 固有 + task 闭包/缓存拷贝，dae 可控部分
+> 为后者）与**池装箱**（敏感，不动）。第二波优化候选排序：① task 闭包 → owned 结构（消除
+> 每包闭包逃逸，e58f87ce 已做 discard 部分，task 主闭包仍在）② `freshRoutingResult` 延迟拷贝
+> ③ AddrPort.String 调用点定位。均为环境无关收益，可真实内核复测后一起验证。
+
+## 4. 结论与决策
+
+1. **070201f7（SetReadBuffer 8MiB）已 revert（23bc22c9）**：两个场景均无实测收益
    （NAT 路径不经 dae；socks 路径 8MiB 无效）。防御性设置不构成提交理由。
 2. **下一步优化方向（按 pprof 证据排序）**：
    a. **出站 UDP 批写（sendmmsg/SendMsgs）**：socks5/direct 出站路径每包一次 write →

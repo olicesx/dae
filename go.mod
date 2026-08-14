@@ -8,14 +8,14 @@ require (
 	github.com/bits-and-blooms/bloom/v3 v3.7.1
 	github.com/cilium/ebpf v0.20.0
 	github.com/daeuniverse/dae-config-dist/go/dae_config v0.0.0-20230604120805-1c27619b592d
-	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260813132909-2ee53c36f826
+	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260814021516-734c8440e93c
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/json-iterator/go v1.1.12
 	github.com/mholt/archives v0.1.5
 	github.com/miekg/dns v1.1.72
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
 	github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac
-	github.com/olicesx/quic-go v0.0.0-20260813130949-99bc5597b649
+	github.com/olicesx/quic-go v0.0.0-20260814021242-ca082f24ea90
 	github.com/panjf2000/ants/v2 v2.11.5
 	github.com/safchain/ethtool v0.7.0
 	github.com/shirou/gopsutil/v4 v4.26.1
@@ -117,10 +117,10 @@ require (
 // DATAGRAM frames (sync.Pool was cleared on every GC cycle, causing an
 // allocation spiral that showed up as 80% GC CPU in production), plus bounded
 // Add on a full send queue (30s timeout -> ErrDatagramQueueFullTimeout).
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260813175631-e7385cedff21
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260814021242-ca082f24ea90
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
 
 // Use the remote outbound fork containing the transport-owned packet delivery API.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-20260813180730-0aef6187f9e5
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-20260814021516-734c8440e93c

@@ -328,11 +328,65 @@ func (c *controlPlaneCore) setupTCPRelayOffload() error {
 		c.log.Debug("TCP relay eBPF offload disabled by DAE_DISABLE_TCP_RELAY_OFFLOAD=1")
 		return nil
 	}
-	// TCP relay eBPF offload is disabled due to kernel panic issues with bpf_msg_redirect_hash().
-	// See: https://github.com/daeuniverse/dae/pull/912
-	// The sk_msg program now returns SK_PASS, so we must not enable offload or connections will hang.
-	// The function body below is preserved for potential future re-enabling.
-	c.log.Info("TCP relay eBPF offload is disabled due to kernel panic issues; falling back to userspace relay")
+
+	// Opt-in only. The sockmap redirect was removed upstream (dae#912) after
+	// CVE-2025-38165 ("bpf, sockmap: Fix panic when calling skb_linearize")
+	// and because the psock ingress_skb queue is still not charged to socket
+	// buffers/memcg (bpf-next 2025-04 series issue #4, unfixed), so a
+	// slow-reading peer can grow kernel memory without bound. The user-space
+	// session enforces tcpOffloadMaxPeerBacklog as a mitigation, but the
+	// feature stays off unless explicitly enabled.
+	if os.Getenv("DAE_ALLOW_TCP_SOCKMAP") != "1" {
+		c.log.Debug("TCP relay eBPF offload disabled (opt-in via DAE_ALLOW_TCP_SOCKMAP=1)")
+		return nil
+	}
+
+	bpf := c.bpf.Load()
+	if bpf == nil || bpf.FastSock == nil || bpf.TcpOffloadRedirect == nil || bpf.TcpOffloadSent == nil || bpf.TcpOffloadPause == nil || bpf.TcpOffloadSentAccount == nil {
+		return fmt.Errorf("fast_sock, tcp_offload_redirect, tcp_offload_pause, tcp_offload_sent or tcp_offload_sent_account unavailable")
+	}
+
+	switch {
+	case c.kernelVersion == nil:
+		return fmt.Errorf("kernel version unavailable")
+	case consts.IsTcpSockmapPanicSafeKernel(*c.kernelVersion):
+		c.log.Infof("Enabling TCP relay eBPF offload (kernel %v has the CVE-2025-38165 fix)", *c.kernelVersion)
+	default:
+		c.log.Warnf("Enabling TCP relay eBPF offload via DAE_ALLOW_TCP_SOCKMAP on kernel %v without a known CVE-2025-38165 fix; a message larger than ~100KB redirected between relay sockets can panic this kernel", *c.kernelVersion)
+	}
+
+	rawLink, err := ciliumLink.AttachRawLink(ciliumLink.RawLinkOptions{
+		Target:  bpf.FastSock.FD(),
+		Program: bpf.TcpOffloadRedirect,
+		Attach:  ebpf.AttachSkSKBStreamVerdict,
+	})
+	if err != nil {
+		return fmt.Errorf("attach tcp_offload_redirect to fast_sock: %w", err)
+	}
+	c.addManagedBpfHookCleanup(func() error {
+		return rawLink.Close()
+	})
+
+	// Backlog-fuse accounting: count bytes entering each relay socket's
+	// send path via skb_send_sock, keyed by reversed four-tuple. fentry
+	// (BPF trampoline) avoids the kprobe trap cost on the hot path.
+	// DAE_FUSE_ACCOUNT=0 skips the attach (diagnostics only: the backlog
+	// fuse cannot engage without the accounting).
+	if os.Getenv("DAE_FUSE_ACCOUNT") != "0" {
+		sentLink, err := ciliumLink.AttachTracing(ciliumLink.TracingOptions{
+			Program:    bpf.TcpOffloadSentAccount,
+			AttachType: ebpf.AttachTraceFEntry,
+		})
+		if err != nil {
+			return fmt.Errorf("attach tcp_offload_sent_account fentry to skb_send_sock: %w", err)
+		}
+		c.addManagedBpfHookCleanup(func() error {
+			return sentLink.Close()
+		})
+	}
+
+	c.tcpSockmapOffloadReady.Store(true)
+	c.log.Info("TCP relay eBPF offload enabled (sk_skb stream verdict on fast_sock)")
 	return nil
 }
 

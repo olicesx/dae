@@ -383,7 +383,6 @@ type loadBpfOptions struct {
 
 const (
 	defaultConnStateMapMaxEntries = 65536 * 4
-	fastSockPlaceholderMaxEntries = 1
 )
 
 func loadBpfObjectsWithConstantsAndCustomizer(
@@ -436,30 +435,11 @@ func tuneConnStateBpfMap(spec *ebpf.CollectionSpec, maxEntries uint32) error {
 	return nil
 }
 
-func tunePlaceholderBpfMaps(spec *ebpf.CollectionSpec) error {
-	if spec == nil {
-		return fmt.Errorf("nil collection spec")
-	}
-
-	fastSock, ok := spec.Maps["fast_sock"]
-	if !ok || fastSock == nil {
-		return fmt.Errorf("missing map spec %q", "fast_sock")
-	}
-	// fast_sock is retained only to keep the generated Go ABI stable while the
-	// sockhash redirect path remains disabled, so a single placeholder slot is
-	// sufficient.
-	fastSock.MaxEntries = fastSockPlaceholderMaxEntries
-	return nil
-}
-
 func customizeBpfMapSpecs(spec *ebpf.CollectionSpec, connStateMapMaxEntries uint32) error {
 	if err := disablePinnedConnStateMaps(spec); err != nil {
 		return err
 	}
 	if err := tuneConnStateBpfMap(spec, connStateMapMaxEntries); err != nil {
-		return err
-	}
-	if err := tunePlaceholderBpfMaps(spec); err != nil {
 		return err
 	}
 	return nil

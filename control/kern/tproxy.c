@@ -16,6 +16,14 @@
 #include "headers/bpf_core_read.h"
 #include "headers/bpf_endian.h"
 #include "headers/bpf_helpers.h"
+/* bpf_tracing.h (kprobe arg accessors) needs a target arch; mirror the
+ * vmlinux.h fallback (x86) unless the build already selects one. */
+#if !defined(__TARGET_ARCH_x86) && !defined(__TARGET_ARCH_arm64) && \
+	!defined(__TARGET_ARCH_riscv) && !defined(__TARGET_ARCH_loongarch) && \
+	!defined(__TARGET_ARCH_powerpc)
+#define __TARGET_ARCH_x86
+#endif
+#include "headers/bpf_tracing.h"
 #include "ebpf_sync_defs.h"
 
 // #define __DEBUG_ROUTING
@@ -60,6 +68,9 @@
 #define MAX_ROUTING_HANDOFF_NUM 65536
 #define MAX_COOKIE_PID_PNAME_MAPPING_NUM 65536
 #define MAX_DOMAIN_ROUTING_NUM 65536
+// MAX_TCP_OFFLOAD_NUM bounds concurrent TCP relay offload sessions. Each
+// session occupies two fast_sock entries (one per direction).
+#define MAX_TCP_OFFLOAD_NUM 16384
 #define MAX_ARG_LEN 128
 #define IPV6_MAX_EXTENSIONS 8
 
@@ -216,18 +227,46 @@ struct {
 	__uint(max_entries, 1);
 } dae_ifindex_map SEC(".maps");
 
-/* fast_sock map and sk_msg programs are preserved here strictly for ABI compatibility
- * with Go's generated bpf2go code (bpf_stub.go) and tcp_offload_linux.go.
- * BPF_PROG_TYPE_SOCK_OPS + BPF_PROG_TYPE_SK_MSG (bpf_msg_redirect_hash) combination
- * has been proven to cause Kernel Panic. We use TC-based redirect instead.
- * The Go side will still interact with these stubs, but they do nothing in the kernel.
+/* fast_sock holds the two sockets of every user-space offloaded TCP relay
+ * pair. The Go control plane registers each socket under its reversed
+ * four-tuple (sip=remote, dip=local, sport=remote_port, dport=local_port),
+ * pointing at the peer socket's fd. The sk_skb stream-verdict program
+ * tcp_offload_redirect then splices received data between the pair in-kernel.
+ * Sockets are automatically deleted from the map once closed.
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_SOCKHASH);
 	__type(key, struct tuples_key);
 	__type(value, __u64);
-	__uint(max_entries, 1);
+	__uint(max_entries, MAX_TCP_OFFLOAD_NUM * 2);
 } fast_sock SEC(".maps");
+
+/* tcp_offload_pause is the backlog fuse: while a key is present, the
+ * stream-verdict program passes received data through (SK_PASS) instead of
+ * redirecting, so the userspace fallback forwards it while the kernel drains
+ * skbs already queued on the peer's egress retry path. Unlike deleting the
+ * fast_sock entry, a pause does not tear down the psock (which would drop
+ * the queued skbs); the Go side removes the key once the backlog drains.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__type(key, struct tuples_key);
+	__type(value, __u8);
+	__uint(max_entries, MAX_TCP_OFFLOAD_NUM * 2);
+} tcp_offload_pause SEC(".maps");
+
+/* tcp_offload_sent counts bytes that skb_send_sock delivered to a socket's
+ * send path, keyed by the skb's reversed four-tuple (the same key space as
+ * fast_sock and tcp_offload_pause). The Go session compares it against
+ * tcp_info receive deltas to compute the egress retry-queue backlog that
+ * drives the pause fuse.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+	__type(key, struct tuples_key);
+	__type(value, __u64);
+	__uint(max_entries, MAX_TCP_OFFLOAD_NUM * 2);
+} tcp_offload_sent SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -3318,20 +3357,125 @@ int tproxy_wan_cg_sendmsg6(struct bpf_sock_addr *ctx)
 	return 1;
 }
 
-// tproxy_sockops is a placeholder for future sockops-based socket tracking.
-// Preserved for Go ABI compatibility.
-SEC("sockops")
-int tproxy_sockops(struct bpf_sock_ops *skops)
+// tcp_offload_redirect is the stream-verdict (RX path) program for the
+// fast_sock SOCKHASH. When a socket registered by the Go control plane
+// receives data, this program redirects it to the peer relay socket's egress
+// path (i.e. the peer socket transmits it), splicing the pair in-kernel.
+//
+// The upstream sockmap fast redirect used an sk_msg program with
+// BPF_F_INGRESS (delivering written data into the peer receive queue), which
+// never transmits bytes for a local<->remote relay pair; this sk_skb +
+// egress-redirect design matches kernel selftest semantics instead.
+//
+// bpf_sk_redirect_hash returns SK_DROP when the key is not found, so a miss
+// must be turned into SK_PASS before calling the helper or the packet would
+// be silently dropped.
+SEC("sk_skb/tcp_offload_redirect")
+int tcp_offload_redirect(struct __sk_buff *skb)
 {
-	return BPF_OK;
-}
+	struct tuples_key peer_key = {};
 
-// tproxy_sk_msg_redir is DISABLED due to kernel panic issues with
-// bpf_msg_redirect_hash(). Preserved for Go ABI compatibility.
-SEC("sk_msg")
-int tproxy_sk_msg_redir(struct sk_msg_md *msg)
-{
-	return SK_PASS;
+	// Key layout must match Go's makeTuplesKey(remote, local, TCP):
+	// sip=remote, dip=local, sport=remote_port(BE), dport=local_port(BE).
+	// __sk_buff.remote_port carries the network-order port in the high 16
+	// bits on little-endian targets (convert_skb_access LSH 16);
+	// local_port is host byte order.
+	peer_key.l4proto = IPPROTO_TCP;
+	peer_key.sport = skb->remote_port >> 16;
+	peer_key.dport = bpf_htons((__u16)skb->local_port);
+	if (skb->family == AF_INET) {
+		peer_key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+		peer_key.sip.u6_addr32[3] = skb->remote_ip4;
+		peer_key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+		peer_key.dip.u6_addr32[3] = skb->local_ip4;
+	} else if (skb->family == AF_INET6) {
+		__builtin_memcpy(&peer_key.sip, skb->remote_ip6,
+				 IPV6_BYTE_LENGTH);
+		__builtin_memcpy(&peer_key.dip, skb->local_ip6, IPV6_BYTE_LENGTH);
+	} else {
+		return SK_PASS;
+	}
+
+	// Backlog fuse: a paused key passes data through to the userspace
+	// fallback. The fast_sock entry stays registered so the kernel keeps
+	// draining already-redirected skbs from the peer's egress retry queue.
+	if (bpf_map_lookup_elem(&tcp_offload_pause, &peer_key))
+		return SK_PASS;
+
+	// Pre-check: bpf_sk_redirect_hash returns SK_DROP when the key is not
+	// found, which would silently discard the packet. Pass instead. The
+	// lookup acquires a socket reference that must be released before the
+	// program exits (the redirect helper takes its own reference).
+	{
+		struct bpf_sock *peer =
+			bpf_map_lookup_elem(&fast_sock, &peer_key);
+		if (!peer)
+			return SK_PASS;
+		bpf_sk_release(peer);
+	}
+
+	// flags == 0 selects the egress path: the peer socket sends the data.
+	return bpf_sk_redirect_hash(skb, &fast_sock, &peer_key, 0);
 }
 
 SEC("license") const char __license[] = "Dual BSD/GPL";
+
+/* tcp_offload_sent_account records, per reversed four-tuple, the bytes that
+ * skb_send_sock pushes into a peer socket's send path. The key layout must
+ * match tcp_offload_redirect's peer_key so the Go session can look up both
+ * directions with its registered keys. fentry keeps the per-packet cost
+ * below the kprobe trap overhead on the hot redirect path. */
+SEC("fentry/skb_send_sock")
+int BPF_PROG(tcp_offload_sent_account, struct sock *sk, struct sk_buff *skb,
+	     int offset, int len)
+{
+	struct tuples_key key = {};
+	struct iphdr ip4;
+	struct tcphdr tcp;
+	__u16 nh;
+	unsigned char *head, *data;
+	__u64 *v;
+
+	nh = BPF_CORE_READ(skb, network_header);
+	head = BPF_CORE_READ(skb, head);
+	data = head + nh;
+	if (bpf_probe_read_kernel(&ip4, sizeof(ip4), data))
+		return 0;
+
+	key.l4proto = IPPROTO_TCP;
+	if (ip4.version == 4) {
+		__u16 th_off = ip4.ihl * 4;
+
+		if (bpf_probe_read_kernel(&tcp, sizeof(tcp), data + th_off))
+			return 0;
+		key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+		key.sip.u6_addr32[3] = ip4.saddr;
+		key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+		key.dip.u6_addr32[3] = ip4.daddr;
+		key.sport = tcp.source;
+		key.dport = tcp.dest;
+	} else if (ip4.version == 6) {
+		struct ipv6hdr ip6;
+
+		if (bpf_probe_read_kernel(&ip6, sizeof(ip6), data))
+			return 0;
+		if (bpf_probe_read_kernel(&tcp, sizeof(tcp), data + sizeof(ip6)))
+			return 0;
+		__builtin_memcpy(&key.sip, &ip6.saddr, IPV6_BYTE_LENGTH);
+		__builtin_memcpy(&key.dip, &ip6.daddr, IPV6_BYTE_LENGTH);
+		key.sport = tcp.source;
+		key.dport = tcp.dest;
+	} else {
+		return 0;
+	}
+
+	v = bpf_map_lookup_elem(&tcp_offload_sent, &key);
+	if (v)
+		__sync_fetch_and_add(v, len);
+	else {
+		__u64 init = len;
+
+		bpf_map_update_elem(&tcp_offload_sent, &key, &init, BPF_ANY);
+	}
+	return 0;
+}

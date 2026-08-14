@@ -105,9 +105,10 @@ type controlPlaneCore struct {
 	bpfHookAttachWg    sync.WaitGroup
 	bpf                atomic.Pointer[bpfObjects]
 	outboundId2Name    map[uint8]string
-	// tcpRelayOffload is permanently disabled due to kernel panic issues.
-	// See: https://github.com/daeuniverse/dae/pull/912
-	// Field preserved for ABI compatibility; always remains false.
+	// tcpSockmapOffloadReady is set once setupTCPRelayOffload attaches the
+	// sk_skb stream-verdict program to fast_sock (kernel passes the
+	// CVE-2025-38165 gate). tryOffloadTCPRelay consults it per relay.
+	tcpSockmapOffloadReady atomic.Bool
 
 	kernelVersion *internal.Version
 

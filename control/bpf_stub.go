@@ -188,15 +188,14 @@ type bpfSpecs struct {
 }
 
 type bpfProgramSpecs struct {
-	TproxyDae0Ingress     *ebpf.ProgramSpec `ebpf:"tproxy_dae0_ingress"`
-	TproxyDae0peerIngress *ebpf.ProgramSpec `ebpf:"tproxy_dae0peer_ingress"`
-	TproxyLanEgressL2     *ebpf.ProgramSpec `ebpf:"tproxy_lan_egress_l2"`
-	TproxyLanEgressL3     *ebpf.ProgramSpec `ebpf:"tproxy_lan_egress_l3"`
-	TproxyLanIngressL2    *ebpf.ProgramSpec `ebpf:"tproxy_lan_ingress_l2"`
-	TproxyLanIngressL3    *ebpf.ProgramSpec `ebpf:"tproxy_lan_ingress_l3"`
-	// SOCK_OPS + SK_MSG stubs preserved for ABI compatibility (DISABLED due to kernel panic)
-	TproxySockops          *ebpf.ProgramSpec `ebpf:"tproxy_sockops"`
-	TproxySkMsgRedir       *ebpf.ProgramSpec `ebpf:"tproxy_sk_msg_redir"`
+	TproxyDae0Ingress      *ebpf.ProgramSpec `ebpf:"tproxy_dae0_ingress"`
+	TproxyDae0peerIngress  *ebpf.ProgramSpec `ebpf:"tproxy_dae0peer_ingress"`
+	TproxyLanEgressL2      *ebpf.ProgramSpec `ebpf:"tproxy_lan_egress_l2"`
+	TproxyLanEgressL3      *ebpf.ProgramSpec `ebpf:"tproxy_lan_egress_l3"`
+	TproxyLanIngressL2     *ebpf.ProgramSpec `ebpf:"tproxy_lan_ingress_l2"`
+	TproxyLanIngressL3     *ebpf.ProgramSpec `ebpf:"tproxy_lan_ingress_l3"`
+	TcpOffloadRedirect     *ebpf.ProgramSpec `ebpf:"tcp_offload_redirect"`
+	TcpOffloadSentAccount  *ebpf.ProgramSpec `ebpf:"tcp_offload_sent_account"`
 	TproxyWanCgConnect4    *ebpf.ProgramSpec `ebpf:"tproxy_wan_cg_connect4"`
 	TproxyWanCgConnect6    *ebpf.ProgramSpec `ebpf:"tproxy_wan_cg_connect6"`
 	TproxyWanCgSendmsg4    *ebpf.ProgramSpec `ebpf:"tproxy_wan_cg_sendmsg4"`
@@ -218,6 +217,8 @@ type bpfMapSpecs struct {
 	DomainRoutingMap         *ebpf.MapSpec `ebpf:"domain_routing_map"`
 	EventRingbuf             *ebpf.MapSpec `ebpf:"event_ringbuf"`
 	FastSock                 *ebpf.MapSpec `ebpf:"fast_sock"`
+	TcpOffloadPause          *ebpf.MapSpec `ebpf:"tcp_offload_pause"`
+	TcpOffloadSent           *ebpf.MapSpec `ebpf:"tcp_offload_sent"`
 	ListenSocketMap          *ebpf.MapSpec `ebpf:"listen_socket_map"`
 	LpmArrayMap              *ebpf.MapSpec `ebpf:"lpm_array_map"`
 	OutboundConnectivityMap  *ebpf.MapSpec `ebpf:"outbound_connectivity_map"`
@@ -260,6 +261,8 @@ type bpfMaps struct {
 	DomainRoutingMap         *ebpf.Map `ebpf:"domain_routing_map"`
 	EventRingbuf             *ebpf.Map `ebpf:"event_ringbuf"`
 	FastSock                 *ebpf.Map `ebpf:"fast_sock"`
+	TcpOffloadPause          *ebpf.Map `ebpf:"tcp_offload_pause"`
+	TcpOffloadSent           *ebpf.Map `ebpf:"tcp_offload_sent"`
 	ListenSocketMap          *ebpf.Map `ebpf:"listen_socket_map"`
 	LpmArrayMap              *ebpf.Map `ebpf:"lpm_array_map"`
 	OutboundConnectivityMap  *ebpf.Map `ebpf:"outbound_connectivity_map"`
@@ -286,6 +289,8 @@ func (m *bpfMaps) Close() error {
 		m.DomainRoutingMap,
 		m.EventRingbuf,
 		m.FastSock,
+		m.TcpOffloadPause,
+		m.TcpOffloadSent,
 		m.ListenSocketMap,
 		m.LpmArrayMap,
 		m.OutboundConnectivityMap,
@@ -308,15 +313,14 @@ type bpfVariables struct {
 }
 
 type bpfPrograms struct {
-	TproxyDae0Ingress     *ebpf.Program `ebpf:"tproxy_dae0_ingress"`
-	TproxyDae0peerIngress *ebpf.Program `ebpf:"tproxy_dae0peer_ingress"`
-	TproxyLanEgressL2     *ebpf.Program `ebpf:"tproxy_lan_egress_l2"`
-	TproxyLanEgressL3     *ebpf.Program `ebpf:"tproxy_lan_egress_l3"`
-	TproxyLanIngressL2    *ebpf.Program `ebpf:"tproxy_lan_ingress_l2"`
-	TproxyLanIngressL3    *ebpf.Program `ebpf:"tproxy_lan_ingress_l3"`
-	// SOCK_OPS + SK_MSG stubs preserved for ABI compatibility (DISABLED due to kernel panic)
-	TproxySockops          *ebpf.Program `ebpf:"tproxy_sockops"`
-	TproxySkMsgRedir       *ebpf.Program `ebpf:"tproxy_sk_msg_redir"`
+	TproxyDae0Ingress      *ebpf.Program `ebpf:"tproxy_dae0_ingress"`
+	TproxyDae0peerIngress  *ebpf.Program `ebpf:"tproxy_dae0peer_ingress"`
+	TproxyLanEgressL2      *ebpf.Program `ebpf:"tproxy_lan_egress_l2"`
+	TproxyLanEgressL3      *ebpf.Program `ebpf:"tproxy_lan_egress_l3"`
+	TproxyLanIngressL2     *ebpf.Program `ebpf:"tproxy_lan_ingress_l2"`
+	TproxyLanIngressL3     *ebpf.Program `ebpf:"tproxy_lan_ingress_l3"`
+	TcpOffloadRedirect     *ebpf.Program `ebpf:"tcp_offload_redirect"`
+	TcpOffloadSentAccount  *ebpf.Program `ebpf:"tcp_offload_sent_account"`
 	TproxyWanCgConnect4    *ebpf.Program `ebpf:"tproxy_wan_cg_connect4"`
 	TproxyWanCgConnect6    *ebpf.Program `ebpf:"tproxy_wan_cg_connect6"`
 	TproxyWanCgSendmsg4    *ebpf.Program `ebpf:"tproxy_wan_cg_sendmsg4"`
@@ -337,8 +341,8 @@ func (p *bpfPrograms) Close() error {
 		p.TproxyLanEgressL3,
 		p.TproxyLanIngressL2,
 		p.TproxyLanIngressL3,
-		p.TproxySockops,
-		p.TproxySkMsgRedir,
+		p.TcpOffloadRedirect,
+		p.TcpOffloadSentAccount,
 		p.TproxyWanCgConnect4,
 		p.TproxyWanCgConnect6,
 		p.TproxyWanCgSendmsg4,
@@ -389,7 +393,6 @@ type loadBpfOptions struct {
 
 const (
 	defaultConnStateMapMaxEntries = 65536 * 4
-	fastSockPlaceholderMaxEntries = 1
 )
 
 func fullLoadBpfObjects(
@@ -475,27 +478,11 @@ func tuneConnStateBpfMap(spec *ebpf.CollectionSpec, maxEntries uint32) error {
 	return nil
 }
 
-func tunePlaceholderBpfMaps(spec *ebpf.CollectionSpec) error {
-	if spec == nil {
-		return fmt.Errorf("nil collection spec")
-	}
-
-	fastSock, ok := spec.Maps["fast_sock"]
-	if !ok || fastSock == nil {
-		return fmt.Errorf("missing map spec %q", "fast_sock")
-	}
-	fastSock.MaxEntries = fastSockPlaceholderMaxEntries
-	return nil
-}
-
 func customizeBpfMapSpecs(spec *ebpf.CollectionSpec, connStateMapMaxEntries uint32) error {
 	if err := disablePinnedConnStateMaps(spec); err != nil {
 		return err
 	}
 	if err := tuneConnStateBpfMap(spec, connStateMapMaxEntries); err != nil {
-		return err
-	}
-	if err := tunePlaceholderBpfMaps(spec); err != nil {
 		return err
 	}
 	return nil

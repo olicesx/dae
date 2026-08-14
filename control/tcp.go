@@ -285,6 +285,19 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 	offloadReason := ""
 	annotateOffload := false
 
+	// Attempt kernel-side splice via fast_sock/sk_skb before falling back to
+	// the user-space relay. A registered offload session blocks until both
+	// sockets close; any pre-registration failure falls through silently.
+	var offloadErr error
+	offloaded, offloadReason, offloadErr = c.tryOffloadTCPRelay(flow.Context(), lRelayConn, rConn, RecordDownloadTraffic, RecordUploadTraffic)
+	if offloadErr != nil {
+		return fmt.Errorf("handleTCP offloaded relay error: %w", offloadErr)
+	}
+	annotateOffload = canAnnotateTCPRelayOffload(rConn)
+	if !offloaded && offloadReason != "" && c.log.IsLevelEnabled(logrus.DebugLevel) {
+		c.log.Debugf("Skip TCP relay eBPF offload: %s", offloadReason)
+	}
+
 	// Log new TCP connections at Info level for visibility (consistent with UDP behavior)
 	// Note: TCP connections are inherently "new" at this point, unlike UDP endpoints which may be reused
 	if c.log.IsLevelEnabled(logrus.InfoLevel) {

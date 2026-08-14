@@ -3424,8 +3424,16 @@ SEC("license") const char __license[] = "Dual BSD/GPL";
  * skb_send_sock pushes into a peer socket's send path. The key layout must
  * match tcp_offload_redirect's peer_key so the Go session can look up both
  * directions with its registered keys. fentry keeps the per-packet cost
- * below the kprobe trap overhead on the hot redirect path. */
-SEC("fentry/skb_send_sock")
+ * below the kprobe trap overhead on the hot redirect path.
+ *
+ * NOTE: we hook skb_send_sock_locked (the actual sockmap egress send path)
+ * rather than skb_send_sock: since v6.12 skb_send_sock is a one-line wrapper
+ * into __skb_send_sock with no standalone fentry stub in the kernel image
+ * (attach returns EBUSY on 6.12+). skb_send_sock_locked is EXPORT_SYMBOL_GPL
+ * (immune to inlining), carries a stable global symbol on 6.12/6.17, and is
+ * the function sockmap's tcp_bpf verdict redirect actually invokes. Its
+ * 4-arg signature matches the accounting program exactly. */
+SEC("fentry/skb_send_sock_locked")
 int BPF_PROG(tcp_offload_sent_account, struct sock *sk, struct sk_buff *skb,
 	     int offset, int len)
 {

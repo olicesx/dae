@@ -110,6 +110,15 @@ WSL2 hv 使单次 syscall ~2-3μs，放大效应明显，但真实内核上同�
   （udp.go:671），缓存指针方案需语义变更，**放弃**（风险 > 收益）
 - x/net `parseInetAddr`（读路径固有）、`pool.Put` 装箱（池类型敏感）——不改
 
+### 第二波实施 ②（2026-08-15，已完成）
+
+**dae e30de886：WriteTo 路径的 dial target String 复用**——每包 `realDst.String()`（alloc
+profile ~0.6 次/包）在 Symmetric endpoint（poolKey.Dst 有效：QUIC/DNS/sniff 流）复用
+创建时已存的 `ue.DialTarget`（同一格式化值，语义等价）；FullCone（{Src,0}，目标每包
+可变）与 nil endpoint（fresh-dial）保持每包格式化。行为不变，测试/race 全绿。
+**注意**：默认 UDP NAT 是 FullCone——本优化只惠及 Symmetric 流（QUIC/DNS/sniff），
+通用 UDP 的 String 成本属 FullCone 语义必然，无法消除。
+
 ## 4. 结论与决策
 
 1. **070201f7（SetReadBuffer 8MiB）已 revert（23bc22c9）**：两个场景均无实测收益

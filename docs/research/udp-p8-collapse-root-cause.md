@@ -90,6 +90,26 @@ WSL2 hv 使单次 syscall ~2-3μs，放大效应明显，但真实内核上同�
 > 每包闭包逃逸，e58f87ce 已做 discard 部分，task 主闭包仍在）② `freshRoutingResult` 延迟拷贝
 > ③ AddrPort.String 调用点定位。均为环境无关收益，可真实内核复测后一起验证。
 
+### 第二波实施（2026-08-15，已完成 ①）
+
+**dae d2085352：task 闭包 owned 化**——`processPacket` 的每包逃逸闭包（~200-300B）替换为
+池化 `udpIngressTask` 结构（字段快照语义等价，Run() 全路径归还池）。`UdpTask` 接口化
+（`udpTaskFunc`/`udpTaskFuncOrNil` 适配测试），`submit` 保留 func() 签名内部适配（测试零改动）。
+
+| alloc 指标（socks 路径饱和） | 改造前 | 改造后 |
+|---|---|---|
+| alloc_space 总量 | 893MB | **338MB（-62%）** |
+| alloc_objects 总量 | 7.37M | **2.94M（-60%）** |
+| Serve.func4.1（闭包+读循环） | 1.59M 次 / 230MB cum | **消失** |
+
+验证：control 全量测试 + `-race`（UDP/DNS 路径）+ vet 全绿。
+
+**剩余候选（下一轮）**：
+- `AddrPort.String`（~437K 次/负载）——调用点待定位
+- `GetBoundRoutingResult` 逃逸拷贝（每包 ~100B）——调用方会修改返回的 Mark
+  （udp.go:671），缓存指针方案需语义变更，**放弃**（风险 > 收益）
+- x/net `parseInetAddr`（读路径固有）、`pool.Put` 装箱（池类型敏感）——不改
+
 ## 4. 结论与决策
 
 1. **070201f7（SetReadBuffer 8MiB）已 revert（23bc22c9）**：两个场景均无实测收益

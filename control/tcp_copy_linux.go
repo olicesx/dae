@@ -94,7 +94,7 @@ func relayFastCopy(ctx context.Context, dst netproxy.Conn, src netproxy.Conn, re
 			if record == nil {
 				return io.Copy(dstTCP, src)
 			}
-			bufPtr := relayCopyBufferPool.Get()
+			bufPtr := relayCopyBufferPool.Get().(*[]byte)
 			buf := *bufPtr
 			defer relayCopyBufferPool.Put(bufPtr)
 			return relayCopyLoop(ctx, dst, src, buf, record, onActive)
@@ -102,7 +102,7 @@ func relayFastCopy(ctx context.Context, dst netproxy.Conn, src netproxy.Conn, re
 	}
 
 	// Slow path: buffered copy (e.g., when wrapper doesn't support fast path)
-	bufPtr := relayCopyBufferPool.Get()
+	bufPtr := relayCopyBufferPool.Get().(*[]byte)
 	buf := *bufPtr
 	defer relayCopyBufferPool.Put(bufPtr)
 	return relayCopyLoop(ctx, dst, src, buf, record, onActive)

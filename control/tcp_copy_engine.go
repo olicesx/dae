@@ -8,52 +8,19 @@ package control
 import (
 	"context"
 	"io"
+	"sync"
 
 	"github.com/daeuniverse/outbound/netproxy"
 )
 
 const relayCopyBufferSize = 32 << 10
 
-// maxRelayCopyBuffers bounds how many 32KiB relay buffers are retained.
-// 256 x 32KiB = 8MiB worst case.
-const maxRelayCopyBuffers = 256
-
-// relayCopyBufferPool recycles relay copy buffers. sync.Pool is cleared on
-// every GC cycle, so under connection churn (speedtest opens hundreds of
-// short-lived connections) every relay re-allocates its 32KiB buffer,
-// feeding the GC loop. A bounded channel pool survives GC.
-type relayCopyBufferPoolT struct {
-	ch chan *[]byte
-}
-
-func newRelayCopyBufferPool() *relayCopyBufferPoolT {
-	ch := make(chan *[]byte, maxRelayCopyBuffers)
-	for i := 0; i < maxRelayCopyBuffers/4; i++ {
-		b := make([]byte, relayCopyBufferSize)
-		ch <- &b
-	}
-	return &relayCopyBufferPoolT{ch: ch}
-}
-
-func (p *relayCopyBufferPoolT) Get() *[]byte {
-	select {
-	case b := <-p.ch:
-		return b
-	default:
+var relayCopyBufferPool = sync.Pool{
+	New: func() any {
 		b := make([]byte, relayCopyBufferSize)
 		return &b
-	}
+	},
 }
-
-func (p *relayCopyBufferPoolT) Put(b *[]byte) {
-	select {
-	case p.ch <- b:
-	default:
-		// pool full: drop the buffer, GC reclaims it
-	}
-}
-
-var relayCopyBufferPool = newRelayCopyBufferPool()
 
 func noopTrafficRecord(int64) {}
 
@@ -85,7 +52,7 @@ func (defaultRelayCopyEngine) Copy(ctx context.Context, dst netproxy.Conn, src n
 		return relayFastCopy(ctx, dst, src, record, onActive)
 	}
 	// Slow path: will call Read() on wrapped connections
-	bufPtr := relayCopyBufferPool.Get()
+	bufPtr := relayCopyBufferPool.Get().(*[]byte)
 	buf := *bufPtr
 	defer relayCopyBufferPool.Put(bufPtr)
 	return relayCopyLoop(ctx, dst, src, buf, record, onActive)

@@ -95,7 +95,7 @@ func tryRelayGatherWrite(ctx context.Context, dst netproxy.Conn, src netproxy.Co
 	}
 	prefixLen := relaySegmentsLen(segments)
 
-	bufPtr := relayCopyBufferPool.Get()
+	bufPtr := relayCopyBufferPool.Get().(*[]byte)
 	buf := *bufPtr
 	defer relayCopyBufferPool.Put(bufPtr)
 

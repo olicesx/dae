@@ -554,7 +554,7 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 		ue.UpdateNatTimeout(QuicNatTimeout)
 	}
 	ue.TrackUdpConnStateTuplePair(src, realDst)
-	_, err := ue.WriteTo(data, realDst.String())
+	_, err := ue.WriteTo(data, ue.dialTargetForWrite(realDst))
 	if err != nil {
 		if isUdpEndpointWriteTolerated(err) {
 			// Transient write failure: drop the datagram, keep the session.
@@ -807,7 +807,7 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 			// It is quic ...
 			// Fast path.
 			domain = ue.SniffedDomain
-			dialTarget := realDst.String()
+			dialTarget := ue.dialTargetForWrite(realDst)
 
 			if !c.checkUdpEndpointHealth(ue, ueKey, true) {
 				ue = nil
@@ -1047,7 +1047,7 @@ afterSniffing:
 		UdpHealthDomain: dialer.UdpHealthDomainData,
 	}
 	// Keep UDP target pinned to original destination IP to avoid QUIC session issues.
-	dialTarget := realDst.String()
+	dialTarget := ue.dialTargetForWrite(realDst)
 getNew:
 	if retry > MaxRetry {
 		c.log.WithFields(logrus.Fields{

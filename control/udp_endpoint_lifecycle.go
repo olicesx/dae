@@ -442,6 +442,18 @@ func isUdpEndpointWriteTolerated(err error) bool {
 // while re-arming at most once per T/2 window. Transports that do not support
 // write deadlines return an error, which is deliberately ignored: they simply
 // keep their previous unbounded behaviour.
+// dialTargetForWrite returns the string form of the datagram's upstream
+// destination for WriteTo. Symmetric endpoints (non-zero Dst in the pool
+// key) have a fixed dial target stored once at creation, so the per-packet
+// netip.AddrPort.String() allocation is skipped; FullCone endpoints
+// (zero Dst) serve multiple destinations and must format per call.
+func (ue *UdpEndpoint) dialTargetForWrite(realDst netip.AddrPort) string {
+	if ue != nil && ue.poolKey.Dst.IsValid() {
+		return ue.DialTarget
+	}
+	return realDst.String()
+}
+
 func (ue *UdpEndpoint) armWriteDeadline(now time.Time) {
 	// QUIC-backed transports (hysteria2/tuic) expose a transport-lifecycle
 	// channel: connection death is signalled via TransportDone and retired by

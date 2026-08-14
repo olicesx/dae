@@ -2195,24 +2195,6 @@ func udpDualStackListenControl(c syscall.RawConn) error {
 	return enableUDPDualStackSocket(c)
 }
 
-// udpIngressReadBufferSize is the SO_RCVBUF size for the UDP ingress listener.
-// The kernel default (~208KB) overflows under saturated multi-flow load
-// (iperf3 UDP P8: 31% loss), dropping packets in the ingress receive queue
-// before userspace drains them; 8MiB brings the same test to 0.099% loss.
-// Aligned with the reuseport probe's listener sizing.
-const udpIngressReadBufferSize = 8 << 20
-
-// tuneUDPIngressBuffers grows the ingress UDP receive buffer so saturated
-// multi-flow traffic is drained by userspace instead of being dropped in the
-// kernel receive queue. Mirrors the outbound dialer's tuneUDPBuffers pattern.
-func tuneUDPIngressBuffers(packetConn net.PacketConn) error {
-	udpConn, ok := packetConn.(*net.UDPConn)
-	if !ok {
-		return nil
-	}
-	return udpConn.SetReadBuffer(udpIngressReadBufferSize)
-}
-
 func udpIngressSupportsBatch(conn *net.UDPConn) bool {
 	if conn == nil {
 		return false
@@ -2887,11 +2869,6 @@ func (c *ControlPlane) Listen(port uint16) (listener *Listener, err error) {
 			_ = tcp4Listener.Close()
 			_ = tcp6Listener.Close()
 			return nil, fmt.Errorf("listenUDP: %w", err)
-		}
-	}
-	if err = tuneUDPIngressBuffers(packetConn); err != nil {
-		if c.log != nil {
-			c.log.WithError(err).Warn("Failed to set UDP ingress read buffer")
 		}
 	}
 	listener = &Listener{

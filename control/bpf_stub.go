@@ -210,6 +210,7 @@ type bpfProgramSpecs struct {
 
 type bpfMapSpecs struct {
 	ActiveRoutingEpochMap    *ebpf.MapSpec `ebpf:"active_routing_epoch_map"`
+	AliveBlockRateMap        *ebpf.MapSpec `ebpf:"alive_block_rate_map"`
 	BpfStatsMap              *ebpf.MapSpec `ebpf:"bpf_stats_map"`
 	ConntrackArgsMap         *ebpf.MapSpec `ebpf:"conntrack_args_map"`
 	CookiePidMap             *ebpf.MapSpec `ebpf:"cookie_pid_map"`
@@ -254,6 +255,7 @@ func (o *bpfObjects) Close() error {
 
 type bpfMaps struct {
 	ActiveRoutingEpochMap    *ebpf.Map `ebpf:"active_routing_epoch_map"`
+	AliveBlockRateMap        *ebpf.Map `ebpf:"alive_block_rate_map"`
 	BpfStatsMap              *ebpf.Map `ebpf:"bpf_stats_map"`
 	ConntrackArgsMap         *ebpf.Map `ebpf:"conntrack_args_map"`
 	CookiePidMap             *ebpf.Map `ebpf:"cookie_pid_map"`

@@ -495,11 +495,23 @@ enum bpf_stats_key {
 	BPF_STATS_TCP_CONN_OVERFLOW = 1,
 };
 
+// alive_block_rate_map rate-limits DAE_EVENT_BLOCKED_ALIVE emission per
+// outbound: key = outbound id, value = last emission time (CLOCK_MONOTONIC ns).
+// Without this, an outbound that is not alive would emit one event per blocked
+// packet and flood the ringbuf until the periodic health check recovers it.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, __u64);
+	__uint(max_entries, 256);
+} alive_block_rate_map SEC(".maps");
+
 // Events delivered to userspace via ring buffer.
 enum dae_event_type {
 	DAE_EVENT_BLOCKED = 0,       // Connection blocked (OUTBOUND_BLOCK)
 	DAE_EVENT_UDP_CONN_OVERFLOW = 1, // UDP conn state map overflow
 	DAE_EVENT_TCP_CONN_OVERFLOW = 2, // TCP conn state map overflow
+	DAE_EVENT_BLOCKED_ALIVE = 3, // Connection blocked (outbound not alive)
 };
 
 struct dae_event {
@@ -575,6 +587,37 @@ send_dae_event(__u32 type, __u32 pid, const char *pname, __u8 outbound,
 		__builtin_memcpy(e.dip, dip, 16);
 
 	return bpf_ringbuf_output(&event_ringbuf, &e, sizeof(e), 0);
+}
+
+// send_blocked_alive_event emits DAE_EVENT_BLOCKED_ALIVE at most once per
+// second per outbound. The rate limit keeps a dead outbound from flooding the
+// ringbuf with one event per blocked packet while the periodic health check is
+// still recovering it. Returns true when an event was actually emitted.
+static __always_inline bool
+send_blocked_alive_event(__u8 outbound, __u8 l4proto, const __u32 *sip,
+			 const __u32 *dip, __u16 sport, __u16 dport)
+{
+	__u32 key = (__u32)outbound;
+	__u64 *last = bpf_map_lookup_elem(&alive_block_rate_map, &key);
+
+	if (!last)
+		return false;
+
+	__u64 now = bpf_ktime_get_ns();
+	__u64 old = *last;
+
+	if (now - old < 1000000000ULL)  // 1s
+		return false;
+	/* CAS makes the read-modify-write atomic: concurrent CPUs blocked on the
+	 * same outbound all read the same old timestamp and only one wins the
+	 * update, so the 1s-per-outbound limit holds under multi-CPU datapath.
+	 */
+	if (__sync_val_compare_and_swap(last, old, now) != old)
+		return false;
+
+	send_dae_event(DAE_EVENT_BLOCKED_ALIVE, 0, NULL, outbound, l4proto,
+		       sip, dip, sport, dport);
+	return true;
 }
 
 static __always_inline __u8 ipv4_get_dscp(const struct iphdr *iph)
@@ -2508,8 +2551,14 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 	}
 
 	if (!wan_outbound_is_alive(skb, outbound, pkt->l4proto,
-				   pkt->tuples.five.dport))
+				   pkt->tuples.five.dport)) {
+		send_blocked_alive_event(outbound, pkt->l4proto,
+					 pkt->tuples.five.sip.u6_addr32,
+					 pkt->tuples.five.dip.u6_addr32,
+					 pkt->tuples.five.sport,
+					 pkt->tuples.five.dport);
 		goto block;
+	}
 	pkt->datapath_generation = PARAM.datapath_generation;
 	return redirect_lan_packet_to_control_plane(
 		skb, link_h_len, pkt,

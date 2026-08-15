@@ -101,26 +101,23 @@ jobs:
           name: dae
           path: dae
 
-      # LVH's built-in install-dependencies caches .deb packages keyed only by
-      # top-level dependency versions. Transitive deps (e.g. systemd-container
-      # pulled in by libvirt-daemon-system) are not part of the cache key, so a
-      # runner image update can leave a stale cache whose debs conflict with the
-      # packages already installed on the runner ("held broken packages").
-      # Install the same dependency set ourselves, always current, instead.
-      - name: Install LVH host dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            qemu-system-x86 cpu-checker libvirt-daemon-system \
-            libvirt-clients bridge-utils virtinst virt-manager
-
+      # NOTE: do NOT pre-install the LVH host dependencies (qemu, libvirt,
+      # virtinst, ...) before the Provision step. find-lvh-cli inside
+      # little-vm-helper derives a cache key via
+      #   apt-get -s install $dep | grep "Inst $dep"
+      # under bash -e -o pipefail; an already-installed package emits no Inst
+      # line, the grep exits 1, and provisioning dies silently (~3s, exit 1,
+      # both matrix legs). install-dependencies: 'true' lets LVH install the
+      # set itself. The 2026-08-14 "held broken packages" apt skew that once
+      # motivated a pre-install bypass was a live jammy-updates resolution
+      # breakage (the failing step ran only on cache miss) and has healed.
       - name: Provision LVH VMs
         uses: cilium/little-vm-helper@v0.0.30
         with:
           test-name: dae-test
           image-version: ${{ matrix.kernel }}
           host-mount: ./
-          install-dependencies: 'false'
+          install-dependencies: 'true'
           cmd: |
             chmod +x /host/dae/dae
 

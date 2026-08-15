@@ -101,13 +101,26 @@ jobs:
           name: dae
           path: dae
 
+      # LVH's built-in install-dependencies caches .deb packages keyed only by
+      # top-level dependency versions. Transitive deps (e.g. systemd-container
+      # pulled in by libvirt-daemon-system) are not part of the cache key, so a
+      # runner image update can leave a stale cache whose debs conflict with the
+      # packages already installed on the runner ("held broken packages").
+      # Install the same dependency set ourselves, always current, instead.
+      - name: Install LVH host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 cpu-checker libvirt-daemon-system \
+            libvirt-clients bridge-utils virtinst virt-manager
+
       - name: Provision LVH VMs
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           test-name: dae-test
           image-version: ${{ matrix.kernel }}
           host-mount: ./
-          install-dependencies: 'true'
+          install-dependencies: 'false'
           cmd: |
             chmod +x /host/dae/dae
 
@@ -115,7 +128,7 @@ jobs:
             apt install -y unzip python3
 
       - name: Check real-BPF reload lifecycle
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -126,7 +139,7 @@ jobs:
             ! ip netns list 2>/dev/null | grep -q '^daens'
 
       - name: Check local UDP reload lifecycle
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -146,7 +159,7 @@ jobs:
             ! ip netns list 2>/dev/null | grep -q '^dae-semantic-udp-server'
 
       - name: Setup network
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -157,7 +170,7 @@ jobs:
             docker run -td --name dae --privileged --network dae -v /host:/host -v /sys:/sys ubuntu:22.04 bash
 
       - name: Setup v2ray server
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -205,7 +218,7 @@ jobs:
             echo '{"v":"2","ps":"test","add":"v2ray","port":"23333","id":"b004539e-0d7b-7996-c378-fb040e42de70","aid":"0","net":"tcp","tls":"","type":"none","path":"","host":"v2ray"}' > vmess.json
 
       - name: Setup dae server
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -259,7 +272,7 @@ jobs:
             cat dae.log
 
       - name: Check WAN IPv4 TCP
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -269,7 +282,7 @@ jobs:
             cat /host/v2ray.access.log | grep -q 'accepted tcp:1.1.1.1:443'
 
       - name: Check WAN IPv4 UDP
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -279,7 +292,7 @@ jobs:
             cat /host/v2ray.access.log | grep -q 'accepted udp:1.1.1.1:53'
 
       - name: Check WAN IPv6 TCP
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -290,7 +303,7 @@ jobs:
             cat /host/v2ray.access.log | grep -F -- 'accepted tcp' | grep -F -- '2606:4700:4700::1111' | grep -F -- ':443'
 
       - name: Check WAN IPv6 UDP
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -303,7 +316,7 @@ jobs:
             cat /host/v2ray.access.log | grep -F -- 'accepted udp' | grep -F -- '2606:4700:4700::1111' | grep -F -- ':53'
 
       - name: Setup WAN UDP port conflict
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -326,7 +339,7 @@ jobs:
             nohup docker exec dae nc -lu 53 &> nc.log &
 
       - name: Check WAN IPv4 UDP with port conflict
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -336,7 +349,7 @@ jobs:
             cat /host/v2ray.access.log | grep -q 'accepted udp:1.1.1.1:53'
 
       - name: Check WAN IPv6 UDP with port conflict
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -349,7 +362,7 @@ jobs:
             cat /host/v2ray.access.log | grep -F -- 'accepted udp' | grep -F -- '2606:4700:4700::1111' | grep -F -- ':53'
 
       - name: Setup LAN
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -435,7 +448,7 @@ jobs:
             cat dae.log
 
       - name: Check LAN IPv4 TCP
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -445,7 +458,7 @@ jobs:
             cat /host/v2ray.access.log | grep -q 'accepted tcp:1.0.0.1:80'
 
       - name: Check LAN IPv4 UDP
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -455,7 +468,7 @@ jobs:
             cat /host/v2ray.access.log | grep -q 'accepted udp:8.8.4.4:53'
 
       - name: Check LAN IPv6 TCP
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -466,7 +479,7 @@ jobs:
             cat /host/v2ray.access.log | grep -F -- 'accepted tcp' | grep -F -- '2606:4700:4700::1001' | grep -F -- ':80'
 
       - name: Check LAN IPv6 UDP
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -479,7 +492,7 @@ jobs:
             cat /host/v2ray.access.log | grep -F -- 'accepted udp' | grep -F -- '2001:4860:4860::8844' | grep -F -- ':53'
 
       - name: Setup LAN UDP port conflict
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -512,7 +525,7 @@ jobs:
             docker exec dae ping -c1 fd00:ffff::1
 
       - name: Check LAN IPv4 UDP with port conflict
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           provision: 'false'
           cmd: |
@@ -522,7 +535,7 @@ jobs:
             cat /host/v2ray.access.log | grep -q 'accepted udp:8.8.4.4:53'
 
       - name: Check LAN IPv6 UDP with port conflict
-        uses: cilium/little-vm-helper@v0.0.28
+        uses: cilium/little-vm-helper@v0.0.30
         with:
           provision: 'false'
           cmd: |

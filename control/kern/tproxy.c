@@ -3470,10 +3470,10 @@ int tcp_offload_redirect(struct __sk_buff *skb)
 SEC("license") const char __license[] = "Dual BSD/GPL";
 
 /* tcp_offload_sent_account records, per reversed four-tuple, the bytes that
- * skb_send_sock pushes into a peer socket's send path. The key layout must
- * match tcp_offload_redirect's peer_key so the Go session can look up both
- * directions with its registered keys. fentry keeps the per-packet cost
- * below the kprobe trap overhead on the hot redirect path.
+ * skb_send_sock_locked pushes into a peer socket's send path. The key layout
+ * must match tcp_offload_redirect's peer_key so the Go session can look up
+ * both directions with its registered keys. fentry keeps the per-packet
+ * cost below the kprobe trap overhead on the hot redirect path.
  *
  * NOTE: we hook skb_send_sock_locked (the actual sockmap egress send path)
  * rather than skb_send_sock: the original hook on skb_send_sock failed with
@@ -3490,58 +3490,78 @@ SEC("license") const char __license[] = "Dual BSD/GPL";
  * kernel/trace/ftrace.c register_ftrace_direct.
  * skb_send_sock_locked is EXPORT_SYMBOL_GPL (immune to inlining), is the
  * function sockmap's tcp_bpf verdict redirect actually invokes, and its
- * 4-arg signature matches the accounting program exactly. */
+ * 4-arg signature matches the accounting program exactly.
+ *
+ * KPROBE FALLBACK: on kernels without CONFIG_DYNAMIC_FTRACE (trimmed router
+ * builds such as ImmortalWrt), functions carry no mcount NOP entry, so
+ * fentry attach goes through bpf_arch_text_poke, which requires the entry
+ * to be a 5-byte NOP and returns EBUSY for tail-call wrappers whose entry
+ * is `jmp`. The kprobe variant attaches at any instruction boundary and is
+ * selected by the Go side when the fentry attach fails. */
+#define TCP_OFFLOAD_SENT_ACCOUNT_BODY(skb, len)					\
+	do {									\
+		struct tuples_key key = {};					\
+		struct iphdr ip4;						\
+		struct tcphdr tcp;						\
+		__u16 nh;							\
+		unsigned char *head, *data;					\
+		__u64 *v;							\
+										\
+		nh = BPF_CORE_READ(skb, network_header);			\
+		head = BPF_CORE_READ(skb, head);				\
+		data = head + nh;						\
+		if (bpf_probe_read_kernel(&ip4, sizeof(ip4), data))		\
+			return 0;						\
+										\
+		key.l4proto = IPPROTO_TCP;					\
+		if (ip4.version == 4) {						\
+			__u16 th_off = ip4.ihl * 4;				\
+										\
+			if (bpf_probe_read_kernel(&tcp, sizeof(tcp), data + th_off))	\
+				return 0;					\
+			key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);		\
+			key.sip.u6_addr32[3] = ip4.saddr;			\
+			key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);		\
+			key.dip.u6_addr32[3] = ip4.daddr;			\
+			key.sport = tcp.source;					\
+			key.dport = tcp.dest;					\
+		} else if (ip4.version == 6) {					\
+			struct ipv6hdr ip6;					\
+										\
+			if (bpf_probe_read_kernel(&ip6, sizeof(ip6), data))	\
+				return 0;					\
+			if (bpf_probe_read_kernel(&tcp, sizeof(tcp), data + sizeof(ip6)))	\
+				return 0;					\
+			__builtin_memcpy(&key.sip, &ip6.saddr, IPV6_BYTE_LENGTH);	\
+			__builtin_memcpy(&key.dip, &ip6.daddr, IPV6_BYTE_LENGTH);	\
+			key.sport = tcp.source;					\
+			key.dport = tcp.dest;					\
+		} else {							\
+			return 0;						\
+		}								\
+										\
+		v = bpf_map_lookup_elem(&tcp_offload_sent, &key);		\
+		if (v) {							\
+			__sync_fetch_and_add(v, len);				\
+		} else {							\
+			__u64 init = len;					\
+										\
+			bpf_map_update_elem(&tcp_offload_sent, &key, &init, BPF_ANY);	\
+		}								\
+	} while (0)
+
 SEC("fentry/skb_send_sock_locked")
 int BPF_PROG(tcp_offload_sent_account, struct sock *sk, struct sk_buff *skb,
 	     int offset, int len)
 {
-	struct tuples_key key = {};
-	struct iphdr ip4;
-	struct tcphdr tcp;
-	__u16 nh;
-	unsigned char *head, *data;
-	__u64 *v;
+	TCP_OFFLOAD_SENT_ACCOUNT_BODY(skb, len);
+	return 0;
+}
 
-	nh = BPF_CORE_READ(skb, network_header);
-	head = BPF_CORE_READ(skb, head);
-	data = head + nh;
-	if (bpf_probe_read_kernel(&ip4, sizeof(ip4), data))
-		return 0;
-
-	key.l4proto = IPPROTO_TCP;
-	if (ip4.version == 4) {
-		__u16 th_off = ip4.ihl * 4;
-
-		if (bpf_probe_read_kernel(&tcp, sizeof(tcp), data + th_off))
-			return 0;
-		key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
-		key.sip.u6_addr32[3] = ip4.saddr;
-		key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
-		key.dip.u6_addr32[3] = ip4.daddr;
-		key.sport = tcp.source;
-		key.dport = tcp.dest;
-	} else if (ip4.version == 6) {
-		struct ipv6hdr ip6;
-
-		if (bpf_probe_read_kernel(&ip6, sizeof(ip6), data))
-			return 0;
-		if (bpf_probe_read_kernel(&tcp, sizeof(tcp), data + sizeof(ip6)))
-			return 0;
-		__builtin_memcpy(&key.sip, &ip6.saddr, IPV6_BYTE_LENGTH);
-		__builtin_memcpy(&key.dip, &ip6.daddr, IPV6_BYTE_LENGTH);
-		key.sport = tcp.source;
-		key.dport = tcp.dest;
-	} else {
-		return 0;
-	}
-
-	v = bpf_map_lookup_elem(&tcp_offload_sent, &key);
-	if (v) {
-		__sync_fetch_and_add(v, len);
-	} else {
-		__u64 init = len;
-
-		bpf_map_update_elem(&tcp_offload_sent, &key, &init, BPF_ANY);
-	}
+SEC("kprobe/skb_send_sock_locked")
+int BPF_KPROBE(tcp_offload_sent_account_kprobe, struct sock *sk,
+	       struct sk_buff *skb, int offset, int len)
+{
+	TCP_OFFLOAD_SENT_ACCOUNT_BODY(skb, len);
 	return 0;
 }

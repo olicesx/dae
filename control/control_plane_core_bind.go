@@ -387,6 +387,17 @@ func (c *controlPlaneCore) setupTCPRelayOffload() error {
 			Program:    bpf.TcpOffloadSentAccount,
 			AttachType: ebpf.AttachTraceFEntry,
 		})
+		if err != nil && bpf.TcpOffloadSentAccountKprobe != nil {
+			// fentry requires a 5-byte NOP entry (an ftrace mcount point).
+			// Kernels without CONFIG_DYNAMIC_FTRACE (common in trimmed router
+			// builds such as ImmortalWrt) leave tail-call wrapper functions
+			// with a `jmp` entry; bpf_arch_text_poke then returns EBUSY
+			// (entry != NOP). Fall back to a kprobe, which attaches at any
+			// instruction boundary and costs a per-packet trap on the
+			// accounting path only.
+			c.log.WithError(err).Debug("TCP relay eBPF offload fentry accounting unavailable; falling back to kprobe")
+			sentLink, err = ciliumLink.Kprobe(tcpRelayOffloadAccountTarget, bpf.TcpOffloadSentAccountKprobe, nil)
+		}
 		if err != nil {
 			// Without the accounting the backlog fuse cannot engage, so the
 			// verdict program is useless; drop it so a retry starts clean.

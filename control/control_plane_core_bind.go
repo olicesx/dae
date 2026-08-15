@@ -324,6 +324,16 @@ func (c *controlPlaneCore) setupSkPidMonitor() error {
 }
 
 func (c *controlPlaneCore) setupTCPRelayOffload() error {
+	// Idempotent: reload/rollback paths re-enter commitInterfaceBindings with
+	// the same loaded program objects, and resetBpfHookDetachForReattach does
+	// not close the links attached by a previous pass. Re-attaching the fentry
+	// link while the first one is alive is rejected by the kernel with EBUSY
+	// ("prog already linked", kernel/bpf/trampoline.c
+	// __bpf_trampoline_link_prog), which surfaced as a spurious
+	// "TCP relay eBPF offload disabled" on rollback.
+	if c.tcpSockmapOffloadReady.Load() {
+		return nil
+	}
 	if os.Getenv("DAE_DISABLE_TCP_RELAY_OFFLOAD") == "1" {
 		c.log.Debug("TCP relay eBPF offload disabled by DAE_DISABLE_TCP_RELAY_OFFLOAD=1")
 		return nil
@@ -368,7 +378,7 @@ func (c *controlPlaneCore) setupTCPRelayOffload() error {
 	})
 
 	// Backlog-fuse accounting: count bytes entering each relay socket's
-	// send path via skb_send_sock, keyed by reversed four-tuple. fentry
+	// send path via skb_send_sock_locked, keyed by reversed four-tuple. fentry
 	// (BPF trampoline) avoids the kprobe trap cost on the hot path.
 	// DAE_FUSE_ACCOUNT=0 skips the attach (diagnostics only: the backlog
 	// fuse cannot engage without the accounting).
@@ -378,7 +388,10 @@ func (c *controlPlaneCore) setupTCPRelayOffload() error {
 			AttachType: ebpf.AttachTraceFEntry,
 		})
 		if err != nil {
-			return fmt.Errorf("attach tcp_offload_sent_account fentry to skb_send_sock: %w", err)
+			// Without the accounting the backlog fuse cannot engage, so the
+			// verdict program is useless; drop it so a retry starts clean.
+			_ = rawLink.Close()
+			return fmt.Errorf("attach tcp_offload_sent_account fentry to %v: %w", tcpRelayOffloadAccountTarget, err)
 		}
 		c.addManagedBpfHookCleanup(func() error {
 			return sentLink.Close()
@@ -389,6 +402,12 @@ func (c *controlPlaneCore) setupTCPRelayOffload() error {
 	c.log.Info("TCP relay eBPF offload enabled (sk_skb stream verdict on fast_sock)")
 	return nil
 }
+
+// tcpRelayOffloadAccountTarget is the kernel function the accounting fentry
+// attaches to (SEC("fentry/...") in kern/tproxy.c). Kept as a named constant
+// so the error message stays truthful if the hook is ever moved; cilium/ebpf
+// v0.20 exposes no Spec() on runtime programs to derive it.
+const tcpRelayOffloadAccountTarget = "skb_send_sock_locked"
 
 // bindWan supports lazy-bind if interface `ifname` is not found.
 // bindWan supports rebinding when the interface `ifname` is detected in the future.

@@ -3476,11 +3476,20 @@ SEC("license") const char __license[] = "Dual BSD/GPL";
  * below the kprobe trap overhead on the hot redirect path.
  *
  * NOTE: we hook skb_send_sock_locked (the actual sockmap egress send path)
- * rather than skb_send_sock: since v6.12 skb_send_sock is a one-line wrapper
- * into __skb_send_sock with no standalone fentry stub in the kernel image
- * (attach returns EBUSY on 6.12+). skb_send_sock_locked is EXPORT_SYMBOL_GPL
- * (immune to inlining), carries a stable global symbol on 6.12/6.17, and is
- * the function sockmap's tcp_bpf verdict redirect actually invokes. Its
+ * rather than skb_send_sock: the original hook on skb_send_sock failed with
+ * EBUSY on the 6.12/6.17/6.18 test kernels, while skb_send_sock_locked
+ * attaches cleanly on 6.17/6.18. That EBUSY is an attachment-conflict
+ * signal, not a function-shape artifact: on both 6.12 and 6.18 the two
+ * functions are identical one-line tail-call wrappers into __skb_send_sock,
+ * and fentry attaches fine to such wrappers (syscall wrappers are the
+ * everyday precedent). The kernel-side EBUSY conditions for fentry
+ * link_create are: an EXT/freplace program on the target, the same prog
+ * linked twice, or an existing direct call on the target function (a
+ * trampoline with a different key, or any other ftrace direct-call user);
+ * see kernel/bpf/trampoline.c __bpf_trampoline_link_prog and
+ * kernel/trace/ftrace.c register_ftrace_direct.
+ * skb_send_sock_locked is EXPORT_SYMBOL_GPL (immune to inlining), is the
+ * function sockmap's tcp_bpf verdict redirect actually invokes, and its
  * 4-arg signature matches the accounting program exactly. */
 SEC("fentry/skb_send_sock_locked")
 int BPF_PROG(tcp_offload_sent_account, struct sock *sk, struct sk_buff *skb,

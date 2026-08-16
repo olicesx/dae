@@ -8,6 +8,7 @@ package control
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"regexp"
@@ -365,52 +366,67 @@ func (c *controlPlaneCore) setupTCPRelayOffload() error {
 		c.log.Warnf("Enabling TCP relay eBPF offload via DAE_ALLOW_TCP_SOCKMAP on kernel %v without a known CVE-2025-38165 fix; a message larger than ~100KB redirected between relay sockets can panic this kernel", *c.kernelVersion)
 	}
 
-	rawLink, err := ciliumLink.AttachRawLink(ciliumLink.RawLinkOptions{
-		Target:  bpf.FastSock.FD(),
-		Program: bpf.TcpOffloadRedirect,
-		Attach:  ebpf.AttachSkSKBStreamVerdict,
+	// The links target maps/programs inside the shared bpfObjects, which are
+	// handed over to the next generation on reload while this core's cleanup
+	// list is not run until the old generation finalizes. attachTCPOffloadLinks
+	// therefore keys the links (and their reference count) by the bpfObjects
+	// themselves: a reload reuses the still-attached links instead of
+	// re-attaching and hitting EBUSY on fast_sock.
+	reused, err := attachTCPOffloadLinks(bpf, func() (tcpOffloadLinks, error) {
+		rawLink, err := ciliumLink.AttachRawLink(ciliumLink.RawLinkOptions{
+			Target:  bpf.FastSock.FD(),
+			Program: bpf.TcpOffloadRedirect,
+			Attach:  ebpf.AttachSkSKBStreamVerdict,
+		})
+		if err != nil {
+			return tcpOffloadLinks{}, fmt.Errorf("attach tcp_offload_redirect to fast_sock: %w", err)
+		}
+		var account io.Closer
+		// Backlog-fuse accounting: count bytes entering each relay socket's
+		// send path via skb_send_sock_locked, keyed by reversed four-tuple.
+		// fentry (BPF trampoline) avoids the kprobe trap cost on the hot path.
+		// DAE_FUSE_ACCOUNT=0 skips the attach (diagnostics only: the backlog
+		// fuse cannot engage without the accounting).
+		if os.Getenv("DAE_FUSE_ACCOUNT") != "0" {
+			sentLink, err := ciliumLink.AttachTracing(ciliumLink.TracingOptions{
+				Program:    bpf.TcpOffloadSentAccount,
+				AttachType: ebpf.AttachTraceFEntry,
+			})
+			if err != nil && bpf.TcpOffloadSentAccountKprobe != nil {
+				// fentry requires a 5-byte NOP entry (an ftrace mcount point).
+				// Kernels without CONFIG_DYNAMIC_FTRACE (common in trimmed router
+				// builds such as ImmortalWrt) leave tail-call wrapper functions
+				// with a `jmp` entry; bpf_arch_text_poke then returns EBUSY
+				// (entry != NOP). Fall back to a kprobe, which attaches at any
+				// instruction boundary and costs a per-packet trap on the
+				// accounting path only.
+				c.log.WithError(err).Debug("TCP relay eBPF offload fentry accounting unavailable; falling back to kprobe")
+				sentLink, err = ciliumLink.Kprobe(tcpRelayOffloadAccountTarget, bpf.TcpOffloadSentAccountKprobe, nil)
+			}
+			if err != nil {
+				// Without the accounting the backlog fuse cannot engage, so the
+				// verdict program is useless; drop it so a retry starts clean.
+				_ = rawLink.Close()
+				return tcpOffloadLinks{}, fmt.Errorf("attach tcp_offload_sent_account fentry to %v: %w", tcpRelayOffloadAccountTarget, err)
+			}
+			account = sentLink
+		}
+		return tcpOffloadLinks{verdict: rawLink, account: account}, nil
 	})
 	if err != nil {
-		return fmt.Errorf("attach tcp_offload_redirect to fast_sock: %w", err)
+		return err
 	}
 	c.addManagedBpfHookCleanup(func() error {
-		return rawLink.Close()
+		releaseTCPOffloadLinks(bpf)
+		return nil
 	})
 
-	// Backlog-fuse accounting: count bytes entering each relay socket's
-	// send path via skb_send_sock_locked, keyed by reversed four-tuple. fentry
-	// (BPF trampoline) avoids the kprobe trap cost on the hot path.
-	// DAE_FUSE_ACCOUNT=0 skips the attach (diagnostics only: the backlog
-	// fuse cannot engage without the accounting).
-	if os.Getenv("DAE_FUSE_ACCOUNT") != "0" {
-		sentLink, err := ciliumLink.AttachTracing(ciliumLink.TracingOptions{
-			Program:    bpf.TcpOffloadSentAccount,
-			AttachType: ebpf.AttachTraceFEntry,
-		})
-		if err != nil && bpf.TcpOffloadSentAccountKprobe != nil {
-			// fentry requires a 5-byte NOP entry (an ftrace mcount point).
-			// Kernels without CONFIG_DYNAMIC_FTRACE (common in trimmed router
-			// builds such as ImmortalWrt) leave tail-call wrapper functions
-			// with a `jmp` entry; bpf_arch_text_poke then returns EBUSY
-			// (entry != NOP). Fall back to a kprobe, which attaches at any
-			// instruction boundary and costs a per-packet trap on the
-			// accounting path only.
-			c.log.WithError(err).Debug("TCP relay eBPF offload fentry accounting unavailable; falling back to kprobe")
-			sentLink, err = ciliumLink.Kprobe(tcpRelayOffloadAccountTarget, bpf.TcpOffloadSentAccountKprobe, nil)
-		}
-		if err != nil {
-			// Without the accounting the backlog fuse cannot engage, so the
-			// verdict program is useless; drop it so a retry starts clean.
-			_ = rawLink.Close()
-			return fmt.Errorf("attach tcp_offload_sent_account fentry to %v: %w", tcpRelayOffloadAccountTarget, err)
-		}
-		c.addManagedBpfHookCleanup(func() error {
-			return sentLink.Close()
-		})
-	}
-
 	c.tcpSockmapOffloadReady.Store(true)
-	c.log.Info("TCP relay eBPF offload enabled (sk_skb stream verdict on fast_sock)")
+	if reused {
+		c.log.Debug("TCP relay eBPF offload links reused from the previous datapath generation")
+	} else {
+		c.log.Info("TCP relay eBPF offload enabled (sk_skb stream verdict on fast_sock)")
+	}
 	return nil
 }
 

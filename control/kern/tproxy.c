@@ -3470,34 +3470,45 @@ int tcp_offload_redirect(struct __sk_buff *skb)
 SEC("license") const char __license[] = "Dual BSD/GPL";
 
 /* tcp_offload_sent_account records, per reversed four-tuple, the bytes that
- * skb_send_sock_locked pushes into a peer socket's send path. The key layout
+ * skb_send_sock pushes into a peer socket's send path. The key layout
  * must match tcp_offload_redirect's peer_key so the Go session can look up
  * both directions with its registered keys. fentry keeps the per-packet
  * cost below the kprobe trap overhead on the hot redirect path.
  *
- * NOTE: we hook skb_send_sock_locked (the actual sockmap egress send path)
- * rather than skb_send_sock: the original hook on skb_send_sock failed with
- * EBUSY on the 6.12/6.17/6.18 test kernels, while skb_send_sock_locked
- * attaches cleanly on 6.17/6.18. That EBUSY is an attachment-conflict
- * signal, not a function-shape artifact: on both 6.12 and 6.18 the two
- * functions are identical one-line tail-call wrappers into __skb_send_sock,
- * and fentry attaches fine to such wrappers (syscall wrappers are the
- * everyday precedent). The kernel-side EBUSY conditions for fentry
- * link_create are: an EXT/freplace program on the target, the same prog
- * linked twice, or an existing direct call on the target function (a
- * trampoline with a different key, or any other ftrace direct-call user);
- * see kernel/bpf/trampoline.c __bpf_trampoline_link_prog and
- * kernel/trace/ftrace.c register_ftrace_direct.
- * skb_send_sock_locked is EXPORT_SYMBOL_GPL (immune to inlining), is the
- * function sockmap's tcp_bpf verdict redirect actually invokes, and its
- * 4-arg signature matches the accounting program exactly.
+ * NOTE: the hook must sit on skb_send_sock, not skb_send_sock_locked.
+ * The sockmap verdict egress path is sk_psock_verdict_apply ->
+ * sk_psock_skb_redirect -> sk_psock_handle_skb -> skb_send_sock
+ * (net/core/skmsg.c); skb_send_sock_locked's only caller in the whole
+ * kernel is net/xfrm/espintcp.c, so a hook placed there never fires on
+ * our redirect path and the sent counters stay empty (verified against
+ * v6.12 and v6.17 sources). Both functions are identical one-line
+ * tail-call wrappers into __skb_send_sock with the same first four
+ * arguments, so the BPF_PROG signature below is unchanged.
  *
- * KPROBE FALLBACK: on kernels without CONFIG_DYNAMIC_FTRACE (trimmed router
- * builds such as ImmortalWrt), functions carry no mcount NOP entry, so
- * fentry attach goes through bpf_arch_text_poke, which requires the entry
- * to be a 5-byte NOP and returns EBUSY for tail-call wrappers whose entry
- * is `jmp`. The kprobe variant attaches at any instruction boundary and is
- * selected by the Go side when the fentry attach fails. */
+ * An earlier EBUSY when attaching to skb_send_sock on 6.12/6.17/6.18 was
+ * an attachment-conflict signal, not a function-shape artifact: the
+ * kernel-side EBUSY conditions for fentry link_create are an EXT/freplace
+ * program on the target, the same prog linked twice, or an existing
+ * direct call on the target function (a trampoline with a different key,
+ * or any other ftrace direct-call user); see kernel/bpf/trampoline.c
+ * __bpf_trampoline_link_prog and kernel/trace/ftrace.c
+ * register_ftrace_direct. The actual conflict was the reload-leftover
+ * fentry link, fixed at the root by the per-bpfObjects link registry
+ * (reuse across reload generations), so re-attaching to skb_send_sock
+ * should now succeed.
+ *
+ * Accounting caveat: fentry fires on function entry, so skbs requeued via
+ * the EAGAIN retry path in sk_psock_handle_skb (!sock_writeable) are
+ * counted once per attempt. Under congestion this over-estimates "sent"
+ * and delays fuse engagement slightly — the conservative direction
+ * relative to a dead counter, accepted deliberately.
+ *
+ * KPROBE FALLBACK: on kernels without CONFIG_DYNAMIC_FTRACE (trimmed
+ * router builds such as ImmortalWrt), functions carry no mcount NOP
+ * entry, so fentry attach goes through bpf_arch_text_poke, which requires
+ * the entry to be a 5-byte NOP and returns EBUSY for tail-call wrappers
+ * whose entry is `jmp`. The kprobe variant attaches at any instruction
+ * boundary and is selected by the Go side when the fentry attach fails. */
 static __always_inline void
 tcp_offload_sent_account_body(struct sk_buff *skb, int len)
 {
@@ -3551,7 +3562,7 @@ tcp_offload_sent_account_body(struct sk_buff *skb, int len)
 	}
 }
 
-SEC("fentry/skb_send_sock_locked")
+SEC("fentry/skb_send_sock")
 int BPF_PROG(tcp_offload_sent_account, struct sock *sk, struct sk_buff *skb,
 	     int offset, int len)
 {
@@ -3559,7 +3570,7 @@ int BPF_PROG(tcp_offload_sent_account, struct sock *sk, struct sk_buff *skb,
 	return 0;
 }
 
-SEC("kprobe/skb_send_sock_locked")
+SEC("kprobe/skb_send_sock")
 int BPF_KPROBE(tcp_offload_sent_account_kprobe, struct sock *sk,
 	       struct sk_buff *skb, int offset, int len)
 {

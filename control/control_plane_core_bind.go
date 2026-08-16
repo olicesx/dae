@@ -383,7 +383,7 @@ func (c *controlPlaneCore) setupTCPRelayOffload() error {
 		}
 		var account io.Closer
 		// Backlog-fuse accounting: count bytes entering each relay socket's
-		// send path via skb_send_sock_locked, keyed by reversed four-tuple.
+		// send path via skb_send_sock, keyed by reversed four-tuple.
 		// fentry (BPF trampoline) avoids the kprobe trap cost on the hot path.
 		// DAE_FUSE_ACCOUNT=0 skips the attach (diagnostics only: the backlog
 		// fuse cannot engage without the accounting).
@@ -433,8 +433,12 @@ func (c *controlPlaneCore) setupTCPRelayOffload() error {
 // tcpRelayOffloadAccountTarget is the kernel function the accounting fentry
 // attaches to (SEC("fentry/...") in kern/tproxy.c). Kept as a named constant
 // so the error message stays truthful if the hook is ever moved; cilium/ebpf
-// v0.20 exposes no Spec() on runtime programs to derive it.
-const tcpRelayOffloadAccountTarget = "skb_send_sock_locked"
+// v0.20 exposes no Spec() on runtime programs to derive it. It must be the
+// function the sockmap verdict egress path actually calls
+// (sk_psock_handle_skb -> skb_send_sock in net/core/skmsg.c); hooking
+// skb_send_sock_locked instead never fires because its only kernel caller
+// is espintcp.
+const tcpRelayOffloadAccountTarget = "skb_send_sock"
 
 // bindWan supports lazy-bind if interface `ifname` is not found.
 // bindWan supports rebinding when the interface `ifname` is detected in the future.

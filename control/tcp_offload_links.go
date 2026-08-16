@@ -24,7 +24,7 @@ import (
 // closes it when the last plane referencing the objects goes away.
 type tcpOffloadLinks struct {
 	verdict io.Closer // sk_skb stream verdict on fast_sock
-	account io.Closer // skb_send_sock_locked fentry/kprobe; nil when accounting is disabled
+	account io.Closer // skb_send_sock fentry/kprobe; nil when accounting is disabled
 }
 
 type tcpOffloadLinkEntry struct {

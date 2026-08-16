@@ -30,6 +30,21 @@
 
 → 瓶颈落在内核 qdisc（QUIC 包出 socket 后才丢），应用层 datagram 队列不满、30s 超时无法达成。**C 的真实触发比审计推演更苛刻**：需要服务端应用层停摆/消费冻结（使 cwnd 塌陷到 drain<offer 持续 30s），路径级劣化（含带宽硬限速）不足以触发。用户普通路径上的周期卡顿**更可能来自 A/B**（无条件触发）而非 C——C 降级为"病态服务端场景"专属。
 
+### 全量 gate（fix 侧 = dae@e261ead2 + quic-go@2ae9729e + outbound@57b60d4）
+
+| Gate | 结果 |
+|------|------|
+| go vet ./... | ✅ 5s |
+| go build -tags=trace ./... | ✅ |
+| go test -short ./control/... ./component/... | ✅ 17s |
+| go test -race -short ./control/... | ✅ 20s |
+| make ebpf-test | ✅ 2.98s（环境修复后，见下） |
+| make dae | ✅ |
+| make ebpf-lint | ✅ |
+| ./dae validate | ✅ |
+
+**环境陷阱（留痕）**：`make ebpf-test` 首跑 7 用例失败于 `Failed to open trace_pipe`——测试硬编码 `/sys/kernel/tracing/trace_pipe`（独立 tracefs 挂载点），本 WSL2 实例 tracefs 只挂在 debugfs 下（`/sys/kernel/debug/tracing`）。对照实验（BASE 侧同败且更多）证明与 fork 修复无关（eBPF 测试不编译 fork 代码）。修复：`mount --bind /sys/kernel/debug/tracing /sys/kernel/tracing`。既往 sprint 记录 23 用例 PASS 时该挂载点应已存在，环境漂移后需重建。
+
 ## TL;DR — 确认的问题机制（按嫌疑排序）
 
 | # | 机制 | 引入日期 | 影响协议 | 触发条件 | 与症状匹配 |

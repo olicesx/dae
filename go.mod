@@ -117,10 +117,10 @@ require (
 // DATAGRAM frames (sync.Pool was cleared on every GC cycle, causing an
 // allocation spiral that showed up as 80% GC CPU in production), plus bounded
 // Add on a full send queue (30s timeout -> ErrDatagramQueueFullTimeout).
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260814025545-9d6cbf7ccd49
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260816030133-2ae9729e70e9
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
 
 // Use the remote outbound fork containing the transport-owned packet delivery API.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260814220143-942b5a4c04c9
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260816030145-57b60d4590bb

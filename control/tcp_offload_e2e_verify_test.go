@@ -118,7 +118,7 @@ func TestTCPOffloadSentAccountE2E(t *testing.T) {
 		}
 		fl = kl
 	}
-	defer fl.Close()
+	defer func() { _ = fl.Close() }()
 	t.Logf("L1 PASS: accounting hook attached to skb_send_sock (%s)", func() string {
 		if fentryErr != nil {
 			return "kprobe fallback"
@@ -135,7 +135,7 @@ func TestTCPOffloadSentAccountE2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("attach verdict to fast_sock: %v", err)
 	}
-	defer vl.Close()
+	defer func() { _ = vl.Close() }()
 
 	// Topology mirroring dae's relay pair:
 	//   fakeClient --conn1-- left (accepted)      right (dialed) --conn2-- fakeUpstream
@@ -143,18 +143,18 @@ func TestTCPOffloadSentAccountE2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l1.Close()
+	defer func() { _ = l1.Close() }()
 	l2, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l2.Close()
+	defer func() { _ = l2.Close() }()
 
 	client, err := net.Dial("tcp", l1.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	leftRaw, err := l1.Accept()
 	if err != nil {
 		t.Fatal(err)
@@ -193,8 +193,8 @@ func TestTCPOffloadSentAccountE2E(t *testing.T) {
 	if err := fastSock.Update(&rightKey, uint64(leftFD), ebpf.UpdateAny); err != nil {
 		t.Fatalf("register right->left: %v", err)
 	}
-	defer fastSock.Delete(&leftKey)
-	defer fastSock.Delete(&rightKey)
+	defer func() { _ = fastSock.Delete(&leftKey) }()
+	defer func() { _ = fastSock.Delete(&rightKey) }()
 
 	rxBase, err := tcpConnRxBytes(left)
 	if err != nil {

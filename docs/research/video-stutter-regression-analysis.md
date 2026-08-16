@@ -4,6 +4,14 @@
 > 用户反馈画像：最新版看视频周期性转圈重缓冲；出站协议混合；内核 6.8~6.14.6（Ubuntu 24.04 等）。
 > 方法：主线程逐 commit 取证 + 3 个异质子 agent 并发审计（quic-go 池化 / dae UDP 生命周期 / outbound 数据面），HIGH 结论均经主线程独立代码复核。
 
+## 追加：reload 后 sockmap offload 静默失效（用户报告，2026-08-16 修复）
+
+用户在 r1092（含 1f2d6de4/353e9526 两个重入修复）+ `DAE_ALLOW_TCP_SOCKMAP=1` + 内核 6.12.94 上报告：`[Reload] Serve` 后出现 `attach tcp_offload_redirect to fast_sock: create link: device or resource busy`，offload 被禁用。
+
+- **根因**：reload 创建新 controlPlaneCore（`tcpSockmapOffloadReady` 归零，setup 全量重跑），而 bpf 对象集合（fast_sock/程序）经 EjectBpf/InjectBpf 交接给新一代——上一代 core 的 cleanup 列表尚未运行、verdict link 仍挂着，第二次 attach 同一 fast_sock 被内核 EBUSY 拒绝。1f2d6de4 的幂等守卫是 per-core 的，只覆盖同 core 回滚路径，跨代失效。**奇数代必失效，偶数代恢复**（WSL2 复现实证：gen1 EBUSY、gen2 恢复——gen0 finalize 释放了 link）。
+- **修复（dae b5724254）**：link 所有权与引用计数挂到共享 `*bpfObjects`（同构 `sharedUdpConnStateTracker` 先例）：reload 对仍挂着的 link 取引用复用而非重挂；最后一个引用释放时关闭（含 SIGTERM DetachBpfHooks 路径）；失败 attach 不注册，重试从干净状态开始。
+- **验证**：registry 单测 3 例（复用不重挂/末次释放才关闭/失败不注册/nil account 安全）；WSL2 复现脚本红→绿（修复前 1 次 EBUSY，修复后连续两次 reload 0 EBUSY、offload 存活）；全量 gate 8/8。测试资产：`tmp/wsle2e/reload_repro.sh`。
+
 ## WSL2 实测验证（2026-08-16，kernel 6.18.33.2）
 
 ### race 闭包（Windows 无 cgo 的缺口已补）

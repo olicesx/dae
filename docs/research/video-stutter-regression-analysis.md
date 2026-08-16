@@ -4,13 +4,39 @@
 > 用户反馈画像：最新版看视频周期性转圈重缓冲；出站协议混合；内核 6.8~6.14.6（Ubuntu 24.04 等）。
 > 方法：主线程逐 commit 取证 + 3 个异质子 agent 并发审计（quic-go 池化 / dae UDP 生命周期 / outbound 数据面），HIGH 结论均经主线程独立代码复核。
 
+## WSL2 实测验证（2026-08-16，kernel 6.18.33.2）
+
+### race 闭包（Windows 无 cgo 的缺口已补）
+
+- quic-go@2ae9729e：`go test -race` 根包 + internal/wire **ok**
+- outbound@57b60d4：`go test -race` hy2 client ×2 + hy2 全树 **ok**
+
+### 顺序 e2e（A/B 交替 ×3 轮，双方 replace 均经 `go version -m` 验证）
+
+拓扑：netns 客户端(4 流) → dae tproxy(dport 5201→hy2-grp) → 官方 hysteria 服务端 → 爆发源（每请求回 32 包突发，下载方向，共 7680 datagrams/轮）。BASE=dae@e261ead2+forks(9d6cbf7c/942b5a4)，FIX=同 dae+forks(2ae9729e/57b60d4)。
+
+| 轮 | BASE 乱序 | FIX 乱序 |
+|----|----------|---------|
+| 1 | **255（3.35%，maxdist 27）** | 26（0.34%） |
+| 2 | **210（2.77%）** | 70（0.92%） |
+| 3 | **183（2.46%）** | 66（0.87%） |
+
+→ **demux 乱序被消除，整体降 3-8×**；FIX 残留 ~0.5-0.9% 为环境底噪（WSL2 veth 多 CPU 软中断重排，与 demux 无关）。两侧均无 retire/rebuild 日志。测试资产：`tmp/wsle2e/`（udpprobe.go / run_order_e2e.sh）。
+
+### C 机制触发验证（两次阴性，重要负结果）
+
+- 5% 丢包 + 40ms 延迟，80Mbps 持续上行 45s：**0 次**队列满/退役
+- 2% 丢包 + 40ms + **rate 20mbit 承载 80M 需求**（接收端 75% 过载丢失）70s：**仍 0 次**
+
+→ 瓶颈落在内核 qdisc（QUIC 包出 socket 后才丢），应用层 datagram 队列不满、30s 超时无法达成。**C 的真实触发比审计推演更苛刻**：需要服务端应用层停摆/消费冻结（使 cwnd 塌陷到 drain<offer 持续 30s），路径级劣化（含带宽硬限速）不足以触发。用户普通路径上的周期卡顿**更可能来自 A/B**（无条件触发）而非 C——C 降级为"病态服务端场景"专属。
+
 ## TL;DR — 确认的问题机制（按嫌疑排序）
 
 | # | 机制 | 引入日期 | 影响协议 | 触发条件 | 与症状匹配 |
 |---|------|---------|---------|---------|-----------|
 | A | quic-go StreamFrame 池 double-put → 跨连接数据污染 | 08-14（9d6cbf7c） | 全部 QUIC 出站（hy2/tuic/juicity） | 流半关闭后连接关闭（常见） | ★★★ 随机流损坏→重缓冲；外层隧道报错→整连接重置 |
 | B | hy2 并行 demux 每会话乱序 | 08-13（outbound 68c91ae） | hy2 UDP（H3/QUIC 视频、游戏） | 多 goroutine demux 并发调度（常态） | ★★★ 内层 QUIC 假丢包→cwnd 减半→周期性吞吐塌陷 |
-| C | datagram 发送队列满 30s 超时 → 立即退役 endpoint | 08-10（dae e2f1e545） | hy2/tuic | 隧道丢包/cwnd 塌陷/带宽上限使 drain < offer 持续 30s（无损 merely-slow 不触发） | ★★ 30s 停顿（含 worker 停驻+队列溢出）+ 会话重建周期 |
+| C | datagram 发送队列满 30s 超时 → 立即退役 endpoint | 08-10（dae e2f1e545） | hy2/tuic | 需服务端应用层停摆级劣化（WSL2 实测：5% 丢包与 75% 带宽过载均不触发） | ★（降级）病态服务端场景专属；30s 停顿 + 会话重建 |
 | D | >5s 双向静默 → endpoint 重建 | 08-10/08-11（7bcca2ef+003da4ea） | 全部代理 UDP | 缓冲满后的 >5s 真实暂停/分段间隙（播放中不触发；每次暂停一次，非周期） | ★★ 暂停后恢复打嗝/断流 |
 | E | bpf_redirect_peer CVE 门控收紧 | 08-13（dae 4bcd8a16） | 全部流量（内核 6.8~6.14.6） | 未打 DAE_ALLOW_REDIRECT_PEER=1 的发行版内核 | ★ 全局路径变重（MAC 重写+完整 ingress 站），压低余量，与 C/D 叠加 |
 

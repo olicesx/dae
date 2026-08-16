@@ -6,6 +6,7 @@
 package control
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"net"
@@ -233,5 +234,112 @@ func TestAggregatorErrorClassified(t *testing.T) {
 	}
 	if ue.dead.Load() {
 		t.Fatal("tolerated flush error must not retire the endpoint")
+	}
+}
+
+// gatingBatchRecorder is a PacketBatchWriter that deliberately does NOT copy
+// item payloads on WriteBatch entry. Real transports read (or encrypt) the
+// payload bytes while the batch call is still in flight, and the
+// netproxy.BatchItem contract requires Data to remain valid until WriteBatch
+// returns. The recorder signals that it entered the call, waits for the test
+// to open the gate, and only then reads the bytes — reproducing the
+// mid-send buffer window the batchRecorder deep copy hides.
+type gatingBatchRecorder struct {
+	batchRecorder
+	entered   chan struct{}
+	release   chan struct{}
+	done      chan struct{}
+	enterOnce sync.Once
+	doneOnce  sync.Once
+	mu        sync.Mutex
+	sent      [][]byte
+}
+
+func (r *gatingBatchRecorder) WriteBatch(items []netproxy.BatchItem) (int, error) {
+	r.enterOnce.Do(func() { close(r.entered) })
+	<-r.release // stays open after the first release
+	for _, it := range items {
+		cp := make([]byte, len(it.Data))
+		copy(cp, it.Data)
+		r.mu.Lock()
+		r.sent = append(r.sent, cp)
+		r.mu.Unlock()
+	}
+	r.doneOnce.Do(func() { close(r.done) })
+	return len(items), nil
+}
+
+func (r *gatingBatchRecorder) sentCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.sent)
+}
+
+func (r *gatingBatchRecorder) sentItem(i int) []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.sent[i]
+}
+
+// TestAggregatorFlushNotCorruptedByConcurrentAppend holds WriteBatch open
+// (simulating a slow or proxied transport) while another flow on the same
+// endpoint appends a datagram. The in-flight batch must deliver the original
+// bytes: the backing buffer may not be reused until WriteBatch has returned.
+func TestAggregatorFlushNotCorruptedByConcurrentAppend(t *testing.T) {
+	rec := &gatingBatchRecorder{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	ue := &UdpEndpoint{conn: rec}
+	agg := newUDPWriteBatchAggregator(ue)
+
+	first := bytes.Repeat([]byte{0xAA}, 64)
+	second := bytes.Repeat([]byte{0xBB}, 64)
+
+	if err := agg.Append(first, "10.0.0.1:53"); err != nil {
+		t.Fatalf("Append first: %v", err)
+	}
+	go agg.flush()
+
+	select {
+	case <-rec.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("WriteBatch did not start")
+	}
+
+	// Concurrent Append from another flow sharing the endpoint. Before the
+	// fix this reused the backing buffer under the in-flight batch; after
+	// the fix it blocks on the aggregator mutex until the send completes.
+	appendDone := make(chan error, 1)
+	go func() { appendDone <- agg.Append(second, "10.0.0.2:53") }()
+
+	// Give the appender room to (wrongly) touch the buffer mid-send.
+	time.Sleep(50 * time.Millisecond)
+	close(rec.release)
+
+	select {
+	case <-rec.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("WriteBatch did not finish")
+	}
+	if err := <-appendDone; err != nil {
+		t.Fatalf("concurrent Append failed: %v", err)
+	}
+
+	if got := rec.sentCount(); got != 1 {
+		t.Fatalf("expected 1 datagram in the in-flight batch, got %d", got)
+	}
+	if got := rec.sentItem(0); !bytes.Equal(got, first) {
+		t.Fatalf("in-flight datagram corrupted by concurrent Append: got % x…, want all 0xAA", got[:min(8, len(got))])
+	}
+
+	// The queued datagram must still be delivered by a subsequent flush.
+	agg.flush()
+	if got := rec.sentCount(); got != 2 {
+		t.Fatalf("expected 2 datagrams after final flush, got %d", got)
+	}
+	if got := rec.sentItem(1); !bytes.Equal(got, second) {
+		t.Fatalf("second datagram corrupted: got % x…, want all 0xBB", got[:min(8, len(got))])
 	}
 }

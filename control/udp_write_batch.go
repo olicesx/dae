@@ -104,7 +104,13 @@ func (a *udpWriteBatchAggregator) Append(data []byte, addr string) error {
 
 // flush drains the current batch through the batched writer. It is safe to
 // call from the timer callback, from Append when the batch is full, and from
-// Close; a CAS serializes concurrent flushes.
+// Close. The aggregator mutex is held across the actual transport write:
+// BatchItem.Data must remain valid until WriteBatch returns (netproxy
+// contract), and the shared backing buffer may not be reused by a concurrent
+// Append while a batch is in flight. Write-error classification is
+// deliberately deferred until after the unlock — handleWriteError can retire
+// the endpoint, whose Close re-enters this aggregator via writeBatch.Close,
+// and Go's mutex is not reentrant.
 func (a *udpWriteBatchAggregator) flush() {
 	if !a.flushing.CompareAndSwap(false, true) {
 		return
@@ -119,9 +125,8 @@ func (a *udpWriteBatchAggregator) flush() {
 		a.timer.Stop()
 		a.timer = nil
 	}
-	a.mu.Unlock()
-
 	if len(items) == 0 {
+		a.mu.Unlock()
 		return
 	}
 	a.ue.armWriteDeadline(time.Now())
@@ -129,14 +134,23 @@ func (a *udpWriteBatchAggregator) flush() {
 	if !ok {
 		// The aggregator is only installed on batched transports; this is a
 		// defensive fallback that preserves ordering via synchronous writes.
+		// It also runs under the mutex for the same buffer-lifetime reason.
+		var fallbackErr error
 		for _, it := range items {
 			if _, err := a.ue.conn.WriteTo(it.Data, it.Addr); err != nil {
-				_ = a.ue.handleWriteError(err)
+				fallbackErr = err
+				break
 			}
+		}
+		a.mu.Unlock()
+		if fallbackErr != nil {
+			_ = a.ue.handleWriteError(fallbackErr)
 		}
 		return
 	}
 	n, err := bw.WriteBatch(items)
+	a.mu.Unlock()
+
 	if err != nil {
 		_ = a.ue.handleWriteError(err)
 		return

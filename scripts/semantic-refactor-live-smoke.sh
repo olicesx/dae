@@ -238,12 +238,15 @@ if [ ! -e /sys/fs/bpf/dae ]; then
 	echo "fast-exit did not leave the expected BPF pin root" >&2
 	exit 1
 fi
-if ! ip link show dae0 >/dev/null 2>&1; then
-	echo "fast-exit did not leave the expected dae0 device" >&2
+# Fast exit closes the dae netns: the dae0/dae0peer (veth or netkit) pair and
+# the named daens namespace are removed. Only the BPF pin root is left for the
+# next startup to purge, so a subsequent restart must not trip over them.
+if ip link show dae0 >/dev/null 2>&1; then
+	echo "fast-exit did not tear down the expected dae0 device" >&2
 	exit 1
 fi
-if ! ip netns list 2>/dev/null | grep -q '^daens'; then
-	echo "fast-exit did not leave the expected daens namespace" >&2
+if ip netns list 2>/dev/null | grep -q '^daens'; then
+	echo "fast-exit did not tear down the expected daens namespace" >&2
 	exit 1
 fi
 

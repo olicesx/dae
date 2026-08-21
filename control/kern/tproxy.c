@@ -2390,15 +2390,7 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 					goto block;
 				}
 
-				// Update conn state timestamp for this fast path packet,
-				// rate-limited to match the slow-path lazy refresh (1s
-				// interval): the per-packet write caused cross-CPU cacheline
-				// contention on high-PPS single flows.
-				__u64 now_ns = bpf_ktime_get_ns();
-
-				if (now_ns - udp_state->last_seen_ns >
-				    UDP_CONN_STATE_UPDATE_INTERVAL_NS)
-					udp_state->last_seen_ns = now_ns;
+				/* last_seen_ns already refreshed by mark_udp_seen. */
 				pkt->datapath_generation = udp_state->datapath_generation;
 				return redirect_lan_packet_to_control_plane(
 					skb, link_h_len, pkt, udp_state->meta.raw,
@@ -2963,24 +2955,26 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 	routing_epoch_slot = routing_epoch_slot_from_route_result(s64_ret);
 
 fast_path_skip_routing:
-		if (udp_conn_state && tuples->five.dport != bpf_htons(53)) {
-			if (outbound != OUTBOUND_DIRECT || mark != 0 || must) {
-				__builtin_memcpy(udp_conn_state->mac, mac, 6);
-				if (pid_pname) {
-					__builtin_memcpy(udp_conn_state->pname,
-							 pid_pname->pname,
-							 TASK_COMM_LEN);
-					udp_conn_state->pid = pid_pname->pid;
-				}
-				udp_conn_state->routing_epoch_slot = routing_epoch_slot;
-				udp_conn_state->datapath_generation = datapath_generation;
-				union routing_meta _m = build_routing_meta(outbound,
-								   mark,
-								   must,
-								   tuples->dscp);
-				publish_routing_meta(&udp_conn_state->meta, _m);
-			}
-		udp_conn_state->last_seen_ns = bpf_ktime_get_ns();
+	/* last_seen_ns is owned by mark_udp_seen's 1s lazy refresh. Do not
+	 * rewrite it here: that undoes the rate-limit and contends the
+	 * conn_state_map cacheline on high-PPS WAN flows.
+	 */
+	if (udp_conn_state && tuples->five.dport != bpf_htons(53) &&
+	    (outbound != OUTBOUND_DIRECT || mark != 0 || must)) {
+		__builtin_memcpy(udp_conn_state->mac, mac, 6);
+		if (pid_pname) {
+			__builtin_memcpy(udp_conn_state->pname,
+					 pid_pname->pname,
+					 TASK_COMM_LEN);
+			udp_conn_state->pid = pid_pname->pid;
+		}
+		udp_conn_state->routing_epoch_slot = routing_epoch_slot;
+		udp_conn_state->datapath_generation = datapath_generation;
+		union routing_meta _m = build_routing_meta(outbound,
+						   mark,
+						   must,
+						   tuples->dscp);
+		publish_routing_meta(&udp_conn_state->meta, _m);
 	}
 
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)

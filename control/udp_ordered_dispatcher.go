@@ -7,6 +7,7 @@ package control
 
 import (
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -556,10 +557,14 @@ func reportUDPDispatcherPanic(dispatcher, taskKind string, panicCount *atomic.Ui
 	if !shouldReportEveryPow2(count) {
 		return
 	}
+	// The deferred recover handler still runs on the panicking goroutine's
+	// stack, so debug.Stack() captures the panic site frames. Without it the
+	// log line only carries the panic value and the site stays unknown.
 	logrus.WithFields(logrus.Fields{
 		"dispatcher":  dispatcher,
 		"task_kind":   taskKind,
 		"panic":       recovered,
 		"panic_count": count,
+		"stack":       string(debug.Stack()),
 	}).Error("recovered panic in UDP dispatcher task")
 }

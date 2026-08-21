@@ -91,3 +91,80 @@ func TestRetireAbortPathKeepsBehavior(t *testing.T) {
 		t.Fatalf("abort retirement must not call AbortPendingConnections, got %d", plane.abortPendingCalls)
 	}
 }
+
+type mockShutdownListener struct {
+	closeCalls int
+}
+
+func (m *mockShutdownListener) Close() error {
+	m.closeCalls++
+	return nil
+}
+
+type mockShutdownPlane struct {
+	detachCalls int
+	abortCalls  int
+	closeCalls  int
+}
+
+func (m *mockShutdownPlane) DetachBpfHooks() error {
+	m.detachCalls++
+	return nil
+}
+
+func (m *mockShutdownPlane) AbortConnections() error {
+	m.abortCalls++
+	return nil
+}
+
+func (m *mockShutdownPlane) Close() error {
+	m.closeCalls++
+	return nil
+}
+
+type mockShutdownNetns struct {
+	closeCalls int
+}
+
+func (m *mockShutdownNetns) Close() error {
+	m.closeCalls++
+	return nil
+}
+
+func TestShutdownFastExitStillTearsDownNetns(t *testing.T) {
+	listener := &mockShutdownListener{}
+	plane := &mockShutdownPlane{}
+	netns := &mockShutdownNetns{}
+
+	if err := shutdownAfterSignalWithHandoff(logrus.New(), listener, plane, netns, true, nil); err != nil {
+		t.Fatalf("fast-exit shutdown returned error: %v", err)
+	}
+	if listener.closeCalls != 1 {
+		t.Fatalf("fast exit must still close the listener, got %d", listener.closeCalls)
+	}
+	if plane.detachCalls != 1 {
+		t.Fatalf("fast exit must still detach BPF hooks, got %d", plane.detachCalls)
+	}
+	if netns.closeCalls != 1 {
+		t.Fatalf("fast exit must tear down dae netns, got %d", netns.closeCalls)
+	}
+	if plane.abortCalls != 0 || plane.closeCalls != 0 {
+		t.Fatalf("fast exit must skip control-plane abort/close, abort=%d close=%d", plane.abortCalls, plane.closeCalls)
+	}
+}
+
+func TestShutdownGracefulTearsDownNetnsAndControlPlane(t *testing.T) {
+	listener := &mockShutdownListener{}
+	plane := &mockShutdownPlane{}
+	netns := &mockShutdownNetns{}
+
+	if err := shutdownAfterSignalWithHandoff(logrus.New(), listener, plane, netns, false, nil); err != nil {
+		t.Fatalf("graceful shutdown returned error: %v", err)
+	}
+	if netns.closeCalls != 1 {
+		t.Fatalf("graceful shutdown must tear down dae netns, got %d", netns.closeCalls)
+	}
+	if plane.abortCalls != 1 || plane.closeCalls != 1 {
+		t.Fatalf("graceful shutdown must abort and close the control plane, abort=%d close=%d", plane.abortCalls, plane.closeCalls)
+	}
+}

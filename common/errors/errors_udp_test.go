@@ -3,10 +3,13 @@ package errors
 import (
 	"context"
 	stderrors "errors"
+	"fmt"
 	"net"
 	"os"
 	"syscall"
 	"testing"
+
+	"github.com/olicesx/quic-go"
 )
 
 func TestIsUDPEndpointNormalClose_ConnectionRefused(t *testing.T) {
@@ -58,5 +61,31 @@ func TestIsCanceledOrClosed_OperationCanceledString(t *testing.T) {
 	}
 	if !IsIgnorableConnectionError(err) {
 		t.Fatal("expected operation was canceled to be ignored for connection handling")
+	}
+}
+
+func TestTypedQUICStreamErrorCodeZeroIsNormalClose(t *testing.T) {
+	err := &quic.StreamError{StreamID: 1, ErrorCode: 0, Remote: true}
+	if !IsIgnorableTCPRelayError(err) {
+		t.Fatal("expected StreamError code 0 to be ignorable for TCP relay")
+	}
+	if !IsUDPEndpointNormalClose(err) {
+		t.Fatal("expected StreamError code 0 to be a normal UDP close")
+	}
+
+	wrapped := fmt.Errorf("relay: %w", err)
+	if !IsIgnorableTCPRelayError(wrapped) {
+		t.Fatal("expected wrapped StreamError code 0 to be ignorable")
+	}
+	if !IsUDPEndpointNormalClose(wrapped) {
+		t.Fatal("expected wrapped StreamError code 0 to be a normal UDP close")
+	}
+
+	nonzero := &quic.StreamError{StreamID: 1, ErrorCode: 1, Remote: true}
+	if IsIgnorableTCPRelayError(nonzero) {
+		t.Fatal("StreamError with a non-zero code must not be treated as ignorable")
+	}
+	if IsUDPEndpointNormalClose(nonzero) {
+		t.Fatal("StreamError with a non-zero code must not be a normal UDP close")
 	}
 }

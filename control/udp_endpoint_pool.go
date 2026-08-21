@@ -77,14 +77,16 @@ type UdpEndpoint struct {
 	// lastSendNano records the last time the client successfully sent a
 	// packet through this endpoint, and lastReplyNano the last time the
 	// upstream replied. A session that was established (hasReply) but whose
-	// BOTH directions went silent for udpEndpointSendStaleTimeout is presumed
-	// to be starting a new round after an inter-round pause: the remote (e.g.
-	// a game server) may have reaped the old session, so the old hy2
+	// BOTH directions went silent for sendStaleTimeout() is presumed to be
+	// starting a new round after an inter-round pause: the remote (e.g. a
+	// game server) may have reaped the old session, so the old hy2
 	// forwarding source port is no longer recognized. Rebuilding the endpoint
 	// allocates a fresh hy2 session with a new forwarding port the peer treats
 	// as a new client. The check uses the newer of the two timestamps, so
 	// active gameplay — where the server keeps replying even if the client
-	// briefly pauses — never rebuilds mid-round.
+	// briefly pauses — never rebuilds mid-round. Sniffed QUIC/H3 flows use
+	// a longer window (udpEndpointQuicSendStaleTimeout) so video segment
+	// gaps do not look like a new round.
 	lastSendNano  atomic.Int64
 	lastReplyNano atomic.Int64
 	// hasSent indicates the endpoint has already forwarded at least one client
@@ -150,10 +152,6 @@ type UdpEndpoint struct {
 	failed atomic.Bool
 
 	softErrorCount int
-	// writeSoftErrorCount tracks consecutive tolerated transport write errors.
-	// Unlike softErrorCount (read-side auth/replay noise), this counts every
-	// transient write failure so a dead write-only transport still retires.
-	writeSoftErrorCount atomic.Int32
 
 	// poolRef and poolKey allow hard-failure paths to self-remove from the pool
 	// immediately. Soft read-loop exits intentionally keep the endpoint cached so

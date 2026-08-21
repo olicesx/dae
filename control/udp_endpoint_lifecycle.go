@@ -20,7 +20,6 @@ import (
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/common/errors"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
-	"github.com/olicesx/quic-go"
 	"github.com/sirupsen/logrus"
 )
 
@@ -401,29 +400,42 @@ func (ue *UdpEndpoint) retire() {
 // UDP datagram normally leaves the socket immediately, but many proxies carry
 // UDP over a TCP transport whose peer can stop ACKing; without a deadline one
 // stalled upstream parks its calling goroutine forever, and under a shared
-// dispatcher a handful of stalled flows would park every worker. A write that
-// hits the deadline errors out and retires the endpoint, which is the correct
-// outcome for a transport that has stopped draining.
+// dispatcher a handful of stalled flows would park every worker. Hitting the
+// deadline means the transport stopped draining: handleWriteError retires the
+// endpoint immediately (fail fast). QUIC-backed transports never arm this
+// deadline: their fork-level SetWriteDeadline delegates to SetDeadline, which
+// closes the whole session instead of aborting the write, so a merely-full
+// datagram queue must be absorbed as a dropped datagram instead.
 const udpEndpointWriteTimeout = 10 * time.Second
 
-// writeSoftErrorThreshold bounds consecutive tolerated transport write errors
-// before the endpoint retires. A genuinely dead transport is still surfaced by
-// the read loop (EOF/error), so the threshold only guards a write-only flow
-// against lingering on a transport that accepts no writes.
-const writeSoftErrorThreshold = 3
-
-// udpEndpointSendStaleTimeout is how long an established endpoint may go
-// without any client send before the next write rebuilds it. A pause this
-// long means the client is starting a new round after an inter-round silence
-// (e.g. between two game matches). Proxy transports (hy2) multiplex many UDP
-// sessions over one QUIC connection and reuse a single forwarding source port
-// per session: when the remote peer reaped the session during the pause, the
-// old source port is no longer recognized and new-round packets are silently
-// ignored. Rebuilding the endpoint allocates a fresh hy2 session and therefore
-// a fresh forwarding port, which the peer treats as a new client. Active
-// gameplay sends heartbeats every tens of milliseconds, so 5s of client
-// silence is a safe "new round" signal and never fires mid-round.
+// udpEndpointSendStaleTimeout is how long an established game-like endpoint
+// may go without traffic in either direction before the next write rebuilds
+// it. A pause this long means the client is starting a new round after an
+// inter-round silence (e.g. between two game matches). Proxy transports (hy2)
+// multiplex many UDP sessions over one QUIC connection and reuse a single
+// forwarding source port per session: when the remote peer reaped the session
+// during the pause, the old source port is no longer recognized and new-round
+// packets are silently ignored. Rebuilding the endpoint allocates a fresh hy2
+// session and therefore a fresh forwarding port, which the peer treats as a
+// new client. Active gameplay sends heartbeats every tens of milliseconds, so
+// 5s of client silence is a safe "new round" signal and never fires mid-round.
 const udpEndpointSendStaleTimeout = 5 * time.Second
+
+// udpEndpointQuicSendStaleTimeout is the equivalent silence window for
+// sniffed flows, whose inner protocol is QUIC (H3/DASH/HLS video, QUIC
+// games). The classification key is not the traffic genre but the inner-QUIC
+// break sensitivity: rebuilding the hy2 session changes the forwarding
+// source port, i.e. the inner connection's 4-tuple, so the QUIC peer treats
+// the flow as a new client and collapses cwnd. Video segment gaps of 6-15s
+// are normal, so the 5s game window would rebuild on every pause; 30s covers
+// those gaps while still catching a peer that actually reaped the session,
+// well under QuicNatTimeout. Known edges (accepted tradeoffs): a SNI-carrying
+// QUIC game gets the 30s window, delaying inter-round recovery by up to 30s;
+// a QUIC flow whose SNI sniff failed keeps the 5s window and can churn on
+// video pauses (unchanged pre-refactor behavior). Both are information-
+// theoretic limits: without application-layer visibility the flow genre is
+// not observable.
+const udpEndpointQuicSendStaleTimeout = 30 * time.Second
 
 // udpEndpointWriteToleratedError wraps a transient transport write error that
 // the endpoint absorbed without retiring. Callers must drop the datagram and
@@ -454,13 +466,29 @@ func (ue *UdpEndpoint) dialTargetForWrite(realDst netip.AddrPort) string {
 	return realDst.String()
 }
 
+// sendStaleTimeout is the bidirectional-silence window that triggers a
+// session rebuild on the next write. The key is the flow's inner-QUIC break
+// sensitivity: sniffed QUIC flows use the 30s window so video segment gaps
+// do not look like a new round, everything else keeps the 5s inter-round
+// signal even when the transport is QUIC-backed (hy2/tuic game tunnels).
+func (ue *UdpEndpoint) sendStaleTimeout() time.Duration {
+	if ue == nil {
+		return udpEndpointSendStaleTimeout
+	}
+	if ue.SniffedDomain != "" {
+		return udpEndpointQuicSendStaleTimeout
+	}
+	return udpEndpointSendStaleTimeout
+}
+
 func (ue *UdpEndpoint) armWriteDeadline(now time.Time) {
-	// QUIC-backed transports (hysteria2/tuic) expose a transport-lifecycle
-	// channel: connection death is signalled via TransportDone and retired by
-	// the pool watcher. Their datagram send queue fills under backpressure,
-	// which is a normal congestion signal rather than a dead peer — arming a
-	// write deadline here tears the session down on a merely-full queue where
-	// a proxy would simply delay the write and keep the connection alive.
+	// QUIC-backed transports (hysteria2/tuic) never arm the deadline. Their
+	// fork-level SetWriteDeadline delegates to SetDeadline, which is a
+	// session-close timer (time.AfterFunc -> conn.Close) rather than a write
+	// abort, so a deadline on a merely-full datagram queue would kill the
+	// whole hy2/tuic session. Connection death there is signalled via
+	// TransportDone and retired by the pool watcher; a full send queue is
+	// congestion and is absorbed as a dropped datagram by handleWriteError.
 	if endpointTransportDoneChannel(ue) != nil {
 		return
 	}
@@ -506,8 +534,8 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	now := time.Now()
 
 	// A session that was established (hasReply) but whose both directions
-	// went silent for udpEndpointSendStaleTimeout is presumed to be starting
-	// a new round after an inter-round pause. The remote (e.g. a game server)
+	// went silent for the flow's stale timeout is presumed to be starting a
+	// new round after an inter-round pause. The remote (e.g. a game server)
 	// may have reaped the old session, so rebuilding the endpoint yields a
 	// fresh hy2 session with a new forwarding source port that the peer
 	// recognizes as a new client. Without this, dae keeps writing to the same
@@ -516,7 +544,8 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	// upstream-reply timestamps, so active gameplay — where the server keeps
 	// replying even if the client briefly pauses — never rebuilds mid-round.
 	// This runs before the write refreshes lastSendNano, firing only on the
-	// first packet after the silence.
+	// first packet after the silence. Sniffed QUIC/H3 flows use a longer
+	// window so DASH/HLS segment gaps do not look like a new round.
 	if ue.hasReply.Load() {
 		lastSend := ue.lastSendNano.Load()
 		lastReply := ue.lastReplyNano.Load()
@@ -525,12 +554,13 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 			last = lastReply
 		}
 		if last != 0 {
-			if now.UnixNano()-last >= int64(udpEndpointSendStaleTimeout) {
+			staleTimeout := ue.sendStaleTimeout()
+			if now.UnixNano()-last >= int64(staleTimeout) {
 				ue.retire()
 				// ErrClosedConnection is classified as a normal UDP endpoint
 				// closure, so the retry removes the stale endpoint and dials a
 				// fresh hy2 session without penalizing the underlying dialer.
-				return 0, fmt.Errorf("%w: both directions silent for %s, rebuilding session", errors.ErrClosedConnection, udpEndpointSendStaleTimeout)
+				return 0, fmt.Errorf("%w: both directions silent for %s, rebuilding session", errors.ErrClosedConnection, staleTimeout)
 			}
 		}
 	}
@@ -550,8 +580,11 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 			}
 			// Oversized datagram: fall through to the direct path.
 		} else {
-			ue.hasSent.Store(true)
-			ue.lastSendNano.Store(time.Now().UnixNano())
+			// Do not refresh hasSent/lastSendNano here. Append only
+			// queues the datagram; flush() is the sole writer of
+			// those fields after WriteBatch actually succeeds. A
+			// premature stamp would hide a later failed flush from
+			// the bidirectional-silence rebuild check.
 			return len(b), nil
 		}
 	}
@@ -563,7 +596,6 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	if err != nil {
 		return n, ue.handleWriteError(err)
 	}
-	ue.writeSoftErrorCount.Store(0)
 	// UDP datagrams are atomic: a successful WriteTo either wrote the whole
 	// encapsulated datagram or returned an error. Some protocol dialers
 	// (e.g. shadowsocks AEAD, vmess) legitimately return the encapsulated
@@ -580,10 +612,18 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 }
 
 // handleWriteError applies the endpoint's write-error policy shared by the
-// synchronous WriteTo path and the asynchronous batched-flush path: hard
-// failures retire the endpoint immediately, transient errors are tolerated
-// up to a threshold. Returns the error to propagate (nil is never returned;
-// tolerated errors are wrapped).
+// synchronous WriteTo path and the asynchronous batched-flush path. Hard
+// failures retire the endpoint immediately; every other failure only drops
+// the datagram and keeps the session. Returns the error to propagate (nil is
+// never returned; tolerated errors are wrapped so callers can distinguish
+// drop-and-keep from retire-and-redial).
+//
+// Session death is deliberately NOT inferred from write-error counting: a
+// transport whose send queue is full (congestion) or that reports transient
+// failures is still alive. Death is owned by three disjoint signals:
+// TransportDone / read-loop EOF for the transport, the armed write deadline
+// (non-QUIC transports) for a transport that stopped draining, and the
+// bidirectional-silence rebuild check for a reaped remote session.
 func (ue *UdpEndpoint) handleWriteError(err error) error {
 	// Connection-refused is a hard failure: evict the bad upstream now.
 	if ue.isConnectionRefused(err) {
@@ -591,25 +631,22 @@ func (ue *UdpEndpoint) handleWriteError(err error) error {
 		ue.handleProxyServerFailure()
 		return err
 	}
-	// A datagram send-queue timeout is a stalled transport, not a transient
-	// error: the queue stayed full for the whole wait. Retire immediately —
-	// the soft-error counter is reset by any enqueue (which is not a peer
-	// ACK), so a half-dead transport could otherwise dodge the threshold
-	// forever by the occasional enqueue that never reaches the peer.
-	if stderrors.Is(err, quic.ErrDatagramQueueFullTimeout) {
+	// A closed conn cannot recover.
+	if stderrors.Is(err, net.ErrClosed) {
 		ue.retire()
 		return err
 	}
-	// Tolerate transient write errors up to a threshold so brief transport
-	// backpressure does not retire a healthy long-lived session. A closed
-	// conn and a genuinely dead transport are still retired promptly: the
-	// former by this threshold, the latter by the read loop (EOF/error).
-	if ue.writeSoftErrorCount.Add(1) <= writeSoftErrorThreshold &&
-		!stderrors.Is(err, net.ErrClosed) {
-		return &udpEndpointWriteToleratedError{err: err}
+	// Only transports that armed the write deadline (non-QUIC) can hit this:
+	// the deadline is the stall probe, so hitting it is the fail-fast signal.
+	// QUIC-backed transports never arm it — their fork-level SetDeadline
+	// closes the whole session instead of aborting the write — so a merely
+	// full datagram queue (ErrDatagramQueueFullTimeout) falls through to the
+	// tolerated path below instead of tearing down a healthy hy2/tuic session.
+	if stderrors.Is(err, os.ErrDeadlineExceeded) {
+		ue.retire()
+		return err
 	}
-	ue.retire()
-	return err
+	return &udpEndpointWriteToleratedError{err: err}
 }
 
 func (ue *UdpEndpoint) Close() error {

@@ -3,7 +3,9 @@ package control
 import (
 	stderrors "errors"
 	"io"
+	"net"
 	"net/netip"
+	"os"
 	"testing"
 	"time"
 
@@ -80,23 +82,19 @@ func TestUdpEndpointWriteToRetiresOnRealShortWrite(t *testing.T) {
 	}
 }
 
-// Transient write errors are tolerated up to writeSoftErrorThreshold: the
-// endpoint survives and callers can identify the dropped datagram via
-// isUdpEndpointWriteTolerated. A successful write resets the counter.
+// Transient write errors never retire the endpoint: the datagram is dropped
+// and the session is kept. Session death is owned by the transport signals
+// (TransportDone / read-loop EOF), the armed write deadline, and the
+// bidirectional-silence rebuild check — not by write-error counting.
 func TestUdpEndpointWriteToToleratesTransientErrors(t *testing.T) {
 	sentinel := stderrors.New("boom")
-	var calls int
 	mock := &mockPacketConn{
 		writeToFn: func(p []byte, addr string) (int, error) {
-			calls++
-			if calls <= writeSoftErrorThreshold {
-				return 0, sentinel
-			}
-			return len(p), nil
+			return 0, sentinel
 		},
 	}
 	ue := newTestEndpoint(mock)
-	for i := 1; i <= writeSoftErrorThreshold; i++ {
+	for i := 1; i <= 10; i++ {
 		_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
 		if !stderrors.Is(err, sentinel) {
 			t.Fatalf("attempt %d: expected sentinel error, got: %v", i, err)
@@ -108,56 +106,74 @@ func TestUdpEndpointWriteToToleratesTransientErrors(t *testing.T) {
 			t.Fatalf("attempt %d: endpoint must survive tolerated errors", i)
 		}
 	}
-	// After the transient window a write succeeds and resets the counter.
-	if _, err := ue.WriteTo([]byte("ok"), "1.2.3.4:53"); err != nil {
-		t.Fatalf("expected success, got: %v", err)
-	}
-	if got := ue.writeSoftErrorCount.Load(); got != 0 {
-		t.Fatalf("expected write soft error counter reset, got %d", got)
-	}
 }
 
-// A datagram send-queue timeout signals a stalled transport, not a transient
-// error: it must retire immediately. Counting it toward the tolerated
-// threshold is unsafe — a later enqueue (which is not a peer ACK) would reset
-// the counter and let a half-dead transport dodge retirement forever.
-func TestUdpEndpointWriteToRetiresOnDatagramQueueTimeout(t *testing.T) {
+// A datagram send-queue timeout is congestion, not a dead peer: it is
+// tolerated unconditionally so a stall does not tear down a healthy hy2/tuic
+// session. Retiring on queue-full would be pointless churn anyway — the
+// datagram queue is per-connection, so a redial shares the same full queue.
+// Connection death is owned by TransportDone, and a reaped remote session by
+// the bidirectional-silence rebuild check.
+func TestUdpEndpointWriteToToleratesDatagramQueueTimeout(t *testing.T) {
 	mock := &mockPacketConn{
 		writeToFn: func(p []byte, addr string) (int, error) {
 			return 0, quic.ErrDatagramQueueFullTimeout
 		},
 	}
 	ue := newTestEndpoint(mock)
-	_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
-	if !stderrors.Is(err, quic.ErrDatagramQueueFullTimeout) {
-		t.Fatalf("expected datagram queue timeout error, got: %v", err)
-	}
-	if !ue.dead.Load() {
-		t.Fatal("endpoint must retire on a datagram send-queue timeout")
+	for i := 1; i <= 10; i++ {
+		_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
+		if !stderrors.Is(err, quic.ErrDatagramQueueFullTimeout) {
+			t.Fatalf("attempt %d: expected datagram queue timeout error, got: %v", i, err)
+		}
+		if !isUdpEndpointWriteTolerated(err) {
+			t.Fatalf("attempt %d: expected tolerated error, got: %v", i, err)
+		}
+		if ue.dead.Load() {
+			t.Fatalf("attempt %d: endpoint must survive a datagram send-queue timeout", i)
+		}
 	}
 }
 
-// A write error beyond the tolerated threshold must retire the endpoint and
-// surface the underlying error (not the tolerated wrapper).
-func TestUdpEndpointWriteToRetiresOnPersistentError(t *testing.T) {
-	sentinel := stderrors.New("boom")
+// Hitting the armed write deadline means the transport stopped draining: the
+// first deadline-exceeded error retires the endpoint (fail fast). Only
+// non-QUIC transports arm the deadline, so this is their stall probe.
+func TestUdpEndpointWriteToRetiresOnWriteDeadlineExceeded(t *testing.T) {
 	mock := &mockPacketConn{
 		writeToFn: func(p []byte, addr string) (int, error) {
-			return 0, sentinel
+			return 0, os.ErrDeadlineExceeded
 		},
 	}
 	ue := newTestEndpoint(mock)
-	for i := 0; i < writeSoftErrorThreshold; i++ {
-		if _, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53"); !isUdpEndpointWriteTolerated(err) {
-			t.Fatalf("attempt %d: expected tolerated error, got: %v", i+1, err)
-		}
-	}
 	_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
-	if !stderrors.Is(err, sentinel) {
-		t.Fatalf("expected sentinel error, got: %v", err)
+	if !stderrors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expected deadline error, got: %v", err)
+	}
+	if isUdpEndpointWriteTolerated(err) {
+		t.Fatal("deadline-exceeded must not be wrapped as tolerated")
 	}
 	if !ue.dead.Load() {
-		t.Fatal("endpoint must be retired after the tolerated threshold is exceeded")
+		t.Fatal("endpoint must retire on the first write-deadline hit")
+	}
+}
+
+// A closed conn is retired on the first write error, not tolerated.
+func TestUdpEndpointWriteToRetiresOnClosedConn(t *testing.T) {
+	mock := &mockPacketConn{
+		writeToFn: func(p []byte, addr string) (int, error) {
+			return 0, net.ErrClosed
+		},
+	}
+	ue := newTestEndpoint(mock)
+	_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
+	if !stderrors.Is(err, net.ErrClosed) {
+		t.Fatalf("expected net.ErrClosed, got: %v", err)
+	}
+	if isUdpEndpointWriteTolerated(err) {
+		t.Fatal("net.ErrClosed must not be wrapped as tolerated")
+	}
+	if !ue.dead.Load() {
+		t.Fatal("endpoint must retire on a closed conn")
 	}
 }
 
@@ -227,6 +243,68 @@ func TestUdpEndpointWriteToKeepsSessionWhileServerReplyFresh(t *testing.T) {
 	}
 	if ue.dead.Load() {
 		t.Fatal("endpoint must not be retired while the upstream is still replying")
+	}
+}
+
+// Game UDP over a QUIC-backed transport (hy2/tuic, empty SniffedDomain)
+// still rebuilds after 5s of bidirectional silence: that is the inter-round
+// signal, independent of the transport.
+func TestUdpEndpointWriteToRebuildsGameSessionOnQuicTransport(t *testing.T) {
+	done := make(chan struct{})
+	mock := &deadlineRecordingPacketConn{transportDone: done}
+	ue := newTestEndpoint(mock)
+	ue.hasReply.Store(true)
+	ue.lastSendNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
+	ue.lastReplyNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
+
+	_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
+	if !stderrors.Is(err, daeerrors.ErrClosedConnection) {
+		t.Fatalf("expected ErrClosedConnection on stale game session, got: %v", err)
+	}
+	if !ue.dead.Load() {
+		t.Fatal("game UDP over hy2/tuic must still rebuild after 5s of silence")
+	}
+}
+
+// A sniffed long-lived session (H3/DASH/HLS video) silent for the game 5s
+// window must NOT be rebuilt: segment gaps of 6-15s are normal and would
+// otherwise look like a new round.
+func TestUdpEndpointWriteToKeepsSniffedSessionAcrossGameStaleWindow(t *testing.T) {
+	mock := &mockPacketConn{}
+	ue := newTestEndpoint(mock)
+	ue.SniffedDomain = "video.example.com"
+	ue.hasReply.Store(true)
+	ue.lastSendNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
+	ue.lastReplyNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
+
+	n, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
+	if err != nil {
+		t.Fatalf("expected success across the 5s game window on a sniffed session, got: %v", err)
+	}
+	if n != len("hello world") {
+		t.Fatalf("expected %d bytes written, got %d", len("hello world"), n)
+	}
+	if ue.dead.Load() {
+		t.Fatal("sniffed session must not rebuild after 5s of silence")
+	}
+}
+
+// Past the 30s QUIC/H3 window, a sniffed session is still rebuilt so a
+// peer that actually reaped the session gets a fresh forwarding port.
+func TestUdpEndpointWriteToRebuildsSniffedSessionAfterQuicStaleWindow(t *testing.T) {
+	mock := &mockPacketConn{}
+	ue := newTestEndpoint(mock)
+	ue.SniffedDomain = "video.example.com"
+	ue.hasReply.Store(true)
+	ue.lastSendNano.Store(time.Now().Add(-2 * udpEndpointQuicSendStaleTimeout).UnixNano())
+	ue.lastReplyNano.Store(time.Now().Add(-2 * udpEndpointQuicSendStaleTimeout).UnixNano())
+
+	_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
+	if !stderrors.Is(err, daeerrors.ErrClosedConnection) {
+		t.Fatalf("expected ErrClosedConnection on QUIC-stale sniffed session, got: %v", err)
+	}
+	if !ue.dead.Load() {
+		t.Fatal("sniffed endpoint must be retired after the 30s silence window")
 	}
 }
 

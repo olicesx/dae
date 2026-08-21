@@ -24,6 +24,7 @@ type batchRecorder struct {
 	mu      sync.Mutex
 	batches [][]netproxy.BatchItem
 	err     error
+	shortN  int // if >0, WriteBatch returns this count instead of len(items)
 }
 
 func (r *batchRecorder) WriteBatch(items []netproxy.BatchItem) (int, error) {
@@ -36,9 +37,16 @@ func (r *batchRecorder) WriteBatch(items []netproxy.BatchItem) (int, error) {
 	r.mu.Lock()
 	r.batches = append(r.batches, clone)
 	err := r.err
+	shortN := r.shortN
 	r.mu.Unlock()
 	if err != nil {
+		if shortN > 0 {
+			return shortN, err
+		}
 		return 0, err
+	}
+	if shortN > 0 {
+		return shortN, nil
 	}
 	return len(items), nil
 }
@@ -215,7 +223,7 @@ func TestAggregatorClosed(t *testing.T) {
 }
 
 // TestAggregatorErrorClassified: a failed WriteBatch is routed through
-// handleWriteError (soft-error counter increments, endpoint not retired).
+// handleWriteError (classified as a tolerated drop, endpoint not retired).
 func TestAggregatorErrorClassified(t *testing.T) {
 	rec := &batchRecorder{err: errors.New("boom")}
 	ue := newBatchTestEndpoint(rec)
@@ -229,11 +237,236 @@ func TestAggregatorErrorClassified(t *testing.T) {
 	if rec.batchCount() < 1 {
 		t.Fatal("expected flush attempt on full batch")
 	}
-	if n := ue.writeSoftErrorCount.Load(); n != 1 {
-		t.Fatalf("expected soft-error counter 1 after failed flush, got %d", n)
-	}
 	if ue.dead.Load() {
 		t.Fatal("tolerated flush error must not retire the endpoint")
+	}
+}
+
+// TestWriteToBatchDoesNotStampSendUntilFlush: Append is not a send. WriteTo
+// on a batched endpoint must leave lastSendNano/hasSent alone until flush
+// actually succeeds; a failed flush must not pretend the datagram left.
+func TestWriteToBatchDoesNotStampSendUntilFlush(t *testing.T) {
+	rec := &batchRecorder{err: errors.New("boom")}
+	ue := newBatchTestEndpoint(rec)
+	ue.writeBatch = newUDPWriteBatchAggregator(ue)
+
+	before := ue.lastSendNano.Load()
+	n, err := ue.WriteTo([]byte("queued"), "10.0.0.1:53")
+	if err != nil {
+		t.Fatalf("WriteTo enqueue: %v", err)
+	}
+	if n != len("queued") {
+		t.Fatalf("expected %d queued bytes, got %d", len("queued"), n)
+	}
+	if ue.hasSent.Load() {
+		t.Fatal("hasSent must stay false until a successful flush")
+	}
+	if got := ue.lastSendNano.Load(); got != before {
+		t.Fatalf("lastSendNano advanced on enqueue: %d -> %d", before, got)
+	}
+
+	ue.writeBatch.flush()
+	if ue.hasSent.Load() {
+		t.Fatal("failed flush must not set hasSent")
+	}
+	if got := ue.lastSendNano.Load(); got != before {
+		t.Fatalf("failed flush advanced lastSendNano: %d -> %d", before, got)
+	}
+}
+
+// TestWriteToBatchStampsSendAfterSuccessfulFlush: a full-batch WriteTo that
+// actually leaves the socket must refresh lastSendNano/hasSent via flush().
+func TestWriteToBatchStampsSendAfterSuccessfulFlush(t *testing.T) {
+	rec := &batchRecorder{}
+	ue := newBatchTestEndpoint(rec)
+	ue.writeBatch = newUDPWriteBatchAggregator(ue)
+
+	payload := []byte("pkt")
+	n, err := ue.WriteTo(payload, "10.0.0.1:53")
+	if err != nil {
+		t.Fatalf("WriteTo enqueue: %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("expected %d queued bytes, got %d", len(payload), n)
+	}
+	if ue.hasSent.Load() || rec.batchCount() != 0 {
+		t.Fatal("enqueue must not flush or stamp hasSent")
+	}
+	ue.writeBatch.flush()
+	if rec.batchCount() < 1 {
+		t.Fatal("expected a flush")
+	}
+	if !ue.hasSent.Load() {
+		t.Fatal("successful flush must set hasSent")
+	}
+	if ue.lastSendNano.Load() == 0 {
+		t.Fatal("successful flush must refresh lastSendNano")
+	}
+}
+
+// fallbackOnlyConn is a PacketConn that does not implement PacketBatchWriter,
+// forcing flush() onto the synchronous WriteTo loop.
+type fallbackOnlyConn struct {
+	mockPacketConn
+	writes int
+}
+
+func (c *fallbackOnlyConn) WriteTo(p []byte, addr string) (int, error) {
+	c.writes++
+	if c.writeToFn != nil {
+		return c.writeToFn(p, addr)
+	}
+	return len(p), nil
+}
+
+func TestFallbackFlushStampsSendOnSuccess(t *testing.T) {
+	conn := &fallbackOnlyConn{}
+	ue := &UdpEndpoint{conn: conn}
+	agg := newUDPWriteBatchAggregator(ue)
+	if err := agg.Append([]byte("solo"), "10.0.0.1:53"); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if ue.hasSent.Load() {
+		t.Fatal("enqueue must not stamp hasSent")
+	}
+	agg.flush()
+	if conn.writes != 1 {
+		t.Fatalf("expected 1 fallback WriteTo, got %d", conn.writes)
+	}
+	if !ue.hasSent.Load() {
+		t.Fatal("successful fallback flush must set hasSent")
+	}
+	if ue.lastSendNano.Load() == 0 {
+		t.Fatal("successful fallback flush must refresh lastSendNano")
+	}
+}
+
+func TestFallbackFlushDoesNotStampSendOnError(t *testing.T) {
+	sentinel := errors.New("boom")
+	conn := &fallbackOnlyConn{
+		mockPacketConn: mockPacketConn{
+			writeToFn: func(p []byte, addr string) (int, error) {
+				return 0, sentinel
+			},
+		},
+	}
+	ue := &UdpEndpoint{conn: conn}
+	agg := newUDPWriteBatchAggregator(ue)
+	if err := agg.Append([]byte("solo"), "10.0.0.1:53"); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	before := ue.lastSendNano.Load()
+	agg.flush()
+	if ue.hasSent.Load() {
+		t.Fatal("failed fallback flush must not set hasSent")
+	}
+	if got := ue.lastSendNano.Load(); got != before {
+		t.Fatalf("failed fallback flush advanced lastSendNano: %d -> %d", before, got)
+	}
+}
+
+// TestFallbackFlushStampsSendOnPartialError: when some fallback datagrams
+// left the socket before the first failure, the send timestamp must stay
+// honest (sentAny path) even though the flush is classified as an error.
+func TestFallbackFlushStampsSendOnPartialError(t *testing.T) {
+	sentinel := errors.New("boom")
+	var calls int
+	conn := &fallbackOnlyConn{
+		mockPacketConn: mockPacketConn{
+			writeToFn: func(p []byte, addr string) (int, error) {
+				calls++
+				if calls == 2 {
+					return 0, sentinel
+				}
+				return len(p), nil
+			},
+		},
+	}
+	ue := &UdpEndpoint{conn: conn}
+	agg := newUDPWriteBatchAggregator(ue)
+	if err := agg.Append([]byte("a"), "10.0.0.1:53"); err != nil {
+		t.Fatalf("Append a: %v", err)
+	}
+	if err := agg.Append([]byte("b"), "10.0.0.1:53"); err != nil {
+		t.Fatalf("Append b: %v", err)
+	}
+	agg.flush()
+	if conn.writes != 2 {
+		t.Fatalf("expected 2 fallback WriteTo calls (1 ok + 1 failed), got %d", conn.writes)
+	}
+	if !ue.hasSent.Load() {
+		t.Fatal("partial-error fallback flush must set hasSent: one datagram left")
+	}
+	if ue.lastSendNano.Load() == 0 {
+		t.Fatal("partial-error fallback flush must refresh lastSendNano")
+	}
+	if ue.dead.Load() {
+		t.Fatal("first partial-error fallback flush is tolerated and must not retire")
+	}
+}
+
+func TestShortWriteBatchStampsSendWhenSomeDatagramsLeft(t *testing.T) {
+	rec := &batchRecorder{shortN: 1}
+	ue := newBatchTestEndpoint(rec)
+	agg := newUDPWriteBatchAggregator(ue)
+	if err := agg.Append([]byte("a"), "10.0.0.1:53"); err != nil {
+		t.Fatalf("Append a: %v", err)
+	}
+	if err := agg.Append([]byte("b"), "10.0.0.1:53"); err != nil {
+		t.Fatalf("Append b: %v", err)
+	}
+	agg.flush()
+	if !ue.hasSent.Load() {
+		t.Fatal("short WriteBatch with n>0 must set hasSent")
+	}
+	if ue.lastSendNano.Load() == 0 {
+		t.Fatal("short WriteBatch with n>0 must refresh lastSendNano")
+	}
+	if ue.dead.Load() {
+		t.Fatal("first short WriteBatch is classified as a tolerated write error")
+	}
+}
+
+func TestShortWriteBatchZeroDoesNotStampSend(t *testing.T) {
+	rec := &batchRecorder{err: errors.New("boom")}
+	ue := newBatchTestEndpoint(rec)
+	agg := newUDPWriteBatchAggregator(ue)
+	if err := agg.Append([]byte("solo"), "10.0.0.1:53"); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	before := ue.lastSendNano.Load()
+	agg.flush()
+	if ue.hasSent.Load() {
+		t.Fatal("failed WriteBatch with n==0 must not set hasSent")
+	}
+	if got := ue.lastSendNano.Load(); got != before {
+		t.Fatalf("failed WriteBatch advanced lastSendNano: %d -> %d", before, got)
+	}
+}
+
+// TestShortWriteBatchWithErrorStampsSendWhenSomeDatagramsLeft: a batched
+// write that reports an error but still sent n>0 datagrams (the sendmmsg
+// partial-failure contract) must stamp hasSent/lastSendNano — some datagrams
+// really left — and count the error toward the soft-error threshold.
+func TestShortWriteBatchWithErrorStampsSendWhenSomeDatagramsLeft(t *testing.T) {
+	rec := &batchRecorder{err: errors.New("boom"), shortN: 1}
+	ue := newBatchTestEndpoint(rec)
+	agg := newUDPWriteBatchAggregator(ue)
+	if err := agg.Append([]byte("a"), "10.0.0.1:53"); err != nil {
+		t.Fatalf("Append a: %v", err)
+	}
+	if err := agg.Append([]byte("b"), "10.0.0.1:53"); err != nil {
+		t.Fatalf("Append b: %v", err)
+	}
+	agg.flush()
+	if !ue.hasSent.Load() {
+		t.Fatal("error WriteBatch with n>0 must set hasSent")
+	}
+	if ue.lastSendNano.Load() == 0 {
+		t.Fatal("error WriteBatch with n>0 must refresh lastSendNano")
+	}
+	if ue.dead.Load() {
+		t.Fatal("first partial-error WriteBatch is tolerated and must not retire")
 	}
 }
 

@@ -136,16 +136,27 @@ func (a *udpWriteBatchAggregator) flush() {
 		// defensive fallback that preserves ordering via synchronous writes.
 		// It also runs under the mutex for the same buffer-lifetime reason.
 		var fallbackErr error
+		sentAny := false
 		for _, it := range items {
 			if _, err := a.ue.conn.WriteTo(it.Data, it.Addr); err != nil {
 				fallbackErr = err
 				break
 			}
+			sentAny = true
 		}
 		a.mu.Unlock()
 		if fallbackErr != nil {
 			_ = a.ue.handleWriteError(fallbackErr)
+			if sentAny {
+				// Some datagrams already left the socket; keep the
+				// send timestamp honest even though the rest failed.
+				a.ue.hasSent.Store(true)
+				a.ue.lastSendNano.Store(time.Now().UnixNano())
+			}
+			return
 		}
+		a.ue.hasSent.Store(true)
+		a.ue.lastSendNano.Store(time.Now().UnixNano())
 		return
 	}
 	n, err := bw.WriteBatch(items)
@@ -153,13 +164,20 @@ func (a *udpWriteBatchAggregator) flush() {
 
 	if err != nil {
 		_ = a.ue.handleWriteError(err)
+		if n > 0 {
+			a.ue.hasSent.Store(true)
+			a.ue.lastSendNano.Store(time.Now().UnixNano())
+		}
 		return
 	}
 	if n < len(items) {
 		_ = a.ue.handleWriteError(fmt.Errorf("%w: batched write sent %d/%d datagrams", io.ErrShortWrite, n, len(items)))
+		if n > 0 {
+			a.ue.hasSent.Store(true)
+			a.ue.lastSendNano.Store(time.Now().UnixNano())
+		}
 		return
 	}
-	a.ue.writeSoftErrorCount.Store(0)
 	a.ue.hasSent.Store(true)
 	a.ue.lastSendNano.Store(time.Now().UnixNano())
 }

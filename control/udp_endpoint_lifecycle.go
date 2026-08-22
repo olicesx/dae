@@ -415,7 +415,7 @@ func (ue *UdpEndpoint) markRetiredFromReceiver() {
 	// longer find it. Run Close() on a fresh goroutine — never on the sender
 	// or transport-callback stack — so it may wait for this sender to drain
 	// and exit before closing the conn.
-	go ue.Close()
+	go func() { _ = ue.Close() }()
 }
 
 // retireFromReplySender evicts the endpoint from the reply sender. Push mode

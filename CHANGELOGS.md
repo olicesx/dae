@@ -56,6 +56,17 @@ curl --silent "https://api.github.com/repos/daeuniverse/dae/releases" | jq -r '.
 Existing config files keep parsing, but the following defaults and semantics
 changed. Review them before upgrading:
 
+- The `DAE_SEMANTIC_REFACTOR_FEATURES` environment variable was removed. The
+  routing epoch (lossless reload) is now the only publication path, and the
+  experimental bounded UDP dispatchers were deleted in favour of the per-flow
+  convoy task pool; setting the variable now has no effect. Convoy tasks also
+  gained per-task panic isolation with rate-limited reporting.
+- Transports implementing the fork's push-mode packet receiver
+  (`netproxy.PacketReceiver`: direct via a shared epoll loop, QUIC-family via
+  their existing transport readers) now deliver upstream UDP replies through
+  that receiver by default instead of one blocking `ReadFrom` goroutine per
+  endpoint. Replies are still ordered per endpoint through a bounded queue,
+  and overload drops only the excess packet.
 - `sniffing_timeout` default lowered from `100ms` to `30ms`. Slow first-packet
   clients that previously sniffed successfully may now fall back to non-sniffed
   routing; combined with the sniff negative cache this makes domain-based

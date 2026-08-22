@@ -313,7 +313,7 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 	if offloadErr != nil {
 		return fmt.Errorf("handleTCP offloaded relay error: %w", offloadErr)
 	}
-	annotateOffload = canAnnotateTCPRelayOffload(rConn)
+	annotateOffload = canResolveTCPRelayOffloadConn(rConn)
 	if !offloaded && offloadReason != "" && c.log.IsLevelEnabled(logrus.DebugLevel) {
 		logOffloadSkipRateLimited(c.log, offloadReason)
 	}
@@ -420,19 +420,10 @@ type WriteCloser interface {
 	CloseWrite() error
 }
 
-// RelayTCP copies data bidirectionally between two connections.
-// A relayCore orchestrates shared cancellation and force-close fallback.
-func RelayTCP(lConn, rConn netproxy.Conn) (err error) {
-	return RelayTCPContext(context.Background(), lConn, rConn)
-}
-
-// RelayTCPContext copies data bidirectionally between two connections with
-// the given context. The context can be used to cancel the relay operation
-// or set a deadline. A nil context is treated as context.Background().
-func RelayTCPContext(ctx context.Context, lConn, rConn netproxy.Conn) (err error) {
-	return RelayTCPContextWithRecords(ctx, lConn, rConn, RecordDownloadTraffic, RecordUploadTraffic)
-}
-
+// RelayTCPContextWithRecords copies data bidirectionally between two
+// connections. The context can be used to cancel the relay operation or set
+// a deadline. A nil context is treated as context.Background(). A relayCore
+// orchestrates shared cancellation and force-close fallback.
 func RelayTCPContextWithRecords(ctx context.Context, lConn, rConn netproxy.Conn, leftRecord func(int64), rightRecord func(int64)) (err error) {
 	core := newRelayCore(lConn, rConn, defaultRelayCopyEngine{}, leftRecord, rightRecord)
 	return core.run(ctx)

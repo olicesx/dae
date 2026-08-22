@@ -114,26 +114,6 @@ func (c *DnsCache) GetFqdn() string {
 	return ""
 }
 
-func (c *DnsCache) MarkRouteBindingRefreshed(now time.Time) {
-	c.lastRouteSyncNano.Store(now.UnixNano())
-}
-
-// ShouldRefreshRouteBinding checks if route binding needs to be refreshed.
-//
-// Deprecated: Use NeedsBpfUpdate for differential updates.
-func (c *DnsCache) ShouldRefreshRouteBinding(now time.Time, minInterval time.Duration) bool {
-	if minInterval <= 0 {
-		return true
-	}
-
-	nowNano := now.UnixNano()
-	last := c.lastRouteSyncNano.Load()
-	if last != 0 && nowNano-last < minInterval.Nanoseconds() {
-		return false
-	}
-	return c.lastRouteSyncNano.CompareAndSwap(last, nowNano)
-}
-
 // ComputeBpfDataHash computes a hash of the data used for BPF updates.
 // This includes IP addresses from Answer and the DomainBitmap.
 // Returns 0 if there are no valid IPs (no update needed).

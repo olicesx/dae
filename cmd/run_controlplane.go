@@ -63,12 +63,8 @@ func newPreparedControlPlane(ctx context.Context, log *logrus.Logger, bpf any, d
 }
 
 // buildControlPlaneRuntime is the final construction boundary after config
-// normalization, subscription resolution, and reload safety checks. Keeping
-// the seam here lets failure tests exercise the real Runner preparation path
-// without replacing the default ControlPlane constructors.
-var buildControlPlaneRuntime = buildControlPlaneRuntimeDefault
-
-func buildControlPlaneRuntimeDefault(
+// normalization, subscription resolution, and reload safety checks.
+func buildControlPlaneRuntime(
 	ctx context.Context,
 	log *logrus.Logger,
 	bpf any,

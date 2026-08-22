@@ -54,11 +54,6 @@ type activeRetirementTask struct {
 	done       chan struct{}
 }
 
-// reloadFailureCompletionHook is an internal observability seam used by
-// lifecycle tests. The production default is a no-op and does not affect
-// reload state transitions.
-var reloadFailureCompletionHook = func() {}
-
 func newReloadManager(reloadReqs chan reloadRequest, runStateChanges chan struct{}, sigs <-chan os.Signal) *reloadManager {
 	m := &reloadManager{
 		reloadReqs:      reloadReqs,
@@ -279,7 +274,6 @@ func (m *reloadManager) finishReloadFailure() {
 	m.reloading.Store(false)
 	m.reloadActive.Store(false)
 	clearReloadPending(&m.reloadPending)
-	reloadFailureCompletionHook()
 }
 
 func (m *reloadManager) finishReloadSuccess() {
@@ -578,7 +572,6 @@ func preserveReloadInterfaceBindings(oldConf, newConf *config.Config) []string {
 // where the old control plane loses domain routing (see dae#1013).
 //
 // Must be kept in sync with config.Dns routing-affecting fields.
-// TestDNSConfigFingerprintCoversAllDnsFields guards the contract.
 func dnsConfigFingerprint(dns config.Dns) string {
 	var b strings.Builder
 	writeKeyableStrings := func(name string, values []config.KeyableString) {

@@ -86,23 +86,16 @@ func (c *DnsController) CloneCacheForReload() map[string]*DnsCache {
 	return result
 }
 
-// RestoreReloadCache restores cache entries during reload and schedules their
-// BPF side effects through the regular asynchronous path.
-func (c *DnsController) RestoreReloadCache(entries map[string]*DnsCache, matchDomainBitmap func(string) []uint32, now time.Time) int {
-	count, _ := c.restoreReloadCache(entries, matchDomainBitmap, now, false)
-	return count
-}
-
 // RestoreReloadCacheAndProject restores cache entries and synchronously
 // applies their BPF side effects. Reload publication uses this variant so an
 // inactive routing plan has a complete domain projection before it becomes
 // visible to packets. The runtime callback must not attempt to update this
 // controller's runtime while it is executing.
 func (c *DnsController) RestoreReloadCacheAndProject(entries map[string]*DnsCache, matchDomainBitmap func(string) []uint32, now time.Time) (int, error) {
-	return c.restoreReloadCache(entries, matchDomainBitmap, now, true)
+	return c.restoreReloadCache(entries, matchDomainBitmap, now)
 }
 
-func (c *DnsController) restoreReloadCache(entries map[string]*DnsCache, matchDomainBitmap func(string) []uint32, now time.Time, projectSynchronously bool) (int, error) {
+func (c *DnsController) restoreReloadCache(entries map[string]*DnsCache, matchDomainBitmap func(string) []uint32, now time.Time) (int, error) {
 	if c == nil || len(entries) == 0 {
 		return 0, nil
 	}
@@ -142,7 +135,7 @@ func (c *DnsController) restoreReloadCache(entries map[string]*DnsCache, matchDo
 			c.enforceDnsCacheCapacityLocked(k)
 			_, loaded := c.storeDnsCache(k, restored)
 			c.rememberDnsKnowledge(dnsCacheBaseKey(k), restored.OriginalDeadline, !loaded)
-			if projectSynchronously && rt != nil && rt.cacheAccessCallback != nil {
+			if rt != nil && rt.cacheAccessCallback != nil {
 				if err := rt.cacheAccessCallback(restored); err != nil {
 					c.cacheProjectionMu.Unlock()
 					c.runtimeMu.RUnlock()

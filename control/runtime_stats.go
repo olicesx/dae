@@ -114,20 +114,6 @@ func RecordDownloadTraffic(n int64) {
 	}
 }
 
-// Deprecated: prefer (*ControlPlane).SnapshotRuntimeStats for per-instance stats.
-// SnapshotRuntimeStats returns the current runtime traffic snapshot.
-func SnapshotRuntimeStats(activeConnections int, udpSessions int, windowSec int, maxPoints int) RuntimeStatsSnapshot {
-	now := time.Now()
-	if store := currentRuntimeStatsStore(); store != nil {
-		return store.snapshot(activeConnections, udpSessions, windowSec, maxPoints, now)
-	}
-	return RuntimeStatsSnapshot{
-		UpdatedAt:         now,
-		ActiveConnections: activeConnections,
-		UDPSessions:       udpSessions,
-	}
-}
-
 func (c *ControlPlane) publishRuntimeStats() {
 	if c == nil {
 		return

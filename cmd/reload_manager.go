@@ -17,9 +17,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
 	"github.com/daeuniverse/dae/pkg/config_parser"
+	"github.com/okzk/sdnotify"
 	"github.com/sirupsen/logrus"
 )
 
@@ -272,6 +274,16 @@ func (m *reloadManager) installPreparedDNSHandoffHooks(log *logrus.Logger, curre
 
 func (m *reloadManager) finishReloadFailure() {
 	m.reloading.Store(false)
+	m.reloadActive.Store(false)
+	clearReloadPending(&m.reloadPending)
+}
+
+// failReloadAttempt reports a failed reload attempt to the service manager
+// and the progress file, then clears the busy/pending bookkeeping so the
+// live generation keeps serving and the next reload request is accepted.
+func (m *reloadManager) failReloadAttempt(reloadErr error) {
+	_ = sdnotify.Ready()
+	_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
 	m.reloadActive.Store(false)
 	clearReloadPending(&m.reloadPending)
 }

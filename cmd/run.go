@@ -439,9 +439,7 @@ loop:
 							failRun(reloadErr)
 							break loop
 						}
-						reloadManager.reloading.Store(false)
-						reloadManager.reloadActive.Store(false)
-						clearReloadPending(&reloadManager.reloadPending)
+						reloadManager.finishReloadFailure()
 						continue
 					}
 					_ = sdnotify.Ready()

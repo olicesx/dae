@@ -77,10 +77,7 @@ func (w *reloadWorker) run() {
 				w.log.WithFields(logrus.Fields{
 					"err": err,
 				}).Errorln("[Reload] Failed to reload")
-				_ = sdnotify.Ready()
-				_ = setRunSignalProgress(consts.ReloadError, err.Error())
-				w.reloadManager.reloadActive.Store(false)
-				clearReloadPending(&w.reloadManager.reloadPending)
+				w.reloadManager.failReloadAttempt(err)
 				continue
 			}
 			newConf.Global = deepcopy.Copy(w.conf.Global).(config.Global)
@@ -94,10 +91,7 @@ func (w *reloadWorker) run() {
 				w.log.WithFields(logrus.Fields{
 					"err": err,
 				}).Errorln("[Reload] Failed to reload")
-				_ = sdnotify.Ready()
-				_ = setRunSignalProgress(consts.ReloadError, err.Error())
-				w.reloadManager.reloadActive.Store(false)
-				clearReloadPending(&w.reloadManager.reloadPending)
+				w.reloadManager.failReloadAttempt(err)
 				continue
 			}
 			w.log.Infof("Include config files: [%v]", strings.Join(includes, ", "))
@@ -184,10 +178,7 @@ func (w *reloadWorker) run() {
 				w.reloadManager.setReloadError(reloadErr)
 				cancel()
 				w.log.WithError(reloadErr).Errorln("[Reload] Failed to prepare staged reload; keeping current generation active")
-				_ = sdnotify.Ready()
-				_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
-				w.reloadManager.reloadActive.Store(false)
-				clearReloadPending(&w.reloadManager.reloadPending)
+				w.reloadManager.failReloadAttempt(reloadErr)
 				releaseReloadTransition()
 				continue
 			}
@@ -200,10 +191,7 @@ func (w *reloadWorker) run() {
 					w.log.WithError(closeErr).Warnln("[Reload] Failed to close prepared staged generation")
 				}
 				w.log.WithError(reloadErr).Errorln("[Reload] Failed to stage listener; keeping current generation active")
-				_ = sdnotify.Ready()
-				_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
-				w.reloadManager.reloadActive.Store(false)
-				clearReloadPending(&w.reloadManager.reloadPending)
+				w.reloadManager.failReloadAttempt(reloadErr)
 				releaseReloadTransition()
 				continue
 			}
@@ -222,10 +210,7 @@ func (w *reloadWorker) run() {
 					w.log.WithError(closeErr).Warnln("[Reload] Failed to close staged generation after epoch link failure")
 				}
 				w.log.WithError(reloadErr).Errorln("[Reload] Failed to prepare staged reload; keeping current generation active")
-				_ = sdnotify.Ready()
-				_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
-				w.reloadManager.reloadActive.Store(false)
-				clearReloadPending(&w.reloadManager.reloadPending)
+				w.reloadManager.failReloadAttempt(reloadErr)
 				releaseReloadTransition()
 				continue
 			}
@@ -258,10 +243,7 @@ func (w *reloadWorker) run() {
 					w.log.WithError(closeErr).Warnln("[Reload] Failed to close staged generation after supervisor setup failure")
 				}
 				w.log.WithError(reloadErr).Errorln("[Reload] Failed to prepare staged reload; keeping current generation active")
-				_ = sdnotify.Ready()
-				_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
-				w.reloadManager.reloadActive.Store(false)
-				clearReloadPending(&w.reloadManager.reloadPending)
+				w.reloadManager.failReloadAttempt(reloadErr)
 				releaseReloadTransition()
 				continue
 			}
@@ -272,10 +254,7 @@ func (w *reloadWorker) run() {
 					w.log.WithError(closeErr).Warnln("[Reload] Failed to close staged generation after supervisor install failure")
 				}
 				w.log.WithError(reloadErr).Errorln("[Reload] Failed to prepare staged reload; keeping current generation active")
-				_ = sdnotify.Ready()
-				_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
-				w.reloadManager.reloadActive.Store(false)
-				clearReloadPending(&w.reloadManager.reloadPending)
+				w.reloadManager.failReloadAttempt(reloadErr)
 				releaseReloadTransition()
 				continue
 			}
@@ -319,10 +298,7 @@ func (w *reloadWorker) run() {
 				w.reloadManager.setReloadError(reloadErr)
 				cancel()
 				w.log.WithError(reloadErr).Errorln("[Reload] Failed to prepare fresh datapath reload; keeping current generation active")
-				_ = sdnotify.Ready()
-				_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
-				w.reloadManager.reloadActive.Store(false)
-				clearReloadPending(&w.reloadManager.reloadPending)
+				w.reloadManager.failReloadAttempt(reloadErr)
 				releaseReloadTransition()
 				continue
 			}
@@ -335,10 +311,7 @@ func (w *reloadWorker) run() {
 					w.log.WithError(closeErr).Warnln("[Reload] Failed to close prepared fresh datapath generation")
 				}
 				w.log.WithError(reloadErr).Errorln("[Reload] Failed to prepare fresh datapath listener; keeping current generation active")
-				_ = sdnotify.Ready()
-				_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
-				w.reloadManager.reloadActive.Store(false)
-				clearReloadPending(&w.reloadManager.reloadPending)
+				w.reloadManager.failReloadAttempt(reloadErr)
 				releaseReloadTransition()
 				continue
 			}
@@ -369,10 +342,7 @@ func (w *reloadWorker) run() {
 					w.log.WithError(closeErr).Warnln("[Reload] Failed to close fresh datapath generation after supervisor setup failure")
 				}
 				w.log.WithError(reloadErr).Errorln("[Reload] Failed to prepare fresh datapath reload; keeping current generation active")
-				_ = sdnotify.Ready()
-				_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
-				w.reloadManager.reloadActive.Store(false)
-				clearReloadPending(&w.reloadManager.reloadPending)
+				w.reloadManager.failReloadAttempt(reloadErr)
 				releaseReloadTransition()
 				continue
 			}
@@ -383,10 +353,7 @@ func (w *reloadWorker) run() {
 					w.log.WithError(closeErr).Warnln("[Reload] Failed to close fresh datapath generation after supervisor install failure")
 				}
 				w.log.WithError(reloadErr).Errorln("[Reload] Failed to prepare fresh datapath reload; keeping current generation active")
-				_ = sdnotify.Ready()
-				_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
-				w.reloadManager.reloadActive.Store(false)
-				clearReloadPending(&w.reloadManager.reloadPending)
+				w.reloadManager.failReloadAttempt(reloadErr)
 				releaseReloadTransition()
 				continue
 			}
@@ -482,10 +449,7 @@ func (w *reloadWorker) run() {
 					w.log.WithError(restartErr).Warnln("[Reload] Failed to restart previous DNS listener after reload preparation error")
 				}
 				w.log.WithError(reloadErr).Errorln("[Reload] Failed to prepare listener; keeping current generation active")
-				_ = sdnotify.Ready()
-				_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
-				w.reloadManager.reloadActive.Store(false)
-				clearReloadPending(&w.reloadManager.reloadPending)
+				w.reloadManager.failReloadAttempt(reloadErr)
 				releaseReloadTransition()
 				continue
 			}
@@ -539,10 +503,7 @@ func (w *reloadWorker) run() {
 				}
 			}
 			w.log.WithError(reloadErr).Errorln("[Reload] Failed to prepare reload candidate; keeping current generation active")
-			_ = sdnotify.Ready()
-			_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
-			w.reloadManager.reloadActive.Store(false)
-			clearReloadPending(&w.reloadManager.reloadPending)
+			w.reloadManager.failReloadAttempt(reloadErr)
 			releaseReloadTransition()
 			continue
 		}
@@ -561,10 +522,7 @@ func (w *reloadWorker) run() {
 				}
 			}
 			w.log.WithError(reloadErr).Errorln("[Reload] Failed to prepare reload candidate; keeping current generation active")
-			_ = sdnotify.Ready()
-			_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
-			w.reloadManager.reloadActive.Store(false)
-			clearReloadPending(&w.reloadManager.reloadPending)
+			w.reloadManager.failReloadAttempt(reloadErr)
 			releaseReloadTransition()
 			continue
 		}

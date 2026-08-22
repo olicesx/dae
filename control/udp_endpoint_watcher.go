@@ -50,6 +50,13 @@ func (ue *UdpEndpoint) startTransportReceiver() bool {
 	ue.receiverMu.Lock()
 	ue.receiverStop = stop
 	ue.receiverMu.Unlock()
+	// hysteria2 drains queued datagrams inside RegisterPacketReceiver. A
+	// hard error there calls markRetiredFromReceiver and stopPacketReceiver
+	// before this assignment, so the first unregister is a no-op. Re-run
+	// now that stop is visible; Close is idempotent via closeOnce.
+	if ue.dead.Load() {
+		ue.stopPacketReceiver()
+	}
 
 	if ue.log != nil && ue.log.IsLevelEnabled(logrus.DebugLevel) {
 		ue.log.Debug("[UdpEndpoint] Using transport-owned packet receiver")
@@ -177,7 +184,10 @@ func (ue *UdpEndpoint) handleReceivedPacket(packet *netproxy.ReceivedPacket) boo
 		ue.markReplied(time.Now().UnixNano())
 	}
 
-	ue.enqueueReceivedReply(packet.Data, from, packet.Release)
+	if !ue.enqueueReceivedReply(packet.Data, from, packet.Release) {
+		ue.stopPacketReceiver()
+		return false
+	}
 	return true
 }
 

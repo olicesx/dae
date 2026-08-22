@@ -26,11 +26,12 @@ import (
 // registered handler directly to the test, mimicking push-mode delivery from
 // a QUIC session reader or the direct protocol's shared epoll loop.
 type receiverConn struct {
-	mu                sync.Mutex
-	handler           netproxy.PacketReceiveHandler
-	stops             int
-	readonly          atomic.Int64 // deliver calls observed after unregister
-	deliverOnRegister bool
+	mu                   sync.Mutex
+	handler              netproxy.PacketReceiveHandler
+	stops                int
+	readonly             atomic.Int64 // deliver calls observed after unregister
+	deliverOnRegister    bool
+	deliverErrOnRegister error
 
 	closed atomic.Bool
 }
@@ -46,6 +47,7 @@ func (c *receiverConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHand
 	}
 	c.handler = handler
 	deliverOnRegister := c.deliverOnRegister
+	errOnRegister := c.deliverErrOnRegister
 	var once sync.Once
 	stop := func() {
 		once.Do(func() {
@@ -56,7 +58,9 @@ func (c *receiverConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHand
 		})
 	}
 	c.mu.Unlock()
-	if deliverOnRegister {
+	if errOnRegister != nil {
+		_ = handler(netproxy.NewReceivedPacket(nil, receiverTestFrom(), errOnRegister, func() {}))
+	} else if deliverOnRegister {
 		_ = handler(netproxy.NewReceivedPacket(
 			[]byte("sync-register"),
 			receiverTestFrom(),
@@ -368,6 +372,41 @@ func TestPacketReceiverRegistersAfterQueueExists(t *testing.T) {
 		t.Fatal("packet delivered during RegisterPacketReceiver was dropped")
 	}
 	require.NoError(t, ue.Close())
+}
+
+// TestPacketReceiverRegisterSyncHardErrorUnregisters covers the hysteria2
+// register-time drain: a hard packet.Err is delivered before Register returns
+// the stop func, so the in-callback stopPacketReceiver is a no-op. Close and
+// the post-assign stopPacketReceiver must still unregister.
+func TestPacketReceiverRegisterSyncHardErrorUnregisters(t *testing.T) {
+	conn := &receiverConn{deliverErrOnRegister: fmt.Errorf("session reset")}
+	ue := newReceiverTestEndpoint(t, conn, func(_ *UdpEndpoint, _ []byte, _ netip.AddrPort) error {
+		return nil
+	})
+	require.True(t, ue.dead.Load(), "sync-register hard error must mark the endpoint dead")
+	require.Eventually(t, func() bool { return conn.closed.Load() },
+		2*time.Second, 10*time.Millisecond,
+		"scheduled Close must release the conn")
+	require.Equal(t, 1, conn.unregisterCount(), "receiverStop must run after Register returns")
+}
+
+// TestPacketReceiverClosedQueueUnregistersReceiver is the race where Close
+// flips the queue closed while a delivery is already past the dead check:
+// enqueue must return false so the transport drops the receiver.
+func TestPacketReceiverClosedQueueUnregistersReceiver(t *testing.T) {
+	conn := &receiverConn{}
+	ue := newReceiverTestEndpoint(t, conn, func(_ *UdpEndpoint, _ []byte, _ netip.AddrPort) error {
+		return nil
+	})
+	ue.stopTransportReceiver()
+	require.Equal(t, 1, conn.unregisterCount())
+
+	released := atomic.Bool{}
+	packet := netproxy.NewReceivedPacket([]byte("late"), receiverTestFrom(), nil, func() {
+		released.Store(true)
+	})
+	require.False(t, ue.handleReceivedPacket(packet), "closed queue must unregister")
+	require.True(t, released.Load(), "rejected enqueue must release the packet")
 }
 
 // TestPacketReceiverWithRealDirectDialer wires a real fork direct dialer

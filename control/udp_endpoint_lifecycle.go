@@ -426,7 +426,11 @@ func (ue *UdpEndpoint) markRetiredFromReceiver() {
 // release the conn — the read loop's defer only waits on its local senderDone.
 func (ue *UdpEndpoint) retireFromReplySender() {
 	ue.replyQueueMu.Lock()
-	pushMode := ue.replyQueueDone != nil
+	// A failed RegisterPacketReceiver tears the shared queue down
+	// (replyQueueClosed) and then falls back to the ReadFrom loop. The
+	// leftover replyQueueDone must not keep us on the push-mode path:
+	// ReadFrom's sender has to Close() the conn itself.
+	pushMode := ue.replyQueueDone != nil && !ue.replyQueueClosed
 	ue.replyQueueMu.Unlock()
 	if pushMode {
 		ue.markRetiredFromReceiver()

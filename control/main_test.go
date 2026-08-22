@@ -49,5 +49,10 @@ func TestMain(m *testing.M) {
 		goleak.IgnoreAnyFunction("github.com/panjf2000/ants/v2.(*poolCommon).ticktock"),
 		// outbound package init background goroutine.
 		goleak.IgnoreAnyFunction("github.com/daeuniverse/dae/component/outbound/dialer.init.0.func1"),
+		// The fork's direct-dial packet receiver registry is a process-global
+		// epoll loop with no stop API (one loop shared by every direct
+		// endpoint, alive for the process lifetime). Tests that dial a real
+		// direct conn (udp_endpoint_receiver_test.go) start it on first use.
+		goleak.IgnoreAnyFunction("github.com/daeuniverse/outbound/protocol/direct.(*packetReceiverRegistry).loop"),
 	)
 }

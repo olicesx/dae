@@ -15,10 +15,10 @@ func TestConfigureGOMAXPROCSDefaultsToOne(t *testing.T) {
 	previous := runtime.GOMAXPROCS(runtime.NumCPU())
 	t.Cleanup(func() { runtime.GOMAXPROCS(previous) })
 	orig, had := os.LookupEnv("GOMAXPROCS")
-	os.Unsetenv("GOMAXPROCS")
+	_ = os.Unsetenv("GOMAXPROCS")
 	t.Cleanup(func() {
 		if had {
-			os.Setenv("GOMAXPROCS", orig)
+			_ = os.Setenv("GOMAXPROCS", orig)
 		}
 	})
 

@@ -17,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/daeuniverse/dae/common/consts"
 	componentdns "github.com/daeuniverse/dae/component/dns"
 	"github.com/daeuniverse/dae/config"
 	dnsmessage "github.com/miekg/dns"
@@ -39,8 +38,13 @@ func TestPhase0TCPDNSIngressCorpus_LegacyBaseline(t *testing.T) {
 		answerIP  = "198.51.100.77"
 	)
 
-	ctrl := newPhase0TCPIngressDnsController(t)
-	installPhase0TCPIngressDnsForwarder(t, func(*componentdns.Upstream, dialArgument, *logrus.Logger) (DnsForwarder, error) {
+	ctrl := newCorpusControllerWithDefaultChooser(t, &config.Dns{
+		Routing: config.DnsRouting{
+			Request:  config.DnsRequestRouting{Fallback: config.FunctionOrString("asis")},
+			Response: config.DnsResponseRouting{Fallback: config.FunctionOrString("accept")},
+		},
+	})
+	installCorpusDnsForwarderFactory(t, func(*componentdns.Upstream, dialArgument, *logrus.Logger) (DnsForwarder, error) {
 		return &stubDnsForwarder{forward: func(context.Context, []byte) (*dnsmessage.Msg, error) {
 			return phase0TCPIngressAResponse(queryName, answerIP), nil
 		}}, nil
@@ -136,35 +140,6 @@ func TestPhase0TCPDNSIngressCorpus_LegacyBaseline(t *testing.T) {
 type tcpDnsIngressResult struct {
 	handled bool
 	err     error
-}
-
-func newPhase0TCPIngressDnsController(t *testing.T) *DnsController {
-	t.Helper()
-
-	ctrl := newCorpusDnsController(t, &config.Dns{
-		Routing: config.DnsRouting{
-			Request:  config.DnsRequestRouting{Fallback: config.FunctionOrString("asis")},
-			Response: config.DnsResponseRouting{Fallback: config.FunctionOrString("accept")},
-		},
-	})
-	setScopedBestDialerChooser(ctrl, func(_ context.Context, snapshot DnsRequestSnapshot, _ *componentdns.Upstream) (*dialArgument, error) {
-		return &dialArgument{
-			l4proto:    consts.L4ProtoStr_UDP,
-			ipversion:  consts.IpVersionStr_4,
-			bestTarget: snapshot.RealDst,
-		}, nil
-	})
-	return ctrl
-}
-
-func installPhase0TCPIngressDnsForwarder(t *testing.T, factory func(*componentdns.Upstream, dialArgument, *logrus.Logger) (DnsForwarder, error)) {
-	t.Helper()
-
-	previous := dnsForwarderFactory
-	dnsForwarderFactory = factory
-	t.Cleanup(func() {
-		dnsForwarderFactory = previous
-	})
 }
 
 func readPhase0TCPDnsFrame(t *testing.T, conn net.Conn) ([]byte, []byte) {

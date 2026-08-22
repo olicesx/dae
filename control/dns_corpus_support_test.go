@@ -120,8 +120,7 @@ func DnsCorpusFixtures() []DnsCorpusFixture {
 // global state into siblings.
 func ReplayDns(t *testing.T, fixture DnsCorpusFixture) {
 	t.Helper()
-	originalFactory := dnsForwarderFactory
-	t.Cleanup(func() { dnsForwarderFactory = originalFactory })
+	installCorpusDnsForwarderFactory(t, fixture.ForwarderFactory)
 
 	ctrl := newCorpusDnsController(t, fixture.BuildConfig())
 
@@ -130,10 +129,6 @@ func ReplayDns(t *testing.T, fixture DnsCorpusFixture) {
 		chooser = defaultCorpusChooser
 	}
 	setScopedBestDialerChooser(ctrl, chooser)
-
-	if fixture.ForwarderFactory != nil {
-		dnsForwarderFactory = fixture.ForwarderFactory
-	}
 
 	for _, tc := range fixture.Cases {
 		tc := tc
@@ -216,6 +211,29 @@ func defaultCorpusChooser(ctx context.Context, snapshot DnsRequestSnapshot, upst
 		ipversion:  consts.IpVersionStr_4,
 		bestTarget: snapshot.RealDst,
 	}, nil
+}
+
+// newCorpusControllerWithDefaultChooser builds a corpus controller whose
+// best-dialer chooser matches the request destination (UDP/IPv4).
+func newCorpusControllerWithDefaultChooser(t *testing.T, cfg *config.Dns) *DnsController {
+	t.Helper()
+	ctrl := newCorpusDnsController(t, cfg)
+	setScopedBestDialerChooser(ctrl, defaultCorpusChooser)
+	return ctrl
+}
+
+// installCorpusDnsForwarderFactory swaps the global forwarder factory for the
+// duration of the test. A nil factory keeps the current one.
+func installCorpusDnsForwarderFactory(t *testing.T, factory func(*componentdns.Upstream, dialArgument, *logrus.Logger) (DnsForwarder, error)) {
+	t.Helper()
+	if factory == nil {
+		return
+	}
+	previous := dnsForwarderFactory
+	dnsForwarderFactory = factory
+	t.Cleanup(func() {
+		dnsForwarderFactory = previous
+	})
 }
 
 // defaultUdpRequest is the placeholder request for cases that do not need

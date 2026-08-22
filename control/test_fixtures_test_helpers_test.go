@@ -102,22 +102,6 @@ func newTestFixedOutboundGroup(dialers ...*componentdialer.Dialer) *ob.DialerGro
 	)
 }
 
-// waitForCondition polls cond until it returns true or timeout elapses.
-// Recovered from udp_endpoint_pool_test.go.
-func waitForCondition(t *testing.T, timeout time.Duration, context string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for {
-		if cond() {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for condition: %s", context)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
 // stubDnsForwarder is a minimal DnsForwarder for DNS corpus/fallback tests.
 // Recovered from dns_fallback_test.go.
 type stubDnsForwarder struct {

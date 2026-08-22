@@ -42,14 +42,6 @@ type udpTaskFunc func()
 
 func (f udpTaskFunc) Run() { f() }
 
-// udpTaskFuncOrNil adapts an optional func literal; nil stays nil.
-func udpTaskFuncOrNil(f func()) UdpTask {
-	if f == nil {
-		return nil
-	}
-	return udpTaskFunc(f)
-}
-
 // UdpTaskQueue makes sure packets with the same UDP flow key are sent in order.
 // Field order optimized for memory alignment (Go best practice).
 type UdpTaskQueue struct {

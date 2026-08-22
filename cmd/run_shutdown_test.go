@@ -1305,6 +1305,51 @@ func TestReloadManagerFailReloadAttemptClearsBusyState(t *testing.T) {
 	}
 }
 
+func TestReloadManagerFailPublishedReloadAttemptClearsHandoffState(t *testing.T) {
+	progressPath := filepath.Join(t.TempDir(), "dae.progress")
+	oldWriter := setRunSignalProgress
+	setRunSignalProgress = func(code byte, content string) error {
+		return writeSignalProgressFile(progressPath, code, content)
+	}
+	t.Cleanup(func() { setRunSignalProgress = oldWriter })
+
+	manager := newReloadManager(make(chan reloadRequest, 1), make(chan struct{}, 1), make(chan os.Signal, 1))
+	manager.reloading.Store(true)
+	manager.reloadActive.Store(true)
+	manager.reloadPending.Store(true)
+
+	manager.failPublishedReloadAttempt(errors.New("publish failed"))
+
+	if manager.reloading.Load() {
+		t.Fatal("expected reloading to be cleared after a published-path failure")
+	}
+	if manager.reloadActive.Load() {
+		t.Fatal("expected reloadActive to be cleared")
+	}
+	if manager.reloadPending.Load() {
+		t.Fatal("expected reloadPending to be cleared")
+	}
+	code, content, err := readSignalProgressFile(progressPath)
+	if err != nil {
+		t.Fatalf("readSignalProgressFile() error = %v", err)
+	}
+	if code != consts.ReloadError || content != "publish failed" {
+		t.Fatalf("progress = (%d, %q), want (ReloadError, %q)", code, content, "publish failed")
+	}
+}
+
+func TestShouldUseStagedHotHandoff(t *testing.T) {
+	if !shouldUseStagedHotHandoff(false, true) {
+		t.Fatal("same-port reload with a live listener must use staged hot handoff")
+	}
+	if shouldUseStagedHotHandoff(true, true) {
+		t.Fatal("fresh datapath reload must not overlap generations")
+	}
+	if shouldUseStagedHotHandoff(false, false) {
+		t.Fatal("cold start without a listener cannot stage a hot handoff")
+	}
+}
+
 func TestCanRecoverReloadReadinessFailureOnlyAfterServeReturns(t *testing.T) {
 	tests := []struct {
 		result reloadReadyWaitResult

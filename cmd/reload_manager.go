@@ -278,12 +278,26 @@ func (m *reloadManager) finishReloadFailure() {
 	clearReloadPending(&m.reloadPending)
 }
 
+// failPublishedReloadAttempt reports a recoverable post-handoff failure to
+// the service manager and progress file, then clears the same busy flags as
+// finishReloadFailure. Unlike failReloadAttempt, reloading is already true
+// (beginHandoff ran) so it must be cleared here.
+func (m *reloadManager) failPublishedReloadAttempt(reloadErr error) {
+	if reloadErr != nil {
+		_ = sdnotify.Ready()
+		_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
+	}
+	m.finishReloadFailure()
+}
+
 // failReloadAttempt reports a failed reload attempt to the service manager
 // and the progress file, then clears the busy/pending bookkeeping so the
 // live generation keeps serving and the next reload request is accepted.
 func (m *reloadManager) failReloadAttempt(reloadErr error) {
-	_ = sdnotify.Ready()
-	_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
+	if reloadErr != nil {
+		_ = sdnotify.Ready()
+		_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
+	}
 	m.reloadActive.Store(false)
 	clearReloadPending(&m.reloadPending)
 }

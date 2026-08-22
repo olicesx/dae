@@ -511,7 +511,7 @@ loop:
 							}
 						}
 						reloadManager.clearPendingStagedHandoff()
-						reloadManager.finishReloadFailure()
+						reloadManager.failPublishedReloadAttempt(reloadErr)
 						continue
 					}
 					serveControlPlane = handoff.preparedGeneration.controlPlane
@@ -718,7 +718,7 @@ loop:
 							}
 						}
 						reloadManager.clearPendingStagedHandoff()
-						reloadManager.finishReloadFailure()
+						reloadManager.failPublishedReloadAttempt(reloadErr)
 						continue
 					}
 

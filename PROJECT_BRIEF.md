@@ -69,9 +69,12 @@ scripts/semantic-refactor-smoke.sh   # live 冒烟（子命令式，见脚本头
    startTransportReceiver/handleReceivedPacket + Close 排空），不再依赖
    已删除的 reply dispatcher。direct 出站走共享 epoll 读循环，
    QUIC 系复用 transport 既有读 goroutine，每 endpoint 省一个
-   ReadFrom goroutine。测试：udp_endpoint_receiver_test.go 五项
+   ReadFrom goroutine。测试：udp_endpoint_receiver_test.go 十一项
    （含真实 direct dialer 端到端）。注意：WAN-hook direct 流量走
-   内核快速路径不建 endpoint，推送模式作用于代理出站/DNS 等用户态路径
+   内核快速路径不建 endpoint，推送模式作用于代理出站/DNS 等用户态路径。
+   后续两轮生命周期修复已沉淀 git history（0f485fb8/80e381d0）：
+   sender/回调栈不得同步 Close（自死锁 + closeOnce 占死）、mark-only
+   退场由独立 goroutine 兜底关 conn、注册同步投递与队列关闭的竞态
 
 ## 相关文档
 

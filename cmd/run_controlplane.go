@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -189,6 +190,32 @@ func configureGcMemoryLimit(log *logrus.Logger) {
 	if log != nil {
 		log.Infof("Configured GOMEMLIMIT=%d MiB (cgroup memory ceiling=%d MiB)",
 			softLimit/1024/1024, limit/1024/1024)
+	}
+}
+
+// configureGOMAXPROCS pins the Go scheduler to a single P by default. On the
+// few-core relay boxes dae targets, cross-P work stealing and netpoll handoffs
+// around the per-packet QUIC receive path cost more CPU than the parallelism
+// buys: on a 2-core box, GOMAXPROCS=1 cut proxied-relay CPU roughly in half at
+// identical throughput (measured 23.6 -> ~13 CPU-seconds per 45s of ~14MB/s
+// relay). The userspace relay stays well under one core, and direct traffic
+// bypasses userspace via the eBPF fast path, so a single P is not a
+// bottleneck; Go's asynchronous preemption keeps head-of-line delays bounded
+// if a bulk burst monopolizes the P.
+//
+// An explicit GOMAXPROCS environment variable always wins, preserving the
+// escape hatch for deployments that can actually saturate a core (e.g. many
+// parallel proxy nodes).
+func configureGOMAXPROCS(log *logrus.Logger) {
+	if value, ok := os.LookupEnv("GOMAXPROCS"); ok {
+		if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
+			log.Debugf("GOMAXPROCS: using explicit environment value %q", value)
+		}
+		return
+	}
+	runtime.GOMAXPROCS(1)
+	if log != nil {
+		log.Infoln("Configured GOMAXPROCS=1 (set GOMAXPROCS in the service environment to override)")
 	}
 }
 

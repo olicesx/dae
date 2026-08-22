@@ -270,6 +270,7 @@ func (r *Runner) Run() (err error) {
 	currCancel = cancel
 	configureTransparentHugePages(log, conf.Global.DisableTHP)
 	configureGcMemoryLimit(log)
+	configureGOMAXPROCS(log)
 	c, err := newControlPlane(ctx, log, nil, nil, conf, externGeoDataDirs, false, false)
 	if err != nil {
 		cancel()

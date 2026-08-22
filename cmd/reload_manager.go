@@ -584,6 +584,7 @@ func preserveReloadInterfaceBindings(oldConf, newConf *config.Config) []string {
 // where the old control plane loses domain routing (see dae#1013).
 //
 // Must be kept in sync with config.Dns routing-affecting fields.
+// TestDNSConfigFingerprintCoversAllDnsFields guards the contract.
 func dnsConfigFingerprint(dns config.Dns) string {
 	var b strings.Builder
 	writeKeyableStrings := func(name string, values []config.KeyableString) {

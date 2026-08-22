@@ -56,8 +56,13 @@ scripts/semantic-refactor-smoke.sh   # live 冒烟（子命令式，见脚本头
    per-task panic 隔离 + pow2 上报移植进 convoy（udp_task_pool.go），
    legacy pool 的 FIFO/独立性/panic/close 测试恢复
    （udp_task_pool_order_test.go）
-3. run.go 内联 reload 状态机（546 行匿名 goroutine）外提；
-   7 步 reload 清理序列重复 16 次待抽函数
+3. ~~run.go 内联 reload 状态机外提 + 清理序列抽函数~~ 已完成（2026-08-22）：
+   546 行匿名 goroutine 外提为 cmd/run_reload_worker.go 的
+   reloadWorker.run()（共享可变状态经 struct 字段，三通道验证逐行一致）；
+   14 处重复的 reload 失败清理尾序列（sdnotify + progress +
+   reloadActive + clearReloadPending）收敛为 reloadManager.failReloadAttempt；
+   run_shutdown_test.go 丢失的 49 个状态机/纯函数单测已恢复并适配
+   （shutdownAfterSignal 并入 WithHandoff、fast-exit 现在也关 netns）
 4. Sprint 10 候选：dns.go / dns_controller_cache.go 拆分（先评估内聚性）
 5. ~~fork 的 netproxy.PacketReceiver 推送模式接入~~ 已完成（2026-08-22）：
    推送模式重接到 legacy replyCh 路径（udp_endpoint_watcher.go 的

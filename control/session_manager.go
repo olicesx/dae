@@ -40,11 +40,6 @@ type controlPlaneSessionManagerBinding struct {
 	owned   bool
 }
 
-type sessionManagerDispatchers struct {
-	ordered *udpOrderedDispatcher
-	reply   *udpReplyDispatcher
-}
-
 type udpFlowSourceSnapshot struct {
 	flows []*UDPFlowRuntime
 }
@@ -64,8 +59,6 @@ type SessionManager struct {
 	generations    map[routing.PolicyEpoch]*sessionGenerationState
 	pinnedTCP      map[bpfTuplesKey]int
 	pinnedRedirect map[bpfRedirectTuple]int
-	udpOrdered     *udpOrderedDispatcher
-	udpDispatcher  *udpReplyDispatcher
 
 	udpStateMu sync.RWMutex
 	udpBPF     atomic.Pointer[bpfObjects]
@@ -174,69 +167,35 @@ func (c *ControlPlane) AttachSessionManager(manager *SessionManager) error {
 		c.sessionManagerMu.Unlock()
 		return fmt.Errorf("attach session manager with active private flows")
 	}
-	dispatchers, err := manager.prepareControlPlane(c)
-	if err != nil {
+	if err := manager.prepareControlPlane(c); err != nil {
 		c.sessionManagerMu.Unlock()
 		return err
-	}
-	oldOrdered := c.udpOrderedDispatcher
-	oldOrderedShared := c.udpOrderedDispatcherShared
-	if dispatchers.ordered != nil && dispatchers.ordered != oldOrdered {
-		c.udpOrderedDispatcher = dispatchers.ordered
-		c.udpOrderedDispatcherShared = true
-	}
-	oldReply := c.udpReplyDispatcher
-	oldReplyShared := c.udpReplyDispatcherShared
-	if dispatchers.reply != nil && dispatchers.reply != oldReply {
-		c.udpReplyDispatcher = dispatchers.reply
-		c.udpReplyDispatcherShared = true
 	}
 	c.sessionManager = manager
 	c.ownsSessionManager = false
 	c.sessionManagerBinding.Store(&controlPlaneSessionManagerBinding{manager: manager})
 	c.sessionManagerMu.Unlock()
-	if oldOrdered != nil && oldOrdered != dispatchers.ordered && !oldOrderedShared {
-		oldOrdered.close()
-		oldOrdered.wait()
-	}
-	if oldReply != nil && oldReply != dispatchers.reply && !oldReplyShared {
-		oldReply.close()
-		oldReply.wait()
-	}
 	if previousOwned && previous != nil && previous != manager {
 		return previous.Close()
 	}
 	return nil
 }
 
-func (m *SessionManager) prepareControlPlane(c *ControlPlane) (sessionManagerDispatchers, error) {
+func (m *SessionManager) prepareControlPlane(c *ControlPlane) error {
 	if m == nil || c == nil {
-		return sessionManagerDispatchers{}, ErrSessionManagerClosed
+		return ErrSessionManagerClosed
 	}
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
-		return sessionManagerDispatchers{}, ErrSessionManagerClosed
-	}
-	var dispatchers sessionManagerDispatchers
-	if c.semanticRefactorFeatures.UDPOrderedDispatcher {
-		if m.udpOrdered == nil {
-			m.udpOrdered = newDefaultUDPOrderedDispatcher()
-		}
-		dispatchers.ordered = m.udpOrdered
-	}
-	if c.semanticRefactorFeatures.UDPReplyDispatcher {
-		if m.udpDispatcher == nil {
-			m.udpDispatcher = newDefaultUDPReplyDispatcher()
-		}
-		dispatchers.reply = m.udpDispatcher
+		return ErrSessionManagerClosed
 	}
 	m.mu.Unlock()
 
 	if bpf := c.PeekBpf(); bpf != nil {
 		m.udpBPF.CompareAndSwap(nil, bpf)
 	}
-	return dispatchers, nil
+	return nil
 }
 
 func (c *ControlPlane) sessionManagerForFlow(parent context.Context) *SessionManager {
@@ -720,17 +679,6 @@ func (m *SessionManager) removeUDPFlowSourceLocked(src netip.AddrPort, flow *UDP
 	m.udpBySource.Store(src, &udpFlowSourceSnapshot{flows: next})
 }
 
-// ActiveUDPConnections returns the number of process-owned UDP endpoints.
-func (m *SessionManager) ActiveUDPConnections() int {
-	if m == nil {
-		return 0
-	}
-	m.mu.RLock()
-	n := len(m.udpFlows)
-	m.mu.RUnlock()
-	return n
-}
-
 // ActiveConnections returns all process-owned TCP and UDP flows.
 func (m *SessionManager) ActiveConnections() int {
 	if m == nil {
@@ -866,22 +814,6 @@ func (m *SessionManager) ActiveTCPConnections() int {
 	return n
 }
 
-// ActiveByGeneration returns the number of live flows established under one
-// policy epoch.
-func (m *SessionManager) ActiveByGeneration(epoch routing.PolicyEpoch) int {
-	if m == nil {
-		return 0
-	}
-	m.mu.RLock()
-	state := m.generations[epoch]
-	n := 0
-	if state != nil {
-		n = state.active
-	}
-	m.mu.RUnlock()
-	return n
-}
-
 // AbortGeneration closes every flow established under one policy epoch.
 // The manager remains open for flows created by other or future generations.
 func (m *SessionManager) AbortGeneration(epoch routing.PolicyEpoch) error {
@@ -1002,25 +934,9 @@ func (m *SessionManager) Close() error {
 	m.closeOnce.Do(func() {
 		m.mu.Lock()
 		m.closed = true
-		ordered := m.udpOrdered
-		m.udpOrdered = nil
 		m.mu.Unlock()
-		// Ordered ingress may still be executing code that touches a live flow.
-		// Quiesce it before canceling contexts or closing endpoint transports.
-		if ordered != nil {
-			ordered.close()
-			ordered.wait()
-		}
 		m.cancel()
 		m.closeErr = m.AbortAll()
-		m.mu.Lock()
-		dispatcher := m.udpDispatcher
-		m.udpDispatcher = nil
-		m.mu.Unlock()
-		if dispatcher != nil {
-			dispatcher.close()
-			dispatcher.wait()
-		}
 	})
 	return m.closeErr
 }

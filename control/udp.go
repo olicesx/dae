@@ -1106,16 +1106,14 @@ getNew:
 			Handler: func(ue *UdpEndpoint, data []byte, from netip.AddrPort) (err error) {
 				return forwardUdpEndpointReplyToClient(replyLog, ue, data, from, realSrc, nil, RecordDownloadTraffic)
 			},
-			NatTimeout:      natTimeout,
-			ConnStateOwner:  connStateOwner,
-			DrainTracker:    endpointDrainTracker,
-			admissionGate:   &c.udpEndpointAdmission,
-			createAdmission: c.orderedUDPEndpointCreateAdmission(flowDecision),
-			Log:             c.log,
-			NowNano:         nowNano,
-			replyDispatcher: c.udpReplyDispatcher,
-			sessionManager:  sessionManager,
-			egressRuntime:   c.egressRuntime,
+			NatTimeout:     natTimeout,
+			ConnStateOwner: connStateOwner,
+			DrainTracker:   endpointDrainTracker,
+			admissionGate:  &c.udpEndpointAdmission,
+			Log:            c.log,
+			NowNano:        nowNano,
+			sessionManager: sessionManager,
+			egressRuntime:  c.egressRuntime,
 			GetDialOption: func(ctx context.Context) (option *DialOption, err error) {
 				dialParam := &proxyDialParam{
 					Outbound:    consts.OutboundIndex(routingResult.Outbound),
@@ -1178,8 +1176,7 @@ getNew:
 		})
 		if err != nil {
 			if stderrors.Is(err, ob.ErrNoAliveDialer) || stderrors.Is(err, ErrEndpointFailed) ||
-				stderrors.Is(err, errUdpEndpointAdmissionClosed) ||
-				stderrors.Is(err, errUdpEndpointCreateAdmissionFull) {
+				stderrors.Is(err, errUdpEndpointAdmissionClosed) {
 				// Already emitted a rate-limited diagnostic log above, or hit negative cache.
 				return nil
 			}

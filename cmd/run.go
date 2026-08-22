@@ -261,15 +261,6 @@ func (r *Runner) Run() (err error) {
 		err = errors.Join(err, processSessions.Close())
 	}()
 
-	semanticRefactorFeatures, err := enableSemanticRefactorFeaturesFromEnvironment()
-	if err != nil {
-		return err
-	}
-	if semanticRefactorFeatures != nil {
-		defer semanticRefactorFeatures.Disable()
-	}
-	routingEpochHandoffEnabled := semanticRefactorFeatures.Enabled(control.SemanticRefactorFeatureRoutingEpoch)
-
 	var currCancel context.CancelFunc
 
 	// Remove AbortFile at beginning.
@@ -435,7 +426,7 @@ func (r *Runner) Run() (err error) {
 			portChanged := conf.Global.TproxyPort != newConf.Global.TproxyPort
 			datapathChanged := bpfDatapathChanged(conf, newConf)
 			freshDatapathReload := portChanged || datapathChanged
-			stagedHotHandoff := shouldUseStagedHotHandoff(routingEpochHandoffEnabled, freshDatapathReload, listener != nil)
+			stagedHotHandoff := shouldUseStagedHotHandoff(freshDatapathReload, listener != nil)
 			freshDatapathHandoff := freshDatapathReload && listener != nil
 			if !reloadManager.beginReloadTransition() {
 				reloadErr := errRuntimeSupervisorClosed
@@ -813,9 +804,6 @@ func (r *Runner) Run() (err error) {
 			// until the candidate reports ready.
 			if !stagedHotHandoff && !freshDatapathReload {
 				newC.InjectBpf(obj)
-				if c != nil {
-					newC.InheritLpmIndices(c.EjectLpmIndices())
-				}
 			}
 
 			var oldListener *control.Listener
@@ -849,7 +837,6 @@ func (r *Runner) Run() (err error) {
 				reloadManager.setReloadError(reloadErr)
 				if !freshDatapathReload && oldC != nil {
 					oldC.InjectBpf(newC.EjectBpf())
-					oldC.InheritLpmIndices(newC.EjectLpmIndices())
 				}
 				if closeErr := candidateGeneration.cleanup(); closeErr != nil {
 					log.WithError(closeErr).Warnln("[Reload] Failed to close candidate generation after supervisor setup failure")
@@ -872,7 +859,6 @@ func (r *Runner) Run() (err error) {
 				reloadManager.setReloadError(reloadErr)
 				if !freshDatapathReload && oldC != nil {
 					oldC.InjectBpf(newC.EjectBpf())
-					oldC.InheritLpmIndices(newC.EjectLpmIndices())
 				}
 				if closeErr := candidateGeneration.cleanup(); closeErr != nil {
 					log.WithError(closeErr).Warnln("[Reload] Failed to close candidate generation after supervisor install failure")
@@ -1274,7 +1260,6 @@ loop:
 					if oldC != nil && !handoff.freshDatapath && !handoff.bpfTransferred {
 						bpf := oldC.EjectBpf()
 						serveControlPlane.InjectBpf(bpf)
-						serveControlPlane.InheritLpmIndices(oldC.EjectLpmIndices())
 					}
 					if handoff.sharedBpfHandoff {
 						// The supervisor now owns the candidate as active. Publish its

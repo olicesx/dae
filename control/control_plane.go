@@ -105,7 +105,6 @@ type ControlPlane struct {
 	dnsReloadCacheStreamSource     func(func(string, *DnsCache) error) error
 	dnsReloadCacheStreamSourceHash [32]byte
 	sharedBpfReload                bool
-	semanticRefactorFeatures       SemanticRefactorFeatureSet
 	// dnsRoutingUnchanged indicates that DNS routing configuration (excluding
 	// runtime-tunable parameters like OptimisticCache) did not change from the
 	// previous generation. It is retained for staged DNS handoff decisions;
@@ -238,32 +237,6 @@ func isIPLikeDomain(domain string) bool {
 		}
 	}
 	return false
-}
-
-func NewControlPlane(
-	log *logrus.Logger,
-	_bpf any,
-	dnsCache map[string]*DnsCache,
-	tagToNodeList map[string][]string,
-	groups []config.Group,
-	routingA *config.Routing,
-	global *config.Global,
-	dnsConfig *config.Dns,
-	externGeoDataDirs []string,
-) (plane *ControlPlane, err error) {
-	return newControlPlaneWithContextOptions(
-		context.Background(),
-		log,
-		_bpf,
-		dnsCache,
-		tagToNodeList,
-		groups,
-		routingA,
-		global,
-		dnsConfig,
-		externGeoDataDirs,
-		controlPlaneBuildOptions{},
-	)
 }
 
 func NewControlPlaneWithContext(
@@ -436,7 +409,6 @@ func newControlPlaneWithContextOptions(
 	if err := checkCtx("prepare"); err != nil {
 		return nil, err
 	}
-	refactorFeatures := semanticRefactorFeatureGateSnapshot()
 
 	// Clear failed QUIC DCID cache on reload/startup.
 	// Network conditions may have changed, so we should allow retrying sniffing
@@ -785,13 +757,11 @@ func newControlPlaneWithContextOptions(
 	if err != nil {
 		return nil, fmt.Errorf("create routing policy identity: %w", err)
 	}
-	if refactorFeatures.RoutingEpoch {
-		if _, err = core.PrepareRoutingEpoch(policyIdentity.Epoch(), sharedBpfReload); err != nil {
-			return nil, fmt.Errorf("prepare routing epoch: %w", err)
-		}
-		if err = core.clearDomainRoutingSlot(core.RoutingEpochSlot()); err != nil {
-			return nil, fmt.Errorf("clear inactive domain routing epoch: %w", err)
-		}
+	if _, err = core.PrepareRoutingEpoch(policyIdentity.Epoch(), sharedBpfReload); err != nil {
+		return nil, fmt.Errorf("prepare routing epoch: %w", err)
+	}
+	if err = core.clearDomainRoutingSlot(core.RoutingEpochSlot()); err != nil {
+		return nil, fmt.Errorf("clear inactive domain routing epoch: %w", err)
 	}
 	if log.IsLevelEnabled(logrus.DebugLevel) {
 		var debugBuilder strings.Builder
@@ -810,15 +780,11 @@ func newControlPlaneWithContextOptions(
 	if !buildOpts.delayDatapathCommit {
 		log.Infoln("Loading routing rules into kernel space (BPF)...")
 		var lpmIndices []uint32
-		if refactorFeatures.RoutingEpoch {
-			if lpmIndices, err = kernspaceSnapshot.BuildKernspaceForSlot(log, core.bpf.Load(), core.RoutingEpochSlot()); err != nil {
-				return nil, fmt.Errorf("routing kernspace snapshot: %w", err)
-			}
-			if err = core.StageRoutingEpoch(); err != nil {
-				return nil, fmt.Errorf("stage routing epoch: %w", err)
-			}
-		} else if lpmIndices, err = kernspaceSnapshot.BuildKernspace(log, core.bpf.Load()); err != nil {
+		if lpmIndices, err = kernspaceSnapshot.BuildKernspaceForSlot(log, core.bpf.Load(), core.RoutingEpochSlot()); err != nil {
 			return nil, fmt.Errorf("routing kernspace snapshot: %w", err)
+		}
+		if err = core.StageRoutingEpoch(); err != nil {
+			return nil, fmt.Errorf("stage routing epoch: %w", err)
 		}
 		core.lpmTrieIndices = lpmIndices
 	} else {
@@ -901,7 +867,6 @@ func newControlPlaneWithContextOptions(
 		sharedBpfReload:               sharedBpfReload,
 		pendingDnsReloadCache:         dnsCache,
 		dnsRoutingUnchanged:           buildOpts.dnsRoutingUnchanged,
-		semanticRefactorFeatures:      refactorFeatures,
 		controlPlaneRealDomainRuntime: newControlPlaneRealDomainRuntime(),
 		lanInterface:                  global.LanInterface,
 		wanInterface:                  global.WanInterface,
@@ -987,53 +952,28 @@ func newControlPlaneWithContextOptions(
 		if err = plane.commitInterfaceBindings(); err != nil {
 			return nil, err
 		}
-		if plane.semanticRefactorFeatures.RoutingEpoch {
-			if err = plane.replayDnsReloadCache(); err != nil {
-				return nil, fmt.Errorf("replay DNS reload cache: %w", err)
-			}
-			if err = core.PublishRoutingEpoch(); err != nil {
-				return nil, fmt.Errorf("publish routing epoch: %w", err)
-			}
-		} else {
-			skipDNSReloadReplay := plane.sharedBpfReload && plane.dnsRoutingUnchanged
-			if !skipDNSReloadReplay {
-				if bpf := core.bpf.Load(); bpf != nil {
-					if err = clearReloadDomainRoutingMap(bpf); err != nil {
-						return nil, fmt.Errorf("clearReloadDomainRoutingMap: %w", err)
-					}
-				}
-				if err = plane.replayDnsReloadCache(); err != nil {
-					return nil, fmt.Errorf("replay DNS reload cache: %w", err)
-				}
-			}
+		if err = plane.replayDnsReloadCache(); err != nil {
+			return nil, fmt.Errorf("replay DNS reload cache: %w", err)
+		}
+		if err = core.PublishRoutingEpoch(); err != nil {
+			return nil, fmt.Errorf("publish routing epoch: %w", err)
 		}
 		if err = core.commitBpfHookFlip(); err != nil {
-			if plane.semanticRefactorFeatures.RoutingEpoch {
-				if rollbackErr := core.RollbackRoutingEpoch(); rollbackErr != nil {
-					return nil, stderrors.Join(err, rollbackErr)
-				}
+			if rollbackErr := core.RollbackRoutingEpoch(); rollbackErr != nil {
+				return nil, stderrors.Join(err, rollbackErr)
 			}
 			return nil, err
 		}
 		plane.releaseCommittedDNSReloadState()
 		plane.markReady()
 	}
-	// Standalone callers retain generation-owned dispatchers. AttachSessionManager
-	// replaces them with process-owned instances before Serve starts.
-	plane.udpOrderedDispatcher = newUDPOrderedDispatcherForFeatures(plane.semanticRefactorFeatures)
-	plane.udpReplyDispatcher = newUDPReplyDispatcherForFeatures(plane.semanticRefactorFeatures)
 	return plane, nil
 }
 
-// clearReloadDomainRoutingMap clears slot zero for callers that operate on a
-// fresh datapath. Shared reloads must use clearReloadDomainRoutingMapSlot so
-// they never erase the still-readable active plan.
+// clearReloadDomainRoutingMapSlot clears one routing epoch slot of the domain
+// routing map.
 // IMPORTANT: Connection-state maps are preserved across in-process reload
 // (Scheme3 Embedded Design). Do NOT clear them here.
-func clearReloadDomainRoutingMap(bpf *bpfObjects) error {
-	return clearReloadDomainRoutingMapSlot(bpf, 0)
-}
-
 func clearReloadDomainRoutingMapSlot(bpf *bpfObjects, slot uint32) error {
 	if bpf == nil || bpf.DomainRoutingMap == nil {
 		return nil
@@ -1122,20 +1062,6 @@ func (c *ControlPlane) DrainIdleCh() <-chan struct{} {
 		return closedDrainIdleCh
 	}
 	return c.drainTracker.IdleCh()
-}
-
-func (c *ControlPlane) EjectLpmIndices() []uint32 {
-	if c == nil || c.core == nil {
-		return nil
-	}
-	return c.core.EjectLpmIndices()
-}
-
-func (c *ControlPlane) InheritLpmIndices(indices []uint32) {
-	if c == nil || c.core == nil {
-		return
-	}
-	c.core.InheritLpmIndices(indices)
 }
 
 func (c *ControlPlane) ReplaceLpmIndices(indices []uint32) {
@@ -2498,7 +2424,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				defer func() {
 					if recovered := recover(); recovered != nil {
 						_ = lconn.Close()
-						reportUDPDispatcherPanic("tcp_conn", "serve", &c.tcpConnPanicCount, recovered)
+						reportPacketPathPanic("tcp_conn", "serve", &c.tcpConnPanicCount, recovered)
 					}
 				}()
 				ownership, ok := c.acquireIncomingConnectionLease(lconn)
@@ -2558,10 +2484,10 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				// DNS, VoIP, and other low-latency exception traffic bypasses the
 				// ordered per-flow queue and runs immediately.
 				go task.Run()
-			} else if !c.submitOrderedUDPIngress(flowDecision.Key, task, pktBuf, &c.udpIngressAdmission) {
-				// Rejected: the dispatcher does not own the buffer or the
-				// admission, so release both inline and return the task to the
-				// pool (it was never queued, so Run() will not run).
+			} else if !DefaultUdpTaskPool.EmitTask(flowDecision.Key, task) {
+				// Rejected: the pool does not own the buffer or the admission,
+				// so release both inline and return the task to the pool (it
+				// was never queued, so Run() will not run).
 				c.udpIngressAdmission.release()
 				pktBuf.Put()
 				udpIngressTaskPool.Put(task)
@@ -2873,9 +2799,7 @@ func (c *ControlPlane) abortConnections(abortManagedTCP bool) (err error) {
 			}
 		}
 	}
-	c.closeUDPOrderedDispatcher()
 	c.udpIngressAdmission.closeAndWait()
-	c.waitUDPOrderedDispatcher()
 	// Wait for endpoint creation already admitted by this generation before
 	// scanning the shared pool. New creation attempts are rejected once closed.
 	c.udpEndpointAdmission.closeAndWait()
@@ -2898,8 +2822,6 @@ func (c *ControlPlane) abortConnections(abortManagedTCP bool) (err error) {
 			errs = append(errs, udpErr)
 		}
 	}
-	c.closeUDPReplyDispatcher()
-	c.waitUDPReplyDispatcher()
 
 	return stderrors.Join(errs...)
 }
@@ -3048,11 +2970,7 @@ func (c *ControlPlane) Close() (err error) {
 		if manager, owned := c.controlPlaneSessionManager(); owned && manager != nil {
 			c.closeErr = stderrors.Join(c.closeErr, manager.Close())
 		}
-		c.closeUDPOrderedDispatcher()
 		c.udpIngressAdmission.closeAndWait()
-		c.waitUDPOrderedDispatcher()
-		c.closeUDPReplyDispatcher()
-		c.waitUDPReplyDispatcher()
 
 		var stopWg sync.WaitGroup
 		stopWg.Add(2)

@@ -22,10 +22,9 @@ import (
 )
 
 var (
-	UdpRoutingResultCacheTtl          = 300 * time.Millisecond
-	ErrEndpointFailed                 = fmt.Errorf("endpoint creation recently failed (negative cache)")
-	errUdpEndpointAdmissionClosed     = stderrors.New("udp endpoint admission closed")
-	errUdpEndpointCreateAdmissionFull = stderrors.New("udp endpoint create admission full")
+	UdpRoutingResultCacheTtl      = 300 * time.Millisecond
+	ErrEndpointFailed             = fmt.Errorf("endpoint creation recently failed (negative cache)")
+	errUdpEndpointAdmissionClosed = stderrors.New("udp endpoint admission closed")
 )
 
 // udpEndpointCreateShardCount is the number of sharded mutexes that guard
@@ -153,6 +152,21 @@ type UdpEndpoint struct {
 
 	softErrorCount int
 
+	// Transport-owned packet receiver ("push mode"): when the conn supports
+	// netproxy.PacketReceiver it delivers packets through handleReceivedPacket
+	// instead of a blocking ReadFrom loop, and the bounded reply queue below
+	// feeds the shared replySender goroutine. ReadFrom-loop endpoints keep
+	// their queue as read-loop locals and never touch these fields.
+	receiverMu   sync.Mutex // guards receiverStop
+	receiverStop func()
+	receiveMu    sync.Mutex // serializes concurrent receiver deliveries
+
+	replyQueueMu     sync.Mutex // guards replyQueueCh vs teardown
+	replyQueueCh     chan *udpEndpointReply
+	replyQueueDone   chan struct{}
+	replyQueueStop   chan struct{} // sender error signal; nobody listens in this mode
+	replyQueueClosed bool
+
 	// poolRef and poolKey allow hard-failure paths to self-remove from the pool
 	// immediately. Soft read-loop exits intentionally keep the endpoint cached so
 	// active flows continue to follow the old timer-based reuse model.
@@ -166,7 +180,6 @@ type UdpEndpoint struct {
 	// transportDone stores a <-chan struct{} once the transport lifecycle is
 	// indexed. atomic.Value avoids carrying a mutex in every endpoint.
 	transportDone  atomic.Value
-	replyRuntime   *udpEndpointReplyRuntime
 	sessionRuntime *UDPFlowRuntime
 }
 
@@ -254,8 +267,6 @@ func (g *udpEndpointAdmissionGate) closeAndWait() {
 	g.mu.Unlock()
 }
 
-type udpEndpointCreateAdmission func() (release func(), ok bool)
-
 type UdpEndpointOptions struct {
 	Ctx        context.Context
 	Handler    UdpHandler
@@ -268,9 +279,6 @@ type UdpEndpointOptions struct {
 	// admissionGate prevents endpoint creation after its control plane begins
 	// forced retirement and keeps in-flight creation visible to retirement.
 	admissionGate *udpEndpointAdmissionGate
-	// createAdmission reserves cold-path capacity before waiting for a creation
-	// shard or dialing. It is never invoked when an existing endpoint is reused.
-	createAdmission udpEndpointCreateAdmission
 	// GetTarget is useful only if the underlay does not support Full-cone.
 	GetDialOption func(ctx context.Context) (option *DialOption, err error)
 	// Log is the logger to use for endpoint lifecycle events.
@@ -279,9 +287,6 @@ type UdpEndpointOptions struct {
 	// NowNano is an optional pre-calculated timestamp to avoid calling time.Now()
 	// in the hot path. If 0, time.Now() will be used.
 	NowNano int64
-	// replyDispatcher is an optional generation-owned dispatcher for replies.
-	// It is private so the legacy endpoint pool API remains unchanged.
-	replyDispatcher *udpReplyDispatcher
 	// sessionManager promotes a successfully dialed endpoint into the
 	// process-owned session lifecycle before it is published in the pool.
 	sessionManager *SessionManager
@@ -700,11 +705,6 @@ dialSuccess:
 				UdpHealthDomain: dialer.UdpHealthDomainData,
 			}
 		}(),
-		replyRuntime: newUdpEndpointReplyRuntime(
-			createOption.replyDispatcher,
-			createOption.DrainTracker,
-			udpEndpointReplyQueueSize,
-		),
 	}
 	if _, ok := packetConn.(netproxy.PacketBatchWriter); ok {
 		ue.writeBatch = newUDPWriteBatchAggregator(ue)
@@ -739,9 +739,9 @@ dialSuccess:
 	shard.mu.Unlock()
 	p.registerEndpoint(ue)
 
-	// Receive UDP messages. Transport-owned receivers register synchronously
-	// and reuse the protocol's existing reader; only legacy PacketConn values
-	// need a dedicated blocking ReadFrom loop.
+	// Receive UDP messages. Transports that own a packet receiver register
+	// synchronously and reuse the protocol's existing reader; everything else
+	// gets a dedicated blocking ReadFrom loop.
 	if !ue.startTransportReceiver() {
 		go ue.startReadLoop()
 	}
@@ -780,9 +780,6 @@ func shouldCacheUdpEndpointCreateFailure(err error) bool {
 	// endpoint creation failure. Caching it per flow key can explode memory
 	// under unhealthy-node bursts without preventing any extra dial attempts.
 	if stderrors.Is(err, outbound.ErrNoAliveDialer) {
-		return false
-	}
-	if stderrors.Is(err, errUdpEndpointCreateAdmissionFull) {
 		return false
 	}
 	if isTransientLocalUdpDialCreateError(err) {
@@ -850,19 +847,6 @@ func (p *UdpEndpointPool) GetOrCreate(key UdpEndpointKey, createOption *UdpEndpo
 		}
 	}
 	shard.mu.RUnlock()
-
-	// Reserve cold-path capacity before waiting for this creation shard. The
-	// creation mutex is held through proxy dialing, so admitting after Lock
-	// would still let one slow dial block unrelated keys in the same shard.
-	if createOption != nil && createOption.createAdmission != nil {
-		release, admitted := createOption.createAdmission()
-		if !admitted {
-			return nil, false, errUdpEndpointCreateAdmissionFull
-		}
-		if release != nil {
-			defer release()
-		}
-	}
 
 	// Slow path: serialize creation for the same key using a creation shard lock.
 	shard.createMu.Lock()

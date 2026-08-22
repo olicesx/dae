@@ -8,7 +8,6 @@ package control
 import (
 	"context"
 	"io"
-	"net/netip"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -144,29 +143,6 @@ func newTestDialControlPlane(outbound *ob.DialerGroup) *ControlPlane {
 			outbounds: outbounds,
 		},
 		soMarkFromDae: 0x100,
-	}
-}
-
-// udpOrderedDispatcherTestKey builds a deterministic UdpFlowKey for dispatcher
-// tests. Recovered from udp_ordered_dispatcher_test.go.
-func udpOrderedDispatcherTestKey(index int) UdpFlowKey {
-	src := netip.AddrPortFrom(
-		netip.AddrFrom4([4]byte{198, 51, byte(index >> 8), byte(index)}),
-		uint16(10000+index%40000),
-	)
-	dst := netip.AddrPortFrom(netip.AddrFrom4([4]byte{203, 0, 113, 1}), 27015)
-	return NewUdpFlowKey(src, dst)
-}
-
-// closeUDPOrderedDispatcherForTest closes a dispatcher and waits for workers to
-// stop. Recovered from udp_ordered_dispatcher_test.go.
-func closeUDPOrderedDispatcherForTest(t *testing.T, dispatcher *udpOrderedDispatcher) {
-	t.Helper()
-	dispatcher.close()
-	select {
-	case <-dispatcher.done:
-	case <-time.After(time.Second):
-		t.Fatal("UDP ordered dispatcher workers did not stop")
 	}
 }
 

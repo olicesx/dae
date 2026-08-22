@@ -653,11 +653,7 @@ func (ue *UdpEndpoint) Close() error {
 	ue.closeOnce.Do(func() {
 		ue.dead.Store(true)
 		ue.expiresAtNano.Store(0)
-		ue.stopPacketReceiver()
-		if ue.replyRuntime != nil {
-			ue.stopReplyDispatcher()
-			ue.replyRuntime.dispatcher.closeInput(ue)
-		}
+		ue.stopTransportReceiver()
 		ue.releaseCachedResponseConns()
 		if ue.poolRef != nil {
 			ue.poolRef.unregisterEndpoint(ue)

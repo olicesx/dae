@@ -30,14 +30,10 @@ func (ue *UdpEndpoint) startTransportReceiver() bool {
 	if !ok {
 		return false
 	}
-	stop, registered := receiver.RegisterPacketReceiver(ue.handleReceivedPacket)
-	if !registered {
-		return false
-	}
-	ue.receiverMu.Lock()
-	ue.receiverStop = stop
-	ue.receiverMu.Unlock()
-
+	// Create the reply queue before registering. Some transports (hysteria2)
+	// drain datagrams queued between session creation and registration
+	// synchronously inside RegisterPacketReceiver; those deliveries must
+	// already see a live queue.
 	ue.replyQueueMu.Lock()
 	ue.replyQueueCh = make(chan *udpEndpointReply, udpEndpointReplyQueueSize)
 	ue.replyQueueDone = make(chan struct{})
@@ -45,6 +41,15 @@ func (ue *UdpEndpoint) startTransportReceiver() bool {
 	ch, done, stopSignal := ue.replyQueueCh, ue.replyQueueDone, ue.replyQueueStop
 	ue.replyQueueMu.Unlock()
 	go ue.replySender(ch, stopSignal, done)
+
+	stop, registered := receiver.RegisterPacketReceiver(ue.handleReceivedPacket)
+	if !registered {
+		ue.stopTransportReceiver()
+		return false
+	}
+	ue.receiverMu.Lock()
+	ue.receiverStop = stop
+	ue.receiverMu.Unlock()
 
 	if ue.log != nil && ue.log.IsLevelEnabled(logrus.DebugLevel) {
 		ue.log.Debug("[UdpEndpoint] Using transport-owned packet receiver")
@@ -149,7 +154,7 @@ func (ue *UdpEndpoint) handleReceivedPacket(packet *netproxy.ReceivedPacket) boo
 			}
 		}
 		if ue.shouldRetireOnReadError(packet.Err) {
-			ue.retire()
+			ue.markRetiredFromReceiver()
 			if ue.isConnectionRefused(packet.Err) {
 				ue.handleProxyServerFailure()
 			}

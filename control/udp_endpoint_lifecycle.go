@@ -224,9 +224,15 @@ func (ue *UdpEndpoint) logEndpointExit(err error, msg string) {
 		return
 	}
 	natTimeout := ue.natTimeout()
+	dialerName := ""
+	if ue.Dialer != nil {
+		if prop := ue.Dialer.Property(); prop != nil {
+			dialerName = prop.Name
+		}
+	}
 	fields := logrus.Fields{
 		"lAddr":       ue.lAddr.String(),
-		"dialer":      ue.Dialer.Property().Name,
+		"dialer":      dialerName,
 		"proxy_addr":  ue.DialTarget,
 		"sniffed":     ue.SniffedDomain,
 		"nat_timeout": natTimeout.String(),
@@ -394,6 +400,39 @@ func (ue *UdpEndpoint) retire() {
 	ue.expiresAtNano.Store(1)
 	ue.selfRemoveFromPool()
 	_ = ue.Close()
+}
+
+// markRetiredFromReceiver is the push-mode equivalent of retire() for a
+// goroutine that already owns the reply-sender lifecycle. Close() waits for
+// replyQueueDone, which only the sender itself closes, so calling retire()
+// from handleReceivedPacket or replySender would deadlock on <-done.
+func (ue *UdpEndpoint) markRetiredFromReceiver() {
+	ue.dead.Store(true)
+	ue.expiresAtNano.Store(1)
+	ue.selfRemoveFromPool()
+	// The conn still has to be released, and after selfRemoveFromPool nobody
+	// else references the endpoint: pool scans and Remove(key, ...) can no
+	// longer find it. Run Close() on a fresh goroutine — never on the sender
+	// or transport-callback stack — so it may wait for this sender to drain
+	// and exit before closing the conn.
+	go ue.Close()
+}
+
+// retireFromReplySender evicts the endpoint from the reply sender. Push mode
+// only marks the endpoint dead: Close() there waits on replyQueueDone, which
+// only this sender closes, so markRetiredFromReceiver hands the actual
+// teardown to a fresh goroutine that waits for this sender to drain. ReadFrom
+// mode has no shared queue, so Close() is safe on this stack and required to
+// release the conn — the read loop's defer only waits on its local senderDone.
+func (ue *UdpEndpoint) retireFromReplySender() {
+	ue.replyQueueMu.Lock()
+	pushMode := ue.replyQueueDone != nil
+	ue.replyQueueMu.Unlock()
+	if pushMode {
+		ue.markRetiredFromReceiver()
+		return
+	}
+	ue.retire()
 }
 
 // udpEndpointWriteTimeout bounds how long one proxy-side write may block. A

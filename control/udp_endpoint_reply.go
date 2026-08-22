@@ -351,7 +351,7 @@ func (ue *UdpEndpoint) replySender(replyCh <-chan *udpEndpointReply, stop chan<-
 			// upstream endpoint's liveness.
 			if err := ue.handler(ue, queued.data, queued.from); err != nil {
 				releaseUdpEndpointReplies(batch[i:])
-				ue.retire()
+				ue.retireFromReplySender()
 				close(stop)
 				ue.logEndpointExit(err, "reply sender")
 				// Drain remaining queued replies to release pool buffers.

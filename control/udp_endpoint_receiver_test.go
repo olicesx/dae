@@ -26,10 +26,11 @@ import (
 // registered handler directly to the test, mimicking push-mode delivery from
 // a QUIC session reader or the direct protocol's shared epoll loop.
 type receiverConn struct {
-	mu       sync.Mutex
-	handler  netproxy.PacketReceiveHandler
-	stops    int
-	readonly atomic.Int64 // deliver calls observed after unregister
+	mu                sync.Mutex
+	handler           netproxy.PacketReceiveHandler
+	stops             int
+	readonly          atomic.Int64 // deliver calls observed after unregister
+	deliverOnRegister bool
 
 	closed atomic.Bool
 }
@@ -39,20 +40,31 @@ func (c *receiverConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHand
 		return nil, false
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.handler != nil {
+		c.mu.Unlock()
 		return nil, false
 	}
 	c.handler = handler
+	deliverOnRegister := c.deliverOnRegister
 	var once sync.Once
-	return func() {
+	stop := func() {
 		once.Do(func() {
 			c.mu.Lock()
 			c.handler = nil
 			c.stops++
 			c.mu.Unlock()
 		})
-	}, true
+	}
+	c.mu.Unlock()
+	if deliverOnRegister {
+		_ = handler(netproxy.NewReceivedPacket(
+			[]byte("sync-register"),
+			receiverTestFrom(),
+			nil,
+			func() {},
+		))
+	}
+	return stop, true
 }
 
 func (c *receiverConn) deliver(seq int) bool {
@@ -86,10 +98,13 @@ func (c *receiverConn) ReadFrom([]byte) (int, netip.AddrPort, error) {
 	return 0, netip.AddrPort{}, io.EOF
 }
 func (c *receiverConn) WriteTo(p []byte, _ string) (int, error) { return len(p), nil }
-func (c *receiverConn) Close() error                            { return nil }
-func (c *receiverConn) SetDeadline(time.Time) error             { return nil }
-func (c *receiverConn) SetReadDeadline(time.Time) error         { return nil }
-func (c *receiverConn) SetWriteDeadline(time.Time) error        { return nil }
+func (c *receiverConn) Close() error {
+	c.closed.Store(true)
+	return nil
+}
+func (c *receiverConn) SetDeadline(time.Time) error      { return nil }
+func (c *receiverConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *receiverConn) SetWriteDeadline(time.Time) error { return nil }
 
 func receiverTestFrom() netip.AddrPort {
 	return netip.MustParseAddrPort("203.0.113.7:4500")
@@ -242,6 +257,117 @@ func TestPacketReceiverDeadEndpointRejectsAndReleases(t *testing.T) {
 	// endpoint callback directly as an in-flight racing delivery would.
 	require.False(t, ue.handleReceivedPacket(packet), "dead endpoint must reject deliveries")
 	require.True(t, released.Load(), "rejected delivery must release its packet")
+}
+
+// TestPacketReceiverHandlerErrorDoesNotDeadlockClose is the regression for
+// the push-mode self-wait: replySender used to call retire()/Close() on a
+// handler error, then park forever in stopTransportReceiver's <-done. Close
+// from another goroutine (pool Remove, janitor, reload Reset) would then
+// block on the same closeOnce.
+func TestPacketReceiverHandlerErrorDoesNotDeadlockClose(t *testing.T) {
+	conn := &receiverConn{}
+	handlerErr := fmt.Errorf("reply send failed")
+	handled := make(chan struct{})
+	ue := newReceiverTestEndpoint(t, conn, func(_ *UdpEndpoint, _ []byte, _ netip.AddrPort) error {
+		close(handled)
+		return handlerErr
+	})
+
+	require.True(t, conn.deliver(0))
+	select {
+	case <-handled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler was never invoked")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- ue.Close() }()
+	select {
+	case err := <-closed:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close blocked; replySender parked in <-done via retire()->Close()")
+	}
+	require.True(t, ue.dead.Load(), "handler error must mark the endpoint dead")
+	require.Equal(t, 1, conn.unregisterCount(), "Close must still unregister the receiver")
+}
+
+// TestPacketReceiverHandlerErrorEventuallyClosesConn proves the mark-only
+// retire still releases the transport conn. After selfRemoveFromPool nobody
+// else references the endpoint (pool scans and Remove(key, ...) can no longer
+// find it), so the endpoint itself must schedule the teardown; without it a
+// direct-dial endpoint (no TransportLifecycle watcher) would leak the socket.
+func TestPacketReceiverHandlerErrorEventuallyClosesConn(t *testing.T) {
+	conn := &receiverConn{}
+	handled := make(chan struct{}, 1)
+	ue := newReceiverTestEndpoint(t, conn, func(_ *UdpEndpoint, _ []byte, _ netip.AddrPort) error {
+		select {
+		case <-handled:
+		default:
+			close(handled)
+		}
+		return fmt.Errorf("reply send failed")
+	})
+
+	require.True(t, conn.deliver(0))
+	select {
+	case <-handled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler was never invoked")
+	}
+
+	require.Eventually(t, func() bool { return conn.closed.Load() },
+		2*time.Second, 10*time.Millisecond,
+		"conn was never closed after the handler-error retire")
+	require.True(t, ue.dead.Load())
+	require.Equal(t, 1, conn.unregisterCount(), "scheduled Close must still unregister the receiver")
+}
+
+// TestPacketReceiverReadErrorDoesNotDeadlockClose covers the other push-mode
+// self-wait: a hard packet.Err used to call retire() from handleReceivedPacket,
+// which is the transport callback itself and likewise must not wait on done.
+func TestPacketReceiverReadErrorDoesNotDeadlockClose(t *testing.T) {
+	conn := &receiverConn{}
+	ue := newReceiverTestEndpoint(t, conn, func(_ *UdpEndpoint, _ []byte, _ netip.AddrPort) error {
+		return nil
+	})
+
+	released := atomic.Bool{}
+	packet := netproxy.NewReceivedPacket(nil, receiverTestFrom(), fmt.Errorf("upstream reset"), func() {
+		released.Store(true)
+	})
+	require.False(t, ue.handleReceivedPacket(packet), "hard receive error must unregister")
+	require.True(t, released.Load(), "hard receive error must release the packet")
+	require.True(t, ue.dead.Load(), "hard receive error must mark the endpoint dead")
+
+	closed := make(chan error, 1)
+	go func() { closed <- ue.Close() }()
+	select {
+	case err := <-closed:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close blocked after handleReceivedPacket retired the endpoint")
+	}
+}
+
+// TestPacketReceiverRegistersAfterQueueExists proves deliveries that arrive
+// synchronously inside RegisterPacketReceiver (hysteria2 drains queued
+// datagrams in-call) are enqueued instead of dropped on a nil queue.
+func TestPacketReceiverRegistersAfterQueueExists(t *testing.T) {
+	conn := &receiverConn{deliverOnRegister: true}
+	got := make(chan []byte, 1)
+	ue := newReceiverTestEndpoint(t, conn, func(_ *UdpEndpoint, data []byte, _ netip.AddrPort) error {
+		got <- append([]byte(nil), data...)
+		return nil
+	})
+
+	select {
+	case data := <-got:
+		require.Equal(t, "sync-register", string(data))
+	case <-time.After(2 * time.Second):
+		t.Fatal("packet delivered during RegisterPacketReceiver was dropped")
+	}
+	require.NoError(t, ue.Close())
 }
 
 // TestPacketReceiverWithRealDirectDialer wires a real fork direct dialer

@@ -118,6 +118,15 @@ func (m *InterfaceManager) monitor(ch <-chan netlink.LinkUpdate, done chan struc
 		case <-m.closed.Done():
 			close(done)
 			close(jobChan)
+			// Closing done makes the library close its netlink socket, but a
+			// subscription goroutine already blocked sending an update (link
+			// teardown itself bursts RTM_NEWLINK/DELLINK events) never regains
+			// a receiver and leaks. Take over the drain until the socket close
+			// unblocks it and the library closes ch.
+			go func() {
+				for range ch {
+				}
+			}()
 			return
 		case update, ok := <-ch:
 			if !ok {

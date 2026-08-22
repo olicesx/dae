@@ -544,6 +544,15 @@ func (c *controlPlaneCore) startIfindexWatcher() {
 		for {
 			select {
 			case <-c.closed.Done():
+				// Closing done makes the library close its netlink socket, but
+				// a subscription goroutine already blocked sending an update
+				// (teardown itself bursts RTM_NEWLINK events) never regains a
+				// receiver and leaks. Take over the drain until the socket
+				// close unblocks it and the library closes ch.
+				go func() {
+					for range ch {
+					}
+				}()
 				return
 			case upd, ok := <-ch:
 				if !ok {

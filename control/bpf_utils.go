@@ -385,6 +385,68 @@ const (
 	defaultConnStateMapMaxEntries = 65536 * 4
 )
 
+// bpfDataplanePrograms mirrors the always-on datapath programs declared in the
+// generated bpfPrograms, but WITHOUT the opt-in tcp_offload_* programs. It is the
+// binding target for the first (mandatory) load pass so that a trimmed kernel
+// that cannot load a specific offload program (e.g. fentry/skb_send_sock on
+// OpenWrt) cannot take down the whole datapath at start. The offload programs
+// are loaded in a separate, fault-tolerant pass (see loadOffloadBpfPrograms).
+type bpfDataplanePrograms struct {
+	TproxyDae0Ingress      *ebpf.Program `ebpf:"tproxy_dae0_ingress"`
+	TproxyDae0peerIngress  *ebpf.Program `ebpf:"tproxy_dae0peer_ingress"`
+	TproxyLanEgressL2      *ebpf.Program `ebpf:"tproxy_lan_egress_l2"`
+	TproxyLanEgressL3      *ebpf.Program `ebpf:"tproxy_lan_egress_l3"`
+	TproxyLanIngressL2     *ebpf.Program `ebpf:"tproxy_lan_ingress_l2"`
+	TproxyLanIngressL3     *ebpf.Program `ebpf:"tproxy_lan_ingress_l3"`
+	TproxyWanCgConnect4    *ebpf.Program `ebpf:"tproxy_wan_cg_connect4"`
+	TproxyWanCgConnect6    *ebpf.Program `ebpf:"tproxy_wan_cg_connect6"`
+	TproxyWanCgSendmsg4    *ebpf.Program `ebpf:"tproxy_wan_cg_sendmsg4"`
+	TproxyWanCgSendmsg6    *ebpf.Program `ebpf:"tproxy_wan_cg_sendmsg6"`
+	TproxyWanCgSockCreate  *ebpf.Program `ebpf:"tproxy_wan_cg_sock_create"`
+	TproxyWanCgSockRelease *ebpf.Program `ebpf:"tproxy_wan_cg_sock_release"`
+	TproxyWanEgressL2      *ebpf.Program `ebpf:"tproxy_wan_egress_l2"`
+	TproxyWanEgressL3      *ebpf.Program `ebpf:"tproxy_wan_egress_l3"`
+	TproxyWanIngressL2     *ebpf.Program `ebpf:"tproxy_wan_ingress_l2"`
+	TproxyWanIngressL3     *ebpf.Program `ebpf:"tproxy_wan_ingress_l3"`
+}
+
+// bpfDataplaneMaps mirrors the always-on datapath maps declared in the generated
+// bpfMaps, but WITHOUT the opt-in offload maps (fast_sock, tcp_offload_pause,
+// tcp_offload_sent). Used as the binding target for the mandatory load pass.
+type bpfDataplaneMaps struct {
+	ActiveRoutingEpochMap    *ebpf.Map `ebpf:"active_routing_epoch_map"`
+	AliveBlockRateMap        *ebpf.Map `ebpf:"alive_block_rate_map"`
+	BpfStatsMap              *ebpf.Map `ebpf:"bpf_stats_map"`
+	ConnStateMap             *ebpf.Map `ebpf:"conn_state_map"`
+	ConntrackArgsMap         *ebpf.Map `ebpf:"conntrack_args_map"`
+	CookiePidMap             *ebpf.Map `ebpf:"cookie_pid_map"`
+	DaeIfindexMap            *ebpf.Map `ebpf:"dae_ifindex_map"`
+	DomainRoutingMap         *ebpf.Map `ebpf:"domain_routing_map"`
+	EventRingbuf             *ebpf.Map `ebpf:"event_ringbuf"`
+	ListenSocketMap          *ebpf.Map `ebpf:"listen_socket_map"`
+	LpmArrayMap              *ebpf.Map `ebpf:"lpm_array_map"`
+	OutboundConnectivityMap  *ebpf.Map `ebpf:"outbound_connectivity_map"`
+	ParseCtxScratchMap       *ebpf.Map `ebpf:"parse_ctx_scratch_map"`
+	PktScratchMap            *ebpf.Map `ebpf:"pkt_scratch_map"`
+	RedirectTrack            *ebpf.Map `ebpf:"redirect_track"`
+	RouteCtxScratchMap       *ebpf.Map `ebpf:"route_ctx_scratch_map"`
+	RoutingEpochMap          *ebpf.Map `ebpf:"routing_epoch_map"`
+	RoutingHandoffMap        *ebpf.Map `ebpf:"routing_handoff_map"`
+	RoutingMap               *ebpf.Map `ebpf:"routing_map"`
+	RoutingMetaMap           *ebpf.Map `ebpf:"routing_meta_map"`
+	UnusedLpmType            *ebpf.Map `ebpf:"unused_lpm_type"`
+	WanEgressRouteScratchMap *ebpf.Map `ebpf:"wan_egress_route_scratch_map"`
+}
+
+// bpfDataplane is the mandatory-load binding target. It intentionally lacks the
+// opt-in tcp_offload_* programs and maps so the mandatory LoadAndAssign pass does
+// not bind them; they are loaded in a separate fault-tolerant pass.
+type bpfDataplane struct {
+	bpfDataplanePrograms
+	bpfDataplaneMaps
+	bpfVariables
+}
+
 func loadBpfObjectsWithConstantsAndCustomizer(
 	obj interface{},
 	opts *ebpf.CollectionOptions,
@@ -579,8 +641,9 @@ retryLoadBpf:
 			daeSocketMark:        soMarkFromDae,
 		},
 	}
+	var dataplane bpfDataplane
 	if err = loadBpfObjectsWithConstantsAndCustomizer(
-		bpf,
+		&dataplane,
 		opts.CollectionOptions,
 		constants,
 		func(spec *ebpf.CollectionSpec) error {
@@ -614,6 +677,23 @@ retryLoadBpf:
 		err = daerrors.WrapBPFError(err)
 		return err
 	}
+	// Move the always-on datapath objects into the canonical bpfObjects so the
+	// rest of the control plane (which references bpf.Tproxy* / bpf.*Map) sees
+	// them exactly as before. bpfObjects embeds the generated bpfPrograms and
+	// bpfMaps; the offload-free dataplane struct is a superset-less copy so we
+	// copy field-by-field.
+	assignDataplaneToBpf(bpf, &dataplane)
+	// Load the opt-in TCP relay offload programs and maps in a separate,
+	// fault-tolerant pass: a kernel that cannot load one of them (e.g. the
+	// fentry/skb_send_sock hook on a trimmed router build) must not take down the
+	// whole datapath. On failure the corresponding field stays nil and the
+	// attach-time gate in setupTCPRelayOffload skips the feature. Only attempt the
+	// load when the feature is enabled — otherwise there is nothing to load.
+	if tcpRelayOffloadEnabled() {
+		if err = loadOffloadBpfObjects(bpf); err != nil {
+			log.Debugf("TCP relay offload programs unavailable; offload disabled: %v", err)
+		}
+	}
 
 	// Initialize the runtime-updatable dae0 ifindex map.
 	// PARAM.dae0_ifindex (rodata) is frozen at load time; this ARRAY map
@@ -623,6 +703,126 @@ retryLoadBpf:
 		if err = bpf.DaeIfindexMap.Update(uint32(0), ifidx, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("init dae_ifindex_map: %w", err)
 		}
+	}
+	return nil
+}
+
+// assignDataplaneToBpf copies the always-on datapath objects loaded into
+// *bpfDataplane into the canonical *bpfObjects. bpfObjects embeds the generated
+// bpfPrograms/bpfMaps, so the offload-free fields select directly (Go promotes
+// embedded-struct fields); the offload fields of bpfObjects are left nil since
+// bpfDataplane never binds them.
+func assignDataplaneToBpf(bpf *bpfObjects, dp *bpfDataplane) {
+	if bpf == nil || dp == nil {
+		return
+	}
+	bpf.TproxyDae0Ingress = dp.TproxyDae0Ingress
+	bpf.TproxyDae0peerIngress = dp.TproxyDae0peerIngress
+	bpf.TproxyLanEgressL2 = dp.TproxyLanEgressL2
+	bpf.TproxyLanEgressL3 = dp.TproxyLanEgressL3
+	bpf.TproxyLanIngressL2 = dp.TproxyLanIngressL2
+	bpf.TproxyLanIngressL3 = dp.TproxyLanIngressL3
+	bpf.TproxyWanCgConnect4 = dp.TproxyWanCgConnect4
+	bpf.TproxyWanCgConnect6 = dp.TproxyWanCgConnect6
+	bpf.TproxyWanCgSendmsg4 = dp.TproxyWanCgSendmsg4
+	bpf.TproxyWanCgSendmsg6 = dp.TproxyWanCgSendmsg6
+	bpf.TproxyWanCgSockCreate = dp.TproxyWanCgSockCreate
+	bpf.TproxyWanCgSockRelease = dp.TproxyWanCgSockRelease
+	bpf.TproxyWanEgressL2 = dp.TproxyWanEgressL2
+	bpf.TproxyWanEgressL3 = dp.TproxyWanEgressL3
+	bpf.TproxyWanIngressL2 = dp.TproxyWanIngressL2
+	bpf.TproxyWanIngressL3 = dp.TproxyWanIngressL3
+
+	bpf.ActiveRoutingEpochMap = dp.ActiveRoutingEpochMap
+	bpf.AliveBlockRateMap = dp.AliveBlockRateMap
+	bpf.BpfStatsMap = dp.BpfStatsMap
+	bpf.ConnStateMap = dp.ConnStateMap
+	bpf.ConntrackArgsMap = dp.ConntrackArgsMap
+	bpf.CookiePidMap = dp.CookiePidMap
+	bpf.DaeIfindexMap = dp.DaeIfindexMap
+	bpf.DomainRoutingMap = dp.DomainRoutingMap
+	bpf.EventRingbuf = dp.EventRingbuf
+	bpf.ListenSocketMap = dp.ListenSocketMap
+	bpf.LpmArrayMap = dp.LpmArrayMap
+	bpf.OutboundConnectivityMap = dp.OutboundConnectivityMap
+	bpf.ParseCtxScratchMap = dp.ParseCtxScratchMap
+	bpf.PktScratchMap = dp.PktScratchMap
+	bpf.RedirectTrack = dp.RedirectTrack
+	bpf.RouteCtxScratchMap = dp.RouteCtxScratchMap
+	bpf.RoutingEpochMap = dp.RoutingEpochMap
+	bpf.RoutingHandoffMap = dp.RoutingHandoffMap
+	bpf.RoutingMap = dp.RoutingMap
+	bpf.RoutingMetaMap = dp.RoutingMetaMap
+	bpf.UnusedLpmType = dp.UnusedLpmType
+	bpf.WanEgressRouteScratchMap = dp.WanEgressRouteScratchMap
+
+	bpf.PARAM = dp.PARAM
+}
+
+// loadOffloadBpfObjects loads the opt-in TCP relay offload programs and maps in a
+// fault-tolerant pass. Unlike the mandatory datapath load, a failure to load any
+// offload object does not abort the whole datapath: the offload feature silently
+// stays disabled (the attach-time gate in setupTCPRelayOffload nil-checks these
+// fields). This lets a trimmed kernel that cannot load, say, the
+// fentry/skb_send_sock accounting hook, still run the always-on tproxy datapath.
+//
+// The offload programs only reference the offload maps (fast_sock,
+// tcp_offload_pause, tcp_offload_sent) and not the PARAM rodata or the main
+// datapath maps, so they can be loaded from a self-contained sub-spec. We load
+// the whole sub-spec as one collection: if any offload program is rejected, the
+// collection fails and we leave every offload field nil (feature off) rather than
+// leaving a half-loaded, dangling state. The returned collection's maps/programs
+// are handed to bpfObjects, which owns their Close() via _BpfClose.
+func loadOffloadBpfObjects(bpf *bpfObjects) error {
+	// The offload objects were not bound by the mandatory LoadAndAssign pass
+	// (bpfDataplane has no offload fields), so load them separately.
+	spec, err := loadBpf()
+	if err != nil {
+		return fmt.Errorf("load spec for offload: %w", err)
+	}
+
+	sub := &ebpf.CollectionSpec{
+		Programs: make(map[string]*ebpf.ProgramSpec),
+		Maps:     make(map[string]*ebpf.MapSpec),
+	}
+	for _, name := range tcpRelayOffloadPrograms {
+		if ps := spec.Programs[name]; ps != nil {
+			sub.Programs[name] = ps
+		}
+	}
+	for _, name := range tcpRelayOffloadMaps {
+		if ms := spec.Maps[name]; ms != nil {
+			sub.Maps[name] = ms
+		}
+	}
+	if len(sub.Programs) != len(tcpRelayOffloadPrograms) || len(sub.Maps) != len(tcpRelayOffloadMaps) {
+		return fmt.Errorf("offload spec incomplete: programs %d/%d maps %d/%d",
+			len(sub.Programs), len(tcpRelayOffloadPrograms), len(sub.Maps), len(tcpRelayOffloadMaps))
+	}
+
+	coll, err := ebpf.NewCollection(sub)
+	if err != nil {
+		return fmt.Errorf("load offload collection: %w", err)
+	}
+
+	// Take ownership of the loaded objects; the caller (bpfObjects) closes them.
+	if p := coll.Programs["tcp_offload_redirect"]; p != nil {
+		bpf.TcpOffloadRedirect = p
+	}
+	if p := coll.Programs["tcp_offload_sent_account"]; p != nil {
+		bpf.TcpOffloadSentAccount = p
+	}
+	if p := coll.Programs["tcp_offload_sent_account_kprobe"]; p != nil {
+		bpf.TcpOffloadSentAccountKprobe = p
+	}
+	if m := coll.Maps["fast_sock"]; m != nil {
+		bpf.FastSock = m
+	}
+	if m := coll.Maps["tcp_offload_pause"]; m != nil {
+		bpf.TcpOffloadPause = m
+	}
+	if m := coll.Maps["tcp_offload_sent"]; m != nil {
+		bpf.TcpOffloadSent = m
 	}
 	return nil
 }

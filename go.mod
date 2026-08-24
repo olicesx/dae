@@ -127,4 +127,4 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260824
 
 // Use the remote outbound fork containing transport-owned packet delivery and
 // the HY2 multi-target/default-target address fixes.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260824055344-eb50c3c7e708
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260824164629-284a14ace09d

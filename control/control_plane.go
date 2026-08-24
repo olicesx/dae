@@ -633,6 +633,9 @@ func newControlPlaneWithContextOptions(
 	if err != nil {
 		return nil, err
 	}
+	if option.DaeDNS != nil {
+		deferFuncs = append(deferFuncs, option.DaeDNS.Close)
+	}
 
 	// Dial mode.
 	dialMode, err := consts.ParseDialMode(global.DialMode)
@@ -835,6 +838,10 @@ func newControlPlaneWithContextOptions(
 		return nil
 	}})
 	egressRuntime.configureResources(outbounds, egressDialers, DefaultUdpEndpointPool.forgetDialerEpochs)
+	var planeDeferFuncs []func() error
+	if option.DaeDNS != nil {
+		planeDeferFuncs = append(planeDeferFuncs, option.DaeDNS.Close)
+	}
 	deferFuncs = nil
 
 	// New control plane.
@@ -843,7 +850,7 @@ func newControlPlaneWithContextOptions(
 		log:           log,
 		runtimeStats:  newRuntimeStats(),
 		core:          core,
-		deferFuncs:    nil,
+		deferFuncs:    planeDeferFuncs,
 		listenIp:      "0.0.0.0",
 		egressRuntime: egressRuntime,
 		controlPlaneGenerationState: controlPlaneGenerationState{

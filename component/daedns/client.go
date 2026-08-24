@@ -44,13 +44,8 @@ var udpDNSBufPool = sync.Pool{
 
 const lookupSharedTimeout = 10 * time.Second
 
-var (
-	// Test seams for queryHTTPS path validation without live network dependencies.
-	sendHTTPDNSFunc      = sendHTTPDNS
-	newHTTPTransportFunc = func(r *Router, upstream *componentdns.Upstream, target netip.AddrPort, http3Mode bool) http.RoundTripper {
-		return r.newHTTPTransport(upstream, target, http3Mode)
-	}
-)
+type httpDNSQueryFunc func(context.Context, *http.Client, string, *componentdns.Upstream, []byte) (*dnsmessage.Msg, error)
+type httpTransportFactoryFunc func(*Router, *componentdns.Upstream, netip.AddrPort, bool) http.RoundTripper
 
 func (r *Router) selectUpstream(ctx context.Context, upstreamName, host string, qtype uint16) (*componentdns.Upstream, error) {
 	if upstreamName != "" {
@@ -410,13 +405,33 @@ func (r *Router) queryTLS(ctx context.Context, upstream *componentdns.Upstream, 
 	return sendStreamDNS(tlsConn, data)
 }
 
-func (r *Router) queryHTTPS(ctx context.Context, upstream *componentdns.Upstream, target netip.AddrPort, data []byte, http3Mode bool) (*dnsmessage.Msg, error) {
-	transport := newHTTPTransportFunc(r, upstream, target, http3Mode)
-	client := &http.Client{
-		Transport: transport,
+func (r *Router) sendHTTPQuery(ctx context.Context, client *http.Client, target string, upstream *componentdns.Upstream, data []byte) (*dnsmessage.Msg, error) {
+	if r.httpSendFunc != nil {
+		return r.httpSendFunc(ctx, client, target, upstream, data)
 	}
-	defer client.CloseIdleConnections()
-	return sendHTTPDNSFunc(ctx, client, target.String(), upstream, data)
+	return sendHTTPDNS(ctx, client, target, upstream, data)
+}
+
+func (r *Router) queryHTTPS(ctx context.Context, upstream *componentdns.Upstream, target netip.AddrPort, data []byte, http3Mode bool) (*dnsmessage.Msg, error) {
+	generation := r.getOrCreateHTTPClient(upstream, target, http3Mode)
+	if generation == nil {
+		return nil, net.ErrClosed
+	}
+	defer func() { r.releaseHTTPClient(generation) }()
+
+	msg, err := r.sendHTTPQuery(ctx, generation.client, target.String(), upstream, data)
+	if err == nil || ctx.Err() != nil || !shouldReplaceHTTPClient(err) {
+		return msg, err
+	}
+
+	next := r.replaceHTTPClient(generation, upstream, target, http3Mode)
+	previous := generation
+	generation = next
+	r.releaseHTTPClient(previous)
+	if generation == nil {
+		return nil, net.ErrClosed
+	}
+	return r.sendHTTPQuery(ctx, generation.client, target.String(), upstream, data)
 }
 
 func (r *Router) newHTTPTransport(upstream *componentdns.Upstream, target netip.AddrPort, http3Mode bool) http.RoundTripper {
@@ -435,7 +450,12 @@ func (r *Router) newHTTPTransport(upstream *componentdns.Upstream, target netip.
 				}
 				udpAddr := net.UDPAddrFromAddrPort(target)
 				fakePkt := netproxy.NewFakeNetPacketConn(conn.(netproxy.PacketConn), net.UDPAddrFromAddrPort(tc.GetUniqueFakeAddrPort()), udpAddr)
-				return quic.DialEarly(ctx, fakePkt, udpAddr, tlsCfg, cfg)
+				qc, dialErr := quic.DialEarly(ctx, fakePkt, udpAddr, tlsCfg, cfg)
+				if dialErr != nil {
+					_ = conn.Close()
+					return nil, dialErr
+				}
+				return ownEarlyConnection(qc, conn), nil
 			},
 		}
 	}
@@ -519,9 +539,6 @@ func requestedIPVersion(network string) string {
 }
 
 func sendHTTPDNS(ctx context.Context, client *http.Client, target string, upstream *componentdns.Upstream, data []byte) (*dnsmessage.Msg, error) {
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		return fmt.Errorf("do not use a server that will redirect, upstream: %v", upstream.String())
-	}
 	serverURL := url.URL{
 		Scheme: "https",
 		Host:   target,

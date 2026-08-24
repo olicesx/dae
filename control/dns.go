@@ -49,10 +49,7 @@ var responseSlotPool = sync.Pool{
 	},
 }
 
-// sendHttpDNSFunc and sendStreamDNSFunc are indirections for testing only.
-// Production code always uses the default sendHttpDNS / sendStreamDNS values.
-// Tests may replace them to mock HTTP or stream DNS transport without real I/O.
-var sendHttpDNSFunc = sendHttpDNS
+// sendStreamDNSFunc is an indirection for tests that replace stream DNS I/O.
 var sendStreamDNSFunc = sendStreamDNS
 
 func newResponseSlot() *responseSlot {
@@ -193,81 +190,152 @@ func newDnsForwarder(upstream *dns.Upstream, dialArgument dialArgument, log *log
 	return forwarder, nil
 }
 
+type doHSendFunc func(*http.Client, string, *dns.Upstream, []byte) (*dnsmessage.Msg, error)
+
+type httpClientGeneration struct {
+	client    *http.Client
+	active    int
+	retired   bool
+	closeOnce sync.Once
+}
+
+func (g *httpClientGeneration) close() {
+	if g == nil {
+		return
+	}
+	g.closeOnce.Do(func() {
+		closeHTTPClient(g.client)
+	})
+}
+
 type DoH struct {
 	dns.Upstream
 	netproxy.Dialer
-	dialArgument  dialArgument
-	http3         bool
-	mu            sync.Mutex
-	closed        bool
-	client        *http.Client
-	clientFactory func() *http.Client
+	dialArgument      dialArgument
+	http3             bool
+	mu                sync.Mutex
+	closed            bool
+	client            *httpClientGeneration
+	clientGenerations map[*httpClientGeneration]struct{}
+	clientFactory     func() *http.Client
+	sendFunc          doHSendFunc
+}
+
+func (d *DoH) sendDNS(client *http.Client, data []byte) (*dnsmessage.Msg, error) {
+	if d.sendFunc != nil {
+		return d.sendFunc(client, d.dialArgument.bestTarget.String(), &d.Upstream, data)
+	}
+	return sendHttpDNS(client, d.dialArgument.bestTarget.String(), &d.Upstream, data)
 }
 
 func (d *DoH) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, error) {
-	client := d.getOrCreateClient()
-	if client == nil {
+	generation := d.getOrCreateClient()
+	if generation == nil {
 		return nil, net.ErrClosed
 	}
-	msg, err := sendHttpDNSFunc(client, d.dialArgument.bestTarget.String(), &d.Upstream, data)
-	if err == nil {
-		return msg, nil
+	defer func() { d.releaseClient(generation) }()
+
+	msg, err := d.sendDNS(generation.client, data)
+	if err == nil || ctx.Err() != nil || !shouldReplaceHTTPClient(err) {
+		return msg, err
 	}
-	if ctx.Err() != nil {
-		return nil, err
-	}
-	// Retry on a fresh client: idle-connection eviction and underlying tunnel
-	// churn can close a connection the forwarder itself still owns. replaceClient
-	// returns nil when the forwarder is closed, preserving net.ErrClosed.
-	client = d.replaceClient(client)
-	if client == nil {
+
+	next := d.replaceClient(generation)
+	previous := generation
+	generation = next
+	d.releaseClient(previous)
+	if generation == nil {
 		return nil, net.ErrClosed
 	}
-	msg, err = sendHttpDNSFunc(client, d.dialArgument.bestTarget.String(), &d.Upstream, data)
-	if err != nil {
-		return nil, err
-	}
-	return msg, nil
+	return d.sendDNS(generation.client, data)
 }
 
-func (d *DoH) getOrCreateClient() *http.Client {
+func (d *DoH) ensureClientGenerationsLocked() {
+	if d.clientGenerations == nil {
+		d.clientGenerations = make(map[*httpClientGeneration]struct{})
+	}
+}
+
+func (d *DoH) newClientGeneration() *httpClientGeneration {
+	client := d.getClient()
+	if d.clientFactory != nil {
+		client = d.clientFactory()
+	}
+	return &httpClientGeneration{client: client}
+}
+
+func (d *DoH) getOrCreateClient() *httpClientGeneration {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.closed {
 		return nil
 	}
+	d.ensureClientGenerationsLocked()
 	if d.client == nil {
-		d.client = d.newClient()
+		d.client = d.newClientGeneration()
+		d.clientGenerations[d.client] = struct{}{}
 	}
+	d.client.active++
 	return d.client
 }
 
-func (d *DoH) replaceClient(previous *http.Client) *http.Client {
+func (d *DoH) releaseClient(generation *httpClientGeneration) {
+	if generation == nil {
+		return
+	}
+	var closeNow bool
+	d.mu.Lock()
+	if generation.active > 0 {
+		generation.active--
+	}
+	if generation.retired && generation.active == 0 {
+		closeNow = true
+	}
+	d.mu.Unlock()
+	if closeNow {
+		generation.close()
+		d.mu.Lock()
+		if generation.retired && generation.active == 0 {
+			delete(d.clientGenerations, generation)
+		}
+		d.mu.Unlock()
+	}
+}
+
+func (d *DoH) replaceClient(previous *httpClientGeneration) *httpClientGeneration {
+	var closePrevious bool
 	d.mu.Lock()
 	if d.closed {
 		d.mu.Unlock()
 		return nil
 	}
+	d.ensureClientGenerationsLocked()
 	if d.client != nil && d.client != previous {
-		client := d.client
+		d.client.active++
+		current := d.client
 		d.mu.Unlock()
-		return client
+		return current
 	}
-	oldClient := d.client
-	nextClient := d.newClient()
-	d.client = nextClient
+	next := d.newClientGeneration()
+	next.active = 1
+	d.client = next
+	d.clientGenerations[next] = struct{}{}
+	if previous != nil {
+		previous.retired = true
+		if previous.active == 0 {
+			closePrevious = true
+		}
+	}
 	d.mu.Unlock()
-	if oldClient != nil {
-		oldClient.CloseIdleConnections()
+	if closePrevious {
+		previous.close()
+		d.mu.Lock()
+		if previous.retired && previous.active == 0 {
+			delete(d.clientGenerations, previous)
+		}
+		d.mu.Unlock()
 	}
-	return nextClient
-}
-
-func (d *DoH) newClient() *http.Client {
-	if d.clientFactory != nil {
-		return d.clientFactory()
-	}
-	return d.getClient()
+	return next
 }
 
 func (d *DoH) getClient() *http.Client {
@@ -334,7 +402,11 @@ func (d *DoH) getHttp3RoundTripper() *http3.Transport {
 			}
 			fakePkt := netproxy.NewFakeNetPacketConn(conn.(netproxy.PacketConn), net.UDPAddrFromAddrPort(tc.GetUniqueFakeAddrPort()), udpAddr)
 			c, e := quic.DialEarly(ctx, fakePkt, udpAddr, tlsCfg, cfg)
-			return c, e
+			if e != nil {
+				_ = conn.Close()
+				return nil, e
+			}
+			return ownEarlyConnection(c, conn), nil
 		},
 	}
 	return roundTripper
@@ -342,11 +414,17 @@ func (d *DoH) getHttp3RoundTripper() *http3.Transport {
 
 func (d *DoH) Close() error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.closed = true
-	if d.client != nil {
-		d.client.CloseIdleConnections()
-		d.client = nil
+	generations := make([]*httpClientGeneration, 0, len(d.clientGenerations))
+	for generation := range d.clientGenerations {
+		generation.retired = true
+		generations = append(generations, generation)
+	}
+	d.client = nil
+	d.clientGenerations = nil
+	d.mu.Unlock()
+	for _, generation := range generations {
+		generation.close()
 	}
 	return nil
 }
@@ -486,7 +564,7 @@ func (d *DoQ) createConnection(ctx context.Context) (quic.EarlyConnection, error
 		_ = conn.Close() // Ensure underlying connection is closed
 		return nil, err
 	}
-	return qc, nil
+	return ownEarlyConnection(qc, conn), nil
 }
 
 func (d *DoQ) Close() error {

@@ -250,6 +250,9 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	if err != nil {
 		return nil, err
 	}
+	if daeDNSRouter != nil {
+		defer func() { _ = daeDNSRouter.Close() }()
+	}
 
 	// Start timing the startup process
 	startTime := time.Now()

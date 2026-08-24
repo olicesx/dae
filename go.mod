@@ -8,14 +8,14 @@ require (
 	github.com/bits-and-blooms/bloom/v3 v3.7.1
 	github.com/cilium/ebpf v0.22.0
 	github.com/daeuniverse/dae-config-dist/go/dae_config v0.0.0-20230604120805-1c27619b592d
-	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260824205421-22c9cd5ec8a4
+	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260824210908-6450dd17e746
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/json-iterator/go v1.1.12
 	github.com/mholt/archives v0.1.5
 	github.com/miekg/dns v1.1.72
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
 	github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac
-	github.com/olicesx/quic-go v0.0.0-20260824204802-b5c87c962d70
+	github.com/olicesx/quic-go v0.0.0-20260824210753-8048a30c5f1e
 	github.com/panjf2000/ants/v2 v2.11.5
 	github.com/safchain/ethtool v0.7.0
 	github.com/shirou/gopsutil/v4 v4.26.1
@@ -120,11 +120,11 @@ require (
 // Add on a full send queue (30s timeout -> ErrDatagramQueueFullTimeout).
 // The current revision preserves package Dial's skip-address fast path while
 // restoring sender addresses for explicit transports.
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260824204802-b5c87c962d70
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260824210753-8048a30c5f1e
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
 
 // Use the remote outbound fork containing transport-owned packet delivery and
 // the HY2 multi-target/default-target address fixes.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260824205421-22c9cd5ec8a4
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260824210908-6450dd17e746

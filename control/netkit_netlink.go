@@ -9,10 +9,12 @@ package control
 
 import (
 	"fmt"
+	"net"
 
 	internal "github.com/daeuniverse/dae/pkg/ebpf_internal"
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 // NetkitConfig holds configuration options for Netkit device creation.
@@ -82,6 +84,42 @@ func createNetkitDeviceViaNetlink(log *logrus.Logger, cfg *NetkitConfig) error {
 
 	log.Infof("Successfully created Netkit device pair %s <-> %s via netlink API (scrub=%v)",
 		cfg.Name, cfg.PeerName, !cfg.ScrubNone)
+	return nil
+}
+
+func isZeroMAC(addr net.HardwareAddr) bool {
+	if len(addr) == 0 {
+		return true
+	}
+	for _, b := range addr {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// requireNetkitL2WithMAC rejects a netkit pair that landed in L3 (kernel
+// default) or without Ethernet addresses. dae's IPv6 datapath installs a
+// permanent NDP neighbor using dae0's MAC; L3 netkit sets IFF_NOARP and
+// leaves HardwareAddr empty, which makes that neighbor unusable.
+func requireNetkitL2WithMAC(primary, peer netlink.Link) error {
+	nk, ok := primary.(*netlink.Netkit)
+	if !ok {
+		return fmt.Errorf("link %s is %T, want netkit", primary.Attrs().Name, primary)
+	}
+	if nk.Mode != netlink.NETKIT_MODE_L2 {
+		return fmt.Errorf("netkit %s mode is %v, want L2", nk.Attrs().Name, nk.Mode)
+	}
+	if primary.Attrs().RawFlags&unix.IFF_NOARP != 0 {
+		return fmt.Errorf("netkit %s still has IFF_NOARP; L2 mode did not take effect", primary.Attrs().Name)
+	}
+	if isZeroMAC(primary.Attrs().HardwareAddr) {
+		return fmt.Errorf("netkit %s has empty MAC; L2 Ethernet datapath is unusable", primary.Attrs().Name)
+	}
+	if isZeroMAC(peer.Attrs().HardwareAddr) {
+		return fmt.Errorf("netkit %s has empty MAC; L2 Ethernet datapath is unusable", peer.Attrs().Name)
+	}
 	return nil
 }
 

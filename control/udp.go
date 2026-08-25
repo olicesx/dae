@@ -1246,10 +1246,11 @@ getNew:
 		lifecycle.reportTrafficSuccess()
 	}
 
-	// Print log.
-	// Only print routing for new connection to avoid the log exploded (Quic and BT).
-	if (isNew && c.log.IsLevelEnabled(logrus.InfoLevel)) || c.log.IsLevelEnabled(logrus.DebugLevel) {
-		entry := c.log.WithFields(logrus.Fields{
+	// Per-flow routing traces are Debug, and only for new endpoints.
+	// Reused endpoints (QUIC/BT) stay silent even at Debug to avoid
+	// exploding logs. Raise log_level to debug to restore new-flow traces.
+	if isNew && c.log.IsLevelEnabled(logrus.DebugLevel) {
+		c.log.WithFields(logrus.Fields{
 			"network":  networkType.StringWithoutDns(),
 			"outbound": ue.Outbound.Name,
 			"policy":   ue.Outbound.GetSelectionPolicy(),
@@ -1260,13 +1261,7 @@ getNew:
 			"dscp":     routingResult.Dscp,
 			"pname":    ProcessName2String(routingResult.Pname[:]),
 			"mac":      Mac2String(routingResult.Mac[:]),
-		})
-		// Build entry once; select level without a second WithFields allocation.
-		logger := entry.Infof
-		if !isNew && c.log.IsLevelEnabled(logrus.DebugLevel) {
-			logger = entry.Debugf
-		}
-		logger("%v <-> %v", RefineSourceToShow(realSrc, realDst.Addr()), dialTarget)
+		}).Debugf("%v <-> %v", RefineSourceToShow(realSrc, realDst.Addr()), dialTarget)
 	}
 
 	return nil

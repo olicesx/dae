@@ -318,10 +318,10 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 		logOffloadSkipRateLimited(c.log, offloadReason)
 	}
 
-	// Log new TCP connections at Info level for visibility (consistent with UDP behavior)
-	// Note: TCP connections are inherently "new" at this point, unlike UDP endpoints which may be reused
-	if c.log.IsLevelEnabled(logrus.InfoLevel) {
-		c.log.WithFields(buildTCPLinkLogFields(res, dialParam, dst, domain, annotateOffload, offloaded, offloadReason)).Infof("%v <-> %v", RefineSourceToShow(src, dst.Addr()), res.DialTarget)
+	// Per-flow routing traces are Debug: at Info they dominate CPU/allocs
+	// under high connection rates. Raise log_level to debug to restore them.
+	if c.log.IsLevelEnabled(logrus.DebugLevel) {
+		c.log.WithFields(buildTCPLinkLogFields(res, dialParam, dst, domain, annotateOffload, offloaded, offloadReason)).Debugf("%v <-> %v", RefineSourceToShow(src, dst.Addr()), res.DialTarget)
 	}
 
 	if offloaded {

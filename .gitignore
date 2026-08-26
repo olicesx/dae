@@ -20,3 +20,8 @@ AGENTS.md
 .claude
 tmp/
 control.test
+.mimosa/
+.playwright-mcp/
+prof/
+kix-discipline/
+api-divergences.png

@@ -42,6 +42,12 @@ type controlPlaneSessionManagerBinding struct {
 
 type udpFlowSourceSnapshot struct {
 	flows []*UDPFlowRuntime
+	// epochCounts tallies held flows per policy epoch. It is rebuilt
+	// together with flows (writers already reserialize under mu) so
+	// retainedUDPEndpoint can skip its whole O(flows) scan when the
+	// current epoch already owns every flow — the steady state between
+	// reloads.
+	epochCounts map[routing.PolicyEpoch]int
 }
 
 // SessionManager owns established flow lifecycles independently of any
@@ -594,6 +600,13 @@ func (m *SessionManager) retainedUDPEndpoint(src, dst netip.AddrPort, result *bp
 	if !ok || snapshot == nil {
 		return nil, false
 	}
+	if snapshot.epochCounts[currentEpoch] == len(snapshot.flows) {
+		// Every flow for this source already routes under the current
+		// epoch: no retained (stale-epoch) endpoint can exist. This keeps
+		// the per-packet probe off the O(flows) scan for high-fan-out
+		// sources outside reload windows.
+		return nil, false
+	}
 	var selected *UDPFlowRuntime
 	selectedScore := -1
 	for _, flow := range snapshot.flows {
@@ -640,7 +653,10 @@ func (m *SessionManager) appendUDPFlowSourceLocked(src netip.AddrPort, flow *UDP
 	next := make([]*UDPFlowRuntime, len(current)+1)
 	copy(next, current)
 	next[len(current)] = flow
-	m.udpBySource.Store(src, &udpFlowSourceSnapshot{flows: next})
+	m.udpBySource.Store(src, &udpFlowSourceSnapshot{
+		flows:       next,
+		epochCounts: udpFlowEpochCounts(next),
+	})
 }
 
 // removeUDPFlowSourceLocked replaces one immutable per-source index. The
@@ -674,7 +690,23 @@ func (m *SessionManager) removeUDPFlowSourceLocked(src netip.AddrPort, flow *UDP
 	next := make([]*UDPFlowRuntime, len(snapshot.flows)-1)
 	copy(next, snapshot.flows[:index])
 	copy(next[index:], snapshot.flows[index+1:])
-	m.udpBySource.Store(src, &udpFlowSourceSnapshot{flows: next})
+	m.udpBySource.Store(src, &udpFlowSourceSnapshot{
+		flows:       next,
+		epochCounts: udpFlowEpochCounts(next),
+	})
+}
+
+// udpFlowEpochCounts tallies the routing epoch of every held flow. The
+// snapshot rebuild paths are already O(flows); folding the tally in keeps the
+// per-packet retained-endpoint probe O(1) in the steady state.
+func udpFlowEpochCounts(flows []*UDPFlowRuntime) map[routing.PolicyEpoch]int {
+	counts := make(map[routing.PolicyEpoch]int, 1)
+	for _, flow := range flows {
+		if flow != nil {
+			counts[flow.binding.Route.PolicyEpoch]++
+		}
+	}
+	return counts
 }
 
 // ActiveConnections returns all process-owned TCP and UDP flows.

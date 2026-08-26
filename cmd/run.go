@@ -171,6 +171,24 @@ type stagedReloadHandoff struct {
 	provisionalOwner      bool
 }
 
+// newStagedReloadHandoff builds the base handoff from the two supervisor
+// generations; path-specific flags (freshDatapath, preparedDNSHandoff,
+// bpfTransferred, ...) are set by the caller.
+func newStagedReloadHandoff(active, candidate *runtimeGeneration, abortConnections, hasOverlap bool) *stagedReloadHandoff {
+	return &stagedReloadHandoff{
+		preparedGeneration: candidate,
+		oldControlPlane:    active.controlPlane,
+		oldCancel:          active.cancel,
+		oldConf:            active.conf,
+		oldListener:        active.listener,
+		newControlPlane:    candidate.controlPlane,
+		newCancel:          candidate.cancel,
+		newListener:        candidate.listener,
+		abortConnections:   abortConnections,
+		hasOverlap:         hasOverlap,
+	}
+}
+
 var setRunSignalProgress = func(code byte, content string) error {
 	return writeSignalProgressFile(SignalProgressFilePath, code, content)
 }

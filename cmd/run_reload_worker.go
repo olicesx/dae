@@ -129,6 +129,27 @@ func (w *reloadWorker) run() {
 				transitionHeld = false
 			}
 		}
+		// failSupervisorStep aborts a prepared candidate whose supervisor
+		// registration failed and keeps the current generation active. step
+		// labels the failure context; preCleanup runs before and postCleanup
+		// after the candidate teardown (the legacy path returns shared BPF
+		// ownership before teardown and restarts the old DNS listener after).
+		failSupervisorStep := func(err error, step string, candidate *runtimeGeneration, preCleanup, postCleanup func()) {
+			reloadErr := fmt.Errorf("%s: %w", step, err)
+			w.reloadManager.setReloadError(reloadErr)
+			if preCleanup != nil {
+				preCleanup()
+			}
+			if closeErr := candidate.cleanup(); closeErr != nil {
+				w.log.WithError(closeErr).Warnf("[Reload] Failed to close candidate generation after %s failure", step)
+			}
+			if postCleanup != nil {
+				postCleanup()
+			}
+			w.log.WithError(reloadErr).Errorln("[Reload] Failed to prepare reload candidate; keeping current generation active")
+			w.reloadManager.failReloadAttempt(reloadErr)
+			releaseReloadTransition()
+		}
 
 		// New control plane.
 		obj := w.c.PeekBpf()
@@ -237,41 +258,17 @@ func (w *reloadWorker) run() {
 				conf:         newConf,
 			}
 			if err := w.runtimeSupervisor.replaceActive(activeGeneration); err != nil {
-				reloadErr := fmt.Errorf("record active generation for staged reload: %w", err)
-				w.reloadManager.setReloadError(reloadErr)
-				if closeErr := candidateGeneration.cleanup(); closeErr != nil {
-					w.log.WithError(closeErr).Warnln("[Reload] Failed to close staged generation after supervisor setup failure")
-				}
-				w.log.WithError(reloadErr).Errorln("[Reload] Failed to prepare staged reload; keeping current generation active")
-				w.reloadManager.failReloadAttempt(reloadErr)
-				releaseReloadTransition()
+				failSupervisorStep(err, "record active generation for staged reload", candidateGeneration, nil, nil)
 				continue
 			}
 			if err := w.runtimeSupervisor.installPrepared(candidateGeneration); err != nil {
-				reloadErr := fmt.Errorf("install staged reload candidate: %w", err)
-				w.reloadManager.setReloadError(reloadErr)
-				if closeErr := candidateGeneration.cleanup(); closeErr != nil {
-					w.log.WithError(closeErr).Warnln("[Reload] Failed to close staged generation after supervisor install failure")
-				}
-				w.log.WithError(reloadErr).Errorln("[Reload] Failed to prepare staged reload; keeping current generation active")
-				w.reloadManager.failReloadAttempt(reloadErr)
-				releaseReloadTransition()
+				failSupervisorStep(err, "install staged reload candidate", candidateGeneration, nil, nil)
 				continue
 			}
-			w.reloadManager.setPendingStagedHandoff(&stagedReloadHandoff{
-				preparedGeneration: candidateGeneration,
-				oldControlPlane:    oldC,
-				oldCancel:          oldCancel,
-				oldConf:            oldConf,
-				oldListener:        oldListener,
-				newControlPlane:    newC,
-				newCancel:          cancel,
-				newListener:        stagedListener,
-				abortConnections:   abortConnections,
-				hasOverlap:         hasOverlap,
-				preparedDNSHandoff: true,
-				sharedBpfHandoff:   true,
-			}, reloadStartedAt, reloadStartedAtMono)
+			handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections, hasOverlap)
+			handoff.preparedDNSHandoff = true
+			handoff.sharedBpfHandoff = true
+			w.reloadManager.setPendingStagedHandoff(handoff, reloadStartedAt, reloadStartedAtMono)
 			w.reloadManager.beginHandoff()
 			releaseReloadTransition()
 			notifyRunStateChange(w.runStateChanges)
@@ -336,40 +333,16 @@ func (w *reloadWorker) run() {
 				conf:         newConf,
 			}
 			if err := w.runtimeSupervisor.replaceActive(activeGeneration); err != nil {
-				reloadErr := fmt.Errorf("record active generation for fresh datapath reload: %w", err)
-				w.reloadManager.setReloadError(reloadErr)
-				if closeErr := candidateGeneration.cleanup(); closeErr != nil {
-					w.log.WithError(closeErr).Warnln("[Reload] Failed to close fresh datapath generation after supervisor setup failure")
-				}
-				w.log.WithError(reloadErr).Errorln("[Reload] Failed to prepare fresh datapath reload; keeping current generation active")
-				w.reloadManager.failReloadAttempt(reloadErr)
-				releaseReloadTransition()
+				failSupervisorStep(err, "record active generation for fresh datapath reload", candidateGeneration, nil, nil)
 				continue
 			}
 			if err := w.runtimeSupervisor.installPrepared(candidateGeneration); err != nil {
-				reloadErr := fmt.Errorf("install fresh datapath reload candidate: %w", err)
-				w.reloadManager.setReloadError(reloadErr)
-				if closeErr := candidateGeneration.cleanup(); closeErr != nil {
-					w.log.WithError(closeErr).Warnln("[Reload] Failed to close fresh datapath generation after supervisor install failure")
-				}
-				w.log.WithError(reloadErr).Errorln("[Reload] Failed to prepare fresh datapath reload; keeping current generation active")
-				w.reloadManager.failReloadAttempt(reloadErr)
-				releaseReloadTransition()
+				failSupervisorStep(err, "install fresh datapath reload candidate", candidateGeneration, nil, nil)
 				continue
 			}
-			w.reloadManager.setPendingStagedHandoff(&stagedReloadHandoff{
-				preparedGeneration: candidateGeneration,
-				oldControlPlane:    oldC,
-				oldCancel:          oldCancel,
-				oldConf:            oldConf,
-				oldListener:        oldListener,
-				newControlPlane:    newC,
-				newCancel:          cancel,
-				newListener:        stagedListener,
-				abortConnections:   abortConnections,
-				hasOverlap:         hasOverlap,
-				freshDatapath:      true,
-			}, reloadStartedAt, reloadStartedAtMono)
+			handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections, hasOverlap)
+			handoff.freshDatapath = true
+			w.reloadManager.setPendingStagedHandoff(handoff, reloadStartedAt, reloadStartedAtMono)
 			w.reloadManager.beginHandoff()
 			releaseReloadTransition()
 			notifyRunStateChange(w.runStateChanges)
@@ -488,57 +461,32 @@ func (w *reloadWorker) run() {
 			cancel:       newCancel,
 			conf:         newConf,
 		}
-		if err := w.runtimeSupervisor.replaceActive(activeGeneration); err != nil {
-			reloadErr := fmt.Errorf("record active generation for reload: %w", err)
-			w.reloadManager.setReloadError(reloadErr)
+		// The legacy path moved its shared BPF object above; on supervisor
+		// failure the ownership must return before candidate teardown, and the
+		// old DNS listener restarts after it.
+		restoreBpfOwnership := func() {
 			if !freshDatapathReload && oldC != nil {
 				oldC.InjectBpf(newC.EjectBpf())
 			}
-			if closeErr := candidateGeneration.cleanup(); closeErr != nil {
-				w.log.WithError(closeErr).Warnln("[Reload] Failed to close candidate generation after supervisor setup failure")
-			}
+		}
+		restartOldDNSListener := func() {
 			if oldC != nil {
 				if restartErr := oldC.RestartDNSListener(); restartErr != nil {
-					w.log.WithError(restartErr).Warnln("[Reload] Failed to restart previous DNS listener after supervisor setup failure")
+					w.log.WithError(restartErr).Warnln("[Reload] Failed to restart previous DNS listener after supervisor failure")
 				}
 			}
-			w.log.WithError(reloadErr).Errorln("[Reload] Failed to prepare reload candidate; keeping current generation active")
-			w.reloadManager.failReloadAttempt(reloadErr)
-			releaseReloadTransition()
+		}
+		if err := w.runtimeSupervisor.replaceActive(activeGeneration); err != nil {
+			failSupervisorStep(err, "record active generation for reload", candidateGeneration, restoreBpfOwnership, restartOldDNSListener)
 			continue
 		}
 		if err := w.runtimeSupervisor.installPrepared(candidateGeneration); err != nil {
-			reloadErr := fmt.Errorf("install reload candidate: %w", err)
-			w.reloadManager.setReloadError(reloadErr)
-			if !freshDatapathReload && oldC != nil {
-				oldC.InjectBpf(newC.EjectBpf())
-			}
-			if closeErr := candidateGeneration.cleanup(); closeErr != nil {
-				w.log.WithError(closeErr).Warnln("[Reload] Failed to close candidate generation after supervisor install failure")
-			}
-			if oldC != nil {
-				if restartErr := oldC.RestartDNSListener(); restartErr != nil {
-					w.log.WithError(restartErr).Warnln("[Reload] Failed to restart previous DNS listener after supervisor install failure")
-				}
-			}
-			w.log.WithError(reloadErr).Errorln("[Reload] Failed to prepare reload candidate; keeping current generation active")
-			w.reloadManager.failReloadAttempt(reloadErr)
-			releaseReloadTransition()
+			failSupervisorStep(err, "install reload candidate", candidateGeneration, restoreBpfOwnership, restartOldDNSListener)
 			continue
 		}
-		w.reloadManager.setPendingStagedHandoff(&stagedReloadHandoff{
-			preparedGeneration: candidateGeneration,
-			oldControlPlane:    oldC,
-			oldCancel:          oldCancel,
-			oldConf:            oldConf,
-			oldListener:        oldListener,
-			newControlPlane:    newC,
-			newCancel:          newCancel,
-			newListener:        stagedListener,
-			abortConnections:   abortConnections,
-			hasOverlap:         hasOverlap,
-			bpfTransferred:     !freshDatapathReload,
-		}, reloadStartedAt, reloadStartedAtMono)
+		handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections, hasOverlap)
+		handoff.bpfTransferred = !freshDatapathReload
+		w.reloadManager.setPendingStagedHandoff(handoff, reloadStartedAt, reloadStartedAtMono)
 		w.reloadManager.clearPendingRetirement()
 		w.reloadManager.setPendingReloadMetadata(reloadStartedAt, reloadStartedAtMono)
 		w.reloadManager.beginHandoff()

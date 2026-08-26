@@ -18,7 +18,6 @@ type dnsControllerRuntimeState struct {
 	routing               *dns.Dns
 	lifecycleCtx          context.Context
 	cacheAccessCallback   func(cache *DnsCache) (err error)
-	cacheRemoveCallback   func(cache *DnsCache) (err error)
 	cacheDeleteCallback   func(cacheKey string, cache *DnsCache) (err error)
 	newCache              func(fqdn string, answers, ns, extra []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
 	routeProjectionEpoch  uint64
@@ -132,7 +131,6 @@ func (c *DnsController) updateRuntime(option *DnsControllerOption, routing *dns.
 		routing:               routing,
 		lifecycleCtx:          lifecycleCtx,
 		cacheAccessCallback:   option.CacheAccessCallback,
-		cacheRemoveCallback:   option.CacheRemoveCallback,
 		cacheDeleteCallback:   option.CacheDeleteCallback,
 		newCache:              option.NewCache,
 		routeProjectionEpoch:  option.RouteProjectionEpoch,

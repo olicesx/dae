@@ -185,9 +185,6 @@ func newCorpusDnsController(t testing.TB, cfg *config.Dns) *DnsController {
 		CacheAccessCallback: func(*DnsCache) error {
 			return nil
 		},
-		CacheRemoveCallback: func(*DnsCache) error {
-			return nil
-		},
 		NewCache: func(fqdn string, answers, ns, extra []dnsmessage.RR, deadline, originalDeadline time.Time) (*DnsCache, error) {
 			return &DnsCache{
 				Answer:           answers,

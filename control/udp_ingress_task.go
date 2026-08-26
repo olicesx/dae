@@ -20,6 +20,40 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// cachedRoutingBinding resolves the flow's bound routing result from the
+// routing-cache endpoints referenced by the flow decision: the primary cached
+// endpoint first, then the symmetric fallback endpoint when the primary's
+// binding missed.
+func cachedRoutingBinding(flowDecision UdpFlowDecision, realDst netip.AddrPort) (*bpfRoutingResult, bool) {
+	if ue, ok := DefaultUdpEndpointPool.Get(flowDecision.CachedRoutingEndpointKey()); ok {
+		if bound, bindingHit := ue.GetBoundRoutingResult(realDst, unix.IPPROTO_UDP); bindingHit {
+			return bound, true
+		}
+	}
+	if fallbackKey, ok := flowDecision.CachedRoutingFallbackKey(); ok {
+		if ue, ok := DefaultUdpEndpointPool.Get(fallbackKey); ok {
+			if bound, bindingHit := ue.GetBoundRoutingResult(realDst, unix.IPPROTO_UDP); bindingHit {
+				return bound, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// routingCacheOwnerEndpoint finds the endpoint that owns the flow's cached
+// routing result: the primary cached endpoint if present, else the fallback.
+func routingCacheOwnerEndpoint(flowDecision UdpFlowDecision) *UdpEndpoint {
+	if ue, ok := DefaultUdpEndpointPool.Get(flowDecision.CachedRoutingEndpointKey()); ok {
+		return ue
+	}
+	if fallbackKey, ok := flowDecision.CachedRoutingFallbackKey(); ok {
+		if ue, ok := DefaultUdpEndpointPool.Get(fallbackKey); ok {
+			return ue
+		}
+	}
+	return nil
+}
+
 // udpIngressTask is the pooled owned form of the per-packet ingress task
 // that used to be an escaping closure inside processPacket. Under saturated
 // UDP load the closure was ~200-300B allocated per packet (~20% of the
@@ -174,19 +208,8 @@ func (t *udpIngressTask) Run() {
 	}
 
 	if !c.udpRouteScopeSensitive && c.ownsActiveRoutingEpoch() {
-		if ue, ok := DefaultUdpEndpointPool.Get(flowDecision.CachedRoutingEndpointKey()); ok {
-			if bound, bindingHit := ue.GetBoundRoutingResult(realDst, unix.IPPROTO_UDP); bindingHit {
-				routingResult = bound
-			}
-		}
-		if routingResult == nil {
-			if fallbackKey, ok := flowDecision.CachedRoutingFallbackKey(); ok {
-				if ue, ok := DefaultUdpEndpointPool.Get(fallbackKey); ok {
-					if bound, bindingHit := ue.GetBoundRoutingResult(realDst, unix.IPPROTO_UDP); bindingHit {
-						routingResult = bound
-					}
-				}
-			}
+		if bound, bindingHit := cachedRoutingBinding(flowDecision, realDst); bindingHit {
+			routingResult = bound
 		}
 	}
 
@@ -242,17 +265,8 @@ func (t *udpIngressTask) Run() {
 	}
 
 	if !c.udpRouteScopeSensitive && c.ownsActiveRoutingEpoch() && freshRoutingResult != nil {
-		updatedCache := false
-		if ue, ok := DefaultUdpEndpointPool.Get(flowDecision.CachedRoutingEndpointKey()); ok {
+		if ue := routingCacheOwnerEndpoint(flowDecision); ue != nil {
 			ue.UpdateCachedRoutingResult(realDst, unix.IPPROTO_UDP, freshRoutingResult)
-			updatedCache = true
-		}
-		if !updatedCache {
-			if fallbackKey, ok := flowDecision.CachedRoutingFallbackKey(); ok {
-				if ue, ok := DefaultUdpEndpointPool.Get(fallbackKey); ok {
-					ue.UpdateCachedRoutingResult(realDst, unix.IPPROTO_UDP, freshRoutingResult)
-				}
-			}
 		}
 	}
 }

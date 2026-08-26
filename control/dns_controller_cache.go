@@ -881,8 +881,13 @@ func (c *DnsController) __updateDnsCacheDeadline(cacheKey string, host string, d
 }
 
 func (c *DnsController) UpdateDnsCacheTtl(host string, dnsTyp uint16, answers, ns, extra []dnsmessage.RR, ttl int) (err error) {
-	c.requireStore()
-	return c.__updateDnsCacheDeadline("", host, dnsTyp, answers, ns, extra, func(now time.Time, host string) (daedline time.Time, originalDeadline time.Time) {
+	return c.UpdateDnsCacheTtlWithKey("", host, dnsTyp, answers, ns, extra, ttl)
+}
+
+// fixedTtlDeadlineFunc applies the fixed-domain TTL override to the response
+// TTL before the cache deadline is computed.
+func (c *DnsController) fixedTtlDeadlineFunc(ttl int) daedlineFunc {
+	return func(now time.Time, host string) (deadline time.Time, originalDeadline time.Time) {
 		originalDeadline = now.Add(time.Duration(ttl) * time.Second)
 		if rt := c.runtime(); rt != nil {
 			if fixedTtl, ok := rt.fixedDomainTtl[host]; ok {
@@ -890,20 +895,12 @@ func (c *DnsController) UpdateDnsCacheTtl(host string, dnsTyp uint16, answers, n
 			}
 		}
 		return originalDeadline, originalDeadline
-	})
+	}
 }
 
 func (c *DnsController) UpdateDnsCacheTtlWithKey(cacheKey string, host string, dnsTyp uint16, answers, ns, extra []dnsmessage.RR, ttl int) (err error) {
 	c.requireStore()
-	return c.__updateDnsCacheDeadline(cacheKey, host, dnsTyp, answers, ns, extra, func(now time.Time, host string) (deadline time.Time, originalDeadline time.Time) {
-		originalDeadline = now.Add(time.Duration(ttl) * time.Second)
-		if rt := c.runtime(); rt != nil {
-			if fixedTtl, ok := rt.fixedDomainTtl[host]; ok {
-				return now.Add(time.Duration(fixedTtl) * time.Second), originalDeadline
-			}
-		}
-		return originalDeadline, originalDeadline
-	})
+	return c.__updateDnsCacheDeadline(cacheKey, host, dnsTyp, answers, ns, extra, c.fixedTtlDeadlineFunc(ttl))
 }
 
 // buildMinHeap constructs a min-heap from the cache entries slice.

@@ -131,6 +131,41 @@ func (ue *UdpEndpoint) enqueueReceivedReply(data []byte, from netip.AddrPort, re
 	}
 }
 
+// applyUpstreamReadErrorPolicy runs the upstream error policy shared by the
+// push-mode receiver and the ReadFrom loop. Soft errors (replay/auth) are
+// absorbed under a dynamic threshold: 3 before any valid reply to fail fast on
+// wrong credentials, 100 afterwards when they are mostly network noise. Hard
+// errors retire the endpoint via the mode-specific retire callback and
+// invalidate the cached proxy IP on connection-refused. Returns true when the
+// error is fatal and delivery must stop.
+func (ue *UdpEndpoint) applyUpstreamReadErrorPolicy(err error, retire func()) bool {
+	if errors.IsReplayAttackError(err) || errors.IsAuthError(err) {
+		threshold := 3
+		if ue.hasReply.Load() {
+			threshold = 100
+		}
+		if ue.softErrorCount < threshold {
+			ue.softErrorCount++
+			if ue.log != nil && ue.log.IsLevelEnabled(logrus.DebugLevel) && ue.softErrorCount%10 == 1 {
+				ue.log.WithFields(logrus.Fields{
+					"lAddr":      ue.lAddr.String(),
+					"dialer":     ue.Dialer.Property().Name,
+					"proxy_addr": ue.DialTarget,
+					"sniffed":    ue.SniffedDomain,
+				}).WithError(err).Debugf("UdpEndpoint soft error (hit %d/%d, ignored)", ue.softErrorCount, threshold)
+			}
+			return false
+		}
+	}
+	if ue.shouldRetireOnReadError(err) {
+		retire()
+		if ue.isConnectionRefused(err) {
+			ue.handleProxyServerFailure()
+		}
+	}
+	return true
+}
+
 // handleReceivedPacket is the push-mode delivery callback. Some transports
 // deliver concurrently from multiple stream readers, so endpoint probing and
 // error counters stay serialized exactly as in ReadFrom mode.
@@ -149,27 +184,14 @@ func (ue *UdpEndpoint) handleReceivedPacket(packet *netproxy.ReceivedPacket) boo
 	}
 
 	if packet.Err != nil {
-		if errors.IsReplayAttackError(packet.Err) || errors.IsAuthError(packet.Err) {
-			threshold := 3
-			if ue.hasReply.Load() {
-				threshold = 100
-			}
-			if ue.softErrorCount < threshold {
-				ue.softErrorCount++
-				packet.Release()
-				return true
-			}
+		if ue.applyUpstreamReadErrorPolicy(packet.Err, ue.markRetiredFromReceiver) {
+			ue.logEndpointExit(packet.Err, "packet receiver")
+			packet.Release()
+			ue.stopPacketReceiver()
+			return false
 		}
-		if ue.shouldRetireOnReadError(packet.Err) {
-			ue.markRetiredFromReceiver()
-			if ue.isConnectionRefused(packet.Err) {
-				ue.handleProxyServerFailure()
-			}
-		}
-		ue.logEndpointExit(packet.Err, "packet receiver")
 		packet.Release()
-		ue.stopPacketReceiver()
-		return false
+		return true
 	}
 
 	ue.softErrorCount = 0
@@ -221,43 +243,11 @@ func (ue *UdpEndpoint) startReadLoop() {
 	for {
 		n, from, err := ue.conn.ReadFrom(buf[:])
 		if err != nil {
-			// Fast path for soft errors (authentication failures/replay attacks from network noise)
-			if errors.IsReplayAttackError(err) || errors.IsAuthError(err) {
-				// Dynamic threshold:
-				// If we haven't received any valid packet yet, keep threshold low (3) to fail fast on wrong passwords/nodes.
-				// If we have successfully received packets, the proxy works. Subsequent errors are likely network noise, so use high threshold (100).
-				threshold := 3
-				if ue.hasReply.Load() {
-					threshold = 100
-				}
-
-				if ue.softErrorCount < threshold {
-					ue.softErrorCount++
-					// Optimize logging condition to avoid unnecessary log object allocation when debug is off
-					if ue.log != nil && ue.log.IsLevelEnabled(logrus.DebugLevel) && ue.softErrorCount%10 == 1 {
-						ue.log.WithFields(logrus.Fields{
-							"lAddr":      ue.lAddr.String(),
-							"dialer":     ue.Dialer.Property().Name,
-							"proxy_addr": ue.DialTarget,
-							"sniffed":    ue.SniffedDomain,
-						}).WithError(err).Debugf("UdpEndpoint read loop soft error (hit %d/%d, ignored)", ue.softErrorCount, threshold)
-					}
-					continue
-				}
+			if ue.applyUpstreamReadErrorPolicy(err, ue.retire) {
+				ue.logEndpointExit(err, "read loop")
+				break
 			}
-
-			if ue.shouldRetireOnReadError(err) {
-				ue.retire()
-
-				// Check if this is a connection refused error from proxy server
-				// If so, invalidate the cached proxy IP so we can try a different one
-				if ue.isConnectionRefused(err) {
-					ue.handleProxyServerFailure()
-				}
-			}
-
-			ue.logEndpointExit(err, "read loop")
-			break
+			continue
 		}
 		ue.softErrorCount = 0
 		if !ue.hasReply.Load() && !ue.acceptsInitialReplyFrom(from) {

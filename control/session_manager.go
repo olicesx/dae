@@ -497,8 +497,6 @@ func (m *SessionManager) adoptUDP(endpoint *UdpEndpoint, binding UdpFlowBinding,
 	}
 	binding.Egress.Outbound = retainedOutbound
 	endpoint.Outbound = retainedOutbound
-	endpoint.flowEgressOverride = nil
-	endpoint.flowBindingSet = false
 	endpoint.setFlowBinding(binding)
 	ctx, cancel := context.WithCancel(m.ctx)
 	flow := &UDPFlowRuntime{

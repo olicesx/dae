@@ -82,6 +82,14 @@ func TestUdpEndpointPoolPreservesOriginalFlowBindingOnReuse(t *testing.T) {
 			Dialer:  d,
 			Target:  "198.51.100.1:443",
 			Network: "udp+4",
+			// FlowBinding() reports the endpoint's normalized network type,
+			// so the expectation mirrors what pool creation derives from the
+			// flow key (UDP over IPv4).
+			NetworkType: dialer.NetworkType{
+				L4Proto:         consts.L4ProtoStr_UDP,
+				IpVersion:       consts.IpVersionStr_4,
+				UdpHealthDomain: dialer.UdpHealthDomainData,
+			},
 		},
 	}
 	firstOptions := &UdpEndpointOptions{

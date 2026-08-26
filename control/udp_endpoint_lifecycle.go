@@ -37,24 +37,25 @@ func sameUdpConnStateOwner(left, right udpConnStateOwner) bool {
 	return left == right
 }
 
-// FlowBinding returns the immutable route and egress selections made when the endpoint was created.
+// FlowBinding returns the immutable route and egress selections made when the
+// endpoint was created. Production code reads only Route.Mark (via
+// replySoMark); the full binding is a verification surface for tests.
 func (ue *UdpEndpoint) FlowBinding() UdpFlowBinding {
 	if ue == nil || !ue.flowBindingSet {
 		return UdpFlowBinding{}
 	}
-	egress := UdpEgressBinding{
-		Dialer:        ue.Dialer,
-		Outbound:      ue.Outbound,
-		Target:        ue.DialTarget,
-		Network:       ue.flowNetwork,
-		NetworkType:   ue.endpointNetworkType,
-		SniffedDomain: ue.SniffedDomain,
-		IsDialIp:      ue.flowBindingDialIP,
+	return UdpFlowBinding{
+		Route: ue.flowRouteBinding,
+		Egress: UdpEgressBinding{
+			Dialer:        ue.Dialer,
+			Outbound:      ue.Outbound,
+			Target:        ue.DialTarget,
+			Network:       ue.flowNetwork,
+			NetworkType:   ue.endpointNetworkType,
+			SniffedDomain: ue.SniffedDomain,
+			IsDialIp:      ue.flowBindingDialIP,
+		},
 	}
-	if ue.flowEgressOverride != nil {
-		egress = *ue.flowEgressOverride
-	}
-	return UdpFlowBinding{Route: ue.flowRouteBinding, Egress: egress}
 }
 
 func (ue *UdpEndpoint) replySoMark() uint32 {
@@ -72,10 +73,6 @@ func (ue *UdpEndpoint) setFlowBinding(binding UdpFlowBinding) {
 	ue.flowNetwork = binding.Egress.Network
 	ue.flowBindingDialIP = binding.Egress.IsDialIp
 	ue.flowBindingSet = true
-	if got := ue.FlowBinding().Egress; got != binding.Egress {
-		override := binding.Egress
-		ue.flowEgressOverride = &override
-	}
 }
 
 func (ue *UdpEndpoint) TrackUdpConnStateTuplePair(src, dst netip.AddrPort) {

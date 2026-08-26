@@ -8,7 +8,6 @@ package control
 import (
 	"net/netip"
 	"sync"
-	"time"
 
 	"github.com/daeuniverse/outbound/pool"
 )
@@ -153,30 +152,14 @@ func (ue *UdpEndpoint) prewarmResponseConn(target string) {
 
 	bindAddr, _ := normalizeSendPktAddrFamily(replyPeer, ue.lAddr)
 	replySoMark := ue.replySoMark()
-	key := anyfromPoolKey{lAddr: bindAddr, soMark: replySoMark}
-	var af *Anyfrom
-	if DefaultAnyfromPool != nil {
-		shard := DefaultAnyfromPool.shardForKey(key)
-		nowNano := time.Now().UnixNano()
-		shard.mu.RLock()
-		if cached, ok := shard.pool[key]; ok && cached != nil && !cached.failed.Load() && !cached.IsExpired(nowNano) {
-			af = cached
-		}
-		shard.mu.RUnlock()
-		if af != nil {
-			af.RefreshTtlWithTime(nowNano)
-		}
+	// The anyfrom cache path is only reachable inside the dae netns: outside
+	// it no cached anyfrom socket can exist and none may be created.
+	if GetDaeNetns() == nil || DefaultAnyfromPool == nil {
+		return
 	}
-
-	if af == nil {
-		if GetDaeNetns() == nil || DefaultAnyfromPool == nil {
-			return
-		}
-		var err error
-		af, _, err = DefaultAnyfromPool.getOrCreateWithMark(bindAddr, replySoMark, AnyfromTimeout)
-		if err != nil {
-			return
-		}
+	af, _, err := DefaultAnyfromPool.getOrCreateWithMark(bindAddr, replySoMark, AnyfromTimeout)
+	if err != nil {
+		return
 	}
 
 	if ue.poolKey.Dst.Port() != 0 {

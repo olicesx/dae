@@ -652,7 +652,7 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 				}
 				// For DNS fast path, never leave client waiting on internal errors.
 				// Respond with SERVFAIL so resolver can retry/fallback promptly.
-				if sendErr := dnsController.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeServerFailure, "ServeFail (dns fast path)", req, nil); sendErr != nil {
+				if sendErr := dnsController.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeServerFailure, false, "ServeFail (dns fast path)", req, nil); sendErr != nil {
 					return stderrors.Join(err, sendErr)
 				}
 				if c.log.IsLevelEnabled(logrus.DebugLevel) {

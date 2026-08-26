@@ -152,7 +152,7 @@ func (t *udpIngressTask) Run() {
 						"error":    e.Error(),
 					}).Warn("DNS ingress fast path failed; sending SERVFAIL response")
 				}
-				if sendErr := dnsController.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeServerFailure, "ServeFail (dns ingress fast path)", req, nil); sendErr != nil {
+				if sendErr := dnsController.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeServerFailure, false, "ServeFail (dns ingress fast path)", req, nil); sendErr != nil {
 					if handler.log.IsLevelEnabled(logrus.WarnLevel) && handler.allowDnsFastPathServfailLog(time.Now()) {
 						handler.log.WithError(stderrors.Join(e, sendErr)).WithFields(logrus.Fields{
 							"src": convergeSrc.String(),

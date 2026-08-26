@@ -460,7 +460,6 @@ func (c *DnsController) dialSend(
 	data []byte,
 	id uint16,
 	upstream *dns.Upstream,
-	needResp bool,
 	responseWriter dnsmessage.ResponseWriter,
 	responseCacheKey string,
 ) (err error) {
@@ -518,75 +517,67 @@ func (c *DnsController) dialSend(
 	// - Cache failures are rare
 	// - The response is already sent to the client
 	// - Next request for same domain will just hit upstream again
-	if needResp {
-		// Keep the id the same with request.
-		respMsg.Id = id
-		respMsg.Compress = true
-		// If responseWriter is provided, use it to write the response.
-		if responseWriter != nil {
-			// For responseWriter path, cache synchronously because
-			// responseWriter may need the message after we return.
-			if err = c.NormalizeAndCacheDnsResp_(respMsg, responseCacheKey); err != nil {
-				c.log.Warnf("failed to cache DNS response: %v", err)
-			}
-			return responseWriter.WriteMsg(respMsg)
+	// Keep the id the same with request.
+	respMsg.Id = id
+	respMsg.Compress = true
+	// If responseWriter is provided, use it to write the response.
+	if responseWriter != nil {
+		// For responseWriter path, cache synchronously because
+		// responseWriter may need the message after we return.
+		if err = c.NormalizeAndCacheDnsResp_(respMsg, responseCacheKey); err != nil {
+			c.log.Warnf("failed to cache DNS response: %v", err)
 		}
-		// Pack into a pooled DNS response buffer; data is consumed synchronously by the send.
-		bufPtr := dnsResponseBufPool.Get().(*[]byte)
-		defer dnsResponseBufPool.Put(bufPtr)
-		data, err = respMsg.PackBuffer((*bufPtr)[:cap(*bufPtr)])
-		if err != nil {
-			return err
-		}
-
-		// Truncate oversized UDP responses with the TC bit set (RFC 1035) so the
-		// client retries over TCP. Without this the client receives a
-		// "noerror, 0 answer, tc=0" reply and believes the name has no
-		// addresses. The cache must keep the FULL response (a later TCP client
-		// query needs all answers), so a deep copy is taken before truncating.
-		limit := dnsDefaultUDPSize
-		if len(data) > limit {
-			var reqMsg dnsmessage.Msg
-			if err = reqMsg.Unpack(dnsRequestData); err == nil {
-				limit = dnsUDPResponseSizeLimit(&reqMsg)
-			}
-			if len(data) > limit {
-				fullResp := *respMsg
-				fullResp.Answer = append([]dnsmessage.RR(nil), respMsg.Answer...)
-				fullResp.Extra = append([]dnsmessage.RR(nil), respMsg.Extra...)
-				respMsg.Truncate(limit)
-				data, err = respMsg.PackBuffer((*bufPtr)[:cap(*bufPtr)])
-				if err != nil {
-					return err
-				}
-				respMsg = &fullResp
-			}
-		}
-
-		if err = sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.replySoMark(), req.downloadRecorder()); err != nil {
-			return err
-		}
-
-		// Cache asynchronously after sending response (UDP path only).
-		// respMsg is owned by this function and won't be accessed after return,
-		// so it's safe to use in goroutine without copying.
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					c.log.Errorf("panic in async DNS cache: %v", r)
-				}
-			}()
-			if err := c.NormalizeAndCacheDnsResp_(respMsg, responseCacheKey); err != nil {
-				c.log.Debugf("failed to cache DNS response (async): %v", err)
-			}
-		}()
-
-		return nil
+		return responseWriter.WriteMsg(respMsg)
 	}
-
-	// No response needed, just cache synchronously
-	if err = c.NormalizeAndCacheDnsResp_(respMsg, responseCacheKey); err != nil {
+	// Pack into a pooled DNS response buffer; data is consumed synchronously by the send.
+	bufPtr := dnsResponseBufPool.Get().(*[]byte)
+	defer dnsResponseBufPool.Put(bufPtr)
+	data, err = respMsg.PackBuffer((*bufPtr)[:cap(*bufPtr)])
+	if err != nil {
 		return err
 	}
+
+	// Truncate oversized UDP responses with the TC bit set (RFC 1035) so the
+	// client retries over TCP. Without this the client receives a
+	// "noerror, 0 answer, tc=0" reply and believes the name has no
+	// addresses. The cache must keep the FULL response (a later TCP client
+	// query needs all answers), so a deep copy is taken before truncating.
+	limit := dnsDefaultUDPSize
+	if len(data) > limit {
+		var reqMsg dnsmessage.Msg
+		if err = reqMsg.Unpack(dnsRequestData); err == nil {
+			limit = dnsUDPResponseSizeLimit(&reqMsg)
+		}
+		if len(data) > limit {
+			fullResp := *respMsg
+			fullResp.Answer = append([]dnsmessage.RR(nil), respMsg.Answer...)
+			fullResp.Extra = append([]dnsmessage.RR(nil), respMsg.Extra...)
+			respMsg.Truncate(limit)
+			data, err = respMsg.PackBuffer((*bufPtr)[:cap(*bufPtr)])
+			if err != nil {
+				return err
+			}
+			respMsg = &fullResp
+		}
+	}
+
+	if err = sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.replySoMark(), req.downloadRecorder()); err != nil {
+		return err
+	}
+
+	// Cache asynchronously after sending response (UDP path only).
+	// respMsg is owned by this function and won't be accessed after return,
+	// so it's safe to use in goroutine without copying.
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				c.log.Errorf("panic in async DNS cache: %v", r)
+			}
+		}()
+		if err := c.NormalizeAndCacheDnsResp_(respMsg, responseCacheKey); err != nil {
+			c.log.Debugf("failed to cache DNS response (async): %v", err)
+		}
+	}()
+
 	return nil
 }

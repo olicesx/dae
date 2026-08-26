@@ -180,12 +180,19 @@ func (t *udpIngressTask) Run() {
 			if dnsRoutingResult.Mark == 0 {
 				dnsRoutingResult.Mark = handler.soMarkFromDae
 			}
+			// Account the query like the ordinary UDP paths do; the
+			// ingress plane owns the packet, so its recorders are used
+			// (matching what the removed udp.go fast path recorded).
+			c.recordUploadTraffic(int64(len(data)))
 			req := &udpRequest{
 				realSrc:       convergeSrc,
 				realDst:       realDst,
 				src:           convergeSrc,
 				lConn:         t.lConn,
 				routingResult: dnsRoutingResult,
+
+				uploadRecord:   c.runtimeUploadRecorder(),
+				downloadRecord: c.runtimeDownloadRecorder(),
 			}
 
 			dnsController := handler.ActiveDnsController()

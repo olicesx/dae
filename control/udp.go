@@ -145,7 +145,7 @@ func shouldRejectNewUdpDialSelection(res *proxyDialResult) bool {
 	return !res.Dialer.MustGetAlive(networkType)
 }
 
-func (c *ControlPlane) checkUdpEndpointHealth(ue *UdpEndpoint, _ UdpEndpointKey, isFastPath bool) bool {
+func (c *ControlPlane) checkUdpEndpointHealth(ue *UdpEndpoint, isFastPath bool) bool {
 	if ue == nil || ue.Dialer == nil || ue.IsDead() {
 		return false
 	}
@@ -507,7 +507,7 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 	if !ok {
 		return false, nil
 	}
-	if !c.checkUdpEndpointHealth(ue, ue.poolKey, true) {
+	if !c.checkUdpEndpointHealth(ue, true) {
 		ue.retire()
 		return true, nil
 	}
@@ -627,50 +627,10 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 		forceSymmetricKey = udpRouteScopeNeedsDestinationAffinity(routingResult)
 	}
 
-	// DNS Fast Path: Skip UdpEndpoint lookup for DNS traffic (port 53).
-	// DNS is a stateless protocol and doesn't need the connection tracking
-	// features that UdpEndpoint provides (designed for QUIC and other long-lived UDP).
-	// This optimization eliminates a sync.Map.Load() operation for every DNS query.
-	if realDst.Port() == 53 {
-		// Potential DNS query - verify with DNS message parsing
-		dnsMessage, _ := ChooseNatTimeout(data, true)
-		if dnsMessage != nil {
-			// Confirmed DNS request - take fast path
-			if routingResult.Mark == 0 {
-				routingResult.Mark = c.soMarkFromDae
-			}
-			c.recordUploadTraffic(int64(len(data)))
-			req := &udpRequest{
-				realSrc:        realSrc,
-				realDst:        realDst,
-				src:            src,
-				lConn:          lConn,
-				routingResult:  routingResult,
-				uploadRecord:   c.runtimeUploadRecorder(),
-				downloadRecord: c.runtimeDownloadRecorder(),
-			}
-			dnsController := c.ActiveDnsController()
-			if dnsController == nil {
-				return fmt.Errorf("dns controller is not available")
-			}
-			if err := dnsController.Handle_(c.dnsRequestContext(c.ctx, dnsController), dnsMessage, req); err != nil {
-				if stderrors.Is(err, ErrDNSQueryConcurrencyLimitExceeded) {
-					return nil
-				}
-				// For DNS fast path, never leave client waiting on internal errors.
-				// Respond with SERVFAIL so resolver can retry/fallback promptly.
-				if sendErr := dnsController.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeServerFailure, false, "ServeFail (dns fast path)", req, nil); sendErr != nil {
-					return stderrors.Join(err, sendErr)
-				}
-				if c.log.IsLevelEnabled(logrus.DebugLevel) {
-					c.log.WithError(err).Debug("DNS fast path failed; SERVFAIL sent")
-				}
-				return nil
-			}
-			return nil
-		}
-		// Not a valid DNS packet (port 53 but not DNS format) - fall through to normal UDP path
-	}
+	// DNS to port 53 never reaches this point in production: the ingress
+	// task intercepts valid DNS messages and answers them before calling
+	// into the handlePkt chain (see udp_ingress_task.go). Port-53 packets
+	// that are not valid DNS simply take the normal UDP path below.
 
 	var ue *UdpEndpoint
 	var ueExists bool
@@ -774,7 +734,7 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 				ueExists = false
 				break
 			}
-			if !c.checkUdpEndpointHealth(ue, ueKey, false) {
+			if !c.checkUdpEndpointHealth(ue, false) {
 				ue = nil
 				ueExists = false
 			}
@@ -784,7 +744,7 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 			domain = ue.SniffedDomain
 			dialTarget := ue.dialTargetForWrite(realDst)
 
-			if !c.checkUdpEndpointHealth(ue, ueKey, true) {
+			if !c.checkUdpEndpointHealth(ue, true) {
 				ue = nil
 				ueExists = false
 			} else {
@@ -846,7 +806,7 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 			}
 		default:
 			// Non-fast-path existing endpoint. Check health.
-			if !c.checkUdpEndpointHealth(ue, ueKey, false) {
+			if !c.checkUdpEndpointHealth(ue, false) {
 				ue = nil
 				ueExists = false
 			}
@@ -1007,9 +967,17 @@ afterSniffing:
 	// and skip the redundant GetOrCreate sync.Map lookup (common path: non-QUIC
 	// existing endpoint, zero domain upgrade).
 	foundUeKey := ueKey
-	payloads := make([][]byte, 0, len(replayPackets)+1)
-	for _, pkt := range replayPackets {
-		payloads = append(payloads, pkt)
+	// The steady state (no sniff-replay packets) is a single payload: keep
+	// it on the stack and only build a heap slice when replays exist.
+	var payloadsHeap [][]byte
+	var inline [1][]byte
+	payloads := inline[:0]
+	if len(replayPackets) > 0 {
+		payloadsHeap = make([][]byte, 0, len(replayPackets)+1)
+		for _, pkt := range replayPackets {
+			payloadsHeap = append(payloadsHeap, pkt)
+		}
+		payloads = payloadsHeap
 	}
 	payloads = append(payloads, data)
 	packetIndex := 0
@@ -1165,7 +1133,7 @@ getNew:
 	// If GetOrCreate reused an existing endpoint on the slow path, re-check the
 	// exact endpoint network type before writing. This keeps the slow path aligned
 	// with the fast-path health checks and exact per-family invalidation.
-	if !isNew && !c.checkUdpEndpointHealth(ue, ueKey, false) {
+	if !isNew && !c.checkUdpEndpointHealth(ue, false) {
 		// Exclude the dead dialer to force selection of a different one on retry.
 		excludedDialer = ue.Dialer
 		retry++

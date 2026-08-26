@@ -811,9 +811,8 @@ func (d *Dialer) submitCheckTasks(workerPool *ants.Pool, wg *sync.WaitGroup, opt
 			// periodic, so skip this probe instead of spawning an unbounded
 			// goroutine that can outlive the dialer lifecycle.
 			wg.Done()
-			if stderrors.Is(err, ants.ErrPoolClosed) || stderrors.Is(err, ants.ErrPoolOverload) {
-				continue
-			}
+			// Pool closed or overloaded: both mean "skip this cycle";
+			// periodic re-checks are the recovery path either way.
 			continue
 		}
 	}

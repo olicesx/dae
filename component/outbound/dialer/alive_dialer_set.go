@@ -170,6 +170,11 @@ func (a *AliveDialerSet) GetMinLatency(excluded *Dialer) (d *Dialer, latency tim
 }
 
 func (a *AliveDialerSet) printLatencies() {
+	if !a.log.IsLevelEnabled(logrus.InfoLevel) {
+		// The caller logs at Info; skip building the sorted snapshot
+		// (which walks every entry) when it would be discarded anyway.
+		return
+	}
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "Group '%v' [%v]:\n", a.dialerGroupName, a.CheckTyp.String())
 	var alive []*struct {

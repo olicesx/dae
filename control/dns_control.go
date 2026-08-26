@@ -51,11 +51,10 @@ var (
 )
 
 var (
-	UnspecifiedAddressA          = netip.MustParseAddr("0.0.0.0")
-	UnspecifiedAddressAAAA       = netip.MustParseAddr("::")
-	DnsCacheRouteRefreshInterval = 10 * time.Second // Aligned with health check granularity (default 30s)
-	dnsCacheJanitorInterval      = 30 * time.Second
-	dnsForwarderIdleTTL          = 2 * time.Minute
+	UnspecifiedAddressA     = netip.MustParseAddr("0.0.0.0")
+	UnspecifiedAddressAAAA  = netip.MustParseAddr("::")
+	dnsCacheJanitorInterval = 30 * time.Second
+	dnsForwarderIdleTTL     = 2 * time.Minute
 )
 
 type DnsControllerOption struct {

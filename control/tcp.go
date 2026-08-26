@@ -717,15 +717,6 @@ func (c *bufioConn) SetWriteDeadline(t time.Time) error {
 	return c.Conn.SetWriteDeadline(t)
 }
 
-// handleTCPDnsFastPath handles DNS-over-TCP transparent proxy.
-// It reads DNS queries from the connection, processes them through the DNS controller,
-// and writes responses back. Returns true if the connection was handled as DNS.
-// Uses bufio.Reader to support peeking at data without consuming it,
-// allowing proper fallback to normal TCP handling if this isn't DNS traffic.
-func (c *ControlPlane) handleTCPDnsFastPath(ctx context.Context, lConn net.Conn, bufReader *bufio.Reader, src, dst netip.AddrPort, routingResult *bpfRoutingResult) (handled bool, err error) {
-	return c.handleTCPDnsFastPathOwned(ctx, lConn, bufReader, src, dst, routingResult, nil)
-}
-
 func (c *ControlPlane) handleTCPDnsFastPathOwned(
 	ctx context.Context,
 	lConn net.Conn,

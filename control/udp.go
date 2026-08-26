@@ -106,11 +106,6 @@ const (
 	connectionErrorLogInterval = 5 * time.Second
 )
 
-// ResetUdpLogLimiters clears all rate limiters for UDP logging.
-// Called on reload to allow fresh logging after configuration changes.
-func ResetUdpLogLimiters() {
-}
-
 func udpEndpointNetworkType(ue *UdpEndpoint) dialer.NetworkType {
 	if ue != nil && ue.endpointNetworkType.L4Proto != "" {
 		networkType := ue.endpointNetworkType
@@ -280,32 +275,6 @@ func normalizeSendPktAddrFamily(from, realTo netip.AddrPort) (bindAddr, writeAdd
 
 type udpEndpointReplySender func(log *logrus.Logger, data []byte, from netip.AddrPort, realTo netip.AddrPort, slot udpEndpointResponseConnSlot) error
 
-type anyfromPtrSlot struct {
-	ptr **Anyfrom
-}
-
-func (s anyfromPtrSlot) Load() *Anyfrom {
-	if s.ptr == nil {
-		return nil
-	}
-	return *s.ptr
-}
-
-func (s anyfromPtrSlot) Swap(next *Anyfrom) {
-	if s.ptr == nil {
-		return
-	}
-	swapPinnedAnyfrom(s.ptr, next)
-}
-
-func (s anyfromPtrSlot) CompareAndSwap(old, next *Anyfrom) bool {
-	if s.ptr == nil || *s.ptr != old {
-		return false
-	}
-	swapPinnedAnyfrom(s.ptr, next)
-	return true
-}
-
 func swapPinnedAnyfrom(slot **Anyfrom, next *Anyfrom) {
 	if slot == nil {
 		return
@@ -470,14 +439,6 @@ func sendPktWithResponseConnSlot(log *logrus.Logger, data []byte, from netip.Add
 		cache.StoreCachedResponseConn(bindAddr, uConn)
 	}
 	return err
-}
-
-func sendPktWithCacheProvider(log *logrus.Logger, data []byte, from netip.AddrPort, realTo netip.AddrPort, soMark uint32, afp **Anyfrom, cache udpEndpointResponseConnCache) (err error) {
-	var slot udpEndpointResponseConnSlot
-	if afp != nil {
-		slot = anyfromPtrSlot{ptr: afp}
-	}
-	return sendPktWithResponseConnSlot(log, data, from, realTo, soMark, slot, cache)
 }
 
 // sendPkt sends a UDP packet to the destination.

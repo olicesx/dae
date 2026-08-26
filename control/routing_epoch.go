@@ -371,29 +371,6 @@ func (c *controlPlaneCore) finalizePreviousRoutingEpochWithCleanup(cleanup routi
 	}
 }
 
-// RoutingEpochForSlot returns metadata for diagnostics and replay. It never
-// participates in a forwarding decision.
-func (c *controlPlaneCore) RoutingEpochForSlot(slot uint32) (routing.PolicyEpoch, bool, error) {
-	if c == nil || !validRoutingEpochSlot(slot) {
-		return 0, false, nil
-	}
-	bpf := c.PeekBpf()
-	if !c.hasRoutingEpochMaps(bpf) {
-		return 0, false, nil
-	}
-	var epoch uint64
-	if err := bpf.RoutingEpochMap.Lookup(slot, &epoch); err != nil {
-		if stderrors.Is(err, ebpf.ErrKeyNotExist) {
-			return 0, false, nil
-		}
-		return 0, false, fmt.Errorf("lookup routing epoch slot %d: %w", slot, err)
-	}
-	if epoch == 0 {
-		return 0, false, nil
-	}
-	return routing.PolicyEpoch(epoch), true, nil
-}
-
 func (c *controlPlaneCore) domainRoutingTrackerForSlot(slot uint32) *domainRoutingTracker {
 	if c == nil || !validRoutingEpochSlot(slot) {
 		return nil

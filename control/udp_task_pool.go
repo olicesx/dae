@@ -325,15 +325,6 @@ createNew:
 	return q
 }
 
-// Reset clears all UDP task queues.
-// Called on reload to clear queued tasks from pre-reload state.
-func (p *UdpTaskPool) Reset() {
-	p.queues.Range(func(key, value any) bool {
-		p.queues.Delete(key)
-		return true
-	})
-}
-
 // Close stops all convoy goroutines and releases resources.
 // After Close, the pool must not be reused (shutdown-only path).
 func (p *UdpTaskPool) Close() {

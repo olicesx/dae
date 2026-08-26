@@ -829,16 +829,6 @@ func buildRoutingKernspaceForSlot(
 	return usedIndices, nil
 }
 
-// BuildKernspaceForSlot constructs routing data in one kernel routing epoch
-// slot. Match-set LPM indexes remain slot-local; only BPF map keys receive the
-// slot offset.
-func (b *RoutingMatcherBuilder) BuildKernspaceForSlot(log *logrus.Logger, slot uint32) (usedIndices []uint32, err error) {
-	if b == nil {
-		return nil, fmt.Errorf("nil routing matcher builder")
-	}
-	return buildRoutingKernspaceForSlot(log, b.bpf, b.rules, b.simulatedLpmTries, len(b.lpmDedup), slot)
-}
-
 // BuildKernspaceForSlot constructs this immutable routing snapshot in one
 // kernel routing epoch slot.
 func (s *routingKernspaceSnapshot) BuildKernspaceForSlot(log *logrus.Logger, bpf *bpfObjects, slot uint32) (usedIndices []uint32, err error) {

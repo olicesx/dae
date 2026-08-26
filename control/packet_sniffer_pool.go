@@ -884,12 +884,6 @@ func (p *PacketSnifferPool) startJanitor() {
 	})
 }
 
-// IsQuicDcidFailed checks if a DCID has been marked as failed due to sniffing timeout.
-// Failed DCIDs bypass sniffing entirely and use IP routing directly.
-func IsQuicDcidFailed(key PacketSnifferKey) bool {
-	return IsQuicDcidFailedAt(key, time.Now())
-}
-
 func IsQuicDcidFailedAt(key PacketSnifferKey, now time.Time) bool {
 	cache := getFailedQuicDcidCache()
 	if cache == nil {
@@ -917,20 +911,6 @@ func ClearFailedQuicDcids() {
 		return
 	}
 	cache.Clear()
-}
-
-// HealthCheckSuccessCallback is a callback function that can be set to
-// be notified when health check succeeds. This allows clearing the failed
-// DCID cache when network conditions improve.
-var HealthCheckSuccessCallback func()
-
-// NotifyHealthCheckSuccess should be called when a health check succeeds.
-// This clears the failed QUIC DCID cache to allow retrying sniffing.
-func NotifyHealthCheckSuccess() {
-	ClearFailedQuicDcids()
-	if HealthCheckSuccessCallback != nil {
-		HealthCheckSuccessCallback()
-	}
 }
 
 func (p *PacketSnifferPool) loadFlowFamily(key PacketSnifferKey) *packetSnifferFlowFamilyRef {

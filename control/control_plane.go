@@ -112,53 +112,6 @@ type ControlPlane struct {
 	dnsRoutingUnchanged bool
 	closeOnce           sync.Once
 	closeErr            error
-	serveHooksMu        sync.RWMutex
-	serveHooks          *ServeLifecycleHooks
-}
-
-// ServeLifecycleHooks provides optional integration hooks for the three
-// prepared-generation boundaries in Serve. The production path leaves every
-// hook nil and calls the normal ControlPlane implementation directly.
-type ServeLifecycleHooks struct {
-	// ValidateListener replaces listener validation when non-nil.
-	ValidateListener func(*Listener) error
-	// CommitPreparedDatapath replaces the prepared BPF commit when non-nil.
-	CommitPreparedDatapath func() error
-	// PublishListenerSockets replaces listener FD publication when non-nil.
-	PublishListenerSockets func(*Listener) error
-	// ActivatePreparedRuntime replaces DNS/runtime activation when non-nil.
-	ActivatePreparedRuntime func() error
-}
-
-// SetServeLifecycleHooks installs optional lifecycle hooks and returns a
-// restore function. It is intended for controlled integration tests and
-// internal lifecycle adapters; nil hooks preserve the default behavior.
-func (c *ControlPlane) SetServeLifecycleHooks(hooks ServeLifecycleHooks) (restore func()) {
-	if c == nil {
-		return func() {}
-	}
-	c.serveHooksMu.Lock()
-	previous := c.serveHooks
-	copy := hooks
-	c.serveHooks = &copy
-	c.serveHooksMu.Unlock()
-	return func() {
-		c.serveHooksMu.Lock()
-		c.serveHooks = previous
-		c.serveHooksMu.Unlock()
-	}
-}
-
-func (c *ControlPlane) serveLifecycleHooks() ServeLifecycleHooks {
-	if c == nil {
-		return ServeLifecycleHooks{}
-	}
-	c.serveHooksMu.RLock()
-	defer c.serveHooksMu.RUnlock()
-	if c.serveHooks == nil {
-		return ServeLifecycleHooks{}
-	}
-	return *c.serveHooks
 }
 
 var policyEpochSequence atomic.Uint64
@@ -2352,7 +2305,6 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			}
 		}
 	}()
-	hooks := c.serveLifecycleHooks()
 	validateListener := func(listener *Listener) error {
 		if listener == nil {
 			return fmt.Errorf("nil listener")
@@ -2369,27 +2321,17 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 		}
 		return nil
 	}
-	if hooks.ValidateListener != nil {
-		validateListener = hooks.ValidateListener
-	}
 	if err := validateListener(listener); err != nil {
 		return err
 	}
 	publishListenerSockets := c.publishListenerSockets
-	if hooks.PublishListenerSockets != nil {
-		publishListenerSockets = hooks.PublishListenerSockets
-	}
 	publishBeforeCommit := c.preparedDatapathCommit && !c.sharedBpfReload && c.core != nil
 	if publishBeforeCommit {
 		if err := publishListenerSockets(listener); err != nil {
 			return err
 		}
 	}
-	commitPreparedDatapath := c.CommitPreparedDatapath
-	if hooks.CommitPreparedDatapath != nil {
-		commitPreparedDatapath = hooks.CommitPreparedDatapath
-	}
-	if err := commitPreparedDatapath(); err != nil {
+	if err := c.CommitPreparedDatapath(); err != nil {
 		return err
 	}
 	if !publishBeforeCommit {
@@ -2397,11 +2339,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			return err
 		}
 	}
-	activatePreparedRuntime := c.activatePreparedRuntime
-	if hooks.ActivatePreparedRuntime != nil {
-		activatePreparedRuntime = hooks.ActivatePreparedRuntime
-	}
-	if err := activatePreparedRuntime(); err != nil {
+	if err := c.activatePreparedRuntime(); err != nil {
 		return err
 	}
 	udpConn, _ := listener.packetConn.(*net.UDPConn)
@@ -2870,24 +2808,6 @@ func ResetGlobalUdpState() {
 	DefaultAnyfromPool.Reset()
 	DefaultUdpTaskPool.Close()
 	DefaultPacketSnifferSessionMgr.Close() // Close() stops janitor goroutines; safe for shutdown path
-	ResetUdpLogLimiters()
-}
-
-// ResetGlobalUdpFlowState evicts stale UDP flow state for a fresh-datapath
-// reload. Unlike ResetGlobalUdpState it only clears pooled endpoints, anyfrom
-// connections and sniffer sessions — each of which may still reference the
-// retiring generation's dialer, outbound group and cached routing result —
-// without stopping the background janitor goroutines, so the successor
-// generation reuses the same pool singletons.
-//
-// This must be called during a fresh-datapath cutover, after the old
-// generation stops accepting traffic and before the new generation starts
-// serving, so incoming flows are routed by the fresh policy instead of
-// inheriting stale decisions bound to the previous (now detached) maps.
-func ResetGlobalUdpFlowState() {
-	DefaultUdpEndpointPool.Reset()
-	DefaultAnyfromPool.Reset()
-	DefaultPacketSnifferSessionMgr.Reset()
 }
 
 func (c *ControlPlane) closeTail() error {

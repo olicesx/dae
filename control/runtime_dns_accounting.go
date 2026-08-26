@@ -16,7 +16,7 @@ import (
 
 func sendRuntimeTrackedPkt(log *logrus.Logger, data []byte, from netip.AddrPort, to netip.AddrPort, soMark uint32, recordDownload func(int64)) error {
 	recordDownload = normalizeTrafficRecord(recordDownload)
-	if err := sendPktWithCacheProvider(log, data, from, to, soMark, nil, nil); err != nil {
+	if err := sendPktWithResponseConnSlot(log, data, from, to, soMark, nil, nil); err != nil {
 		return err
 	}
 	// UDP datagrams are treated as all-or-nothing here: sendPkt returns nil only

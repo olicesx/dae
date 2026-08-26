@@ -163,11 +163,3 @@ func (c *DnsController) runtime() *dnsControllerRuntimeState {
 func (c *DnsController) TryUpdateRuntime(option *DnsControllerOption, routing *dns.Dns) error {
 	return c.updateRuntime(option, routing)
 }
-
-// UpdateRuntime preserves the historical panic-on-invalid-input API for
-// external callers. New internal code should use TryUpdateRuntime.
-func (c *DnsController) UpdateRuntime(option *DnsControllerOption, routing *dns.Dns) {
-	if err := c.TryUpdateRuntime(option, routing); err != nil {
-		panic(err)
-	}
-}

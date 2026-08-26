@@ -79,13 +79,14 @@ func TestPhase0TCPDNSIngressCorpus_LegacyBaseline(t *testing.T) {
 
 	resultCh := make(chan tcpDnsIngressResult, 1)
 	go func() {
-		handled, err := plane.handleTCPDnsFastPath(
+		handled, err := plane.handleTCPDnsFastPathOwned(
 			context.Background(),
 			serverConn,
 			bufio.NewReader(serverConn),
 			netip.MustParseAddrPort("192.0.2.10:42424"),
 			netip.MustParseAddrPort("198.51.100.53:53"),
 			&bpfRoutingResult{},
+			nil,
 		)
 		resultCh <- tcpDnsIngressResult{handled: handled, err: err}
 	}()

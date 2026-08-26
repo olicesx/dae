@@ -13,9 +13,8 @@ import (
 )
 
 // BenchmarkUdpProxyDial measures the cost of the proxy-dial slow path under
-// UdpEndpointPool.GetOrCreate. This is the second coverage gap the SLO gate in
-// cmd/semantic_refactor_features.go was waiting on: no existing benchmark
-// exercised DialContext through the proxy dialer under UDP traffic.
+// UdpEndpointPool.GetOrCreate: no other benchmark exercises DialContext
+// through the proxy dialer under UDP traffic.
 //
 // Two cache regimes are compared:
 //

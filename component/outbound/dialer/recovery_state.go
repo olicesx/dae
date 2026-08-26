@@ -309,13 +309,6 @@ func (m *dialerRecoveryManager) incrementBackoffLevelByIndex(protoIdx int) {
 	}
 }
 
-func (m *dialerRecoveryManager) getBackoffLevelByIndex(protoIdx int) int {
-	state := m.state(protoIdx)
-	state.Lock()
-	defer state.Unlock()
-	return state.backoffLevel
-}
-
 func (m *dialerRecoveryManager) getBackoffPenaltyByIndex(protoIdx int) time.Duration {
 	state := m.state(protoIdx)
 	state.Lock()

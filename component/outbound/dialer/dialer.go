@@ -814,10 +814,6 @@ func (d *Dialer) incrementBackoffLevelByIndex(protoIdx int) {
 	d.ensureRecoveryManager().incrementBackoffLevelByIndex(protoIdx)
 }
 
-func (d *Dialer) getBackoffLevelByIndex(protoIdx int) int {
-	return d.ensureRecoveryManager().getBackoffLevelByIndex(protoIdx)
-}
-
 func (d *Dialer) getBackoffPenaltyForType(typ *NetworkType) time.Duration {
 	if typ == nil {
 		return 0

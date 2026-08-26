@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"slices"
@@ -21,6 +22,7 @@ import (
 	"github.com/daeuniverse/dae/common/assets"
 	"github.com/daeuniverse/dae/common/netutils"
 	componentdns "github.com/daeuniverse/dae/component/dns"
+	"github.com/daeuniverse/dae/component/dnstransport"
 	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
@@ -49,18 +51,24 @@ type subscriptionMeta struct {
 }
 
 type Router struct {
-	log             *logrus.Logger
-	upstreams       map[string]*componentdns.UpstreamResolver
-	upstreamByIndex []*componentdns.UpstreamResolver
-	requestMatcher  *componentdns.RequestMatcher
-	subMatcher      *compiledMatcher[subscriptionMeta]
-	nodeMatcher     *compiledMatcher[NodeMeta]
-	subNodeMatcher  *compiledMatcher[NodeMeta]
-	bootstrapDns    []netip.AddrPort
-	soMark          uint32
-	mptcp           bool
-	lookupMu        sync.Mutex
-	lookupCalls     map[string]*lookupCall
+	log                   *logrus.Logger
+	upstreams             map[string]*componentdns.UpstreamResolver
+	upstreamByIndex       []*componentdns.UpstreamResolver
+	requestMatcher        *componentdns.RequestMatcher
+	subMatcher            *compiledMatcher[subscriptionMeta]
+	nodeMatcher           *compiledMatcher[NodeMeta]
+	subNodeMatcher        *compiledMatcher[NodeMeta]
+	bootstrapDns          []netip.AddrPort
+	soMark                uint32
+	mptcp                 bool
+	lookupMu              sync.Mutex
+	lookupCalls           map[string]*lookupCall
+	httpClientMu          sync.Mutex
+	httpClients           map[string]*dnstransport.HTTPClientGeneration
+	httpClientGenerations map[*dnstransport.HTTPClientGeneration]struct{}
+	httpSendFunc          httpDNSQueryFunc
+	httpTransportFactory  httpTransportFactoryFunc
+	closed                bool
 }
 
 type lookupCall struct {
@@ -103,10 +111,6 @@ func (m *compiledMatcher[T]) Match(input T) (string, bool) {
 	return "", false
 }
 
-func New(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns) (*Router, error) {
-	return NewWithOption(log, global, dnsCfg, nil)
-}
-
 func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns, opt *NewOption) (*Router, error) {
 	if dnsCfg == nil {
 		return nil, nil
@@ -132,11 +136,13 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 	}
 
 	router := &Router{
-		log:         log,
-		upstreams:   make(map[string]*componentdns.UpstreamResolver),
-		soMark:      common.EffectiveSoMarkFromDae(global.SoMarkFromDae),
-		mptcp:       global.Mptcp,
-		lookupCalls: make(map[string]*lookupCall),
+		log:                   log,
+		upstreams:             make(map[string]*componentdns.UpstreamResolver),
+		soMark:                common.EffectiveSoMarkFromDae(global.SoMarkFromDae),
+		mptcp:                 global.Mptcp,
+		lookupCalls:           make(map[string]*lookupCall),
+		httpClients:           make(map[string]*dnstransport.HTTPClientGeneration),
+		httpClientGenerations: make(map[*dnstransport.HTTPClientGeneration]struct{}),
 	}
 	router.bootstrapDns, err = config.BootstrapResolvers(global)
 	if err != nil {
@@ -175,6 +181,118 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 		return nil, err
 	}
 	return router, nil
+}
+
+func (r *Router) Close() error {
+	if r == nil {
+		return nil
+	}
+	r.httpClientMu.Lock()
+	r.closed = true
+	generations := make([]*dnstransport.HTTPClientGeneration, 0, len(r.httpClientGenerations))
+	for generation := range r.httpClientGenerations {
+		generation.Retired = true
+		generations = append(generations, generation)
+	}
+	r.httpClients = nil
+	r.httpClientGenerations = nil
+	r.httpClientMu.Unlock()
+	for _, generation := range generations {
+		generation.Close()
+	}
+	return nil
+}
+
+func httpClientCacheKey(upstream *componentdns.Upstream, target netip.AddrPort, http3Mode bool) string {
+	scheme := "https"
+	if http3Mode {
+		scheme = "h3"
+	}
+	return scheme + "|" + upstream.String() + "|" + target.String()
+}
+
+func (r *Router) ensureHTTPClientMapsLocked() {
+	if r.httpClients == nil {
+		r.httpClients = make(map[string]*dnstransport.HTTPClientGeneration)
+	}
+	if r.httpClientGenerations == nil {
+		r.httpClientGenerations = make(map[*dnstransport.HTTPClientGeneration]struct{})
+	}
+}
+
+func (r *Router) newHTTPClientGeneration(upstream *componentdns.Upstream, target netip.AddrPort, http3Mode bool) *dnstransport.HTTPClientGeneration {
+	transport := r.newHTTPTransport(upstream, target, http3Mode)
+	if r.httpTransportFactory != nil {
+		transport = r.httpTransportFactory(r, upstream, target, http3Mode)
+	}
+	upstreamName := upstream.String()
+	return &dnstransport.HTTPClientGeneration{Client: &http.Client{
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return fmt.Errorf("do not use a server that will redirect, upstream: %v", upstreamName)
+		},
+	}}
+}
+
+func (r *Router) getOrCreateHTTPClient(upstream *componentdns.Upstream, target netip.AddrPort, http3Mode bool) *dnstransport.HTTPClientGeneration {
+	key := httpClientCacheKey(upstream, target, http3Mode)
+	r.httpClientMu.Lock()
+	defer r.httpClientMu.Unlock()
+	if r.closed {
+		return nil
+	}
+	r.ensureHTTPClientMapsLocked()
+	if generation := r.httpClients[key]; generation != nil {
+		generation.Active++
+		return generation
+	}
+	generation := r.newHTTPClientGeneration(upstream, target, http3Mode)
+	generation.Active = 1
+	r.httpClients[key] = generation
+	r.httpClientGenerations[generation] = struct{}{}
+	return generation
+}
+
+func (r *Router) releaseHTTPClient(generation *dnstransport.HTTPClientGeneration) {
+	dnstransport.ReleaseHTTPClientGeneration(&r.httpClientMu, generation, func() {
+		delete(r.httpClientGenerations, generation)
+	})
+}
+
+func (r *Router) replaceHTTPClient(previous *dnstransport.HTTPClientGeneration, upstream *componentdns.Upstream, target netip.AddrPort, http3Mode bool) *dnstransport.HTTPClientGeneration {
+	key := httpClientCacheKey(upstream, target, http3Mode)
+	var closePrevious bool
+	r.httpClientMu.Lock()
+	if r.closed {
+		r.httpClientMu.Unlock()
+		return nil
+	}
+	r.ensureHTTPClientMapsLocked()
+	if current := r.httpClients[key]; current != nil && current != previous {
+		current.Active++
+		r.httpClientMu.Unlock()
+		return current
+	}
+	next := r.newHTTPClientGeneration(upstream, target, http3Mode)
+	next.Active = 1
+	r.httpClients[key] = next
+	r.httpClientGenerations[next] = struct{}{}
+	if previous != nil {
+		previous.Retired = true
+		if previous.Active == 0 {
+			closePrevious = true
+		}
+	}
+	r.httpClientMu.Unlock()
+	if closePrevious {
+		previous.Close()
+		r.httpClientMu.Lock()
+		if previous.Retired && previous.Active == 0 {
+			delete(r.httpClientGenerations, previous)
+		}
+		r.httpClientMu.Unlock()
+	}
+	return next
 }
 
 func (r *Router) initUpstreams(rawUpstreams []config.KeyableString) error {

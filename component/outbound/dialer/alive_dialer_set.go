@@ -103,10 +103,6 @@ func NewAliveDialerSet(
 	return a
 }
 
-func (a *AliveDialerSet) GetRand() *Dialer {
-	return a.GetRandExcluded(nil)
-}
-
 func (a *AliveDialerSet) GetRandExcluded(excluded *Dialer) *Dialer {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -139,17 +135,6 @@ func (a *AliveDialerSet) Len() int {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return len(a.aliveEntries)
-}
-
-func (a *AliveDialerSet) SortingLatency(d *Dialer) time.Duration {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-
-	if idx, ok := a.dialerToIndex[d]; ok && idx >= 0 && idx < len(a.aliveEntries) {
-		return a.aliveEntries[idx].sortingLatency
-	}
-	// Fallback to direct calculation (should not happen in normal operation).
-	return a.dialerToLatency[d] + a.dialerToLatencyOffset[d]
 }
 
 // GetMinLatency acquires correct selectionPolicy.

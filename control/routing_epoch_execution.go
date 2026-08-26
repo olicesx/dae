@@ -427,7 +427,6 @@ func (c *ControlPlane) StopRoutingEpochExecution() {
 		return
 	}
 	c.closeRoutingEpochExecution()
-	c.closeUDPOrderedDispatcher()
 	c.udpIngressAdmission.closeAndWait()
 	if c.drainTracker != nil {
 		<-c.drainTracker.IdleCh()

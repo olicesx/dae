@@ -6,9 +6,12 @@
 package control
 
 import (
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -38,14 +41,6 @@ type UdpTask interface {
 type udpTaskFunc func()
 
 func (f udpTaskFunc) Run() { f() }
-
-// udpTaskFuncOrNil adapts an optional func literal; nil stays nil.
-func udpTaskFuncOrNil(f func()) UdpTask {
-	if f == nil {
-		return nil
-	}
-	return udpTaskFunc(f)
-}
 
 // UdpTaskQueue makes sure packets with the same UDP flow key are sent in order.
 // Field order optimized for memory alignment (Go best practice).
@@ -162,11 +157,12 @@ func (q *UdpTaskQueue) safeTimerReset(timer *time.Timer) {
 func (q *UdpTaskQueue) convoy() {
 	defer func() {
 		if r := recover(); r != nil {
+			reportPacketPathPanic("convoy", "lifecycle", &udpTaskPoolPanicCount, r)
 			if q.p != nil {
-				// Log or handle panic as needed. For now, ensure queue is removed from pool
-				// so a new one can be created if traffic continues.
+				// Ensure the queue is removed from the pool so a new one can be
+				// created if traffic continues.
 				q.p.queues.Delete(q.key)
-				q.p.queueChPool.Put(q.ch) // return channel to pool to prevent leak
+				q.p.releaseQueueCh(q)
 			}
 		}
 	}()
@@ -182,7 +178,7 @@ func (q *UdpTaskQueue) convoy() {
 		drainedAny := false
 		for {
 			if task, ok := q.popReadyTask(); ok {
-				task.Run()
+				runConvoyTask(task)
 				drainedAny = true
 				continue
 			}
@@ -195,12 +191,12 @@ func (q *UdpTaskQueue) convoy() {
 
 		select {
 		case task := <-q.ch:
-			task.Run()
+			runConvoyTask(task)
 			// Drain follow-up tasks that arrived while we were running the
 			// first one, then re-arm the timer once.
 			for {
 				if task, ok := q.popReadyTask(); ok {
-					task.Run()
+					runConvoyTask(task)
 					continue
 				}
 				break
@@ -329,15 +325,6 @@ createNew:
 	return q
 }
 
-// Reset clears all UDP task queues.
-// Called on reload to clear queued tasks from pre-reload state.
-func (p *UdpTaskPool) Reset() {
-	p.queues.Range(func(key, value any) bool {
-		p.queues.Delete(key)
-		return true
-	})
-}
-
 // Close stops all convoy goroutines and releases resources.
 // After Close, the pool must not be reused (shutdown-only path).
 func (p *UdpTaskPool) Close() {
@@ -385,3 +372,44 @@ func (p *UdpTaskPool) tryDeleteQueue(key UdpFlowKey, expected *UdpTaskQueue) boo
 var (
 	DefaultUdpTaskPool = NewUdpTaskPool()
 )
+
+// udpTaskPoolPanicCount backs the rate-limited panic reporting for the convoy
+// task pool.
+var udpTaskPoolPanicCount atomic.Uint64
+
+// runConvoyTask executes one queued task with panic isolation: a panic in one
+// packet's handling unwinds the task's own resource-releasing defers but must
+// not take down the convoy goroutine or the whole process.
+func runConvoyTask(task UdpTask) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			reportPacketPathPanic("convoy", "run", &udpTaskPoolPanicCount, recovered)
+		}
+	}()
+	task.Run()
+}
+
+// shouldReportEveryPow2 returns true on the 1st, 2nd, 4th, ... occurrence so
+// recurring panics log at exponentially decreasing rates.
+func shouldReportEveryPow2(count uint64) bool {
+	return count&(count-1) == 0
+}
+
+// reportPacketPathPanic reports a recovered panic from a per-packet or
+// per-connection execution path. The deferred recover handler still runs on
+// the panicking goroutine's stack, so debug.Stack() captures the panic site
+// frames; without it the log line only carries the panic value and the site
+// stays unknown.
+func reportPacketPathPanic(path, taskKind string, panicCount *atomic.Uint64, recovered any) {
+	count := panicCount.Add(1)
+	if !shouldReportEveryPow2(count) {
+		return
+	}
+	logrus.WithFields(logrus.Fields{
+		"path":        path,
+		"task_kind":   taskKind,
+		"panic":       recovered,
+		"panic_count": count,
+		"stack":       string(debug.Stack()),
+	}).Error("recovered panic in packet path task")
+}

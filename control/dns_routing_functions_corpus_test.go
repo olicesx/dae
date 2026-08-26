@@ -25,7 +25,7 @@ import (
 // observable through the deterministic forwarder and captured client response.
 func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 	t.Run("request_qtype_selects_named_upstream", func(t *testing.T) {
-		ctrl := newPhase0DnsRoutingFunctionsController(t, &config.Dns{
+		ctrl := newCorpusControllerWithDefaultChooser(t, &config.Dns{
 			Upstream: []config.KeyableString{"typed:udp://192.0.2.53:53"},
 			Routing: config.DnsRouting{
 				Request: config.DnsRequestRouting{
@@ -39,7 +39,7 @@ func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 		})
 
 		var selectedHost string
-		installPhase0DnsRoutingFunctionsForwarder(t, func(upstream *componentdns.Upstream, _ dialArgument, _ *logrus.Logger) (DnsForwarder, error) {
+		installCorpusDnsForwarderFactory(t, func(upstream *componentdns.Upstream, _ dialArgument, _ *logrus.Logger) (DnsForwarder, error) {
 			if upstream == nil {
 				return nil, fmt.Errorf("qtype rule selected as-is upstream")
 			}
@@ -59,7 +59,7 @@ func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 	})
 
 	t.Run("response_qname_rejects_matching_answer", func(t *testing.T) {
-		ctrl := newPhase0DnsRoutingFunctionsController(t, &config.Dns{
+		ctrl := newCorpusControllerWithDefaultChooser(t, &config.Dns{
 			Upstream: []config.KeyableString{"primary:udp://192.0.2.53:53"},
 			Routing: config.DnsRouting{
 				Request: config.DnsRequestRouting{Fallback: config.FunctionOrString("primary")},
@@ -75,7 +75,7 @@ func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 			},
 		})
 
-		installPhase0DnsRoutingFunctionsForwarder(t, phase0DnsRoutingAForwarder("response-qname.test.", "203.0.113.53"))
+		installCorpusDnsForwarderFactory(t, phase0DnsRoutingAForwarder("response-qname.test.", "203.0.113.53"))
 		response := replayPhase0DnsRoutingQuery(t, ctrl, "response-qname.test.", dnsmessage.TypeA)
 		if len(response.Answer) != 0 {
 			t.Fatalf("response qname reject returned %d answers, want 0", len(response.Answer))
@@ -83,7 +83,7 @@ func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 	})
 
 	t.Run("response_qtype_rejects_matching_answer", func(t *testing.T) {
-		ctrl := newPhase0DnsRoutingFunctionsController(t, &config.Dns{
+		ctrl := newCorpusControllerWithDefaultChooser(t, &config.Dns{
 			Upstream: []config.KeyableString{"primary:udp://192.0.2.53:53"},
 			Routing: config.DnsRouting{
 				Request: config.DnsRequestRouting{Fallback: config.FunctionOrString("primary")},
@@ -96,7 +96,7 @@ func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 			},
 		})
 
-		installPhase0DnsRoutingFunctionsForwarder(t, func(*componentdns.Upstream, dialArgument, *logrus.Logger) (DnsForwarder, error) {
+		installCorpusDnsForwarderFactory(t, func(*componentdns.Upstream, dialArgument, *logrus.Logger) (DnsForwarder, error) {
 			return &stubDnsForwarder{forward: func(context.Context, []byte) (*dnsmessage.Msg, error) {
 				return phase0DnsAAAAResponseMsg("response-qtype.test.", "2001:db8::54"), nil
 			}}, nil
@@ -109,7 +109,7 @@ func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 	})
 
 	t.Run("response_ip_rejects_matching_answer", func(t *testing.T) {
-		ctrl := newPhase0DnsRoutingFunctionsController(t, &config.Dns{
+		ctrl := newCorpusControllerWithDefaultChooser(t, &config.Dns{
 			Upstream: []config.KeyableString{"primary:udp://192.0.2.53:53"},
 			Routing: config.DnsRouting{
 				Request: config.DnsRequestRouting{Fallback: config.FunctionOrString("primary")},
@@ -122,7 +122,7 @@ func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 			},
 		})
 
-		installPhase0DnsRoutingFunctionsForwarder(t, phase0DnsRoutingAForwarder("response-ip.test.", "203.0.113.54"))
+		installCorpusDnsForwarderFactory(t, phase0DnsRoutingAForwarder("response-ip.test.", "203.0.113.54"))
 		response := replayPhase0DnsRoutingQuery(t, ctrl, "response-ip.test.", dnsmessage.TypeA)
 		if len(response.Answer) != 0 {
 			t.Fatalf("response ip reject returned %d answers, want 0", len(response.Answer))
@@ -130,7 +130,7 @@ func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 	})
 
 	t.Run("response_upstream_resends_via_selected_upstream", func(t *testing.T) {
-		ctrl := newPhase0DnsRoutingFunctionsController(t, &config.Dns{
+		ctrl := newCorpusControllerWithDefaultChooser(t, &config.Dns{
 			Upstream: []config.KeyableString{
 				"primary:udp://192.0.2.53:53",
 				"secondary:udp://192.0.2.54:53",
@@ -147,7 +147,7 @@ func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 		})
 
 		var calls []string
-		installPhase0DnsRoutingFunctionsForwarder(t, func(upstream *componentdns.Upstream, _ dialArgument, _ *logrus.Logger) (DnsForwarder, error) {
+		installCorpusDnsForwarderFactory(t, func(upstream *componentdns.Upstream, _ dialArgument, _ *logrus.Logger) (DnsForwarder, error) {
 			if upstream == nil {
 				return nil, fmt.Errorf("response upstream rule selected as-is upstream")
 			}
@@ -173,30 +173,6 @@ func TestPhase0DnsRoutingFunctionsCorpus_LegacyBaseline(t *testing.T) {
 		if got := dnsAnswerIPv4(t, response); got != "198.51.100.55" {
 			t.Fatalf("response upstream final answer = %s, want %s", got, "198.51.100.55")
 		}
-	})
-}
-
-func newPhase0DnsRoutingFunctionsController(t *testing.T, cfg *config.Dns) *DnsController {
-	t.Helper()
-
-	ctrl := newCorpusDnsController(t, cfg)
-	setScopedBestDialerChooser(ctrl, func(_ context.Context, snapshot DnsRequestSnapshot, _ *componentdns.Upstream) (*dialArgument, error) {
-		return &dialArgument{
-			l4proto:    consts.L4ProtoStr_UDP,
-			ipversion:  consts.IpVersionStr_4,
-			bestTarget: snapshot.RealDst,
-		}, nil
-	})
-	return ctrl
-}
-
-func installPhase0DnsRoutingFunctionsForwarder(t *testing.T, factory func(*componentdns.Upstream, dialArgument, *logrus.Logger) (DnsForwarder, error)) {
-	t.Helper()
-
-	previous := dnsForwarderFactory
-	dnsForwarderFactory = factory
-	t.Cleanup(func() {
-		dnsForwarderFactory = previous
 	})
 }
 

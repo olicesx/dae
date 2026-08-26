@@ -22,6 +22,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/btf"
+	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/daeuniverse/dae/common/consts"
@@ -204,28 +205,69 @@ func attachBpfToTargets(objs *bpfObjects, targets map[string]int) (links []link.
 		links = append(links, kp)
 	}
 
-	i := 0
+	// Group target functions by the position of their sk_buff argument; all
+	// functions in a group fire the same program, so on kernels with
+	// kprobe_multi support (5.18+) the whole group is attached with a single
+	// link instead of one perf event attach per symbol.
+	progByPos := map[int]*ebpf.Program{
+		1: objs.KprobeSkb1,
+		2: objs.KprobeSkb2,
+		3: objs.KprobeSkb3,
+		4: objs.KprobeSkb4,
+		5: objs.KprobeSkb5,
+	}
+	symbolsByPos := make(map[int][]string, len(progByPos))
 	for fn, pos := range targets {
-		i++
-		fmt.Printf("attaching kprobes: %04d/%04d\r", i, len(targets))
-		var kp link.Link
-		switch pos {
-		case 1:
-			kp, err = link.Kprobe(fn, objs.KprobeSkb1, nil)
-		case 2:
-			kp, err = link.Kprobe(fn, objs.KprobeSkb2, nil)
-		case 3:
-			kp, err = link.Kprobe(fn, objs.KprobeSkb3, nil)
-		case 4:
-			kp, err = link.Kprobe(fn, objs.KprobeSkb4, nil)
-		case 5:
-			kp, err = link.Kprobe(fn, objs.KprobeSkb5, nil)
-		}
-		if err != nil {
-			logrus.Debugf("failed to attach kprobe to %s: %+v\n", fn, err)
+		if _, ok := progByPos[pos]; !ok {
 			continue
 		}
-		links = append(links, kp)
+		symbolsByPos[pos] = append(symbolsByPos[pos], fn)
+	}
+	positions := make([]int, 0, len(symbolsByPos))
+	for pos := range symbolsByPos {
+		positions = append(positions, pos)
+	}
+	slices.Sort(positions)
+	for _, symbols := range symbolsByPos {
+		slices.Sort(symbols)
+	}
+
+	// DAE_TRACE_NO_KPROBE_MULTI=1 forces the per-symbol attach path, e.g. to
+	// compare behavior on kernels where kprobe_multi misbehaves.
+	useKprobeMulti := os.Getenv("DAE_TRACE_NO_KPROBE_MULTI") != "1"
+	if useKprobeMulti {
+		if err := features.HaveBPFLinkKprobeMulti(); err != nil {
+			logrus.Infof("kernel has no kprobe_multi support: %v; attaching %d kprobes one by one", err, len(targets))
+			useKprobeMulti = false
+		}
+	}
+
+	i, total := 0, len(targets)
+	for _, pos := range positions {
+		prog, symbols := progByPos[pos], symbolsByPos[pos]
+		if useKprobeMulti {
+			multi, err := link.KprobeMulti(prog, link.KprobeMultiOptions{Symbols: symbols})
+			if err == nil {
+				fmt.Printf("attached %d kprobes via kprobe_multi (sk_buff arg position %d)\n", len(symbols), pos)
+				links = append(links, multi)
+				continue
+			}
+			// One unattachable symbol fails the whole group; fall back to
+			// per-symbol attachment so the rest of the group keeps working.
+			logrus.Warnf("kprobe_multi attach failed for sk_buff arg position %d (%d symbols): %+v; falling back to per-symbol attach\n",
+				pos, len(symbols), err)
+		}
+		for _, fn := range symbols {
+			i++
+			fmt.Printf("attaching kprobes: %04d/%04d\r", i, total)
+			var kp link.Link
+			kp, err = link.Kprobe(fn, prog, nil)
+			if err != nil {
+				logrus.Debugf("failed to attach kprobe to %s: %+v\n", fn, err)
+				continue
+			}
+			links = append(links, kp)
+		}
 	}
 	if len(links) == 0 {
 		return nil, fmt.Errorf("failed to attach kprobes to any target")

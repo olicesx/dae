@@ -82,6 +82,14 @@ func TestUdpEndpointPoolPreservesOriginalFlowBindingOnReuse(t *testing.T) {
 			Dialer:  d,
 			Target:  "198.51.100.1:443",
 			Network: "udp+4",
+			// FlowBinding() reports the endpoint's normalized network type,
+			// so the expectation mirrors what pool creation derives from the
+			// flow key (UDP over IPv4).
+			NetworkType: dialer.NetworkType{
+				L4Proto:         consts.L4ProtoStr_UDP,
+				IpVersion:       consts.IpVersionStr_4,
+				UdpHealthDomain: dialer.UdpHealthDomainData,
+			},
 		},
 	}
 	firstOptions := &UdpEndpointOptions{
@@ -140,5 +148,69 @@ func TestUdpEndpointPoolPreservesOriginalFlowBindingOnReuse(t *testing.T) {
 	}
 	if got := firstTracker.Count(); got != 0 {
 		t.Fatalf("closed endpoint left original generation count = %d, want 0", got)
+	}
+}
+
+func TestUdpEndpointPoolAdoptUDPSetsFlowBindingOnce(t *testing.T) {
+	pool := NewUdpEndpointPool()
+	t.Cleanup(pool.Close)
+
+	conn := &scriptedPacketConn{
+		reads:   make(chan scriptedPacketRead),
+		closeCh: make(chan struct{}),
+	}
+	d := newTestEndpointDialer(conn)
+	t.Cleanup(func() { _ = d.Close() })
+	outbound := newTestFixedOutboundGroup(d)
+	manager := NewSessionManager(context.Background())
+	t.Cleanup(func() { _ = manager.Close() })
+
+	key := UdpEndpointKey{Src: netip.MustParseAddrPort("192.0.2.10:40001")}
+	networkType := dialer.NetworkType{
+		L4Proto:         consts.L4ProtoStr_UDP,
+		IpVersion:       consts.IpVersionStr_4,
+		UdpHealthDomain: dialer.UdpHealthDomainData,
+	}
+	binding := UdpFlowBinding{
+		Route: UdpRouteBinding{
+			PolicyEpoch: 3,
+			Outbound:    consts.OutboundUserDefinedMin,
+			Mark:        33,
+			Must:        true,
+		},
+		Egress: UdpEgressBinding{
+			Dialer:      d,
+			Outbound:    outbound,
+			Target:      "198.51.100.3:443",
+			Network:     "udp+4",
+			NetworkType: networkType,
+		},
+	}
+	endpoint, isNew, err := pool.GetOrCreate(key, &UdpEndpointOptions{
+		Handler:        func(*UdpEndpoint, []byte, netip.AddrPort) error { return nil },
+		sessionManager: manager,
+		GetDialOption: func(context.Context) (*DialOption, error) {
+			return &DialOption{
+				Dialer:      d,
+				Outbound:    outbound,
+				Network:     "udp+4",
+				NetworkType: &networkType,
+				Target:      "198.51.100.3:443",
+				Binding:     binding,
+			}, nil
+		},
+	})
+	if err != nil || !isNew || endpoint == nil {
+		t.Fatalf("GetOrCreate() = (%v, %v, %v), want new endpoint", endpoint, isNew, err)
+	}
+	got := endpoint.FlowBinding()
+	if got.Route != binding.Route {
+		t.Fatalf("adopted route = %+v, want %+v", got.Route, binding.Route)
+	}
+	if got.Egress.Outbound != outbound || got.Egress.Dialer != d || got.Egress.Target != binding.Egress.Target {
+		t.Fatalf("adopted egress = %+v, want outbound %p dialer %p target %q", got.Egress, outbound, d, binding.Egress.Target)
+	}
+	if endpoint.sessionRuntime == nil {
+		t.Fatal("adoptUDP did not attach a session runtime")
 	}
 }

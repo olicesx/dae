@@ -130,7 +130,7 @@ jobs:
           provision: 'false'
           cmd: |
             set -euo pipefail
-            /host/scripts/semantic-refactor-live-smoke.sh /host/dae/dae /host/install/empty.dae 16
+            /host/scripts/semantic-refactor-smoke.sh lifecycle /host/dae/dae /host/install/empty.dae 16
             test ! -e /sys/fs/bpf/dae
             ! ip link show dae0 >/dev/null 2>&1
             ! ip netns list 2>/dev/null | grep -q '^daens'
@@ -141,20 +141,12 @@ jobs:
           provision: 'false'
           cmd: |
             set -euo pipefail
-            /host/scripts/semantic-refactor-live-local-udp-smoke.sh /host/dae/dae 8
+            /host/scripts/semantic-refactor-smoke.sh udp-local /host/dae/dae 8
             test ! -e /sys/fs/bpf/dae
             ! ip link show dae0 >/dev/null 2>&1
             ! ip netns list 2>/dev/null | grep -q '^daens'
             ! ip link show dsmoke-udp0 >/dev/null 2>&1
             ! ip netns list 2>/dev/null | grep -q '^dae-semantic-udp-server'
-            env DAE_SEMANTIC_REFACTOR_FEATURES=udp-reply-dispatcher,udp-ordered-dispatcher \
-              /host/scripts/semantic-refactor-live-local-udp-smoke.sh /host/dae/dae 8
-            test ! -e /sys/fs/bpf/dae
-            ! ip link show dae0 >/dev/null 2>&1
-            ! ip netns list 2>/dev/null | grep -q '^daens'
-            ! ip link show dsmoke-udp0 >/dev/null 2>&1
-            ! ip netns list 2>/dev/null | grep -q '^dae-semantic-udp-server'
-
       - name: Setup network
         uses: cilium/little-vm-helper@v0.0.30
         with:

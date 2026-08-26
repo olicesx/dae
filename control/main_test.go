@@ -41,13 +41,17 @@ func TestMain(m *testing.M) {
 		goleak.IgnoreAnyFunction("github.com/daeuniverse/dae/control.NewUdpEndpointPool.(*UdpEndpointPool).startJanitor.func1.1"),
 		goleak.IgnoreAnyFunction("github.com/daeuniverse/dae/control.(*AnyfromPool).startJanitor.func1.1"),
 		goleak.IgnoreAnyFunction("github.com/daeuniverse/dae/control.NewAnyfromPool.(*AnyfromPool).startJanitor.func1.1"),
-		// DNS cache janitor + evictor (explicitly do NOT watch baseContext).
+		// DNS cache janitor (explicitly does NOT watch baseContext).
 		goleak.IgnoreAnyFunction("github.com/daeuniverse/dae/control.(*DnsController).startDnsCacheJanitor.func1"),
-		goleak.IgnoreAnyFunction("github.com/daeuniverse/dae/control.(*DnsController).startCacheEvictor.func1"),
 		// Third-party goroutine-pool supervisors (ants) — background by design.
 		goleak.IgnoreAnyFunction("github.com/panjf2000/ants/v2.(*poolCommon).purgeStaleWorkers"),
 		goleak.IgnoreAnyFunction("github.com/panjf2000/ants/v2.(*poolCommon).ticktock"),
 		// outbound package init background goroutine.
 		goleak.IgnoreAnyFunction("github.com/daeuniverse/dae/component/outbound/dialer.init.0.func1"),
+		// The fork's direct-dial packet receiver registry is a process-global
+		// epoll loop with no stop API (one loop shared by every direct
+		// endpoint, alive for the process lifetime). Tests that dial a real
+		// direct conn (udp_endpoint_receiver_test.go) start it on first use.
+		goleak.IgnoreAnyFunction("github.com/daeuniverse/outbound/protocol/direct.(*packetReceiverRegistry).loop"),
 	)
 }

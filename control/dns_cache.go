@@ -7,7 +7,6 @@ package control
 
 import (
 	"net/netip"
-	"slices"
 	"sync/atomic"
 	"time"
 
@@ -58,8 +57,7 @@ type DnsCache struct {
 	// This eliminates the performance bottleneck in the hot path (cache hits).
 	// Readers never block - they always get a valid (possibly stale) response immediately.
 	//
-	// Thread-safe access: Use GetPackedResponse() for atomic load.
-	// Internal use: ptr := c.packedResponse.Load(); if ptr != nil { data := *ptr }
+	// Internal access: ptr := c.packedResponse.Load(); if ptr != nil { data := *ptr }
 	packedResponse atomic.Pointer[[]byte]
 	// packedResponseTTL is the TTL used when creating packedResponse.
 	// Used to determine if refresh is needed (when TTL difference > threshold).
@@ -93,45 +91,11 @@ func ttlFromDeadline(deadline time.Time, now time.Time) uint32 {
 	return uint32(ttlSeconds)
 }
 
-// GetPackedResponse returns the pre-packed DNS response in a thread-safe manner.
-// This is a lock-free operation using atomic.Pointer.Load().
-// Returns nil if no pre-packed response is available.
-//
-// OPTIMIZATION: Uses atomic load for zero-contention reads.
-// Performance: ~0.2-2ns per call, no memory allocation.
-func (c *DnsCache) GetPackedResponse() []byte {
-	ptr := c.packedResponse.Load()
-	if ptr == nil {
-		return nil
-	}
-	return *ptr
-}
-
 func (c *DnsCache) GetFqdn() string {
 	if len(c.Answer) > 0 {
 		return c.Answer[0].Header().Name
 	}
 	return ""
-}
-
-func (c *DnsCache) MarkRouteBindingRefreshed(now time.Time) {
-	c.lastRouteSyncNano.Store(now.UnixNano())
-}
-
-// ShouldRefreshRouteBinding checks if route binding needs to be refreshed.
-//
-// Deprecated: Use NeedsBpfUpdate for differential updates.
-func (c *DnsCache) ShouldRefreshRouteBinding(now time.Time, minInterval time.Duration) bool {
-	if minInterval <= 0 {
-		return true
-	}
-
-	nowNano := now.UnixNano()
-	last := c.lastRouteSyncNano.Load()
-	if last != 0 && nowNano-last < minInterval.Nanoseconds() {
-		return false
-	}
-	return c.lastRouteSyncNano.CompareAndSwap(last, nowNano)
 }
 
 // ComputeBpfDataHash computes a hash of the data used for BPF updates.
@@ -251,73 +215,6 @@ func (c *DnsCache) FillInto(req *dnsmessage.Msg) {
 	req.Response = true
 	req.RecursionAvailable = true
 	req.Truncated = false
-}
-
-// FillIntoWithPacked fills the DNS response using pre-packed data if available.
-// This is the fast path for cache hits - it avoids deep copy and packing overhead.
-// Returns the packed response bytes (caller should patch the DNS ID if needed).
-func (c *DnsCache) FillIntoWithPacked(req *dnsmessage.Msg) []byte {
-	// Fast path: use pre-packed response (lock-free read)
-	packedPtr := c.packedResponse.Load()
-	if packedPtr != nil && *packedPtr != nil {
-		// Still need to unpack to fill the request message for logging/tracing
-		// But we return the pre-packed bytes for sending
-		return *packedPtr
-	}
-	// Slow path: fill and pack (should not happen if cache is properly initialized)
-	c.FillInto(req)
-	req.Compress = true
-	b, err := req.Pack()
-	if err != nil {
-		return nil
-	}
-	return b
-}
-
-func (c *DnsCache) Clone() *DnsCache {
-	newCache := &DnsCache{
-		RouteOwnerKey:        c.RouteOwnerKey,
-		RouteProjectionEpoch: c.RouteProjectionEpoch,
-		Deadline:             c.Deadline,
-		OriginalDeadline:     c.OriginalDeadline,
-	}
-
-	if c.DomainBitmap != nil {
-		newCache.DomainBitmap = slices.Clone(c.DomainBitmap)
-	}
-
-	if c.Answer != nil {
-		newCache.Answer = make([]dnsmessage.RR, len(c.Answer))
-		for i, rr := range c.Answer {
-			newCache.Answer[i] = dnsmessage.Copy(rr)
-		}
-	}
-	if c.NS != nil {
-		newCache.NS = make([]dnsmessage.RR, len(c.NS))
-		for i, rr := range c.NS {
-			newCache.NS[i] = dnsmessage.Copy(rr)
-		}
-	}
-	if c.Extra != nil {
-		newCache.Extra = make([]dnsmessage.RR, len(c.Extra))
-		for i, rr := range c.Extra {
-			newCache.Extra[i] = dnsmessage.Copy(rr)
-		}
-	}
-
-	if packedPtr := c.packedResponse.Load(); packedPtr != nil && *packedPtr != nil {
-		packedCopy := slices.Clone(*packedPtr)
-		newCache.packedResponse.Store(&packedCopy)
-		newCache.packedResponseTTL.Store(c.packedResponseTTL.Load())
-		newCache.packedResponseCreatedAt.Store(c.packedResponseCreatedAt.Load())
-	}
-
-	newCache.deadlineNano.Store(c.deadlineNano.Load())
-	newCache.lastRouteSyncNano.Store(0)
-	newCache.lastBpfDataHash.Store(0)
-
-	return newCache
-
 }
 
 // CloneForReload creates a new generation-local cache wrapper for reload.
@@ -667,16 +564,6 @@ func (c *DnsCache) FillIntoWithTTL(req *dnsmessage.Msg, now time.Time) []byte {
 func (c *DnsCache) IncludeIp(ip netip.Addr) bool {
 	for _, ans := range c.Answer {
 		if a, ok := dnsAnswerIP(ans); ok && a == ip {
-			return true
-		}
-	}
-	return false
-}
-
-func (c *DnsCache) IncludeAnyIp() bool {
-	for _, ans := range c.Answer {
-		switch ans.(type) {
-		case *dnsmessage.A, *dnsmessage.AAAA:
 			return true
 		}
 	}

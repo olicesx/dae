@@ -403,51 +403,6 @@ func WrapBPFError(err error) error {
 // DNS and Timeout Errors
 // ============================================================================
 
-var (
-	// ErrDNSTimeout indicates DNS lookup timeout.
-	ErrDNSTimeout = errors.New("i/o timeout on DNS lookup")
-
-	// ErrDNSTemporaryFailure indicates temporary DNS failure.
-	ErrDNSTemporaryFailure = errors.New("temporary DNS failure")
-)
-
-// IsDNSTimeout checks if the error is a DNS timeout.
-// This matches errors that contain both "i/o timeout" and "lookup" in the message,
-// which indicates a DNS lookup timeout.
-//
-// Best Practice (Go 1.20+):
-//   - Use errors.As() to check for net.Error with Timeout()
-//   - Use Contains() to verify "lookup" in message
-//   - Avoid pure string matching when possible
-//
-// Example:
-//
-//	if IsDNSTimeout(err) {
-//	    // Handle DNS timeout
-//	}
-func IsDNSTimeout(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	// Check standard error
-	if errors.Is(err, ErrDNSTimeout) {
-		return true
-	}
-
-	// Check for timeout using net.Error interface (Go 1.13+)
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		// Verify it's DNS-related by checking for "lookup" in message
-		return Contains(err.Error(), "lookup")
-	}
-
-	// Fallback: string matching for backward compatibility
-	// This handles cases where timeout is wrapped or error type is not net.Error
-	errStr := err.Error()
-	return Contains(errStr, "i/o timeout") && Contains(errStr, "lookup")
-}
-
 // ============================================================================
 // String Utilities
 // ============================================================================
@@ -463,11 +418,6 @@ func Contains(s, substr string) bool {
 // HasSuffix reports whether s ends with suffix.
 func HasSuffix(s, suffix string) bool {
 	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
-}
-
-// HasPrefix reports whether s starts with prefix.
-func HasPrefix(s, prefix string) bool {
-	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }
 
 func indexOf(s, substr string) int {

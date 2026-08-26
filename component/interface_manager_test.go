@@ -48,7 +48,7 @@ func TestInterfaceManagerMonitorStopsOnClosedUpdateChannel(t *testing.T) {
 	done := make(chan struct{})
 	close(ch)
 
-	go mgr.monitor(ch, done)
+	go mgr.monitor(ch, done, true)
 
 	select {
 	case <-done:
@@ -82,7 +82,7 @@ func TestInterfaceManagerRunsEveryMatchingCallback(t *testing.T) {
 
 	ch := make(chan netlink.LinkUpdate)
 	done := make(chan struct{})
-	go mgr.monitor(ch, done)
+	go mgr.monitor(ch, done, true)
 
 	ch <- testLinkUpdate(unix.RTM_NEWLINK, "eth0")
 
@@ -126,7 +126,7 @@ func TestInterfaceManagerIgnoresRepeatedDelLink(t *testing.T) {
 
 	ch := make(chan netlink.LinkUpdate)
 	done := make(chan struct{})
-	go mgr.monitor(ch, done)
+	go mgr.monitor(ch, done, true)
 
 	ch <- testLinkUpdate(unix.RTM_DELLINK, "eth0")
 	ch <- testLinkUpdate(unix.RTM_DELLINK, "eth0")

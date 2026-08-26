@@ -9,13 +9,9 @@ import (
 	"github.com/daeuniverse/outbound/netproxy"
 )
 
-// canAnnotateTCPRelayOffload reports whether the connection is offload-capable
-// (both ends resolve to concrete TCP sockets), so link logs can annotate
-// offload outcome and skip reasons.
-func canAnnotateTCPRelayOffload(conn netproxy.Conn) bool {
-	return canResolveTCPRelayOffloadConn(conn)
-}
-
+// canResolveTCPRelayOffloadConn reports whether the connection is
+// offload-capable (both ends resolve to concrete TCP sockets), so link logs
+// can annotate offload outcome and skip reasons.
 func canResolveTCPRelayOffloadConn(conn netproxy.Conn) bool {
 	if conn == nil {
 		return false

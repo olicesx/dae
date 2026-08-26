@@ -8,15 +8,12 @@ package daedns
 import (
 	"context"
 	"crypto/tls"
-	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/netip"
-	"net/url"
 	"sync"
 	"time"
 
@@ -24,13 +21,13 @@ import (
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/common/netutils"
 	componentdns "github.com/daeuniverse/dae/component/dns"
+	"github.com/daeuniverse/dae/component/dnstransport"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pkg/fastrand"
 	"github.com/daeuniverse/outbound/protocol/direct"
 	tc "github.com/daeuniverse/outbound/protocol/tuic/common"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/olicesx/quic-go"
-	"github.com/olicesx/quic-go/http3"
 )
 
 var errInternalDNSTruncated = fmt.Errorf("internal dns response truncated")
@@ -44,13 +41,8 @@ var udpDNSBufPool = sync.Pool{
 
 const lookupSharedTimeout = 10 * time.Second
 
-var (
-	// Test seams for queryHTTPS path validation without live network dependencies.
-	sendHTTPDNSFunc      = sendHTTPDNS
-	newHTTPTransportFunc = func(r *Router, upstream *componentdns.Upstream, target netip.AddrPort, http3Mode bool) http.RoundTripper {
-		return r.newHTTPTransport(upstream, target, http3Mode)
-	}
-)
+type httpDNSQueryFunc func(context.Context, *http.Client, string, *componentdns.Upstream, []byte) (*dnsmessage.Msg, error)
+type httpTransportFactoryFunc func(*Router, *componentdns.Upstream, netip.AddrPort, bool) http.RoundTripper
 
 func (r *Router) selectUpstream(ctx context.Context, upstreamName, host string, qtype uint16) (*componentdns.Upstream, error) {
 	if upstreamName != "" {
@@ -386,7 +378,7 @@ func (r *Router) queryTCP(ctx context.Context, target netip.AddrPort, data []byt
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	}
-	return sendStreamDNS(conn, data)
+	return dnstransport.SendStreamDNS(conn, data)
 }
 
 func (r *Router) queryTLS(ctx context.Context, upstream *componentdns.Upstream, target netip.AddrPort, data []byte) (*dnsmessage.Msg, error) {
@@ -407,57 +399,54 @@ func (r *Router) queryTLS(ctx context.Context, upstream *componentdns.Upstream, 
 	if err = tlsConn.Handshake(); err != nil {
 		return nil, err
 	}
-	return sendStreamDNS(tlsConn, data)
+	return dnstransport.SendStreamDNS(tlsConn, data)
+}
+
+func (r *Router) sendHTTPQuery(ctx context.Context, client *http.Client, target string, upstream *componentdns.Upstream, data []byte) (*dnsmessage.Msg, error) {
+	if r.httpSendFunc != nil {
+		return r.httpSendFunc(ctx, client, target, upstream, data)
+	}
+	return dnstransport.SendHTTPDNS(ctx, client, target, upstream, data)
 }
 
 func (r *Router) queryHTTPS(ctx context.Context, upstream *componentdns.Upstream, target netip.AddrPort, data []byte, http3Mode bool) (*dnsmessage.Msg, error) {
-	transport := newHTTPTransportFunc(r, upstream, target, http3Mode)
-	client := &http.Client{
-		Transport: transport,
+	generation := r.getOrCreateHTTPClient(upstream, target, http3Mode)
+	if generation == nil {
+		return nil, net.ErrClosed
 	}
-	defer client.CloseIdleConnections()
-	return sendHTTPDNSFunc(ctx, client, target.String(), upstream, data)
+	defer func() { r.releaseHTTPClient(generation) }()
+
+	msg, err := r.sendHTTPQuery(ctx, generation.Client, target.String(), upstream, data)
+	if err == nil || ctx.Err() != nil || !dnstransport.ShouldReplaceHTTPClient(err) {
+		return msg, err
+	}
+
+	next := r.replaceHTTPClient(generation, upstream, target, http3Mode)
+	previous := generation
+	generation = next
+	r.releaseHTTPClient(previous)
+	if generation == nil {
+		return nil, net.ErrClosed
+	}
+	return r.sendHTTPQuery(ctx, generation.Client, target.String(), upstream, data)
 }
 
 func (r *Router) newHTTPTransport(upstream *componentdns.Upstream, target netip.AddrPort, http3Mode bool) http.RoundTripper {
 	if http3Mode {
-		return &http3.Transport{
-			TLSClientConfig: &tls.Config{
-				ServerName:         upstream.Hostname,
-				NextProtos:         []string{"h3"},
-				InsecureSkipVerify: false,
-			},
-			QUICConfig: &quic.Config{},
-			Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
-				conn, err := direct.SymmetricDirect.DialContext(ctx, common.MagicNetwork("udp", r.soMark, r.mptcp), target.String())
-				if err != nil {
-					return nil, err
-				}
-				udpAddr := net.UDPAddrFromAddrPort(target)
-				fakePkt := netproxy.NewFakeNetPacketConn(conn.(netproxy.PacketConn), net.UDPAddrFromAddrPort(tc.GetUniqueFakeAddrPort()), udpAddr)
-				return quic.DialEarly(ctx, fakePkt, udpAddr, tlsCfg, cfg)
-			},
-		}
+		return dnstransport.NewHTTP3Transport(upstream.Hostname, func(ctx context.Context, _ string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
+			return dnstransport.DialEarlyOwned(ctx, func(ctx context.Context) (netproxy.Conn, error) {
+				return direct.SymmetricDirect.DialContext(ctx, common.MagicNetwork("udp", r.soMark, r.mptcp), target.String())
+			}, target, tlsCfg, cfg)
+		})
 	}
 
-	return &http.Transport{
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   20,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: time.Second,
-		TLSClientConfig: &tls.Config{
-			ServerName:         upstream.Hostname,
-			InsecureSkipVerify: false,
-		},
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			conn, err := direct.SymmetricDirect.DialContext(ctx, common.MagicNetwork("tcp", r.soMark, r.mptcp), target.String())
-			if err != nil {
-				return nil, err
-			}
-			return &netproxy.FakeNetConn{Conn: conn}, nil
-		},
-	}
+	return dnstransport.NewHTTPTransport(upstream.Hostname, func(ctx context.Context, _, _ string) (net.Conn, error) {
+		conn, err := direct.SymmetricDirect.DialContext(ctx, common.MagicNetwork("tcp", r.soMark, r.mptcp), target.String())
+		if err != nil {
+			return nil, err
+		}
+		return &netproxy.FakeNetConn{Conn: conn}, nil
+	})
 }
 
 func (r *Router) queryQUIC(ctx context.Context, upstream *componentdns.Upstream, target netip.AddrPort, data []byte) (*dnsmessage.Msg, error) {
@@ -489,7 +478,7 @@ func (r *Router) queryQUIC(ctx context.Context, upstream *componentdns.Upstream,
 
 	wire := append([]byte(nil), data...)
 	binary.BigEndian.PutUint16(wire[:2], 0)
-	return sendStreamDNS(stream, wire)
+	return dnstransport.SendStreamDNS(stream, wire)
 }
 
 func upstreamTargets(upstream *componentdns.Upstream) []netip.AddrPort {
@@ -516,90 +505,4 @@ func requestedIPVersion(network string) string {
 	default:
 		return ""
 	}
-}
-
-func sendHTTPDNS(ctx context.Context, client *http.Client, target string, upstream *componentdns.Upstream, data []byte) (*dnsmessage.Msg, error) {
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		return fmt.Errorf("do not use a server that will redirect, upstream: %v", upstream.String())
-	}
-	serverURL := url.URL{
-		Scheme: "https",
-		Host:   target,
-		Path:   upstream.Path,
-	}
-	wire := append([]byte(nil), data...)
-	binary.BigEndian.PutUint16(wire[0:2], 0)
-	q := serverURL.Query()
-	q.Set("dns", base64.RawURLEncoding.EncodeToString(wire))
-	serverURL.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverURL.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/dns-message")
-	req.Host = upstream.Hostname
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("http status code: %v", resp.StatusCode)
-	}
-	if contentType := resp.Header.Get("Content-Type"); contentType != "application/dns-message" {
-		return nil, fmt.Errorf("unexpected content-type: %v", contentType)
-	}
-	// io.ReadAll(LimitReader(body, 65535)) is equivalent to ReadFull into a
-	// 64KiB buffer: short reads return io.ErrUnexpectedEOF with the partial
-	// payload, which we treat as success to match ReadAll semantics.
-	poolBuf := udpDNSBufPool.Get().([]byte)
-	defer udpDNSBufPool.Put(poolBuf) //nolint:staticcheck
-	n, err := io.ReadFull(io.LimitReader(resp.Body, 65535), poolBuf)
-	if err != nil && err != io.ErrUnexpectedEOF {
-		return nil, err
-	}
-	var msg dnsmessage.Msg
-	if err = msg.Unpack(poolBuf[:n]); err != nil {
-		return nil, err
-	}
-	return &msg, nil
-}
-
-func sendStreamDNS(stream io.ReadWriter, data []byte) (*dnsmessage.Msg, error) {
-	buf := udpDNSBufPool.Get().([]byte)
-	defer udpDNSBufPool.Put(buf) //nolint:staticcheck
-
-	// Frame the request (2-byte big-endian length prefix + payload) into the
-	// pooled buffer. Typical DNS queries fit comfortably; fall back to a one-off
-	// allocation only for the pathological >64KiB query.
-	var req []byte
-	if reqLen := 2 + len(data); reqLen <= cap(buf) {
-		req = buf[:reqLen]
-	} else {
-		req = make([]byte, reqLen)
-	}
-	binary.BigEndian.PutUint16(req[:2], uint16(len(data)))
-	copy(req[2:], data)
-	if _, err := stream.Write(req); err != nil {
-		return nil, fmt.Errorf("failed to write DNS request: %w", err)
-	}
-
-	// The 2-byte length prefix is read into a stack array to avoid per-call
-	// heap allocation; the response payload reuses the pooled buffer. respLen is
-	// a uint16 so it always fits within buf's 64KiB capacity.
-	var lengthBuf [2]byte
-	if _, err := io.ReadFull(stream, lengthBuf[:]); err != nil {
-		return nil, fmt.Errorf("failed to read DNS response length: %w", err)
-	}
-	respLen := int(binary.BigEndian.Uint16(lengthBuf[:]))
-	respBuf := buf[:respLen]
-	if _, err := io.ReadFull(stream, respBuf); err != nil {
-		return nil, fmt.Errorf("failed to read DNS response payload: %w", err)
-	}
-	var msg dnsmessage.Msg
-	if err := msg.Unpack(respBuf); err != nil {
-		return nil, err
-	}
-	return &msg, nil
 }

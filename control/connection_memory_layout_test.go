@@ -51,9 +51,6 @@ func TestConnectionMemoryLayout(t *testing.T) {
 	egressLeaseBytes := unsafe.Sizeof(egressRuntimeLease{})
 	var emptyContext context.Context
 	contextInterfaceBytes := unsafe.Sizeof(emptyContext)
-	if runtime := newUdpEndpointReplyRuntime(nil, nil, udpEndpointReplyQueueSize); runtime != nil {
-		t.Fatal("reply runtime allocated while the generation dispatcher is disabled")
-	}
 	if endpointBytes >= baselineUdpEndpointBytes {
 		t.Fatalf("UdpEndpoint=%d bytes, want below pre-optimization %d", endpointBytes, baselineUdpEndpointBytes)
 	}
@@ -118,10 +115,9 @@ func TestConnectionMemoryLayout(t *testing.T) {
 		t.Fatalf("close measured session manager: %v", err)
 	}
 
-	t.Logf("UdpEndpoint=%d (was %d) optionalReplyRuntime=%d (disabled=nil) udpEndpointReply=%d legacyQueueElement=%d legacyQueueBacking=%d (was %d) staticLegacyEnvelope=%d FlowRuntime=%d UDPFlowRuntime=%d egressRuntimeLease=%d contextInterfaceSlot=%d contextWithDoneAllocs=%.1f tcpLifecycleAllocs=%.1f udpLifecycleAllocs=%.1f bpfUpdateTask=%d (was %d) DnsController=%d (was %d) UdpFlowBinding=%d TcpFlowBinding=%d",
+	t.Logf("UdpEndpoint=%d (was %d) udpEndpointReply=%d legacyQueueElement=%d legacyQueueBacking=%d (was %d) staticLegacyEnvelope=%d FlowRuntime=%d UDPFlowRuntime=%d egressRuntimeLease=%d contextInterfaceSlot=%d contextWithDoneAllocs=%.1f tcpLifecycleAllocs=%.1f udpLifecycleAllocs=%.1f bpfUpdateTask=%d (was %d) DnsController=%d (was %d) UdpFlowBinding=%d TcpFlowBinding=%d",
 		endpointBytes,
 		baselineUdpEndpointBytes,
-		unsafe.Sizeof(udpEndpointReplyRuntime{}),
 		replyBytes,
 		queueElementBytes,
 		queueElementBytes*udpEndpointReplyQueueSize,

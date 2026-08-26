@@ -27,7 +27,7 @@ func TestNewControlPlaneWithContextOptionsAbortsOnCanceledContext(t *testing.T) 
 	dnsConfig := &config.Dns{}
 	routingA := &config.Routing{}
 
-	_, err := newControlPlaneWithContextOptions(
+	_, err := NewControlPlaneWithContextOptions(
 		ctx,
 		log,
 		nil,
@@ -38,12 +38,12 @@ func TestNewControlPlaneWithContextOptionsAbortsOnCanceledContext(t *testing.T) 
 		global,
 		dnsConfig,
 		nil,
-		controlPlaneBuildOptions{},
+		ControlPlaneBuildOptions{},
 	)
 	if err == nil {
-		t.Fatal("newControlPlaneWithContextOptions() error = nil, want cancellation failure")
+		t.Fatal("NewControlPlaneWithContextOptions() error = nil, want cancellation failure")
 	}
 	if !stderrors.Is(err, context.Canceled) {
-		t.Fatalf("newControlPlaneWithContextOptions() error = %v, want context.Canceled", err)
+		t.Fatalf("NewControlPlaneWithContextOptions() error = %v, want context.Canceled", err)
 	}
 }

@@ -32,25 +32,31 @@ const (
 	NETKIT_L3 = 1
 )
 
+// netkitIpLinkAddArgs builds `ip link add` arguments for a netkit pair.
+// iproute2 only accepts lowercase "l2"/"l3" and "none"/"default". Mode must be
+// specified before `peer <name>`: after `peer`, iplink_netkit.c hands remaining
+// tokens to iplink_parse() as peer interface attributes, so a trailing
+// `mode l2` is either rejected or silently dropped. Kernel default is L3
+// (IFF_NOARP, empty MAC), which breaks dae's Ethernet/IPv6 NDP datapath.
+func netkitIpLinkAddArgs(name, peerName string, scrubNone bool) []string {
+	// Grammar from iproute2 iplink_netkit.c:
+	//   [ mode MODE ] [ POLICY ] [ scrub SCRUB ] [ peer [ POLICY ] [ scrub SCRUB ] NAME ]
+	// After `peer`, unknown tokens are handed to iplink_parse() as the peer
+	// ifname; there is no `peer_scrub` keyword.
+	args := []string{"link", "add", name, "type", "netkit", "mode", "l2"}
+	if scrubNone {
+		args = append(args, "scrub", "none", "peer", "scrub", "none", peerName)
+	} else {
+		args = append(args, "peer", peerName)
+	}
+	return args
+}
+
 // createNetkitDeviceViaIpCmd creates a Netkit device pair using the ip command.
 // This is the most reliable method as it uses iproute2 which has Netkit support.
-// When scrubNone is true, it attempts to set scrub=0 to preserve skb->mark.
+// When scrubNone is true, it attempts to set scrub=none to preserve skb->mark.
 func createNetkitDeviceViaIpCmd(name, peerName string, txQLen int, scrubNone bool) error {
-	// Try multiple syntax variations for Netkit device creation
-
-	// Build base command arguments
-	args := []string{"link", "add", name, "type", "netkit", "peer", peerName}
-
-	// Add mode. L2 keeps netkit compatible with dae's Ethernet-based datapath.
-	args = append(args, "mode", "L2")
-
-	// Add scrub configuration if requested
-	// scrub=0 means NETKIT_SCRUB_NONE (don't clear skb->mark)
-	// This requires iproute2 that supports the scrub parameter (kernel 6.6+)
-	if scrubNone {
-		args = append(args, "scrub", "0", "peer_scrub", "0")
-	}
-
+	args := netkitIpLinkAddArgs(name, peerName, scrubNone)
 	cmd := exec.Command("ip", args...)
 	output, err := cmd.CombinedOutput()
 	if err == nil {
@@ -64,9 +70,11 @@ func createNetkitDeviceViaIpCmd(name, peerName string, txQLen int, scrubNone boo
 		return nil
 	}
 
-	// If scrub configuration was requested and failed, try without it
-	if scrubNone && strings.Contains(string(output), "Unknown parameter") {
-		// ip command doesn't support scrub parameter, retry without it
+	// If scrub configuration was requested and failed, try without it.
+	out := string(output)
+	if scrubNone && (strings.Contains(out, "Unknown parameter") ||
+		strings.Contains(out, "Error: argument of \"scrub\"") ||
+		strings.Contains(out, "Garbage instead of arguments")) {
 		return createNetkitDeviceViaIpCmd(name, peerName, txQLen, false)
 	}
 

@@ -86,23 +86,16 @@ func (c *DnsController) CloneCacheForReload() map[string]*DnsCache {
 	return result
 }
 
-// RestoreReloadCache restores cache entries during reload and schedules their
-// BPF side effects through the regular asynchronous path.
-func (c *DnsController) RestoreReloadCache(entries map[string]*DnsCache, matchDomainBitmap func(string) []uint32, now time.Time) int {
-	count, _ := c.restoreReloadCache(entries, matchDomainBitmap, now, false)
-	return count
-}
-
 // RestoreReloadCacheAndProject restores cache entries and synchronously
 // applies their BPF side effects. Reload publication uses this variant so an
 // inactive routing plan has a complete domain projection before it becomes
 // visible to packets. The runtime callback must not attempt to update this
 // controller's runtime while it is executing.
 func (c *DnsController) RestoreReloadCacheAndProject(entries map[string]*DnsCache, matchDomainBitmap func(string) []uint32, now time.Time) (int, error) {
-	return c.restoreReloadCache(entries, matchDomainBitmap, now, true)
+	return c.restoreReloadCache(entries, matchDomainBitmap, now)
 }
 
-func (c *DnsController) restoreReloadCache(entries map[string]*DnsCache, matchDomainBitmap func(string) []uint32, now time.Time, projectSynchronously bool) (int, error) {
+func (c *DnsController) restoreReloadCache(entries map[string]*DnsCache, matchDomainBitmap func(string) []uint32, now time.Time) (int, error) {
 	if c == nil || len(entries) == 0 {
 		return 0, nil
 	}
@@ -142,7 +135,7 @@ func (c *DnsController) restoreReloadCache(entries map[string]*DnsCache, matchDo
 			c.enforceDnsCacheCapacityLocked(k)
 			_, loaded := c.storeDnsCache(k, restored)
 			c.rememberDnsKnowledge(dnsCacheBaseKey(k), restored.OriginalDeadline, !loaded)
-			if projectSynchronously && rt != nil && rt.cacheAccessCallback != nil {
+			if rt != nil && rt.cacheAccessCallback != nil {
 				if err := rt.cacheAccessCallback(restored); err != nil {
 					c.cacheProjectionMu.Unlock()
 					c.runtimeMu.RUnlock()
@@ -222,130 +215,6 @@ func ensureDNSCacheRouteOwnerKey(cacheKey string, cache *DnsCache) *DnsCache {
 	return cache
 }
 
-func aggregateDNSRemovalCandidate(caches []*DnsCache) *DnsCache {
-	var (
-		base    *DnsCache
-		answers []dnsmessage.RR
-		seen    = make(map[netip.Addr]struct{})
-	)
-
-	for _, cache := range caches {
-		if cache == nil {
-			continue
-		}
-		if base == nil {
-			base = cache
-		}
-		for _, ans := range cache.Answer {
-			ip, ok := dnsAnswerIP(ans)
-			if !ok || ip.IsUnspecified() {
-				continue
-			}
-			if _, ok := seen[ip]; ok {
-				continue
-			}
-			seen[ip] = struct{}{}
-			answers = append(answers, ans)
-		}
-	}
-
-	if base == nil || len(answers) == 0 {
-		return nil
-	}
-	return &DnsCache{
-		DomainBitmap:     base.DomainBitmap,
-		Answer:           answers,
-		Deadline:         base.Deadline,
-		OriginalDeadline: base.OriginalDeadline,
-	}
-}
-
-// orphanedDnsSideEffects filters removal side effects against the authoritative
-// remaining cache state for the same base key. Once scoped cache keys exist,
-// removing one scoped entry must not blindly delete IP-derived side effects
-// that are still backed by another live scoped entry.
-func (c *DnsController) orphanedDnsSideEffects(baseKey string, candidate *DnsCache) *DnsCache {
-	if candidate == nil {
-		return nil
-	}
-	if baseKey == "" {
-		return candidate
-	}
-	// Cache deletion updates dnsKnowledge before reaching this function. A
-	// missing family proves that no sibling cache can still own these IPs and
-	// avoids an O(total cache size) scan for normal unique-domain eviction.
-	if _, familyStillCached := c.dnsKnowledge.Load(baseKey); !familyStillCached {
-		return candidate
-	}
-
-	liveIPs := make(map[netip.Addr]struct{})
-	c.dnsCache.Range(func(key, value any) bool {
-		cacheKey, ok := key.(string)
-		if !ok || dnsCacheBaseKey(cacheKey) != baseKey {
-			return true
-		}
-		cache, ok := value.(*DnsCache)
-		if !ok {
-			c.loadAndDeleteDnsCache(cacheKey)
-			return true
-		}
-		for _, ans := range cache.Answer {
-			ip, ok := dnsAnswerIP(ans)
-			if !ok || ip.IsUnspecified() {
-				continue
-			}
-			liveIPs[ip] = struct{}{}
-		}
-		return true
-	})
-
-	if len(liveIPs) == 0 {
-		return candidate
-	}
-
-	orphaned := make([]dnsmessage.RR, 0, len(candidate.Answer))
-	for _, ans := range candidate.Answer {
-		ip, ok := dnsAnswerIP(ans)
-		if !ok || ip.IsUnspecified() {
-			continue
-		}
-		if _, ok := liveIPs[ip]; ok {
-			continue
-		}
-		orphaned = append(orphaned, ans)
-	}
-
-	if len(orphaned) == 0 {
-		return nil
-	}
-	return &DnsCache{
-		DomainBitmap:     candidate.DomainBitmap,
-		Answer:           orphaned,
-		Deadline:         candidate.Deadline,
-		OriginalDeadline: candidate.OriginalDeadline,
-	}
-}
-
-func (c *DnsController) onBaseKeySideEffectsEvicted(baseKey string, candidate *DnsCache) {
-	if cache := c.orphanedDnsSideEffects(baseKey, candidate); cache != nil {
-		c.onDnsCacheEvicted(cache)
-	}
-}
-
-func (c *DnsController) RemoveDnsRespCache(cacheKey string) {
-	c.requireStore()
-	c.cacheProjectionMu.Lock()
-	defer c.cacheProjectionMu.Unlock()
-	if removed, ok := c.loadAndDeleteDnsCache(cacheKey); ok {
-		if cache, ok := removed.(*DnsCache); ok {
-			baseKey := dnsCacheBaseKey(cacheKey)
-			c.forgetDnsKnowledge(cacheKey, cache)
-			c.invokeCacheDeleteCallback(cacheKey, cache)
-			c.onBaseKeySideEffectsEvicted(baseKey, cache)
-		}
-	}
-}
-
 func (c *DnsController) RemoveDnsRespCacheFamily(baseKey string) {
 	c.requireStore()
 	if baseKey == "" {
@@ -353,7 +222,6 @@ func (c *DnsController) RemoveDnsRespCacheFamily(baseKey string) {
 	}
 	c.cacheProjectionMu.Lock()
 	defer c.cacheProjectionMu.Unlock()
-	var removedCaches []*DnsCache
 	c.dnsCache.Range(func(key, value any) bool {
 		cacheKey, ok := key.(string)
 		if !ok || dnsCacheBaseKey(cacheKey) != baseKey {
@@ -366,12 +234,10 @@ func (c *DnsController) RemoveDnsRespCacheFamily(baseKey string) {
 		}
 		if c.compareAndDeleteDnsCache(cacheKey, cache) {
 			c.invokeCacheDeleteCallback(cacheKey, cache)
-			removedCaches = append(removedCaches, cache)
 		}
 		return true
 	})
 	c.syncDnsKnowledge(baseKey)
-	c.onBaseKeySideEffectsEvicted(baseKey, aggregateDNSRemovalCandidate(removedCaches))
 }
 
 func (c *DnsController) rememberDnsKnowledge(baseKey string, originalDeadline time.Time, newCacheEntry bool) {
@@ -488,106 +354,6 @@ func (c *DnsController) HasDnsKnowledge(baseKey string) bool {
 	return true
 }
 
-func (c *DnsController) onDnsCacheEvicted(cache *DnsCache) {
-	rt := c.runtime()
-	if cache == nil || rt == nil || rt.cacheRemoveCallback == nil {
-		return
-	}
-
-	if c.janitorStop != nil {
-		select {
-		case <-c.janitorStop:
-			c.invokeCacheRemoveCallback(cache)
-			return
-		default:
-		}
-	}
-
-	c.evictorChMu.RLock()
-	evictorQ := c.evictorQ
-	c.evictorChMu.RUnlock()
-	if evictorQ == nil {
-		c.invokeCacheRemoveCallback(cache)
-		return
-	}
-
-	select {
-	case evictorQ <- cache:
-	default:
-		// Keep datapath non-blocking under eviction bursts without creating an
-		// unbounded number of short-lived goroutines. A single background worker
-		// drains this spill buffer with the same callback semantics.
-		c.enqueueEvictorSpill(cache)
-	}
-}
-
-func (c *DnsController) enqueueEvictorSpill(cache *DnsCache) {
-	if cache == nil {
-		return
-	}
-	// If the evictor worker was never initialized, fall back to direct removal.
-	// This preserves behavior for manually constructed test controllers.
-	c.evictorChMu.RLock()
-	evictorWake := c.evictorWake
-	c.evictorChMu.RUnlock()
-	if evictorWake == nil {
-		c.invokeCacheRemoveCallback(cache)
-		return
-	}
-
-	const maxEvictorSpillEntries = 4096
-	c.evictorMu.Lock()
-	if len(c.evictorBuf) >= maxEvictorSpillEntries {
-		c.evictorMu.Unlock()
-		// Sustained callback overload must not create an unbounded retention
-		// queue. Preserve cleanup correctness with synchronous backpressure.
-		c.invokeCacheRemoveCallback(cache)
-		return
-	}
-	c.evictorBuf = append(c.evictorBuf, cache)
-	c.evictorMu.Unlock()
-
-	select {
-	case evictorWake <- struct{}{}:
-	default:
-	}
-}
-
-func (c *DnsController) takeEvictorSpillBatch() []*DnsCache {
-	c.evictorMu.Lock()
-	defer c.evictorMu.Unlock()
-	if len(c.evictorBuf) == 0 {
-		return nil
-	}
-	batch := c.evictorBuf
-	c.evictorBuf = nil
-	return batch
-}
-
-func (c *DnsController) drainEvictorSpill() {
-	for {
-		batch := c.takeEvictorSpillBatch()
-		if len(batch) == 0 {
-			return
-		}
-		for _, cache := range batch {
-			c.invokeCacheRemoveCallback(cache)
-		}
-	}
-}
-
-func (c *DnsController) invokeCacheRemoveCallback(cache *DnsCache) {
-	rt := c.runtime()
-	if cache == nil || rt == nil || rt.cacheRemoveCallback == nil {
-		return
-	}
-	if err := rt.cacheRemoveCallback(cache); err != nil {
-		if c.log != nil {
-			c.log.Warnf("failed to remove dns cache side effects: %v", err)
-		}
-	}
-}
-
 func (c *DnsController) invokeCacheDeleteCallback(cacheKey string, cache *DnsCache) {
 	rt := c.runtime()
 	if cache == nil || rt == nil || rt.cacheDeleteCallback == nil {
@@ -605,10 +371,8 @@ func (c *DnsController) evictDnsCacheLocked(cacheKey string, cache *DnsCache) bo
 	if cache == nil || !c.compareAndDeleteDnsCache(cacheKey, cache) {
 		return false
 	}
-	baseKey := dnsCacheBaseKey(cacheKey)
 	c.forgetDnsKnowledge(cacheKey, cache)
 	c.invokeCacheDeleteCallback(cacheKey, cache)
-	c.onBaseKeySideEffectsEvicted(baseKey, cache)
 	return true
 }
 
@@ -881,45 +645,6 @@ func (c *DnsController) startDnsCacheJanitor() {
 	}()
 }
 
-// startCacheEvictor runs a goroutine that processes asynchronous cache eviction
-// callbacks (CacheRemoveCallback / BatchRemoveDomainRouting).
-//
-// IMPORTANT: This goroutine intentionally does NOT watch baseContext().Done().
-// See bpfUpdateWorker comment for the rationale — the same stale-context problem
-// applies here when the DnsController is reused across reload generations.
-func (c *DnsController) startCacheEvictor() {
-	c.requireStore()
-	go func() {
-		defer close(c.evictorDone)
-		if c.evictorQ == nil {
-			return
-		}
-		if c.evictorWake == nil {
-			c.evictorWake = make(chan struct{}, 1)
-		}
-
-		for {
-			select {
-			case cache := <-c.evictorQ:
-				c.invokeCacheRemoveCallback(cache)
-				c.drainEvictorSpill()
-			case <-c.evictorWake:
-				c.drainEvictorSpill()
-			case <-c.janitorStop:
-				for {
-					select {
-					case cache := <-c.evictorQ:
-						c.invokeCacheRemoveCallback(cache)
-					default:
-						c.drainEvictorSpill()
-						return
-					}
-				}
-			}
-		}
-	}()
-}
-
 func (c *DnsController) LookupDnsRespCache(cacheKey string, ignoreFixedTtl bool) (cache *DnsCache) {
 	c.requireStore()
 	val, ok := c.dnsCache.Load(cacheKey)
@@ -1073,55 +798,6 @@ func (c *DnsController) updateDnsCache(msg *dnsmessage.Msg, responseCacheKey str
 	return nil
 }
 
-// staleDnsSideEffects builds a minimal cache entry containing only IP answers
-// that exist in prev but not in next. This lets us remove stale domain-routing
-// side effects after replacing a cache entry without deleting IPs that are
-// still present in the refreshed cache.
-func staleDnsSideEffects(prev, next *DnsCache) *DnsCache {
-	if prev == nil {
-		return nil
-	}
-	if next == nil {
-		return prev
-	}
-
-	staleCount := 0
-	firstStaleIdx := -1
-	lastStaleIdx := -1
-	contiguous := true
-
-	for i, ans := range prev.Answer {
-		ip, ok := dnsAnswerIP(ans)
-		if !ok || ip.IsUnspecified() || next.IncludeIp(ip) {
-			continue
-		}
-		if firstStaleIdx == -1 {
-			firstStaleIdx = i
-		} else if i != lastStaleIdx+1 {
-			contiguous = false
-		}
-		lastStaleIdx = i
-		staleCount++
-	}
-
-	if staleCount == 0 {
-		return nil
-	}
-	if contiguous {
-		return &DnsCache{Answer: prev.Answer[firstStaleIdx : lastStaleIdx+1 : lastStaleIdx+1]}
-	}
-
-	staleAnswers := make([]dnsmessage.RR, 0, staleCount)
-	for _, ans := range prev.Answer {
-		ip, ok := dnsAnswerIP(ans)
-		if !ok || ip.IsUnspecified() || next.IncludeIp(ip) {
-			continue
-		}
-		staleAnswers = append(staleAnswers, ans)
-	}
-	return &DnsCache{Answer: staleAnswers}
-}
-
 type daedlineFunc func(now time.Time, host string) (deadline time.Time, originalDeadline time.Time)
 
 func (c *DnsController) __updateDnsCacheDeadline(cacheKey string, host string, dnsTyp uint16, answers, ns, extra []dnsmessage.RR, deadlineFunc daedlineFunc) (err error) {
@@ -1177,12 +853,6 @@ func (c *DnsController) __updateDnsCacheDeadline(cacheKey string, host string, d
 			continue
 		}
 
-		var staleSideEffects *DnsCache
-		if oldValue, ok := c.dnsCache.Load(cacheKey); ok {
-			if oldCache, ok := oldValue.(*DnsCache); ok {
-				staleSideEffects = staleDnsSideEffects(oldCache, newCache)
-			}
-		}
 		newCache.RouteOwnerKey = cacheKey
 		c.enforceDnsCacheCapacityLocked(cacheKey)
 		_, loaded := c.storeDnsCache(cacheKey, newCache)
@@ -1206,17 +876,18 @@ func (c *DnsController) __updateDnsCacheDeadline(cacheKey string, host string, d
 			})
 			return projectionErr
 		}
-		if staleSideEffects != nil {
-			staleSideEffects.RouteOwnerKey = cacheKey
-			c.onBaseKeySideEffectsEvicted(baseKey, staleSideEffects)
-		}
 		return nil
 	}
 }
 
 func (c *DnsController) UpdateDnsCacheTtl(host string, dnsTyp uint16, answers, ns, extra []dnsmessage.RR, ttl int) (err error) {
-	c.requireStore()
-	return c.__updateDnsCacheDeadline("", host, dnsTyp, answers, ns, extra, func(now time.Time, host string) (daedline time.Time, originalDeadline time.Time) {
+	return c.UpdateDnsCacheTtlWithKey("", host, dnsTyp, answers, ns, extra, ttl)
+}
+
+// fixedTtlDeadlineFunc applies the fixed-domain TTL override to the response
+// TTL before the cache deadline is computed.
+func (c *DnsController) fixedTtlDeadlineFunc(ttl int) daedlineFunc {
+	return func(now time.Time, host string) (deadline time.Time, originalDeadline time.Time) {
 		originalDeadline = now.Add(time.Duration(ttl) * time.Second)
 		if rt := c.runtime(); rt != nil {
 			if fixedTtl, ok := rt.fixedDomainTtl[host]; ok {
@@ -1224,20 +895,12 @@ func (c *DnsController) UpdateDnsCacheTtl(host string, dnsTyp uint16, answers, n
 			}
 		}
 		return originalDeadline, originalDeadline
-	})
+	}
 }
 
 func (c *DnsController) UpdateDnsCacheTtlWithKey(cacheKey string, host string, dnsTyp uint16, answers, ns, extra []dnsmessage.RR, ttl int) (err error) {
 	c.requireStore()
-	return c.__updateDnsCacheDeadline(cacheKey, host, dnsTyp, answers, ns, extra, func(now time.Time, host string) (deadline time.Time, originalDeadline time.Time) {
-		originalDeadline = now.Add(time.Duration(ttl) * time.Second)
-		if rt := c.runtime(); rt != nil {
-			if fixedTtl, ok := rt.fixedDomainTtl[host]; ok {
-				return now.Add(time.Duration(fixedTtl) * time.Second), originalDeadline
-			}
-		}
-		return originalDeadline, originalDeadline
-	})
+	return c.__updateDnsCacheDeadline(cacheKey, host, dnsTyp, answers, ns, extra, c.fixedTtlDeadlineFunc(ttl))
 }
 
 // buildMinHeap constructs a min-heap from the cache entries slice.

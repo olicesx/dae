@@ -20,15 +20,6 @@ func (c *ControlPlane) PolicyEpoch() routing.PolicyEpoch {
 	return c.PolicyIdentity().Epoch()
 }
 
-// RoutingEpochForSlot returns kernel-plan metadata for diagnostics and replay.
-// It does not participate in routing or alter any control-plane state.
-func (c *ControlPlane) RoutingEpochForSlot(slot uint32) (routing.PolicyEpoch, bool, error) {
-	if c == nil || c.core == nil {
-		return 0, false, nil
-	}
-	return c.core.RoutingEpochForSlot(slot)
-}
-
 // RollbackPreparedRoutingEpoch restores the previously active kernel plan
 // before a failed prepared generation releases its slot-owned resources.
 func (c *ControlPlane) RollbackPreparedRoutingEpoch() error {

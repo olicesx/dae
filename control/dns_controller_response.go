@@ -128,12 +128,13 @@ func (c *DnsController) writeCachedResponse(resp []byte, reqId uint16, req *udpR
 	return nil
 }
 
-// sendDnsErrorResponse_ is the shared implementation for both sendRejectWithResponseWriter_
-// and sendRefusedWithResponseWriter_. It sets the common response fields, logs at trace
-// level, and sends the response via responseWriter or UDP.
+// sendDnsErrorResponse_ is the shared implementation for the reject/refused/
+// truncated control responses. It sets the common response fields, logs at
+// trace level, and sends the response via responseWriter or UDP.
 func (c *DnsController) sendDnsErrorResponse_(
 	dnsMessage *dnsmessage.Msg,
 	rcode int,
+	truncated bool,
 	traceMsg string,
 	req *udpRequest,
 	responseWriter dnsmessage.ResponseWriter,
@@ -142,7 +143,7 @@ func (c *DnsController) sendDnsErrorResponse_(
 	dnsMessage.Rcode = rcode
 	dnsMessage.Response = true
 	dnsMessage.RecursionAvailable = true
-	dnsMessage.Truncated = false
+	dnsMessage.Truncated = truncated
 	dnsMessage.Compress = true
 	if c.log.IsLevelEnabled(logrus.TraceLevel) {
 		c.log.WithFields(logrus.Fields{
@@ -170,43 +171,17 @@ func (c *DnsController) sendDnsErrorResponse_(
 
 // sendRefusedWithResponseWriter_ sends REFUSED response when overload protection is triggered.
 func (c *DnsController) sendRefusedWithResponseWriter_(dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
-	return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeRefused, "Refused due to concurrency limit", req, responseWriter)
+	return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeRefused, false, "Refused due to concurrency limit", req, responseWriter)
 }
 
+// sendDnsTruncatedResponse_ sends a TC=1 success response for oversized answers.
 func (c *DnsController) sendDnsTruncatedResponse_(dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) error {
-	dnsMessage.Answer = nil
-	dnsMessage.Rcode = dnsmessage.RcodeSuccess
-	dnsMessage.Response = true
-	dnsMessage.RecursionAvailable = true
-	dnsMessage.Truncated = true
-	dnsMessage.Compress = true
-	if c.log.IsLevelEnabled(logrus.TraceLevel) {
-		c.log.WithFields(logrus.Fields{
-			"question": dnsMessage.Question,
-		}).Traceln("Truncated")
-	}
-	if responseWriter != nil {
-		return responseWriter.WriteMsg(dnsMessage)
-	}
-	if req == nil || req.lConn == nil {
-		return nil
-	}
-	// Pack into a pooled DNS response buffer; data is consumed synchronously by the send.
-	bufPtr := dnsResponseBufPool.Get().(*[]byte)
-	defer dnsResponseBufPool.Put(bufPtr)
-	data, err := dnsMessage.PackBuffer((*bufPtr)[:cap(*bufPtr)])
-	if err != nil {
-		return fmt.Errorf("pack DNS packet: %w", err)
-	}
-	if err = sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.replySoMark(), req.downloadRecorder()); err != nil {
-		return err
-	}
-	return nil
+	return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeSuccess, true, "Truncated", req, responseWriter)
 }
 
 // sendRejectWithResponseWriter_ send empty answer.
 func (c *DnsController) sendRejectWithResponseWriter_(dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
-	return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeSuccess, "Reject", req, responseWriter)
+	return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeSuccess, false, "Reject", req, responseWriter)
 }
 
 // applyPreferenceWait implements RFC 8305 Happy Eyeballs Resolution Delay.

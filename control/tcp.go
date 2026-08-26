@@ -313,15 +313,15 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 	if offloadErr != nil {
 		return fmt.Errorf("handleTCP offloaded relay error: %w", offloadErr)
 	}
-	annotateOffload = canAnnotateTCPRelayOffload(rConn)
+	annotateOffload = canResolveTCPRelayOffloadConn(rConn)
 	if !offloaded && offloadReason != "" && c.log.IsLevelEnabled(logrus.DebugLevel) {
 		logOffloadSkipRateLimited(c.log, offloadReason)
 	}
 
-	// Log new TCP connections at Info level for visibility (consistent with UDP behavior)
-	// Note: TCP connections are inherently "new" at this point, unlike UDP endpoints which may be reused
-	if c.log.IsLevelEnabled(logrus.InfoLevel) {
-		c.log.WithFields(buildTCPLinkLogFields(res, dialParam, dst, domain, annotateOffload, offloaded, offloadReason)).Infof("%v <-> %v", RefineSourceToShow(src, dst.Addr()), res.DialTarget)
+	// Per-flow routing traces are Debug: at Info they dominate CPU/allocs
+	// under high connection rates. Raise log_level to debug to restore them.
+	if c.log.IsLevelEnabled(logrus.DebugLevel) {
+		c.log.WithFields(buildTCPLinkLogFields(res, dialParam, dst, domain, annotateOffload, offloaded, offloadReason)).Debugf("%v <-> %v", RefineSourceToShow(src, dst.Addr()), res.DialTarget)
 	}
 
 	if offloaded {
@@ -420,19 +420,10 @@ type WriteCloser interface {
 	CloseWrite() error
 }
 
-// RelayTCP copies data bidirectionally between two connections.
-// A relayCore orchestrates shared cancellation and force-close fallback.
-func RelayTCP(lConn, rConn netproxy.Conn) (err error) {
-	return RelayTCPContext(context.Background(), lConn, rConn)
-}
-
-// RelayTCPContext copies data bidirectionally between two connections with
-// the given context. The context can be used to cancel the relay operation
-// or set a deadline. A nil context is treated as context.Background().
-func RelayTCPContext(ctx context.Context, lConn, rConn netproxy.Conn) (err error) {
-	return RelayTCPContextWithRecords(ctx, lConn, rConn, RecordDownloadTraffic, RecordUploadTraffic)
-}
-
+// RelayTCPContextWithRecords copies data bidirectionally between two
+// connections. The context can be used to cancel the relay operation or set
+// a deadline. A nil context is treated as context.Background(). A relayCore
+// orchestrates shared cancellation and force-close fallback.
 func RelayTCPContextWithRecords(ctx context.Context, lConn, rConn netproxy.Conn, leftRecord func(int64), rightRecord func(int64)) (err error) {
 	core := newRelayCore(lConn, rConn, defaultRelayCopyEngine{}, leftRecord, rightRecord)
 	return core.run(ctx)
@@ -724,15 +715,6 @@ func (c *bufioConn) SetReadDeadline(t time.Time) error {
 
 func (c *bufioConn) SetWriteDeadline(t time.Time) error {
 	return c.Conn.SetWriteDeadline(t)
-}
-
-// handleTCPDnsFastPath handles DNS-over-TCP transparent proxy.
-// It reads DNS queries from the connection, processes them through the DNS controller,
-// and writes responses back. Returns true if the connection was handled as DNS.
-// Uses bufio.Reader to support peeking at data without consuming it,
-// allowing proper fallback to normal TCP handling if this isn't DNS traffic.
-func (c *ControlPlane) handleTCPDnsFastPath(ctx context.Context, lConn net.Conn, bufReader *bufio.Reader, src, dst netip.AddrPort, routingResult *bpfRoutingResult) (handled bool, err error) {
-	return c.handleTCPDnsFastPathOwned(ctx, lConn, bufReader, src, dst, routingResult, nil)
 }
 
 func (c *ControlPlane) handleTCPDnsFastPathOwned(

@@ -18,7 +18,6 @@ type dnsControllerRuntimeState struct {
 	routing               *dns.Dns
 	lifecycleCtx          context.Context
 	cacheAccessCallback   func(cache *DnsCache) (err error)
-	cacheRemoveCallback   func(cache *DnsCache) (err error)
 	cacheDeleteCallback   func(cacheKey string, cache *DnsCache) (err error)
 	newCache              func(fqdn string, answers, ns, extra []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
 	routeProjectionEpoch  uint64
@@ -132,7 +131,6 @@ func (c *DnsController) updateRuntime(option *DnsControllerOption, routing *dns.
 		routing:               routing,
 		lifecycleCtx:          lifecycleCtx,
 		cacheAccessCallback:   option.CacheAccessCallback,
-		cacheRemoveCallback:   option.CacheRemoveCallback,
 		cacheDeleteCallback:   option.CacheDeleteCallback,
 		newCache:              option.NewCache,
 		routeProjectionEpoch:  option.RouteProjectionEpoch,
@@ -164,12 +162,4 @@ func (c *DnsController) runtime() *dnsControllerRuntimeState {
 // invalid behavior config via error.
 func (c *DnsController) TryUpdateRuntime(option *DnsControllerOption, routing *dns.Dns) error {
 	return c.updateRuntime(option, routing)
-}
-
-// UpdateRuntime preserves the historical panic-on-invalid-input API for
-// external callers. New internal code should use TryUpdateRuntime.
-func (c *DnsController) UpdateRuntime(option *DnsControllerOption, routing *dns.Dns) {
-	if err := c.TryUpdateRuntime(option, routing); err != nil {
-		panic(err)
-	}
 }

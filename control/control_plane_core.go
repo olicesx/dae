@@ -489,72 +489,14 @@ func (c *controlPlaneCore) EjectBpf() *bpfObjects {
 	return bpf
 }
 
-func (c *controlPlaneCore) EjectLpmIndices() []uint32 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.routingEpochEnabled() {
-		// The retiring generation keeps its slot until Close() so a later
-		// route retry cannot observe a reused LPM map while it still drains.
-		return nil
-	}
-
-	indices := c.lpmTrieIndices
-	c.lpmTrieIndices = nil
-	return indices
-}
-
-// InheritLpmIndices adopts retired generations' ring slots. Slots that are no
-// longer referenced by the current generation are deleted immediately to free
-// memory; slots already reused by the current generation are skipped.
-func (c *controlPlaneCore) InheritLpmIndices(indices []uint32) {
-	if len(indices) == 0 {
-		return
-	}
-	if c.routingEpochEnabled() {
-		return
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	bpf := c.bpf.Load()
-
-	current := make(map[uint32]struct{}, len(c.lpmTrieIndices))
-	for _, idx := range c.lpmTrieIndices {
-		current[idx] = struct{}{}
-	}
-
-	pending := make([]uint32, 0, len(indices))
-	for _, idx := range indices {
-		if _, reused := current[idx]; reused {
-			continue
-		}
-		if bpf == nil || bpf.LpmArrayMap == nil {
-			pending = append(pending, idx)
-			current[idx] = struct{}{}
-			continue
-		}
-		if err := bpf.LpmArrayMap.Delete(idx); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-			c.log.Errorf("Failed to clear inherited BPF LPM slot %d: %v", idx, err)
-			pending = append(pending, idx)
-			current[idx] = struct{}{}
-		}
-	}
-	c.lpmTrieIndices = append(c.lpmTrieIndices, pending...)
-}
-
-// ReplaceLpmIndices installs a new active LPM index set for this generation
-// and eagerly reclaims the superseded indices when possible.
+// ReplaceLpmIndices installs a new active LPM index set for this generation.
+// Epoch slots own their LPM ring entries until the generation closes, so the
+// superseded set is reclaimed by finalizePreviousRoutingEpoch rather than
+// eagerly here.
 func (c *controlPlaneCore) ReplaceLpmIndices(indices []uint32) {
 	c.mu.Lock()
-	bpf := c.bpf.Load()
-	old := c.lpmTrieIndices
+	defer c.mu.Unlock()
 	c.lpmTrieIndices = append([]uint32(nil), indices...)
-	shouldCleanupOld := bpf != nil && bpf.LpmArrayMap != nil && !c.routingEpochEnabled()
-	c.mu.Unlock()
-
-	if shouldCleanupOld {
-		c.InheritLpmIndices(old)
-	}
 }
 
 // InjectBpf will inject bpf back.
@@ -602,6 +544,15 @@ func (c *controlPlaneCore) startIfindexWatcher() {
 		for {
 			select {
 			case <-c.closed.Done():
+				// Closing done makes the library close its netlink socket, but
+				// a subscription goroutine already blocked sending an update
+				// (teardown itself bursts RTM_NEWLINK events) never regains a
+				// receiver and leaks. Take over the drain until the socket
+				// close unblocks it and the library closes ch.
+				go func() {
+					for range ch {
+					}
+				}()
 				return
 			case upd, ok := <-ch:
 				if !ok {

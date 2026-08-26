@@ -13,9 +13,8 @@ import (
 )
 
 // BenchmarkUdpProxyDial measures the cost of the proxy-dial slow path under
-// UdpEndpointPool.GetOrCreate. This is the second coverage gap the SLO gate in
-// cmd/semantic_refactor_features.go was waiting on: no existing benchmark
-// exercised DialContext through the proxy dialer under UDP traffic.
+// UdpEndpointPool.GetOrCreate: no other benchmark exercises DialContext
+// through the proxy dialer under UDP traffic.
 //
 // Two cache regimes are compared:
 //
@@ -23,14 +22,6 @@ import (
 //     the slow path and actually performs a proxy dial.
 //   - cache=hit:  the same flow key is reused so GetOrCreate resolves through
 //     the shard lookup and skips dialing entirely.
-//
-// Endpoint-create admission gating is intentionally not measured here. That
-// gate is owned by the ordered dispatcher and is only meaningful when a task
-// is submitted through submitOrderedUDPIngress (it borrows a compensating
-// worker for the duration of the dial). Its cost is therefore covered by
-// BenchmarkQuicInitialEndToEnd/ordered_ingress, which runs the full dispatch
-// path. Calling acquireEndpointCreateAdmission outside the dispatcher would
-// spawn workers with no task to run, so it cannot be isolated correctly.
 func BenchmarkUdpProxyDial(b *testing.B) {
 	for _, cache := range []struct {
 		name string
@@ -125,5 +116,23 @@ func runUdpProxyDialBenchmark(b *testing.B, miss bool) {
 	}
 	if got := underlay.calls.Load(); got != wantDials {
 		b.Fatalf("proxy DialContext count = %d, want %d", got, wantDials)
+	}
+}
+
+// closeQuicBenchmarkEndpoint closes a benchmark endpoint with a timeout so a
+// hung Close fails the benchmark instead of deadlocking teardown.
+func closeQuicBenchmarkEndpoint(tb testing.TB, ue *UdpEndpoint) {
+	if ue == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = ue.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		tb.Errorf("UdpEndpoint.Close hung during benchmark teardown")
 	}
 }

@@ -360,7 +360,7 @@ func (ns *DaeNetns) setupVethOrNetkit() (err error) {
 }
 
 // tryCreateNetkit attempts to create a Netkit device pair.
-// It uses the ip command which has Netkit support in iproute2 6.7.0+.
+// createNetkitDevice prefers netlink and falls back to iproute2.
 func (ns *DaeNetns) tryCreateNetkit() (err error) {
 	ns.log.Debug("Starting Netkit device creation")
 
@@ -393,6 +393,14 @@ func (ns *DaeNetns) tryCreateNetkit() (err error) {
 		return fmt.Errorf("failed to get link dae0peer: %v", err)
 	}
 	ns.log.Debug("Got link reference for dae0peer")
+
+	if err = requireNetkitL2WithMAC(ns.dae0, ns.dae0peer); err != nil {
+		ns.log.Warnf("Rejecting Netkit pair: %v", err)
+		_ = DeleteLink(HostVethName)
+		ns.dae0 = nil
+		ns.dae0peer = nil
+		return err
+	}
 
 	// Set link up
 	ns.log.Debug("Setting link dae0 up")
@@ -676,15 +684,23 @@ func (ns *DaeNetns) setupIPv4Datapath() (err error) {
 	return
 }
 
-func (ns *DaeNetns) setupIPv6Datapath() (err error) {
-	// ip -6 a a fe80::ecee:eeff:feee:eeee/128 dev dae0 scope link
-	// fe80::ecee:eeff:feee:eeee/128 is the link-local address used for L2 NDP addressing
-	if err = netlink.AddrAdd(ns.dae0, &netlink.Addr{
+// dae0IPv6LinkLocal is the hardcoded next-hop used by dae netns IPv6 NDP.
+// IFA_F_NODAD skips Duplicate Address Detection so the address is usable
+// immediately; a tentative LL on netkit delays or blocks the default route.
+func dae0IPv6LinkLocal() *netlink.Addr {
+	return &netlink.Addr{
 		IPNet: &net.IPNet{
 			IP:   net.ParseIP("fe80::ecee:eeff:feee:eeee"),
 			Mask: net.CIDRMask(128, 128),
 		},
-	}); err != nil {
+		Flags: unix.IFA_F_NODAD,
+	}
+}
+
+func (ns *DaeNetns) setupIPv6Datapath() (err error) {
+	// ip -6 a a fe80::ecee:eeff:feee:eeee/128 dev dae0 scope link nodad
+	// fe80::ecee:eeff:feee:eeee/128 is the link-local address used for L2 NDP addressing
+	if err = netlink.AddrAdd(ns.dae0, dae0IPv6LinkLocal()); err != nil {
 		return fmt.Errorf("failed to add v6 addr to dae0: %v", err)
 	}
 

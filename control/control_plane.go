@@ -105,7 +105,6 @@ type ControlPlane struct {
 	dnsReloadCacheStreamSource     func(func(string, *DnsCache) error) error
 	dnsReloadCacheStreamSourceHash [32]byte
 	sharedBpfReload                bool
-	semanticRefactorFeatures       SemanticRefactorFeatureSet
 	// dnsRoutingUnchanged indicates that DNS routing configuration (excluding
 	// runtime-tunable parameters like OptimisticCache) did not change from the
 	// previous generation. It is retained for staged DNS handoff decisions;
@@ -113,62 +112,20 @@ type ControlPlane struct {
 	dnsRoutingUnchanged bool
 	closeOnce           sync.Once
 	closeErr            error
-	serveHooksMu        sync.RWMutex
-	serveHooks          *ServeLifecycleHooks
-}
-
-// ServeLifecycleHooks provides optional integration hooks for the three
-// prepared-generation boundaries in Serve. The production path leaves every
-// hook nil and calls the normal ControlPlane implementation directly.
-type ServeLifecycleHooks struct {
-	// ValidateListener replaces listener validation when non-nil.
-	ValidateListener func(*Listener) error
-	// CommitPreparedDatapath replaces the prepared BPF commit when non-nil.
-	CommitPreparedDatapath func() error
-	// PublishListenerSockets replaces listener FD publication when non-nil.
-	PublishListenerSockets func(*Listener) error
-	// ActivatePreparedRuntime replaces DNS/runtime activation when non-nil.
-	ActivatePreparedRuntime func() error
-}
-
-// SetServeLifecycleHooks installs optional lifecycle hooks and returns a
-// restore function. It is intended for controlled integration tests and
-// internal lifecycle adapters; nil hooks preserve the default behavior.
-func (c *ControlPlane) SetServeLifecycleHooks(hooks ServeLifecycleHooks) (restore func()) {
-	if c == nil {
-		return func() {}
-	}
-	c.serveHooksMu.Lock()
-	previous := c.serveHooks
-	copy := hooks
-	c.serveHooks = &copy
-	c.serveHooksMu.Unlock()
-	return func() {
-		c.serveHooksMu.Lock()
-		c.serveHooks = previous
-		c.serveHooksMu.Unlock()
-	}
-}
-
-func (c *ControlPlane) serveLifecycleHooks() ServeLifecycleHooks {
-	if c == nil {
-		return ServeLifecycleHooks{}
-	}
-	c.serveHooksMu.RLock()
-	defer c.serveHooksMu.RUnlock()
-	if c.serveHooks == nil {
-		return ServeLifecycleHooks{}
-	}
-	return *c.serveHooks
 }
 
 var policyEpochSequence atomic.Uint64
 
-type controlPlaneBuildOptions struct {
-	delayDatapathCommit   bool
-	delayDNSListenerStart bool
-	dnsRoutingUnchanged   bool
-	isReload              bool
+// ControlPlaneBuildOptions selects generation-mode behavior for
+// NewControlPlaneWithContextOptions. DelayDatapathCommit and
+// DelayDNSListenerStart build a prepared candidate that does not touch the
+// kernel datapath until CommitPreparedDatapath; IsReload selects reload-mode
+// TC handle flipping and skips startup-only stale hook purges.
+type ControlPlaneBuildOptions struct {
+	DelayDatapathCommit   bool
+	DelayDNSListenerStart bool
+	DNSRoutingUnchanged   bool
+	IsReload              bool
 }
 
 var (
@@ -240,33 +197,10 @@ func isIPLikeDomain(domain string) bool {
 	return false
 }
 
-func NewControlPlane(
-	log *logrus.Logger,
-	_bpf any,
-	dnsCache map[string]*DnsCache,
-	tagToNodeList map[string][]string,
-	groups []config.Group,
-	routingA *config.Routing,
-	global *config.Global,
-	dnsConfig *config.Dns,
-	externGeoDataDirs []string,
-) (plane *ControlPlane, err error) {
-	return newControlPlaneWithContextOptions(
-		context.Background(),
-		log,
-		_bpf,
-		dnsCache,
-		tagToNodeList,
-		groups,
-		routingA,
-		global,
-		dnsConfig,
-		externGeoDataDirs,
-		controlPlaneBuildOptions{},
-	)
-}
-
-func NewControlPlaneWithContext(
+// NewControlPlaneWithContextOptions is the single control-plane constructor;
+// the previous New{,Reload,Prepared,PreparedReload}ControlPlaneWithContext
+// wrapper family collapsed into this options-based entry point.
+func NewControlPlaneWithContextOptions(
 	ctx context.Context,
 	log *logrus.Logger,
 	_bpf any,
@@ -277,143 +211,7 @@ func NewControlPlaneWithContext(
 	global *config.Global,
 	dnsConfig *config.Dns,
 	externGeoDataDirs []string,
-	dnsRoutingUnchanged bool,
-) (plane *ControlPlane, err error) {
-	return newControlPlaneWithContextOptions(
-		ctx,
-		log,
-		_bpf,
-		dnsCache,
-		tagToNodeList,
-		groups,
-		routingA,
-		global,
-		dnsConfig,
-		externGeoDataDirs,
-		controlPlaneBuildOptions{
-			dnsRoutingUnchanged: dnsRoutingUnchanged,
-			isReload:            _bpf != nil,
-		},
-	)
-}
-
-// NewReloadControlPlaneWithContext builds a control plane during reload even
-// when it receives fresh BPF objects instead of shared objects from the old
-// generation. Reload builds must use reload TC handle flipping and must not run
-// startup-only stale hook purges.
-func NewReloadControlPlaneWithContext(
-	ctx context.Context,
-	log *logrus.Logger,
-	_bpf any,
-	dnsCache map[string]*DnsCache,
-	tagToNodeList map[string][]string,
-	groups []config.Group,
-	routingA *config.Routing,
-	global *config.Global,
-	dnsConfig *config.Dns,
-	externGeoDataDirs []string,
-	dnsRoutingUnchanged bool,
-) (plane *ControlPlane, err error) {
-	return newControlPlaneWithContextOptions(
-		ctx,
-		log,
-		_bpf,
-		dnsCache,
-		tagToNodeList,
-		groups,
-		routingA,
-		global,
-		dnsConfig,
-		externGeoDataDirs,
-		controlPlaneBuildOptions{
-			dnsRoutingUnchanged: dnsRoutingUnchanged,
-			isReload:            true,
-		},
-	)
-}
-
-// NewPreparedControlPlaneWithContext builds a new generation without mutating
-// the shared datapath. Call CommitPreparedDatapath before switching traffic.
-func NewPreparedControlPlaneWithContext(
-	ctx context.Context,
-	log *logrus.Logger,
-	_bpf any,
-	dnsCache map[string]*DnsCache,
-	tagToNodeList map[string][]string,
-	groups []config.Group,
-	routingA *config.Routing,
-	global *config.Global,
-	dnsConfig *config.Dns,
-	externGeoDataDirs []string,
-	dnsRoutingUnchanged bool,
-) (plane *ControlPlane, err error) {
-	return newControlPlaneWithContextOptions(
-		ctx,
-		log,
-		_bpf,
-		dnsCache,
-		tagToNodeList,
-		groups,
-		routingA,
-		global,
-		dnsConfig,
-		externGeoDataDirs,
-		controlPlaneBuildOptions{
-			delayDatapathCommit:   true,
-			delayDNSListenerStart: true,
-			dnsRoutingUnchanged:   dnsRoutingUnchanged,
-			isReload:              _bpf != nil,
-		},
-	)
-}
-
-// NewPreparedReloadControlPlaneWithContext builds a reload generation without
-// mutating the kernel datapath until CommitPreparedDatapath is called.
-func NewPreparedReloadControlPlaneWithContext(
-	ctx context.Context,
-	log *logrus.Logger,
-	_bpf any,
-	dnsCache map[string]*DnsCache,
-	tagToNodeList map[string][]string,
-	groups []config.Group,
-	routingA *config.Routing,
-	global *config.Global,
-	dnsConfig *config.Dns,
-	externGeoDataDirs []string,
-	dnsRoutingUnchanged bool,
-) (plane *ControlPlane, err error) {
-	return newControlPlaneWithContextOptions(
-		ctx,
-		log,
-		_bpf,
-		dnsCache,
-		tagToNodeList,
-		groups,
-		routingA,
-		global,
-		dnsConfig,
-		externGeoDataDirs,
-		controlPlaneBuildOptions{
-			delayDatapathCommit:   true,
-			delayDNSListenerStart: true,
-			dnsRoutingUnchanged:   dnsRoutingUnchanged,
-			isReload:              true,
-		},
-	)
-}
-
-func newControlPlaneWithContextOptions(
-	ctx context.Context,
-	log *logrus.Logger,
-	_bpf any,
-	dnsCache map[string]*DnsCache,
-	tagToNodeList map[string][]string,
-	groups []config.Group,
-	routingA *config.Routing,
-	global *config.Global,
-	dnsConfig *config.Dns,
-	externGeoDataDirs []string,
-	buildOpts controlPlaneBuildOptions,
+	buildOpts ControlPlaneBuildOptions,
 ) (plane *ControlPlane, err error) {
 	var freshDatapathState *FreshDatapathState
 	if state, ok := _bpf.(*FreshDatapathState); ok {
@@ -436,7 +234,6 @@ func newControlPlaneWithContextOptions(
 	if err := checkCtx("prepare"); err != nil {
 		return nil, err
 	}
-	refactorFeatures := semanticRefactorFeatureGateSnapshot()
 
 	// Clear failed QUIC DCID cache on reload/startup.
 	// Network conditions may have changed, so we should allow retrying sniffing
@@ -528,7 +325,7 @@ func newControlPlaneWithContextOptions(
 	}()
 	pinPath := filepath.Join(consts.BpfPinRoot, consts.AppName)
 	ephemeralPinPath := false
-	if _bpf == nil && buildOpts.isReload {
+	if _bpf == nil && buildOpts.IsReload {
 		pinPath = filepath.Join(pinPath, fmt.Sprintf("reload-%d-%d", os.Getpid(), time.Now().UnixNano()))
 		ephemeralPinPath = true
 	}
@@ -622,14 +419,14 @@ func newControlPlaneWithContextOptions(
 		bpf,
 		outboundId2Name,
 		&kernelVersion,
-		buildOpts.isReload,
+		buildOpts.IsReload,
 		!sharedBpfReload,
 	)
 	// A prepared shared-BPF routing-epoch generation must not overwrite the
 	// active generation's health map while it is still only a candidate. The
 	// runtime supervisor resumes its writes after publish, or leaves it paused
 	// while rollback restores the old generation.
-	if buildOpts.delayDatapathCommit && sharedBpfReload {
+	if buildOpts.DelayDatapathCommit && sharedBpfReload {
 		core.pauseOutboundConnectivityUpdates()
 	}
 	if ephemeralPinPath {
@@ -660,6 +457,9 @@ func newControlPlaneWithContextOptions(
 	option.DaeDNS, err = daedns.NewWithOption(log, global, dnsConfig, &daedns.NewOption{LocationFinder: locationFinder})
 	if err != nil {
 		return nil, err
+	}
+	if option.DaeDNS != nil {
+		deferFuncs = append(deferFuncs, option.DaeDNS.Close)
 	}
 
 	// Dial mode.
@@ -785,13 +585,11 @@ func newControlPlaneWithContextOptions(
 	if err != nil {
 		return nil, fmt.Errorf("create routing policy identity: %w", err)
 	}
-	if refactorFeatures.RoutingEpoch {
-		if _, err = core.PrepareRoutingEpoch(policyIdentity.Epoch(), sharedBpfReload); err != nil {
-			return nil, fmt.Errorf("prepare routing epoch: %w", err)
-		}
-		if err = core.clearDomainRoutingSlot(core.RoutingEpochSlot()); err != nil {
-			return nil, fmt.Errorf("clear inactive domain routing epoch: %w", err)
-		}
+	if _, err = core.PrepareRoutingEpoch(policyIdentity.Epoch(), sharedBpfReload); err != nil {
+		return nil, fmt.Errorf("prepare routing epoch: %w", err)
+	}
+	if err = core.clearDomainRoutingSlot(core.RoutingEpochSlot()); err != nil {
+		return nil, fmt.Errorf("clear inactive domain routing epoch: %w", err)
 	}
 	if log.IsLevelEnabled(logrus.DebugLevel) {
 		var debugBuilder strings.Builder
@@ -807,18 +605,14 @@ func newControlPlaneWithContextOptions(
 		return nil, fmt.Errorf("NewRoutingMatcherBuilder: %w", err)
 	}
 	kernspaceSnapshot := builder.KernspaceSnapshot()
-	if !buildOpts.delayDatapathCommit {
+	if !buildOpts.DelayDatapathCommit {
 		log.Infoln("Loading routing rules into kernel space (BPF)...")
 		var lpmIndices []uint32
-		if refactorFeatures.RoutingEpoch {
-			if lpmIndices, err = kernspaceSnapshot.BuildKernspaceForSlot(log, core.bpf.Load(), core.RoutingEpochSlot()); err != nil {
-				return nil, fmt.Errorf("routing kernspace snapshot: %w", err)
-			}
-			if err = core.StageRoutingEpoch(); err != nil {
-				return nil, fmt.Errorf("stage routing epoch: %w", err)
-			}
-		} else if lpmIndices, err = kernspaceSnapshot.BuildKernspace(log, core.bpf.Load()); err != nil {
+		if lpmIndices, err = kernspaceSnapshot.BuildKernspaceForSlot(log, core.bpf.Load(), core.RoutingEpochSlot()); err != nil {
 			return nil, fmt.Errorf("routing kernspace snapshot: %w", err)
+		}
+		if err = core.StageRoutingEpoch(); err != nil {
+			return nil, fmt.Errorf("stage routing epoch: %w", err)
 		}
 		core.lpmTrieIndices = lpmIndices
 	} else {
@@ -869,6 +663,10 @@ func newControlPlaneWithContextOptions(
 		return nil
 	}})
 	egressRuntime.configureResources(outbounds, egressDialers, DefaultUdpEndpointPool.forgetDialerEpochs)
+	var planeDeferFuncs []func() error
+	if option.DaeDNS != nil {
+		planeDeferFuncs = append(planeDeferFuncs, option.DaeDNS.Close)
+	}
 	deferFuncs = nil
 
 	// New control plane.
@@ -877,7 +675,7 @@ func newControlPlaneWithContextOptions(
 		log:           log,
 		runtimeStats:  newRuntimeStats(),
 		core:          core,
-		deferFuncs:    nil,
+		deferFuncs:    planeDeferFuncs,
 		listenIp:      "0.0.0.0",
 		egressRuntime: egressRuntime,
 		controlPlaneGenerationState: controlPlaneGenerationState{
@@ -888,7 +686,7 @@ func newControlPlaneWithContextOptions(
 			routingMatcher:      routingMatcher,
 			bootstrapResolvers:  bootstrapResolvers,
 		},
-		controlPlaneDNSRuntime:        newControlPlaneDNSRuntime(buildOpts.delayDNSListenerStart),
+		controlPlaneDNSRuntime:        newControlPlaneDNSRuntime(buildOpts.DelayDNSListenerStart),
 		controlPlaneDatapathJanitor:   newControlPlaneDatapathJanitor(),
 		onceNetworkReady:              sync.Once{},
 		drainTracker:                  newControlPlaneDrainTracker(),
@@ -897,11 +695,10 @@ func newControlPlaneWithContextOptions(
 		ready:                         make(chan struct{}),
 		autoConfigKernelParameter:     global.AutoConfigKernelParameter,
 		routingKernspaceSnapshot:      kernspaceSnapshot,
-		preparedDatapathCommit:        buildOpts.delayDatapathCommit,
+		preparedDatapathCommit:        buildOpts.DelayDatapathCommit,
 		sharedBpfReload:               sharedBpfReload,
 		pendingDnsReloadCache:         dnsCache,
-		dnsRoutingUnchanged:           buildOpts.dnsRoutingUnchanged,
-		semanticRefactorFeatures:      refactorFeatures,
+		dnsRoutingUnchanged:           buildOpts.DNSRoutingUnchanged,
 		controlPlaneRealDomainRuntime: newControlPlaneRealDomainRuntime(),
 		lanInterface:                  global.LanInterface,
 		wanInterface:                  global.WanInterface,
@@ -918,7 +715,7 @@ func newControlPlaneWithContextOptions(
 	SetAnyfromSoMark(global.SoMarkFromDae)
 	plane.deferFuncs = append(plane.deferFuncs, plane.closePublishedListenerFiles)
 	plane.startRealDomainNegJanitor()
-	if !buildOpts.delayDatapathCommit {
+	if !buildOpts.DelayDatapathCommit {
 		plane.startConnStateJanitor()
 	}
 
@@ -961,7 +758,7 @@ func newControlPlaneWithContextOptions(
 		if err != nil {
 			return nil, err
 		}
-		if !buildOpts.delayDNSListenerStart {
+		if !buildOpts.DelayDNSListenerStart {
 			if err = plane.dnsListener.Start(); err != nil {
 				log.Errorf("Failed to start DNS listener: %v", err)
 			} else {
@@ -981,59 +778,34 @@ func newControlPlaneWithContextOptions(
 		dnsUpstream.InitUpstreams(plane.ctx)
 	}()
 
-	if buildOpts.delayDatapathCommit {
+	if buildOpts.DelayDatapathCommit {
 		plane.preparedDatapathCommit = true
 	} else {
 		if err = plane.commitInterfaceBindings(); err != nil {
 			return nil, err
 		}
-		if plane.semanticRefactorFeatures.RoutingEpoch {
-			if err = plane.replayDnsReloadCache(); err != nil {
-				return nil, fmt.Errorf("replay DNS reload cache: %w", err)
-			}
-			if err = core.PublishRoutingEpoch(); err != nil {
-				return nil, fmt.Errorf("publish routing epoch: %w", err)
-			}
-		} else {
-			skipDNSReloadReplay := plane.sharedBpfReload && plane.dnsRoutingUnchanged
-			if !skipDNSReloadReplay {
-				if bpf := core.bpf.Load(); bpf != nil {
-					if err = clearReloadDomainRoutingMap(bpf); err != nil {
-						return nil, fmt.Errorf("clearReloadDomainRoutingMap: %w", err)
-					}
-				}
-				if err = plane.replayDnsReloadCache(); err != nil {
-					return nil, fmt.Errorf("replay DNS reload cache: %w", err)
-				}
-			}
+		if err = plane.replayDnsReloadCache(); err != nil {
+			return nil, fmt.Errorf("replay DNS reload cache: %w", err)
+		}
+		if err = core.PublishRoutingEpoch(); err != nil {
+			return nil, fmt.Errorf("publish routing epoch: %w", err)
 		}
 		if err = core.commitBpfHookFlip(); err != nil {
-			if plane.semanticRefactorFeatures.RoutingEpoch {
-				if rollbackErr := core.RollbackRoutingEpoch(); rollbackErr != nil {
-					return nil, stderrors.Join(err, rollbackErr)
-				}
+			if rollbackErr := core.RollbackRoutingEpoch(); rollbackErr != nil {
+				return nil, stderrors.Join(err, rollbackErr)
 			}
 			return nil, err
 		}
 		plane.releaseCommittedDNSReloadState()
 		plane.markReady()
 	}
-	// Standalone callers retain generation-owned dispatchers. AttachSessionManager
-	// replaces them with process-owned instances before Serve starts.
-	plane.udpOrderedDispatcher = newUDPOrderedDispatcherForFeatures(plane.semanticRefactorFeatures)
-	plane.udpReplyDispatcher = newUDPReplyDispatcherForFeatures(plane.semanticRefactorFeatures)
 	return plane, nil
 }
 
-// clearReloadDomainRoutingMap clears slot zero for callers that operate on a
-// fresh datapath. Shared reloads must use clearReloadDomainRoutingMapSlot so
-// they never erase the still-readable active plan.
+// clearReloadDomainRoutingMapSlot clears one routing epoch slot of the domain
+// routing map.
 // IMPORTANT: Connection-state maps are preserved across in-process reload
 // (Scheme3 Embedded Design). Do NOT clear them here.
-func clearReloadDomainRoutingMap(bpf *bpfObjects) error {
-	return clearReloadDomainRoutingMapSlot(bpf, 0)
-}
-
 func clearReloadDomainRoutingMapSlot(bpf *bpfObjects, slot uint32) error {
 	if bpf == nil || bpf.DomainRoutingMap == nil {
 		return nil
@@ -1122,20 +894,6 @@ func (c *ControlPlane) DrainIdleCh() <-chan struct{} {
 		return closedDrainIdleCh
 	}
 	return c.drainTracker.IdleCh()
-}
-
-func (c *ControlPlane) EjectLpmIndices() []uint32 {
-	if c == nil || c.core == nil {
-		return nil
-	}
-	return c.core.EjectLpmIndices()
-}
-
-func (c *ControlPlane) InheritLpmIndices(indices []uint32) {
-	if c == nil || c.core == nil {
-		return
-	}
-	c.core.InheritLpmIndices(indices)
 }
 
 func (c *ControlPlane) ReplaceLpmIndices(indices []uint32) {
@@ -1663,6 +1421,12 @@ func (c *ControlPlane) stopRealDomainNegJanitor() {
 	})
 }
 
+// RunReloadRetirementCleanup purges old-generation datapath state after a
+// reload retires the previous control plane. staleBeforeNs is the monotonic
+// timestamp of the reload request: entries not refreshed since that point
+// belonged to the retired generation and are deleted immediately instead of
+// waiting for their TTL. Entries kept by active flows (last_seen refreshed
+// per packet) and by session-manager pins (adopted-but-idle sessions) survive.
 func (c *ControlPlane) RunReloadRetirementCleanup(staleBeforeNs uint64) {
 	if c == nil {
 		return
@@ -1678,10 +1442,10 @@ func (c *ControlPlane) RunReloadRetirementCleanup(staleBeforeNs uint64) {
 	}
 
 	c.connStateCleanupMu.Lock()
-	redirectDeleted := c.cleanupRedirectTrackMapBeforeLocked(0)
-	cookieDeleted := c.cleanupCookiePidMapBeforeLocked(0)
-	routingHandoffDeleted := c.cleanupRoutingHandoffMapBeforeLocked(0)
-	udpStats, tcpStats := c.cleanupConnStateMapBeforeLocked(true, 0)
+	redirectDeleted := c.cleanupRedirectTrackMapBeforeLocked(staleBeforeNs)
+	cookieDeleted := c.cleanupCookiePidMapBeforeLocked(staleBeforeNs)
+	routingHandoffDeleted := c.cleanupRoutingHandoffMapBeforeLocked(staleBeforeNs)
+	udpStats, tcpStats := c.cleanupConnStateMapBeforeLocked(true, staleBeforeNs)
 	c.connStateCleanupMu.Unlock()
 
 	if c.log == nil {
@@ -2413,7 +2177,6 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			}
 		}
 	}()
-	hooks := c.serveLifecycleHooks()
 	validateListener := func(listener *Listener) error {
 		if listener == nil {
 			return fmt.Errorf("nil listener")
@@ -2430,27 +2193,17 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 		}
 		return nil
 	}
-	if hooks.ValidateListener != nil {
-		validateListener = hooks.ValidateListener
-	}
 	if err := validateListener(listener); err != nil {
 		return err
 	}
 	publishListenerSockets := c.publishListenerSockets
-	if hooks.PublishListenerSockets != nil {
-		publishListenerSockets = hooks.PublishListenerSockets
-	}
 	publishBeforeCommit := c.preparedDatapathCommit && !c.sharedBpfReload && c.core != nil
 	if publishBeforeCommit {
 		if err := publishListenerSockets(listener); err != nil {
 			return err
 		}
 	}
-	commitPreparedDatapath := c.CommitPreparedDatapath
-	if hooks.CommitPreparedDatapath != nil {
-		commitPreparedDatapath = hooks.CommitPreparedDatapath
-	}
-	if err := commitPreparedDatapath(); err != nil {
+	if err := c.CommitPreparedDatapath(); err != nil {
 		return err
 	}
 	if !publishBeforeCommit {
@@ -2458,11 +2211,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			return err
 		}
 	}
-	activatePreparedRuntime := c.activatePreparedRuntime
-	if hooks.ActivatePreparedRuntime != nil {
-		activatePreparedRuntime = hooks.ActivatePreparedRuntime
-	}
-	if err := activatePreparedRuntime(); err != nil {
+	if err := c.activatePreparedRuntime(); err != nil {
 		return err
 	}
 	udpConn, _ := listener.packetConn.(*net.UDPConn)
@@ -2498,7 +2247,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				defer func() {
 					if recovered := recover(); recovered != nil {
 						_ = lconn.Close()
-						reportUDPDispatcherPanic("tcp_conn", "serve", &c.tcpConnPanicCount, recovered)
+						reportPacketPathPanic("tcp_conn", "serve", &c.tcpConnPanicCount, recovered)
 					}
 				}()
 				ownership, ok := c.acquireIncomingConnectionLease(lconn)
@@ -2558,10 +2307,10 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				// DNS, VoIP, and other low-latency exception traffic bypasses the
 				// ordered per-flow queue and runs immediately.
 				go task.Run()
-			} else if !c.submitOrderedUDPIngress(flowDecision.Key, task, pktBuf, &c.udpIngressAdmission) {
-				// Rejected: the dispatcher does not own the buffer or the
-				// admission, so release both inline and return the task to the
-				// pool (it was never queued, so Run() will not run).
+			} else if !DefaultUdpTaskPool.EmitTask(flowDecision.Key, task) {
+				// Rejected: the pool does not own the buffer or the admission,
+				// so release both inline and return the task to the pool (it
+				// was never queued, so Run() will not run).
 				c.udpIngressAdmission.release()
 				pktBuf.Put()
 				udpIngressTaskPool.Put(task)
@@ -2873,9 +2622,7 @@ func (c *ControlPlane) abortConnections(abortManagedTCP bool) (err error) {
 			}
 		}
 	}
-	c.closeUDPOrderedDispatcher()
 	c.udpIngressAdmission.closeAndWait()
-	c.waitUDPOrderedDispatcher()
 	// Wait for endpoint creation already admitted by this generation before
 	// scanning the shared pool. New creation attempts are rejected once closed.
 	c.udpEndpointAdmission.closeAndWait()
@@ -2898,8 +2645,6 @@ func (c *ControlPlane) abortConnections(abortManagedTCP bool) (err error) {
 			errs = append(errs, udpErr)
 		}
 	}
-	c.closeUDPReplyDispatcher()
-	c.waitUDPReplyDispatcher()
 
 	return stderrors.Join(errs...)
 }
@@ -2935,24 +2680,6 @@ func ResetGlobalUdpState() {
 	DefaultAnyfromPool.Reset()
 	DefaultUdpTaskPool.Close()
 	DefaultPacketSnifferSessionMgr.Close() // Close() stops janitor goroutines; safe for shutdown path
-	ResetUdpLogLimiters()
-}
-
-// ResetGlobalUdpFlowState evicts stale UDP flow state for a fresh-datapath
-// reload. Unlike ResetGlobalUdpState it only clears pooled endpoints, anyfrom
-// connections and sniffer sessions — each of which may still reference the
-// retiring generation's dialer, outbound group and cached routing result —
-// without stopping the background janitor goroutines, so the successor
-// generation reuses the same pool singletons.
-//
-// This must be called during a fresh-datapath cutover, after the old
-// generation stops accepting traffic and before the new generation starts
-// serving, so incoming flows are routed by the fresh policy instead of
-// inheriting stale decisions bound to the previous (now detached) maps.
-func ResetGlobalUdpFlowState() {
-	DefaultUdpEndpointPool.Reset()
-	DefaultAnyfromPool.Reset()
-	DefaultPacketSnifferSessionMgr.Reset()
 }
 
 func (c *ControlPlane) closeTail() error {
@@ -3048,11 +2775,7 @@ func (c *ControlPlane) Close() (err error) {
 		if manager, owned := c.controlPlaneSessionManager(); owned && manager != nil {
 			c.closeErr = stderrors.Join(c.closeErr, manager.Close())
 		}
-		c.closeUDPOrderedDispatcher()
 		c.udpIngressAdmission.closeAndWait()
-		c.waitUDPOrderedDispatcher()
-		c.closeUDPReplyDispatcher()
-		c.waitUDPReplyDispatcher()
 
 		var stopWg sync.WaitGroup
 		stopWg.Add(2)

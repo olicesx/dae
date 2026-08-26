@@ -6,7 +6,6 @@
 package control
 
 import (
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -98,28 +97,6 @@ func TestDnsCacheLRUScratchDoesNotRetainCacheSizedPeak(t *testing.T) {
 	controller.putLRUScratch(make([]cacheEntry, 128))
 	if got := cap(controller.lruScratch); got != 128 {
 		t.Fatalf("small LRU scratch capacity retained = %d, want 128", got)
-	}
-}
-
-func TestDnsCacheEvictorSpillAppliesBoundedBackpressure(t *testing.T) {
-	controller := newCapacityTestDnsController(1)
-	controller.evictorWake = make(chan struct{}, 1)
-	var synchronousCallbacks atomic.Int32
-	setTestDnsControllerRuntime(controller, func(rt *dnsControllerRuntimeState) {
-		rt.cacheRemoveCallback = func(*DnsCache) error {
-			synchronousCallbacks.Add(1)
-			return nil
-		}
-	})
-	cache := &DnsCache{}
-	for range 4097 {
-		controller.enqueueEvictorSpill(cache)
-	}
-	if got := len(controller.evictorBuf); got != 4096 {
-		t.Fatalf("evictor spill length = %d, want 4096", got)
-	}
-	if got := synchronousCallbacks.Load(); got != 1 {
-		t.Fatalf("synchronous overflow callbacks = %d, want 1", got)
 	}
 }
 

@@ -46,8 +46,9 @@ var errUDPWriteBatchOversized = stderrors.New("udp write batch: datagram too lar
 // policy asynchronously, so the synchronous Append path stays allocation-
 // light and lock-free for the common case.
 //
-// Per-flow ordering is preserved: the upstream ordered dispatcher serializes
-// WriteTo calls per flow, Append preserves order, and flush drains in order.
+// Per-flow ordering is preserved: the per-flow convoy task pool funnels each
+// flow's WriteTo calls through a single producer, Append preserves order, and
+// flush drains in order.
 type udpWriteBatchAggregator struct {
 	ue *UdpEndpoint
 

@@ -67,15 +67,6 @@ func (r *controlPlaneDNSRuntime) activeController(handoff *atomic.Pointer[DnsCon
 	return r.dnsController
 }
 
-func (r *controlPlaneDNSRuntime) detachController() *DnsController {
-	if r == nil {
-		return nil
-	}
-	controller := r.dnsController
-	r.dnsController = nil
-	return controller
-}
-
 func (r *controlPlaneDNSRuntime) registerListenerStop(deferFuncs *[]func() error, stop func() error) {
 	if r == nil || r.dnsListener == nil || r.dnsListenerStopRegistered {
 		return

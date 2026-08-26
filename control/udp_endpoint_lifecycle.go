@@ -37,24 +37,25 @@ func sameUdpConnStateOwner(left, right udpConnStateOwner) bool {
 	return left == right
 }
 
-// FlowBinding returns the immutable route and egress selections made when the endpoint was created.
+// FlowBinding returns the immutable route and egress selections made when the
+// endpoint was created. Production code reads only Route.Mark (via
+// replySoMark); the full binding is a verification surface for tests.
 func (ue *UdpEndpoint) FlowBinding() UdpFlowBinding {
 	if ue == nil || !ue.flowBindingSet {
 		return UdpFlowBinding{}
 	}
-	egress := UdpEgressBinding{
-		Dialer:        ue.Dialer,
-		Outbound:      ue.Outbound,
-		Target:        ue.DialTarget,
-		Network:       ue.flowNetwork,
-		NetworkType:   ue.endpointNetworkType,
-		SniffedDomain: ue.SniffedDomain,
-		IsDialIp:      ue.flowBindingDialIP,
+	return UdpFlowBinding{
+		Route: ue.flowRouteBinding,
+		Egress: UdpEgressBinding{
+			Dialer:        ue.Dialer,
+			Outbound:      ue.Outbound,
+			Target:        ue.DialTarget,
+			Network:       ue.flowNetwork,
+			NetworkType:   ue.endpointNetworkType,
+			SniffedDomain: ue.SniffedDomain,
+			IsDialIp:      ue.flowBindingDialIP,
+		},
 	}
-	if ue.flowEgressOverride != nil {
-		egress = *ue.flowEgressOverride
-	}
-	return UdpFlowBinding{Route: ue.flowRouteBinding, Egress: egress}
 }
 
 func (ue *UdpEndpoint) replySoMark() uint32 {
@@ -72,10 +73,6 @@ func (ue *UdpEndpoint) setFlowBinding(binding UdpFlowBinding) {
 	ue.flowNetwork = binding.Egress.Network
 	ue.flowBindingDialIP = binding.Egress.IsDialIp
 	ue.flowBindingSet = true
-	if got := ue.FlowBinding().Egress; got != binding.Egress {
-		override := binding.Egress
-		ue.flowEgressOverride = &override
-	}
 }
 
 func (ue *UdpEndpoint) TrackUdpConnStateTuplePair(src, dst netip.AddrPort) {
@@ -224,9 +221,15 @@ func (ue *UdpEndpoint) logEndpointExit(err error, msg string) {
 		return
 	}
 	natTimeout := ue.natTimeout()
+	dialerName := ""
+	if ue.Dialer != nil {
+		if prop := ue.Dialer.Property(); prop != nil {
+			dialerName = prop.Name
+		}
+	}
 	fields := logrus.Fields{
 		"lAddr":       ue.lAddr.String(),
-		"dialer":      ue.Dialer.Property().Name,
+		"dialer":      dialerName,
 		"proxy_addr":  ue.DialTarget,
 		"sniffed":     ue.SniffedDomain,
 		"nat_timeout": natTimeout.String(),
@@ -394,6 +397,43 @@ func (ue *UdpEndpoint) retire() {
 	ue.expiresAtNano.Store(1)
 	ue.selfRemoveFromPool()
 	_ = ue.Close()
+}
+
+// markRetiredFromReceiver is the push-mode equivalent of retire() for a
+// goroutine that already owns the reply-sender lifecycle. Close() waits for
+// replyQueueDone, which only the sender itself closes, so calling retire()
+// from handleReceivedPacket or replySender would deadlock on <-done.
+func (ue *UdpEndpoint) markRetiredFromReceiver() {
+	ue.dead.Store(true)
+	ue.expiresAtNano.Store(1)
+	ue.selfRemoveFromPool()
+	// The conn still has to be released, and after selfRemoveFromPool nobody
+	// else references the endpoint: pool scans and Remove(key, ...) can no
+	// longer find it. Run Close() on a fresh goroutine — never on the sender
+	// or transport-callback stack — so it may wait for this sender to drain
+	// and exit before closing the conn.
+	go func() { _ = ue.Close() }()
+}
+
+// retireFromReplySender evicts the endpoint from the reply sender. Push mode
+// only marks the endpoint dead: Close() there waits on replyQueueDone, which
+// only this sender closes, so markRetiredFromReceiver hands the actual
+// teardown to a fresh goroutine that waits for this sender to drain. ReadFrom
+// mode has no shared queue, so Close() is safe on this stack and required to
+// release the conn — the read loop's defer only waits on its local senderDone.
+func (ue *UdpEndpoint) retireFromReplySender() {
+	ue.replyQueueMu.Lock()
+	// A failed RegisterPacketReceiver tears the shared queue down
+	// (replyQueueClosed) and then falls back to the ReadFrom loop. The
+	// leftover replyQueueDone must not keep us on the push-mode path:
+	// ReadFrom's sender has to Close() the conn itself.
+	pushMode := ue.replyQueueDone != nil && !ue.replyQueueClosed
+	ue.replyQueueMu.Unlock()
+	if pushMode {
+		ue.markRetiredFromReceiver()
+		return
+	}
+	ue.retire()
 }
 
 // udpEndpointWriteTimeout bounds how long one proxy-side write may block. A
@@ -653,11 +693,7 @@ func (ue *UdpEndpoint) Close() error {
 	ue.closeOnce.Do(func() {
 		ue.dead.Store(true)
 		ue.expiresAtNano.Store(0)
-		ue.stopPacketReceiver()
-		if ue.replyRuntime != nil {
-			ue.stopReplyDispatcher()
-			ue.replyRuntime.dispatcher.closeInput(ue)
-		}
+		ue.stopTransportReceiver()
 		ue.releaseCachedResponseConns()
 		if ue.poolRef != nil {
 			ue.poolRef.unregisterEndpoint(ue)
@@ -880,50 +916,18 @@ func (ue *UdpEndpoint) GetBoundRoutingResult(dst netip.AddrPort, l4proto uint8) 
 	return &result, true
 }
 
-func (ue *UdpEndpoint) GetCachedRoutingResult(dst netip.AddrPort, l4proto uint8) (*bpfRoutingResult, bool) {
-	ttl := UdpRoutingResultCacheTtl
-	if ttl <= 0 {
-		return nil, false
-	}
-
-	ue.routingMu.RLock()
-	defer ue.routingMu.RUnlock()
-
-	if !ue.hasRoutingCache {
-		return nil, false
-	}
-	if ue.routingCacheProto != l4proto || ue.routingCacheDst != dst {
-		return nil, false
-	}
-	if time.Since(ue.routingCacheAt) > ttl {
-		return nil, false
-	}
-
-	result := ue.routingCache
-	return &result, true
-}
-
 func (ue *UdpEndpoint) UpdateCachedRoutingResult(dst netip.AddrPort, l4proto uint8, result *bpfRoutingResult) {
 	if result == nil {
-		return
-	}
-	if UdpRoutingResultCacheTtl <= 0 {
 		return
 	}
 
 	ue.routingMu.Lock()
 	ue.routingCacheDst = dst
 	ue.routingCacheProto = l4proto
-	ue.routingCacheAt = time.Now()
 	ue.routingCache = *result
 	ue.hasRoutingCache = true
 	ue.routingMu.Unlock()
 }
-
-// UdpEndpointKey is the pool key. Dst=0 for Full-Cone NAT, non-zero for
-// destination-affine flows such as QUIC or userspace-routed UDP. RouteScope is
-// only populated when UDP routing depends on packet metadata that userspace
-// cannot safely infer from payload reuse alone.
 
 // endpointSurvivesDialerInvalidation reports whether an endpoint should remain
 // reusable after its dialer transitions to not alive.

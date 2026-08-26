@@ -217,13 +217,6 @@ func (c *ControlPlane) SharesActiveDnsControllerWith(other *ControlPlane) bool {
 	return controller != nil && controller == other.ActiveDnsController()
 }
 
-func (c *ControlPlane) DetachDnsController() *DnsController {
-	if c == nil {
-		return nil
-	}
-	return c.detachController()
-}
-
 func (c *ControlPlane) replaceDNSHandoffController(controller *DnsController, owned bool) (*DnsController, bool) {
 	if c == nil {
 		return nil, false
@@ -267,37 +260,6 @@ func (c *ControlPlane) takeDNSHandoffController() (*DnsController, bool) {
 	c.dnsHandoffOwned = false
 	c.dnsHandoffController.Store(nil)
 	return controller, owned
-}
-
-func (c *ControlPlane) EnableDNSHandoff(controller *DnsController, duration time.Duration) {
-	if c == nil || controller == nil {
-		return
-	}
-	if c.log != nil {
-		c.log.WithField("duration", duration).Warnln("[Reload] Enabled DNS handoff controller")
-	}
-	if previous, previousOwned := c.replaceDNSHandoffController(controller, true); previous != nil && previousOwned && previous != controller {
-		_ = previous.Close()
-	}
-	go func(ctrl *DnsController) {
-		timer := time.NewTimer(duration)
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-			if _, owned, cleared := c.clearDNSHandoffControllerIfMatch(ctrl); cleared {
-				if c.log != nil {
-					c.log.Warnln("[Reload] DNS handoff controller expired")
-				}
-				if owned {
-					_ = ctrl.Close()
-				}
-			}
-		case <-c.ctx.Done():
-			if _, owned, cleared := c.clearDNSHandoffControllerIfMatch(ctrl); cleared && owned {
-				_ = ctrl.Close()
-			}
-		}
-	}(controller)
 }
 
 func (c *ControlPlane) SetDNSHandoffController(controller *DnsController) {

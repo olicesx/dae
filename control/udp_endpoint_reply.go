@@ -8,77 +8,9 @@ package control
 import (
 	"net/netip"
 	"sync"
-	"sync/atomic"
-	"time"
 
 	"github.com/daeuniverse/outbound/pool"
 )
-
-type udpEndpointReplyRuntime struct {
-	receiverMu   sync.Mutex
-	receiverStop func()
-	receiveMu    sync.Mutex
-
-	dispatcher        *udpReplyDispatcher
-	slots             chan struct{}
-	stop              chan struct{}
-	stopOnce          sync.Once
-	admissionMu       sync.Mutex
-	admissionClosed   bool
-	admissions        int
-	admissionsDrained chan struct{}
-	failed            atomic.Bool
-	tasks             sync.WaitGroup
-	drainTracker      *controlPlaneDrainTracker
-}
-
-func newUdpEndpointReplyRuntime(dispatcher *udpReplyDispatcher, drainTracker *controlPlaneDrainTracker, queueCapacity int) *udpEndpointReplyRuntime {
-	if dispatcher == nil {
-		return nil
-	}
-	if queueCapacity <= 0 {
-		queueCapacity = udpEndpointReplyQueueSize
-	}
-	return &udpEndpointReplyRuntime{
-		dispatcher:        dispatcher,
-		slots:             make(chan struct{}, queueCapacity),
-		stop:              make(chan struct{}),
-		admissionsDrained: make(chan struct{}),
-		drainTracker:      drainTracker,
-	}
-}
-
-func (runtime *udpEndpointReplyRuntime) beginReplyAdmission() bool {
-	runtime.admissionMu.Lock()
-	defer runtime.admissionMu.Unlock()
-	if runtime.admissionClosed {
-		return false
-	}
-	runtime.admissions++
-	return true
-}
-
-func (runtime *udpEndpointReplyRuntime) finishReplyAdmission() {
-	runtime.admissionMu.Lock()
-	runtime.admissions--
-	if runtime.admissionClosed && runtime.admissions == 0 {
-		close(runtime.admissionsDrained)
-	}
-	runtime.admissionMu.Unlock()
-}
-
-func (runtime *udpEndpointReplyRuntime) stopReplyAdmissions() {
-	runtime.stopOnce.Do(func() {
-		runtime.admissionMu.Lock()
-		runtime.admissionClosed = true
-		close(runtime.stop)
-		if runtime.admissions == 0 {
-			close(runtime.admissionsDrained)
-		}
-		runtime.admissionMu.Unlock()
-		<-runtime.admissionsDrained
-	})
-}
 
 type udpEndpointResponseCacheEntry struct {
 	bindAddr netip.AddrPort
@@ -220,30 +152,14 @@ func (ue *UdpEndpoint) prewarmResponseConn(target string) {
 
 	bindAddr, _ := normalizeSendPktAddrFamily(replyPeer, ue.lAddr)
 	replySoMark := ue.replySoMark()
-	key := anyfromPoolKey{lAddr: bindAddr, soMark: replySoMark}
-	var af *Anyfrom
-	if DefaultAnyfromPool != nil {
-		shard := DefaultAnyfromPool.shardForKey(key)
-		nowNano := time.Now().UnixNano()
-		shard.mu.RLock()
-		if cached, ok := shard.pool[key]; ok && cached != nil && !cached.failed.Load() && !cached.IsExpired(nowNano) {
-			af = cached
-		}
-		shard.mu.RUnlock()
-		if af != nil {
-			af.RefreshTtlWithTime(nowNano)
-		}
+	// The anyfrom cache path is only reachable inside the dae netns: outside
+	// it no cached anyfrom socket can exist and none may be created.
+	if GetDaeNetns() == nil || DefaultAnyfromPool == nil {
+		return
 	}
-
-	if af == nil {
-		if GetDaeNetns() == nil || DefaultAnyfromPool == nil {
-			return
-		}
-		var err error
-		af, _, err = DefaultAnyfromPool.getOrCreateWithMark(bindAddr, replySoMark, AnyfromTimeout)
-		if err != nil {
-			return
-		}
+	af, _, err := DefaultAnyfromPool.getOrCreateWithMark(bindAddr, replySoMark, AnyfromTimeout)
+	if err != nil {
+		return
 	}
 
 	if ue.poolKey.Dst.Port() != 0 {
@@ -345,6 +261,10 @@ const udpEndpointReplyQueueSize = 256
 type udpEndpointReply struct {
 	data pool.PB
 	from netip.AddrPort
+	// release, when set, owns the reply payload instead of the package pool:
+	// transport-owned packet receivers hand their buffers in with a release
+	// callback (ReceivedPacket.Release).
+	release func()
 }
 
 var udpEndpointReplyObjects = sync.Pool{
@@ -368,7 +288,9 @@ func recycleUdpEndpointReply(reply *udpEndpointReply, releaseData bool) {
 	if reply == nil {
 		return
 	}
-	if releaseData {
+	if reply.release != nil {
+		reply.release()
+	} else if releaseData {
 		putUdpEndpointReplyData(reply.data)
 	}
 	*reply = udpEndpointReply{}
@@ -379,108 +301,6 @@ func releaseUdpEndpointReplies(replies []*udpEndpointReply) {
 	for i := range replies {
 		recycleUdpEndpointReply(replies[i], true)
 	}
-}
-
-func releaseUdpEndpointReply(reply udpEndpointReply, release func()) {
-	if release != nil {
-		release()
-		return
-	}
-	putUdpEndpointReplyData(reply.data)
-}
-
-// submitReplyWithMode returns whether the reply was accepted and whether the
-// transport-owned reader should remain registered. A full bounded queue drops
-// only the current packet and keeps the receiver alive; a closed dispatcher
-// requires the transport reader to unregister.
-func (ue *UdpEndpoint) submitReplyWithMode(reply udpEndpointReply, release func(), nonBlocking bool) (accepted, keepReceiver bool) {
-	if ue == nil || ue.replyRuntime == nil {
-		return false, false
-	}
-	runtime := ue.replyRuntime
-	if !runtime.beginReplyAdmission() {
-		return false, false
-	}
-	if nonBlocking {
-		select {
-		case runtime.slots <- struct{}{}:
-		case <-runtime.stop:
-			runtime.finishReplyAdmission()
-			return false, false
-		default:
-			runtime.finishReplyAdmission()
-			releaseUdpEndpointReply(reply, release)
-			return false, true
-		}
-	} else {
-		select {
-		case runtime.slots <- struct{}{}:
-		case <-runtime.stop:
-			runtime.finishReplyAdmission()
-			return false, false
-		}
-	}
-
-	runtime.admissionMu.Lock()
-	if runtime.admissionClosed {
-		runtime.admissionMu.Unlock()
-		<-runtime.slots
-		runtime.finishReplyAdmission()
-		return false, false
-	}
-	drainRelease := runtime.drainTracker.Acquire()
-	runtime.tasks.Add(1)
-	complete := func() {
-		releaseUdpEndpointReply(reply, release)
-		<-runtime.slots
-		drainRelease()
-		runtime.tasks.Done()
-	}
-	run := func() {
-		defer complete()
-		if runtime.failed.Load() {
-			return
-		}
-		if err := ue.handler(ue, reply.data, reply.from); err != nil {
-			runtime.failed.Store(true)
-			ue.retire()
-			ue.stopReplyDispatcher()
-			runtime.dispatcher.abortInput(ue)
-			ue.logEndpointExit(err, "reply sender")
-		}
-	}
-	submitted := runtime.dispatcher.submit(ue, run, complete)
-	runtime.admissionMu.Unlock()
-	runtime.finishReplyAdmission()
-	if submitted {
-		return true, true
-	}
-	// udpReplyDispatcher.submit documents that a rejected task leaves
-	// the reply buffer owned by the caller. Release the bookkeeping here,
-	// while the read loop releases the buffer itself.
-	<-runtime.slots
-	drainRelease()
-	runtime.tasks.Done()
-	ue.stopReplyDispatcher()
-	ue.retire()
-	return false, false
-}
-
-func (ue *UdpEndpoint) submitReply(reply udpEndpointReply) bool {
-	accepted, _ := ue.submitReplyWithMode(reply, nil, false)
-	return accepted
-}
-
-func (ue *UdpEndpoint) submitReplyFromReceiver(reply udpEndpointReply, release func()) (accepted, keepReceiver bool) {
-	return ue.submitReplyWithMode(reply, release, true)
-}
-
-func (ue *UdpEndpoint) stopReplyDispatcher() {
-	if ue == nil || ue.replyRuntime == nil {
-		return
-	}
-	runtime := ue.replyRuntime
-	runtime.stopReplyAdmissions()
 }
 
 // replySender is the dedicated goroutine that drains the reply channel and
@@ -514,7 +334,7 @@ func (ue *UdpEndpoint) replySender(replyCh <-chan *udpEndpointReply, stop chan<-
 			// upstream endpoint's liveness.
 			if err := ue.handler(ue, queued.data, queued.from); err != nil {
 				releaseUdpEndpointReplies(batch[i:])
-				ue.retire()
+				ue.retireFromReplySender()
 				close(stop)
 				ue.logEndpointExit(err, "reply sender")
 				// Drain remaining queued replies to release pool buffers.

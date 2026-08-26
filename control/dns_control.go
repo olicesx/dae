@@ -51,18 +51,16 @@ var (
 )
 
 var (
-	UnspecifiedAddressA          = netip.MustParseAddr("0.0.0.0")
-	UnspecifiedAddressAAAA       = netip.MustParseAddr("::")
-	DnsCacheRouteRefreshInterval = 10 * time.Second // Aligned with health check granularity (default 30s)
-	dnsCacheJanitorInterval      = 30 * time.Second
-	dnsForwarderIdleTTL          = 2 * time.Minute
+	UnspecifiedAddressA     = netip.MustParseAddr("0.0.0.0")
+	UnspecifiedAddressAAAA  = netip.MustParseAddr("::")
+	dnsCacheJanitorInterval = 30 * time.Second
+	dnsForwarderIdleTTL     = 2 * time.Minute
 )
 
 type DnsControllerOption struct {
 	Log                  *logrus.Logger
 	LifecycleContext     context.Context
 	CacheAccessCallback  func(cache *DnsCache) (err error)
-	CacheRemoveCallback  func(cache *DnsCache) (err error)
 	CacheDeleteCallback  func(cacheKey string, cache *DnsCache) (err error)
 	NewCache             func(fqdn string, answers, ns, extra []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
 	RouteProjectionEpoch uint64
@@ -104,12 +102,6 @@ type dnsControllerStore struct {
 
 	janitorStop  chan struct{}
 	janitorDone  chan struct{}
-	evictorDone  chan struct{}
-	evictorQ     chan *DnsCache
-	evictorWake  chan struct{}
-	evictorChMu  sync.RWMutex
-	evictorMu    sync.Mutex
-	evictorBuf   []*DnsCache
 	lruScratchMu sync.Mutex
 	lruScratch   []cacheEntry
 	closeOnce    sync.Once
@@ -153,9 +145,6 @@ func newDnsControllerStore() *dnsControllerStore {
 		dnsForwarderCache: sync.Map{},
 		janitorStop:       make(chan struct{}),
 		janitorDone:       make(chan struct{}),
-		evictorDone:       make(chan struct{}),
-		evictorQ:          make(chan *DnsCache, 512),
-		evictorWake:       make(chan struct{}, 1),
 		prefWaitRegistry:  newPreferenceWaitRegistry(),
 	}
 }
@@ -256,7 +245,6 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 		return nil, err
 	}
 	controller.startDnsCacheJanitor()
-	controller.startCacheEvictor()
 	return controller, nil
 }
 
@@ -267,7 +255,6 @@ func (c *DnsController) Close() error {
 	var (
 		bpfWorkerDone <-chan struct{}
 		janitorDone   <-chan struct{}
-		evictorDone   <-chan struct{}
 	)
 
 	// Acquire lock before closeOnce to synchronize with startBpfUpdateWorker.
@@ -299,9 +286,6 @@ func (c *DnsController) Close() error {
 		if c.janitorDone != nil {
 			janitorDone = c.janitorDone
 		}
-		if c.evictorDone != nil {
-			evictorDone = c.evictorDone
-		}
 	})
 	c.bpfUpdateStopMu.Unlock()
 	// Wait for any in-flight projection callback before cache teardown. A task
@@ -311,18 +295,16 @@ func (c *DnsController) Close() error {
 	//nolint:staticcheck // The empty critical section provides the required wait barrier.
 	c.cacheProjectionMu.Unlock()
 
-	if bpfWorkerDone != nil || janitorDone != nil || evictorDone != nil {
+	if bpfWorkerDone != nil || janitorDone != nil {
 		timer := time.NewTimer(gracefulShutdownWaitTimeout)
 		defer timer.Stop()
 
-		for bpfWorkerDone != nil || janitorDone != nil || evictorDone != nil {
+		for bpfWorkerDone != nil || janitorDone != nil {
 			select {
 			case <-bpfWorkerDone:
 				bpfWorkerDone = nil
 			case <-janitorDone:
 				janitorDone = nil
-			case <-evictorDone:
-				evictorDone = nil
 			case <-timer.C:
 				if c.log != nil {
 					if bpfWorkerDone != nil {
@@ -331,13 +313,9 @@ func (c *DnsController) Close() error {
 					if janitorDone != nil {
 						c.log.Warn("DnsController.Close: timeout waiting for janitorDone")
 					}
-					if evictorDone != nil {
-						c.log.Warn("DnsController.Close: timeout waiting for evictorDone")
-					}
 				}
 				bpfWorkerDone = nil
 				janitorDone = nil
-				evictorDone = nil
 			}
 		}
 	}
@@ -358,16 +336,9 @@ func (c *DnsController) Close() error {
 		c.dnsKnowledge.Delete(key)
 		return true
 	})
-	c.evictorMu.Lock()
-	c.evictorBuf = nil
-	c.evictorMu.Unlock()
 	c.lruScratchMu.Lock()
 	c.lruScratch = nil
 	c.lruScratchMu.Unlock()
-	c.evictorChMu.Lock()
-	c.evictorWake = nil
-	c.evictorQ = nil
-	c.evictorChMu.Unlock()
 	c.bpfUpdateStopMu.Lock()
 	c.bpfUpdateCh = nil
 	c.bpfUpdateStop = nil

@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -63,12 +64,11 @@ func newPreparedControlPlane(ctx context.Context, log *logrus.Logger, bpf any, d
 }
 
 // buildControlPlaneRuntime is the final construction boundary after config
-// normalization, subscription resolution, and reload safety checks. Keeping
-// the seam here lets failure tests exercise the real Runner preparation path
-// without replacing the default ControlPlane constructors.
-var buildControlPlaneRuntime = buildControlPlaneRuntimeDefault
-
-func buildControlPlaneRuntimeDefault(
+// normalization, subscription resolution, and reload safety checks. The
+// prepareOnly × isReloadBuild matrix folds into build options: prepared
+// candidates delay both the datapath commit and the DNS listener start, and
+// any reload build (or an inherited BPF handle) selects reload-mode flipping.
+func buildControlPlaneRuntime(
 	ctx context.Context,
 	log *logrus.Logger,
 	bpf any,
@@ -83,52 +83,7 @@ func buildControlPlaneRuntimeDefault(
 	dnsRoutingUnchanged bool,
 	isReloadBuild bool,
 ) (*control.ControlPlane, error) {
-	if prepareOnly {
-		if isReloadBuild {
-			return control.NewPreparedReloadControlPlaneWithContext(
-				ctx,
-				log,
-				bpf,
-				dnsCache,
-				tagToNodeList,
-				groups,
-				routing,
-				global,
-				dns,
-				externGeoDataDirs,
-				dnsRoutingUnchanged,
-			)
-		}
-		return control.NewPreparedControlPlaneWithContext(
-			ctx,
-			log,
-			bpf,
-			dnsCache,
-			tagToNodeList,
-			groups,
-			routing,
-			global,
-			dns,
-			externGeoDataDirs,
-			dnsRoutingUnchanged,
-		)
-	}
-	if isReloadBuild {
-		return control.NewReloadControlPlaneWithContext(
-			ctx,
-			log,
-			bpf,
-			dnsCache,
-			tagToNodeList,
-			groups,
-			routing,
-			global,
-			dns,
-			externGeoDataDirs,
-			dnsRoutingUnchanged,
-		)
-	}
-	return control.NewControlPlaneWithContext(
+	return control.NewControlPlaneWithContextOptions(
 		ctx,
 		log,
 		bpf,
@@ -139,7 +94,12 @@ func buildControlPlaneRuntimeDefault(
 		global,
 		dns,
 		externGeoDataDirs,
-		dnsRoutingUnchanged,
+		control.ControlPlaneBuildOptions{
+			DelayDatapathCommit:   prepareOnly,
+			DelayDNSListenerStart: prepareOnly,
+			DNSRoutingUnchanged:   dnsRoutingUnchanged,
+			IsReload:              isReloadBuild || bpf != nil,
+		},
 	)
 }
 
@@ -196,6 +156,32 @@ func configureGcMemoryLimit(log *logrus.Logger) {
 	}
 }
 
+// configureGOMAXPROCS pins the Go scheduler to a single P by default. On the
+// few-core relay boxes dae targets, cross-P work stealing and netpoll handoffs
+// around the per-packet QUIC receive path cost more CPU than the parallelism
+// buys: on a 2-core box, GOMAXPROCS=1 cut proxied-relay CPU roughly in half at
+// identical throughput (measured 23.6 -> ~13 CPU-seconds per 45s of ~14MB/s
+// relay). The userspace relay stays well under one core, and direct traffic
+// bypasses userspace via the eBPF fast path, so a single P is not a
+// bottleneck; Go's asynchronous preemption keeps head-of-line delays bounded
+// if a bulk burst monopolizes the P.
+//
+// An explicit GOMAXPROCS environment variable always wins, preserving the
+// escape hatch for deployments that can actually saturate a core (e.g. many
+// parallel proxy nodes).
+func configureGOMAXPROCS(log *logrus.Logger) {
+	if value, ok := os.LookupEnv("GOMAXPROCS"); ok {
+		if log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
+			log.Debugf("GOMAXPROCS: using explicit environment value %q", value)
+		}
+		return
+	}
+	runtime.GOMAXPROCS(1)
+	if log != nil {
+		log.Infoln("Configured GOMAXPROCS=1 (set GOMAXPROCS in the service environment to override)")
+	}
+}
+
 func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {
 	// Deep copy to prevent modification.
 	conf = deepcopy.Copy(conf).(*config.Config)
@@ -226,6 +212,9 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	daeDNSRouter, err := daedns.NewWithOption(log, &conf.Global, &conf.Dns, &daedns.NewOption{LocationFinder: locationFinder})
 	if err != nil {
 		return nil, err
+	}
+	if daeDNSRouter != nil {
+		defer func() { _ = daeDNSRouter.Close() }()
 	}
 
 	// Start timing the startup process

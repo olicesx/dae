@@ -85,10 +85,10 @@ func clearReloadPending(flag *atomic.Bool) {
 //
 // Overlapping generations both publish routing state, and what keeps the kernel
 // from observing a half-written rule set is the routing epoch's prepared-slot
-// indirection. The epoch is opt-in, so without it the staged path has no such
-// protection and the reload falls back to the non-overlapping form.
-func shouldUseStagedHotHandoff(routingEpochEnabled, freshDatapathReload, listenerPresent bool) bool {
-	return routingEpochEnabled && !freshDatapathReload && listenerPresent
+// indirection. A fresh datapath (port or BPF change) cannot overlap, and
+// neither can a cold start without a listener.
+func shouldUseStagedHotHandoff(freshDatapathReload, listenerPresent bool) bool {
+	return !freshDatapathReload && listenerPresent
 }
 
 func shouldStreamStagedDnsCache(
@@ -340,7 +340,6 @@ func rollbackStagedReloadHandoff(log *logrus.Logger, handoff *stagedReloadHandof
 
 	if handoff.bpfTransferred && handoff.oldControlPlane != nil && handoff.newControlPlane != nil {
 		handoff.oldControlPlane.InjectBpf(handoff.newControlPlane.EjectBpf())
-		handoff.oldControlPlane.InheritLpmIndices(handoff.newControlPlane.EjectLpmIndices())
 		handoff.bpfTransferred = false
 	}
 

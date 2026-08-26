@@ -17,9 +17,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
 	"github.com/daeuniverse/dae/pkg/config_parser"
+	"github.com/okzk/sdnotify"
 	"github.com/sirupsen/logrus"
 )
 
@@ -53,11 +55,6 @@ type activeRetirementTask struct {
 	cancel     context.CancelFunc
 	done       chan struct{}
 }
-
-// reloadFailureCompletionHook is an internal observability seam used by
-// lifecycle tests. The production default is a no-op and does not affect
-// reload state transitions.
-var reloadFailureCompletionHook = func() {}
 
 func newReloadManager(reloadReqs chan reloadRequest, runStateChanges chan struct{}, sigs <-chan os.Signal) *reloadManager {
 	m := &reloadManager{
@@ -279,7 +276,30 @@ func (m *reloadManager) finishReloadFailure() {
 	m.reloading.Store(false)
 	m.reloadActive.Store(false)
 	clearReloadPending(&m.reloadPending)
-	reloadFailureCompletionHook()
+}
+
+// failPublishedReloadAttempt reports a recoverable post-handoff failure to
+// the service manager and progress file, then clears the same busy flags as
+// finishReloadFailure. Unlike failReloadAttempt, reloading is already true
+// (beginHandoff ran) so it must be cleared here.
+func (m *reloadManager) failPublishedReloadAttempt(reloadErr error) {
+	if reloadErr != nil {
+		_ = sdnotify.Ready()
+		_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
+	}
+	m.finishReloadFailure()
+}
+
+// failReloadAttempt reports a failed reload attempt to the service manager
+// and the progress file, then clears the busy/pending bookkeeping so the
+// live generation keeps serving and the next reload request is accepted.
+func (m *reloadManager) failReloadAttempt(reloadErr error) {
+	if reloadErr != nil {
+		_ = sdnotify.Ready()
+		_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
+	}
+	m.reloadActive.Store(false)
+	clearReloadPending(&m.reloadPending)
 }
 
 func (m *reloadManager) finishReloadSuccess() {

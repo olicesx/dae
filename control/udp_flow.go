@@ -33,10 +33,6 @@ func NewUdpFlowKey(src, dst netip.AddrPort) UdpFlowKey {
 	return UdpFlowKey{Src: src, Dst: dst}
 }
 
-func NewUdpSrcOnlyFlowKey(src netip.AddrPort) UdpFlowKey {
-	return UdpFlowKey{Src: src}
-}
-
 func (k UdpFlowKey) PacketSnifferKey() PacketSnifferKey {
 	return PacketSnifferKey{LAddr: k.Src, RAddr: k.Dst}
 }

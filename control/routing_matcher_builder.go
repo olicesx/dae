@@ -567,10 +567,9 @@ func (b *RoutingMatcherBuilder) addFallback(fallbackOutbound config.FunctionOrSt
 	return nil
 }
 
-// globalNextLpmIndex allocates local LPM indexes across builds. It reduces
-// reuse when a slot is rebuilt and preserves the legacy slot-zero allocation
-// behavior. BuildKernspace is expected to run serially; atomic protects
-// against accidental concurrent invocation.
+// globalNextLpmIndex allocates local LPM indexes across builds, reducing
+// reuse when a slot is rebuilt. BuildKernspace is expected to run serially;
+// atomic protects against accidental concurrent invocation.
 var globalNextLpmIndex atomic.Uint32
 
 func routingEpochSlotBase(slot uint32) (uint32, error) {
@@ -828,24 +827,6 @@ func buildRoutingKernspaceForSlot(
 	}
 
 	return usedIndices, nil
-}
-
-func (b *RoutingMatcherBuilder) BuildKernspace(log *logrus.Logger) (usedIndices []uint32, err error) {
-	return b.BuildKernspaceForSlot(log, 0)
-}
-
-// BuildKernspaceForSlot constructs routing data in one kernel routing epoch
-// slot. Match-set LPM indexes remain slot-local; only BPF map keys receive the
-// slot offset.
-func (b *RoutingMatcherBuilder) BuildKernspaceForSlot(log *logrus.Logger, slot uint32) (usedIndices []uint32, err error) {
-	if b == nil {
-		return nil, fmt.Errorf("nil routing matcher builder")
-	}
-	return buildRoutingKernspaceForSlot(log, b.bpf, b.rules, b.simulatedLpmTries, len(b.lpmDedup), slot)
-}
-
-func (s *routingKernspaceSnapshot) BuildKernspace(log *logrus.Logger, bpf *bpfObjects) (usedIndices []uint32, err error) {
-	return s.BuildKernspaceForSlot(log, bpf, 0)
 }
 
 // BuildKernspaceForSlot constructs this immutable routing snapshot in one

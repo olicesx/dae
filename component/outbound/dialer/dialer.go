@@ -814,21 +814,8 @@ func (d *Dialer) incrementBackoffLevelByIndex(protoIdx int) {
 	d.ensureRecoveryManager().incrementBackoffLevelByIndex(protoIdx)
 }
 
-func (d *Dialer) GetBackoffLevel(proto consts.L4ProtoStr) int {
-	protoIdx := d.protoIdx(proto)
-	return d.getBackoffLevelByIndex(protoIdx)
-}
-
 func (d *Dialer) getBackoffLevelByIndex(protoIdx int) int {
 	return d.ensureRecoveryManager().getBackoffLevelByIndex(protoIdx)
-}
-
-// GetBackoffPenalty returns a latency penalty for nodes in recovery for a specific protocol.
-// Penalty = current backoff duration / 20.
-// This ensures recently recovered nodes are deprioritized until stable.
-func (d *Dialer) GetBackoffPenalty(proto consts.L4ProtoStr) time.Duration {
-	protoIdx := d.protoIdx(proto)
-	return d.getBackoffPenaltyByIndex(protoIdx)
 }
 
 func (d *Dialer) getBackoffPenaltyForType(typ *NetworkType) time.Duration {

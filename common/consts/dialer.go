@@ -81,16 +81,6 @@ const (
 	IpVersionStr_6 IpVersionStr = "6"
 )
 
-func (v IpVersionStr) ToIpVersion() uint8 {
-	switch v {
-	case IpVersionStr_4:
-		return 4
-	case IpVersionStr_6:
-		return 6
-	}
-	panic("unsupported ipversion")
-}
-
 func (v IpVersionStr) ToIpVersionType() IpVersionType {
 	switch v {
 	case IpVersionStr_4:

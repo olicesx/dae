@@ -39,13 +39,6 @@ type dnsResolveResult struct {
 	err error
 }
 
-func TryUpdateSystemDns() (err error) {
-	systemDnsMu.Lock()
-	err = tryUpdateSystemDns()
-	systemDnsMu.Unlock()
-	return err
-}
-
 // TryUpdateSystemDnsElapse will update system DNS if duration has elapsed since the last TryUpdateSystemDns1s call.
 func TryUpdateSystemDnsElapse(k time.Duration) (err error) {
 	systemDnsMu.Lock()

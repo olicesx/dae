@@ -46,10 +46,6 @@ func (s *DialerSet) AllDialers() []*dialer.Dialer {
 	return append([]*dialer.Dialer(nil), s.dialers...)
 }
 
-func NewDialerSetFromLinks(option *dialer.GlobalOption, tagToNodeList map[string][]string) *DialerSet {
-	return NewDialerSetFromLinksContext(context.Background(), option, tagToNodeList)
-}
-
 func NewDialerSetFromLinksContext(ctx context.Context, option *dialer.GlobalOption, tagToNodeList map[string][]string) *DialerSet {
 	s := &DialerSet{
 		log:          option.Log,

@@ -106,24 +106,6 @@ func TransparentControl(c syscall.RawConn) error {
 	return sockOptErr
 }
 
-func BindControl(c syscall.RawConn, lAddrPort netip.AddrPort) error {
-	var sockOptErr error
-	controlErr := c.Control(func(fd uintptr) {
-		if err := setTransparentSocketOptions(int(fd)); err != nil {
-			sockOptErr = err
-			return
-		}
-		if err := bindAddr(fd, lAddrPort); err != nil {
-			sockOptErr = fmt.Errorf("error bindAddr %v: %w", lAddrPort.String(), err)
-			return
-		}
-	})
-	if controlErr != nil {
-		return fmt.Errorf("error invoking socket control function: %w", controlErr)
-	}
-	return sockOptErr
-}
-
 func bindAddr(fd uintptr, addrPort netip.AddrPort) error {
 	if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
 		return fmt.Errorf("error setting SO_REUSEADDR socket option: %w", err)

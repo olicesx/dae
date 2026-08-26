@@ -18,9 +18,8 @@ type PolicyEpoch uint64
 // which is what lets a reload compare policies without keeping the previous
 // generation's rules alive.
 type PolicyIdentity struct {
-	epoch     PolicyEpoch
-	hash      [sha256.Size]byte
-	ruleCount int
+	epoch PolicyEpoch
+	hash  [sha256.Size]byte
 }
 
 // NewPolicyIdentity calculates a generation identity without retaining program.
@@ -35,9 +34,8 @@ func NewPolicyIdentity(epoch PolicyEpoch, program *NormalizedProgram) (PolicyIde
 	}
 
 	return PolicyIdentity{
-		epoch:     epoch,
-		hash:      policyHash,
-		ruleCount: len(program.Rules),
+		epoch: epoch,
+		hash:  policyHash,
 	}, nil
 }
 
@@ -49,9 +47,4 @@ func (i PolicyIdentity) Epoch() PolicyEpoch {
 // Hash returns the semantic content hash without the generation identifier.
 func (i PolicyIdentity) Hash() [sha256.Size]byte {
 	return i.hash
-}
-
-// RuleCount returns the number of normalized routing rules in the identity.
-func (i PolicyIdentity) RuleCount() int {
-	return i.ruleCount
 }

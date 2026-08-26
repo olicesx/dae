@@ -19,10 +19,6 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-func NewFromLink(gOption *GlobalOption, iOption InstanceOption, link string, subscriptionTag string) (*Dialer, error) {
-	return NewFromLinkContext(context.Background(), gOption, iOption, link, subscriptionTag)
-}
-
 func NewFromLinkContext(ctx context.Context, gOption *GlobalOption, iOption InstanceOption, link string, subscriptionTag string) (*Dialer, error) {
 	return NewFromLinkWithProxyCacheContext(ctx, gOption, iOption, link, subscriptionTag, globalProxyIpCache)
 }

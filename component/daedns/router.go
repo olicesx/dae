@@ -126,10 +126,6 @@ func (m *compiledMatcher[T]) Match(input T) (string, bool) {
 	return "", false
 }
 
-func New(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns) (*Router, error) {
-	return NewWithOption(log, global, dnsCfg, nil)
-}
-
 func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns, opt *NewOption) (*Router, error) {
 	if dnsCfg == nil {
 		return nil, nil

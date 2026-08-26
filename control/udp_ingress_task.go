@@ -20,38 +20,86 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// cachedRoutingBinding resolves the flow's bound routing result from the
+// cachedRoutingLookup is the per-packet routing-cache probe. Endpoint
+// pointers live only for this packet; they are never stored on UdpFlowDecision.
+type cachedRoutingLookup struct {
+	bound       *bpfRoutingResult
+	bindingHit  bool
+	owner       *UdpEndpoint
+	prefetch    *UdpEndpoint
+	prefetchKey UdpEndpointKey
+	prefetchOK  bool
+}
+
+// lookupCachedRoutingBinding resolves the flow's bound routing result from the
 // routing-cache endpoints referenced by the flow decision: the primary cached
 // endpoint first, then the symmetric fallback endpoint when the primary's
-// binding missed.
-func cachedRoutingBinding(flowDecision UdpFlowDecision, realDst netip.AddrPort) (*bpfRoutingResult, bool) {
-	if ue, ok := DefaultUdpEndpointPool.Get(flowDecision.CachedRoutingEndpointKey()); ok {
+// binding missed. owner is the last endpoint Get actually found (primary, or
+// fallback if primary was absent) so Run can UpdateCachedRoutingResult without
+// a second pool lookup. prefetch is the primary endpoint only when its bound
+// result hit AND its pool key is the same key handlePkt would Get first
+// without a cross-probe; a binding miss must not prefetch, because handlePkt
+// still has to probe the live NAT key independently.
+func lookupCachedRoutingBinding(flowDecision UdpFlowDecision, realDst netip.AddrPort) cachedRoutingLookup {
+	out := cachedRoutingLookup{}
+	primaryKey := flowDecision.CachedRoutingEndpointKey()
+	if ue, ok := DefaultUdpEndpointPool.Get(primaryKey); ok {
+		out.owner = ue
 		if bound, bindingHit := ue.GetBoundRoutingResult(realDst, unix.IPPROTO_UDP); bindingHit {
-			return bound, true
+			out.bound = bound
+			out.bindingHit = true
+			if canPrefetchCachedEndpoint(flowDecision, primaryKey) {
+				out.prefetch = ue
+				out.prefetchKey = primaryKey
+				out.prefetchOK = true
+			}
+			return out
 		}
+		// Binding miss: keep owner for a later cache write, but still try
+		// the fallback endpoint in case it holds the dst+proto binding.
 	}
 	if fallbackKey, ok := flowDecision.CachedRoutingFallbackKey(); ok {
 		if ue, ok := DefaultUdpEndpointPool.Get(fallbackKey); ok {
+			out.owner = ue
 			if bound, bindingHit := ue.GetBoundRoutingResult(realDst, unix.IPPROTO_UDP); bindingHit {
-				return bound, true
+				out.bound = bound
+				out.bindingHit = true
+				if canPrefetchCachedEndpoint(flowDecision, fallbackKey) {
+					out.prefetch = ue
+					out.prefetchKey = fallbackKey
+					out.prefetchOK = true
+				}
 			}
 		}
 	}
-	return nil, false
+	return out
+}
+
+// canPrefetchCachedEndpoint reports whether handlePkt's first Get uses key
+// with no required src-only/symmetric cross-probe. Prefetch is only valid
+// for this packet and only when that first lookup would be a pure hit.
+//
+// The NAT cross-probe in handlePkt runs only after a first-Get miss. A
+// prefetch of the same first key therefore cannot skip a required probe:
+// if the first Get would have missed, prefetchOK is already false because
+// this function requires firstKey == key. Sniff-eligible ordinary UDP
+// starts at the symmetric key, so a FullCone cache hit never prefetches.
+func canPrefetchCachedEndpoint(flowDecision UdpFlowDecision, key UdpEndpointKey) bool {
+	emptyScope := udpEndpointRouteScope{}
+	firstKey := flowDecision.EndpointKeyForInitialLookupWithScope(emptyScope, false)
+	return firstKey == key
+}
+
+// cachedRoutingBinding is the bound-result view of lookupCachedRoutingBinding.
+func cachedRoutingBinding(flowDecision UdpFlowDecision, realDst netip.AddrPort) (*bpfRoutingResult, bool) {
+	lookup := lookupCachedRoutingBinding(flowDecision, realDst)
+	return lookup.bound, lookup.bindingHit
 }
 
 // routingCacheOwnerEndpoint finds the endpoint that owns the flow's cached
 // routing result: the primary cached endpoint if present, else the fallback.
 func routingCacheOwnerEndpoint(flowDecision UdpFlowDecision) *UdpEndpoint {
-	if ue, ok := DefaultUdpEndpointPool.Get(flowDecision.CachedRoutingEndpointKey()); ok {
-		return ue
-	}
-	if fallbackKey, ok := flowDecision.CachedRoutingFallbackKey(); ok {
-		if ue, ok := DefaultUdpEndpointPool.Get(fallbackKey); ok {
-			return ue
-		}
-	}
-	return nil
+	return lookupCachedRoutingBinding(flowDecision, netip.AddrPort{}).owner
 }
 
 // udpIngressTask is the pooled owned form of the per-packet ingress task
@@ -207,9 +255,11 @@ func (t *udpIngressTask) Run() {
 		}
 	}
 
+	var cacheLookup cachedRoutingLookup
 	if !c.udpRouteScopeSensitive && c.ownsActiveRoutingEpoch() {
-		if bound, bindingHit := cachedRoutingBinding(flowDecision, realDst); bindingHit {
-			routingResult = bound
+		cacheLookup = lookupCachedRoutingBinding(flowDecision, realDst)
+		if cacheLookup.bindingHit {
+			routingResult = cacheLookup.bound
 		}
 	}
 
@@ -251,7 +301,7 @@ func (t *udpIngressTask) Run() {
 		}
 	}
 
-	if e := c.handlePkt(t.lConn, data, convergeSrc, realDst, routingResult, flowDecision, false); e != nil {
+	if e := c.handlePktWithPrefetch(t.lConn, data, convergeSrc, realDst, routingResult, flowDecision, false, cacheLookup.prefetch, cacheLookup.prefetchKey, cacheLookup.prefetchOK); e != nil {
 		// Rate-limit the expected reload-window routing-epoch
 		// ownership loss; other handlePkt errors still log always.
 		if stderrors.Is(e, errRoutingEpochOwnerUnavailable) {
@@ -265,8 +315,12 @@ func (t *udpIngressTask) Run() {
 	}
 
 	if !c.udpRouteScopeSensitive && c.ownsActiveRoutingEpoch() && freshRoutingResult != nil {
-		if ue := routingCacheOwnerEndpoint(flowDecision); ue != nil {
-			ue.UpdateCachedRoutingResult(realDst, unix.IPPROTO_UDP, freshRoutingResult)
+		owner := cacheLookup.owner
+		if owner == nil {
+			owner = routingCacheOwnerEndpoint(flowDecision)
+		}
+		if owner != nil {
+			owner.UpdateCachedRoutingResult(realDst, unix.IPPROTO_UDP, freshRoutingResult)
 		}
 	}
 }

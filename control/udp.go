@@ -573,6 +573,10 @@ func (c *ControlPlane) prepareUnownedUDPCurrentPolicyFallback(src, dst netip.Add
 }
 
 func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision, skipSniffing bool) (err error) {
+	return c.handlePktWithPrefetch(lConn, data, src, realDst, routingResult, flowDecision, skipSniffing, nil, UdpEndpointKey{}, false)
+}
+
+func (c *ControlPlane) handlePktWithPrefetch(lConn *net.UDPConn, data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision, skipSniffing bool, prefetched *UdpEndpoint, prefetchKey UdpEndpointKey, prefetchOK bool) (err error) {
 	if handled, retainedErr := c.handleRetainedUDPEndpoint(data, src, realDst, routingResult, flowDecision); handled {
 		return retainedErr
 	}
@@ -591,6 +595,9 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, realDst n
 					fallbackResult,
 					flowDecision,
 					skipSniffing,
+					nil,
+					UdpEndpointKey{},
+					false,
 				)
 			}
 		}
@@ -600,12 +607,12 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, realDst n
 		defer release()
 	}
 	if owner != c {
-		return owner.handlePktOwned(lConn, data, src, realDst, routingResult, flowDecision, skipSniffing)
+		return owner.handlePktOwned(lConn, data, src, realDst, routingResult, flowDecision, skipSniffing, prefetched, prefetchKey, prefetchOK)
 	}
-	return c.handlePktOwned(lConn, data, src, realDst, routingResult, flowDecision, skipSniffing)
+	return c.handlePktOwned(lConn, data, src, realDst, routingResult, flowDecision, skipSniffing, prefetched, prefetchKey, prefetchOK)
 }
 
-func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision, skipSniffing bool) (err error) {
+func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision, skipSniffing bool, prefetched *UdpEndpoint, prefetchKey UdpEndpointKey, prefetchOK bool) (err error) {
 	var realSrc netip.AddrPort
 	var domain string
 	var ueKey UdpEndpointKey
@@ -686,7 +693,14 @@ func (c *ControlPlane) handlePktOwned(lConn *net.UDPConn, data []byte, src, real
 		failedQuicDcidKnown = IsQuicDcidFailedAt(quicSnifferKey, now)
 	}
 	ueKey = flowDecision.EndpointKeyForInitialLookupWithScope(routeScope, forceSymmetricKey)
-	ue, ueExists = DefaultUdpEndpointPool.Get(ueKey)
+	if prefetchOK && prefetched != nil && prefetchKey == ueKey {
+		// Same-packet reuse of the routing-cache Get. Lifetime is this
+		// packet only; a binding miss never sets prefetchOK, so NAT
+		// cross-probe still runs when the live key may differ.
+		ue, ueExists = prefetched, true
+	} else {
+		ue, ueExists = DefaultUdpEndpointPool.Get(ueKey)
+	}
 	if !ueExists && !forceSymmetricKey {
 		if ueKey.Dst.Port() != 0 {
 			// Sniff-eligible UDP can re-enter here with a symmetric lookup even

@@ -591,7 +591,14 @@ func (p *UdpEndpointPool) Remove(key UdpEndpointKey, udpEndpoint *UdpEndpoint) (
 	return nil
 }
 
+// udpEndpointPoolGetObserver, when non-nil, is invoked on every Get. Tests
+// use it to count per-packet pool lookups; production leaves it nil.
+var udpEndpointPoolGetObserver func(UdpEndpointKey)
+
 func (p *UdpEndpointPool) Get(key UdpEndpointKey) (udpEndpoint *UdpEndpoint, ok bool) {
+	if observe := udpEndpointPoolGetObserver; observe != nil {
+		observe(key)
+	}
 	shard := p.shardFor(key)
 	shard.mu.RLock()
 	defer shard.mu.RUnlock()

@@ -119,6 +119,29 @@ profile ~0.6 次/包）在 Symmetric endpoint（poolKey.Dst 有效：QUIC/DNS/sn
 **注意**：默认 UDP NAT 是 FullCone——本优化只惠及 Symmetric 流（QUIC/DNS/sniff），
 通用 UDP 的 String 成本属 FullCone 语义必然，无法消除。
 
+### D3 测量后停手（2026-08-26）
+
+问题：`UdpEndpoint.WriteTo` 仍走 `netip.AddrPort → string → parse`，要不要改
+`PacketConn.WriteTo` 或加 `WriteToAddrPort`。
+
+测量（`BenchmarkUdpWriteStringRoundtrip`，本机 i7-14650HX）：
+
+| 路径 | ns/op | B/op | allocs |
+|---|---|---|---|
+| FullCone `realDst.String()` | 28.4 | 16 | 1 |
+| Symmetric `ue.DialTarget` 复用 | 1.3 | 0 | 0 |
+| `ParseAddrPort` | 33.7 | 0 | 0 |
+| String then Parse | 59.6 | 16 | 1 |
+
+对照既有 pprof（本文 §5）：写 syscall ~31% flat；String ~7.7% samples / 1.5% alloc。
+outbound 侧 `LastStringValue`（direct/socks5/ss/tuic/juicity/vmess）已缓存同一
+string 的 parse；hy2 协议消息本身就要 string。FullCone 每包目标可变，不能把
+last String 写进 `DialTarget`。
+
+结论：**不改** `PacketConn.WriteTo(string)`，不加 `WriteToAddrPort`，不碰 outbound
+fork / sticky-ip。剩余热点仍是出站写 syscall（已有 batch aggregator），不是
+这一圈格式化。
+
 ## 4. 结论与决策
 
 1. **070201f7（SetReadBuffer 8MiB）已 revert（23bc22c9）**：两个场景均无实测收益

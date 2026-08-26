@@ -274,8 +274,12 @@ func (c *ControlPlane) cleanupConnStateMap(aggressiveCleanup bool) (udpStats, tc
 	return c.cleanupConnStateMapBeforeLocked(aggressiveCleanup, 0)
 }
 
+// cleanupConnStateMapBeforeLocked scans ConnStateMap under connStateCleanupMu.
+// aggressiveCleanup halves the protocol TTLs under map pressure. A nonzero
+// staleBeforeNs (monotonic reload-request timestamp) additionally retires
+// entries not refreshed since the retired generation; pinned entries are
+// exempt via the pin snapshots and the scan-to-delete recheck below.
 func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, staleBeforeNs uint64) (udpStats, tcpStats mapCleanupStats) {
-	_ = staleBeforeNs
 	select {
 	case <-c.connStateJanitorStop:
 		return
@@ -348,7 +352,8 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 						}
 					}
 					age := nowNano - int64(value.LastSeenNs)
-					if age > timeout {
+					if age > timeout ||
+						(staleBeforeNs > 0 && (value.LastSeenNs == 0 || value.LastSeenNs < staleBeforeNs)) {
 						udpKeysToDelete = append(udpKeysToDelete, key)
 					}
 				case unix.IPPROTO_TCP:
@@ -366,6 +371,12 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 						if age > closingTimeout {
 							shouldDelete = true
 						}
+					}
+					// Established TCP has no TTL here (pin-governed), so the stale
+					// threshold is the only retirement path for orphaned entries.
+					if !shouldDelete && staleBeforeNs > 0 &&
+						(value.LastSeenNs == 0 || value.LastSeenNs < staleBeforeNs) {
+						shouldDelete = true
 					}
 					if shouldDelete {
 						tcpKeysToDelete = append(tcpKeysToDelete, key)

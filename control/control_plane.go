@@ -1596,6 +1596,12 @@ func (c *ControlPlane) stopRealDomainNegJanitor() {
 	})
 }
 
+// RunReloadRetirementCleanup purges old-generation datapath state after a
+// reload retires the previous control plane. staleBeforeNs is the monotonic
+// timestamp of the reload request: entries not refreshed since that point
+// belonged to the retired generation and are deleted immediately instead of
+// waiting for their TTL. Entries kept by active flows (last_seen refreshed
+// per packet) and by session-manager pins (adopted-but-idle sessions) survive.
 func (c *ControlPlane) RunReloadRetirementCleanup(staleBeforeNs uint64) {
 	if c == nil {
 		return
@@ -1611,10 +1617,10 @@ func (c *ControlPlane) RunReloadRetirementCleanup(staleBeforeNs uint64) {
 	}
 
 	c.connStateCleanupMu.Lock()
-	redirectDeleted := c.cleanupRedirectTrackMapBeforeLocked(0)
-	cookieDeleted := c.cleanupCookiePidMapBeforeLocked(0)
-	routingHandoffDeleted := c.cleanupRoutingHandoffMapBeforeLocked(0)
-	udpStats, tcpStats := c.cleanupConnStateMapBeforeLocked(true, 0)
+	redirectDeleted := c.cleanupRedirectTrackMapBeforeLocked(staleBeforeNs)
+	cookieDeleted := c.cleanupCookiePidMapBeforeLocked(staleBeforeNs)
+	routingHandoffDeleted := c.cleanupRoutingHandoffMapBeforeLocked(staleBeforeNs)
+	udpStats, tcpStats := c.cleanupConnStateMapBeforeLocked(true, staleBeforeNs)
 	c.connStateCleanupMu.Unlock()
 
 	if c.log == nil {

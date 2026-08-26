@@ -116,11 +116,16 @@ type ControlPlane struct {
 
 var policyEpochSequence atomic.Uint64
 
-type controlPlaneBuildOptions struct {
-	delayDatapathCommit   bool
-	delayDNSListenerStart bool
-	dnsRoutingUnchanged   bool
-	isReload              bool
+// ControlPlaneBuildOptions selects generation-mode behavior for
+// NewControlPlaneWithContextOptions. DelayDatapathCommit and
+// DelayDNSListenerStart build a prepared candidate that does not touch the
+// kernel datapath until CommitPreparedDatapath; IsReload selects reload-mode
+// TC handle flipping and skips startup-only stale hook purges.
+type ControlPlaneBuildOptions struct {
+	DelayDatapathCommit   bool
+	DelayDNSListenerStart bool
+	DNSRoutingUnchanged   bool
+	IsReload              bool
 }
 
 var (
@@ -192,7 +197,10 @@ func isIPLikeDomain(domain string) bool {
 	return false
 }
 
-func NewControlPlaneWithContext(
+// NewControlPlaneWithContextOptions is the single control-plane constructor;
+// the previous New{,Reload,Prepared,PreparedReload}ControlPlaneWithContext
+// wrapper family collapsed into this options-based entry point.
+func NewControlPlaneWithContextOptions(
 	ctx context.Context,
 	log *logrus.Logger,
 	_bpf any,
@@ -203,143 +211,7 @@ func NewControlPlaneWithContext(
 	global *config.Global,
 	dnsConfig *config.Dns,
 	externGeoDataDirs []string,
-	dnsRoutingUnchanged bool,
-) (plane *ControlPlane, err error) {
-	return newControlPlaneWithContextOptions(
-		ctx,
-		log,
-		_bpf,
-		dnsCache,
-		tagToNodeList,
-		groups,
-		routingA,
-		global,
-		dnsConfig,
-		externGeoDataDirs,
-		controlPlaneBuildOptions{
-			dnsRoutingUnchanged: dnsRoutingUnchanged,
-			isReload:            _bpf != nil,
-		},
-	)
-}
-
-// NewReloadControlPlaneWithContext builds a control plane during reload even
-// when it receives fresh BPF objects instead of shared objects from the old
-// generation. Reload builds must use reload TC handle flipping and must not run
-// startup-only stale hook purges.
-func NewReloadControlPlaneWithContext(
-	ctx context.Context,
-	log *logrus.Logger,
-	_bpf any,
-	dnsCache map[string]*DnsCache,
-	tagToNodeList map[string][]string,
-	groups []config.Group,
-	routingA *config.Routing,
-	global *config.Global,
-	dnsConfig *config.Dns,
-	externGeoDataDirs []string,
-	dnsRoutingUnchanged bool,
-) (plane *ControlPlane, err error) {
-	return newControlPlaneWithContextOptions(
-		ctx,
-		log,
-		_bpf,
-		dnsCache,
-		tagToNodeList,
-		groups,
-		routingA,
-		global,
-		dnsConfig,
-		externGeoDataDirs,
-		controlPlaneBuildOptions{
-			dnsRoutingUnchanged: dnsRoutingUnchanged,
-			isReload:            true,
-		},
-	)
-}
-
-// NewPreparedControlPlaneWithContext builds a new generation without mutating
-// the shared datapath. Call CommitPreparedDatapath before switching traffic.
-func NewPreparedControlPlaneWithContext(
-	ctx context.Context,
-	log *logrus.Logger,
-	_bpf any,
-	dnsCache map[string]*DnsCache,
-	tagToNodeList map[string][]string,
-	groups []config.Group,
-	routingA *config.Routing,
-	global *config.Global,
-	dnsConfig *config.Dns,
-	externGeoDataDirs []string,
-	dnsRoutingUnchanged bool,
-) (plane *ControlPlane, err error) {
-	return newControlPlaneWithContextOptions(
-		ctx,
-		log,
-		_bpf,
-		dnsCache,
-		tagToNodeList,
-		groups,
-		routingA,
-		global,
-		dnsConfig,
-		externGeoDataDirs,
-		controlPlaneBuildOptions{
-			delayDatapathCommit:   true,
-			delayDNSListenerStart: true,
-			dnsRoutingUnchanged:   dnsRoutingUnchanged,
-			isReload:              _bpf != nil,
-		},
-	)
-}
-
-// NewPreparedReloadControlPlaneWithContext builds a reload generation without
-// mutating the kernel datapath until CommitPreparedDatapath is called.
-func NewPreparedReloadControlPlaneWithContext(
-	ctx context.Context,
-	log *logrus.Logger,
-	_bpf any,
-	dnsCache map[string]*DnsCache,
-	tagToNodeList map[string][]string,
-	groups []config.Group,
-	routingA *config.Routing,
-	global *config.Global,
-	dnsConfig *config.Dns,
-	externGeoDataDirs []string,
-	dnsRoutingUnchanged bool,
-) (plane *ControlPlane, err error) {
-	return newControlPlaneWithContextOptions(
-		ctx,
-		log,
-		_bpf,
-		dnsCache,
-		tagToNodeList,
-		groups,
-		routingA,
-		global,
-		dnsConfig,
-		externGeoDataDirs,
-		controlPlaneBuildOptions{
-			delayDatapathCommit:   true,
-			delayDNSListenerStart: true,
-			dnsRoutingUnchanged:   dnsRoutingUnchanged,
-			isReload:              true,
-		},
-	)
-}
-
-func newControlPlaneWithContextOptions(
-	ctx context.Context,
-	log *logrus.Logger,
-	_bpf any,
-	dnsCache map[string]*DnsCache,
-	tagToNodeList map[string][]string,
-	groups []config.Group,
-	routingA *config.Routing,
-	global *config.Global,
-	dnsConfig *config.Dns,
-	externGeoDataDirs []string,
-	buildOpts controlPlaneBuildOptions,
+	buildOpts ControlPlaneBuildOptions,
 ) (plane *ControlPlane, err error) {
 	var freshDatapathState *FreshDatapathState
 	if state, ok := _bpf.(*FreshDatapathState); ok {
@@ -453,7 +325,7 @@ func newControlPlaneWithContextOptions(
 	}()
 	pinPath := filepath.Join(consts.BpfPinRoot, consts.AppName)
 	ephemeralPinPath := false
-	if _bpf == nil && buildOpts.isReload {
+	if _bpf == nil && buildOpts.IsReload {
 		pinPath = filepath.Join(pinPath, fmt.Sprintf("reload-%d-%d", os.Getpid(), time.Now().UnixNano()))
 		ephemeralPinPath = true
 	}
@@ -547,14 +419,14 @@ func newControlPlaneWithContextOptions(
 		bpf,
 		outboundId2Name,
 		&kernelVersion,
-		buildOpts.isReload,
+		buildOpts.IsReload,
 		!sharedBpfReload,
 	)
 	// A prepared shared-BPF routing-epoch generation must not overwrite the
 	// active generation's health map while it is still only a candidate. The
 	// runtime supervisor resumes its writes after publish, or leaves it paused
 	// while rollback restores the old generation.
-	if buildOpts.delayDatapathCommit && sharedBpfReload {
+	if buildOpts.DelayDatapathCommit && sharedBpfReload {
 		core.pauseOutboundConnectivityUpdates()
 	}
 	if ephemeralPinPath {
@@ -733,7 +605,7 @@ func newControlPlaneWithContextOptions(
 		return nil, fmt.Errorf("NewRoutingMatcherBuilder: %w", err)
 	}
 	kernspaceSnapshot := builder.KernspaceSnapshot()
-	if !buildOpts.delayDatapathCommit {
+	if !buildOpts.DelayDatapathCommit {
 		log.Infoln("Loading routing rules into kernel space (BPF)...")
 		var lpmIndices []uint32
 		if lpmIndices, err = kernspaceSnapshot.BuildKernspaceForSlot(log, core.bpf.Load(), core.RoutingEpochSlot()); err != nil {
@@ -814,7 +686,7 @@ func newControlPlaneWithContextOptions(
 			routingMatcher:      routingMatcher,
 			bootstrapResolvers:  bootstrapResolvers,
 		},
-		controlPlaneDNSRuntime:        newControlPlaneDNSRuntime(buildOpts.delayDNSListenerStart),
+		controlPlaneDNSRuntime:        newControlPlaneDNSRuntime(buildOpts.DelayDNSListenerStart),
 		controlPlaneDatapathJanitor:   newControlPlaneDatapathJanitor(),
 		onceNetworkReady:              sync.Once{},
 		drainTracker:                  newControlPlaneDrainTracker(),
@@ -823,10 +695,10 @@ func newControlPlaneWithContextOptions(
 		ready:                         make(chan struct{}),
 		autoConfigKernelParameter:     global.AutoConfigKernelParameter,
 		routingKernspaceSnapshot:      kernspaceSnapshot,
-		preparedDatapathCommit:        buildOpts.delayDatapathCommit,
+		preparedDatapathCommit:        buildOpts.DelayDatapathCommit,
 		sharedBpfReload:               sharedBpfReload,
 		pendingDnsReloadCache:         dnsCache,
-		dnsRoutingUnchanged:           buildOpts.dnsRoutingUnchanged,
+		dnsRoutingUnchanged:           buildOpts.DNSRoutingUnchanged,
 		controlPlaneRealDomainRuntime: newControlPlaneRealDomainRuntime(),
 		lanInterface:                  global.LanInterface,
 		wanInterface:                  global.WanInterface,
@@ -843,7 +715,7 @@ func newControlPlaneWithContextOptions(
 	SetAnyfromSoMark(global.SoMarkFromDae)
 	plane.deferFuncs = append(plane.deferFuncs, plane.closePublishedListenerFiles)
 	plane.startRealDomainNegJanitor()
-	if !buildOpts.delayDatapathCommit {
+	if !buildOpts.DelayDatapathCommit {
 		plane.startConnStateJanitor()
 	}
 
@@ -886,7 +758,7 @@ func newControlPlaneWithContextOptions(
 		if err != nil {
 			return nil, err
 		}
-		if !buildOpts.delayDNSListenerStart {
+		if !buildOpts.DelayDNSListenerStart {
 			if err = plane.dnsListener.Start(); err != nil {
 				log.Errorf("Failed to start DNS listener: %v", err)
 			} else {
@@ -906,7 +778,7 @@ func newControlPlaneWithContextOptions(
 		dnsUpstream.InitUpstreams(plane.ctx)
 	}()
 
-	if buildOpts.delayDatapathCommit {
+	if buildOpts.DelayDatapathCommit {
 		plane.preparedDatapathCommit = true
 	} else {
 		if err = plane.commitInterfaceBindings(); err != nil {

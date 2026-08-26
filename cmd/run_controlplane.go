@@ -64,7 +64,10 @@ func newPreparedControlPlane(ctx context.Context, log *logrus.Logger, bpf any, d
 }
 
 // buildControlPlaneRuntime is the final construction boundary after config
-// normalization, subscription resolution, and reload safety checks.
+// normalization, subscription resolution, and reload safety checks. The
+// prepareOnly × isReloadBuild matrix folds into build options: prepared
+// candidates delay both the datapath commit and the DNS listener start, and
+// any reload build (or an inherited BPF handle) selects reload-mode flipping.
 func buildControlPlaneRuntime(
 	ctx context.Context,
 	log *logrus.Logger,
@@ -80,52 +83,7 @@ func buildControlPlaneRuntime(
 	dnsRoutingUnchanged bool,
 	isReloadBuild bool,
 ) (*control.ControlPlane, error) {
-	if prepareOnly {
-		if isReloadBuild {
-			return control.NewPreparedReloadControlPlaneWithContext(
-				ctx,
-				log,
-				bpf,
-				dnsCache,
-				tagToNodeList,
-				groups,
-				routing,
-				global,
-				dns,
-				externGeoDataDirs,
-				dnsRoutingUnchanged,
-			)
-		}
-		return control.NewPreparedControlPlaneWithContext(
-			ctx,
-			log,
-			bpf,
-			dnsCache,
-			tagToNodeList,
-			groups,
-			routing,
-			global,
-			dns,
-			externGeoDataDirs,
-			dnsRoutingUnchanged,
-		)
-	}
-	if isReloadBuild {
-		return control.NewReloadControlPlaneWithContext(
-			ctx,
-			log,
-			bpf,
-			dnsCache,
-			tagToNodeList,
-			groups,
-			routing,
-			global,
-			dns,
-			externGeoDataDirs,
-			dnsRoutingUnchanged,
-		)
-	}
-	return control.NewControlPlaneWithContext(
+	return control.NewControlPlaneWithContextOptions(
 		ctx,
 		log,
 		bpf,
@@ -136,7 +94,12 @@ func buildControlPlaneRuntime(
 		global,
 		dns,
 		externGeoDataDirs,
-		dnsRoutingUnchanged,
+		control.ControlPlaneBuildOptions{
+			DelayDatapathCommit:   prepareOnly,
+			DelayDNSListenerStart: prepareOnly,
+			DNSRoutingUnchanged:   dnsRoutingUnchanged,
+			IsReload:              isReloadBuild || bpf != nil,
+		},
 	)
 }
 

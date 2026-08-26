@@ -46,6 +46,21 @@ type reloadWorker struct {
 	pprofServer *http.Server
 }
 
+// attachPreparedSessionManager attaches the process-owned session manager to a
+// newly built control plane. A prior construction error is returned unchanged
+// so callers can keep their existing failure tails. An attach failure closes
+// the candidate before it is returned, matching the previous inline copies.
+func attachPreparedSessionManager(c *control.ControlPlane, manager *control.SessionManager, err error) error {
+	if err != nil || c == nil {
+		return err
+	}
+	if attachErr := c.AttachSessionManager(manager); attachErr != nil {
+		_ = c.Close()
+		return attachErr
+	}
+	return nil
+}
+
 // run consumes reload requests until the process exits. It is started once by
 // Run and performs no generation publication itself; every prepared candidate
 // is published from Run's signal loop after it reports readiness.
@@ -188,12 +203,7 @@ func (w *reloadWorker) run() {
 			ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
 			newC, prepareErr := newPreparedControlPlane(ctx, w.log, reloadBpf, dnsCache, newConf, w.externGeoDataDirs, dnsConfigUnchanged, true)
 			dnsCache = nil
-			if prepareErr == nil {
-				prepareErr = newC.AttachSessionManager(w.processSessions)
-				if prepareErr != nil {
-					_ = newC.Close()
-				}
-			}
+			prepareErr = attachPreparedSessionManager(newC, w.processSessions, prepareErr)
 			if prepareErr != nil {
 				reloadErr := wrapReloadTimeoutError("prepare staged reload", prepareErr, reloadPrepareTimeout)
 				w.reloadManager.setReloadError(reloadErr)
@@ -284,12 +294,7 @@ func (w *reloadWorker) run() {
 				newC, prepareErr = newPreparedControlPlane(ctx, w.log, freshState, dnsCache, newConf, w.externGeoDataDirs, false, true)
 			}
 			dnsCache = nil
-			if prepareErr == nil {
-				prepareErr = newC.AttachSessionManager(w.processSessions)
-				if prepareErr != nil {
-					_ = newC.Close()
-				}
-			}
+			prepareErr = attachPreparedSessionManager(newC, w.processSessions, prepareErr)
 			if prepareErr != nil {
 				reloadErr := wrapReloadTimeoutError("prepare fresh datapath reload", prepareErr, reloadPrepareTimeout)
 				w.reloadManager.setReloadError(reloadErr)
@@ -357,12 +362,7 @@ func (w *reloadWorker) run() {
 		w.log.Warnln("[Reload] Load new control plane")
 		ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
 		newC, err := newControlPlane(ctx, w.log, reloadBpf, dnsCache, newConf, w.externGeoDataDirs, dnsConfigUnchanged, true)
-		if err == nil {
-			err = newC.AttachSessionManager(w.processSessions)
-			if err != nil {
-				_ = newC.Close()
-			}
-		}
+		err = attachPreparedSessionManager(newC, w.processSessions, err)
 		dnsCache = nil // Allow previous generation's clone to be GC'd.
 
 		var newCancel context.CancelFunc
@@ -381,12 +381,7 @@ func (w *reloadWorker) run() {
 			}
 			ctx, cancel = context.WithTimeout(context.Background(), reloadPrepareTimeout)
 			newC, err = newControlPlane(ctx, w.log, reloadBpf, rollbackDNSCache, w.conf, w.externGeoDataDirs, false, true)
-			if err == nil {
-				err = newC.AttachSessionManager(w.processSessions)
-				if err != nil {
-					_ = newC.Close()
-				}
-			}
+			err = attachPreparedSessionManager(newC, w.processSessions, err)
 			err = wrapReloadTimeoutError("rollback control plane", err, reloadPrepareTimeout)
 			if err != nil {
 				_ = sdnotify.Stopping()

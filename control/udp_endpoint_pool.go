@@ -108,8 +108,8 @@ type UdpEndpoint struct {
 	pendingReplyPeerCount int
 	pendingReplyPeerNext  int
 
-	Dialer             *dialer.Dialer
-	Outbound           *outbound.DialerGroup
+	Dialer            *dialer.Dialer
+	Outbound          *outbound.DialerGroup
 	flowRouteBinding  UdpRouteBinding
 	flowNetwork       string
 	flowBindingSet    bool
@@ -702,12 +702,13 @@ dialSuccess:
 	if _, ok := packetConn.(netproxy.PacketBatchWriter); ok {
 		ue.writeBatch = newUDPWriteBatchAggregator(ue)
 	}
-	ue.setFlowBinding(dialOption.Binding)
 	if createOption.sessionManager != nil {
 		if _, err := createOption.sessionManager.adoptUDP(ue, dialOption.Binding, createOption.egressRuntime); err != nil {
 			_ = packetConn.Close()
 			return nil, err
 		}
+	} else {
+		ue.setFlowBinding(dialOption.Binding)
 	}
 	if createOption.DrainTracker != nil {
 		ue.drainRelease = createOption.DrainTracker.Acquire()

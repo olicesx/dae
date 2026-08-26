@@ -127,4 +127,4 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260825
 
 // Use the remote outbound fork containing hot-path buffer reuse, underlay-
 // first Close, and honest WriteBatch n on top of the HY2/quic-go pins.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260826170018-89233dfc1b2d
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260826182007-dd3816d37d19

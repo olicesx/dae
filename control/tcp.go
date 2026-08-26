@@ -658,12 +658,12 @@ func (c *bufioConn) TakeRelayPrefix() []byte {
 	return prefix
 }
 
-func (c *bufioConn) CopyRelayRemainder(dst io.Writer, buf []byte, record func(int64)) (int64, error) {
+func (c *bufioConn) CopyRelayRemainder(dst io.Writer, buf []byte, record func(int64), onActive func(int64)) (int64, error) {
 	if c == nil {
 		return 0, nil
 	}
 	if c.reader == nil {
-		return relayCopyDirect(dst, c.Conn, buf, record, nil)
+		return relayCopyDirect(dst, c.Conn, buf, record, onActive)
 	}
 
 	// Once buffered bytes are drained we can resume directly on the underlying

@@ -18,7 +18,7 @@ type relaySegmentSource interface {
 }
 
 type relayContinuationSource interface {
-	CopyRelayRemainder(dst io.Writer, buf []byte, record func(int64)) (int64, error)
+	CopyRelayRemainder(dst io.Writer, buf []byte, record func(int64), onActive func(int64)) (int64, error)
 }
 
 type relayPrefixSource interface {

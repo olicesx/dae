@@ -916,50 +916,18 @@ func (ue *UdpEndpoint) GetBoundRoutingResult(dst netip.AddrPort, l4proto uint8) 
 	return &result, true
 }
 
-func (ue *UdpEndpoint) GetCachedRoutingResult(dst netip.AddrPort, l4proto uint8) (*bpfRoutingResult, bool) {
-	ttl := UdpRoutingResultCacheTtl
-	if ttl <= 0 {
-		return nil, false
-	}
-
-	ue.routingMu.RLock()
-	defer ue.routingMu.RUnlock()
-
-	if !ue.hasRoutingCache {
-		return nil, false
-	}
-	if ue.routingCacheProto != l4proto || ue.routingCacheDst != dst {
-		return nil, false
-	}
-	if time.Since(ue.routingCacheAt) > ttl {
-		return nil, false
-	}
-
-	result := ue.routingCache
-	return &result, true
-}
-
 func (ue *UdpEndpoint) UpdateCachedRoutingResult(dst netip.AddrPort, l4proto uint8, result *bpfRoutingResult) {
 	if result == nil {
-		return
-	}
-	if UdpRoutingResultCacheTtl <= 0 {
 		return
 	}
 
 	ue.routingMu.Lock()
 	ue.routingCacheDst = dst
 	ue.routingCacheProto = l4proto
-	ue.routingCacheAt = time.Now()
 	ue.routingCache = *result
 	ue.hasRoutingCache = true
 	ue.routingMu.Unlock()
 }
-
-// UdpEndpointKey is the pool key. Dst=0 for Full-Cone NAT, non-zero for
-// destination-affine flows such as QUIC or userspace-routed UDP. RouteScope is
-// only populated when UDP routing depends on packet metadata that userspace
-// cannot safely infer from payload reuse alone.
 
 // endpointSurvivesDialerInvalidation reports whether an endpoint should remain
 // reusable after its dialer transitions to not alive.

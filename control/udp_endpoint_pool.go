@@ -22,7 +22,6 @@ import (
 )
 
 var (
-	UdpRoutingResultCacheTtl      = 300 * time.Millisecond
 	ErrEndpointFailed             = fmt.Errorf("endpoint creation recently failed (negative cache)")
 	errUdpEndpointAdmissionClosed = stderrors.New("udp endpoint admission closed")
 )
@@ -122,7 +121,6 @@ type UdpEndpoint struct {
 	routingMu         sync.RWMutex
 	routingCacheDst   netip.AddrPort
 	routingCacheProto uint8
-	routingCacheAt    time.Time
 	routingCache      bpfRoutingResult
 	hasRoutingCache   bool
 
@@ -182,6 +180,10 @@ type UdpEndpoint struct {
 	sessionRuntime *UDPFlowRuntime
 }
 
+// UdpEndpointKey is the pool key. Dst=0 for Full-Cone NAT, non-zero for
+// destination-affine flows such as QUIC or userspace-routed UDP. RouteScope is
+// only populated when UDP routing depends on packet metadata that userspace
+// cannot safely infer from payload reuse alone.
 type UdpEndpointKey struct {
 	Src        netip.AddrPort
 	Dst        netip.AddrPort

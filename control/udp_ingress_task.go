@@ -90,12 +90,6 @@ func canPrefetchCachedEndpoint(flowDecision UdpFlowDecision, key UdpEndpointKey)
 	return firstKey == key
 }
 
-// cachedRoutingBinding is the bound-result view of lookupCachedRoutingBinding.
-func cachedRoutingBinding(flowDecision UdpFlowDecision, realDst netip.AddrPort) (*bpfRoutingResult, bool) {
-	lookup := lookupCachedRoutingBinding(flowDecision, realDst)
-	return lookup.bound, lookup.bindingHit
-}
-
 // routingCacheOwnerEndpoint finds the endpoint that owns the flow's cached
 // routing result: the primary cached endpoint if present, else the fallback.
 func routingCacheOwnerEndpoint(flowDecision UdpFlowDecision) *UdpEndpoint {

@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/daeuniverse/dae/component/dnstransport"
 	"github.com/olicesx/quic-go"
 	"github.com/olicesx/quic-go/congestion"
 )
@@ -68,34 +69,13 @@ func (c *stubEarlyConn) NextConnection(context.Context) (quic.Connection, error)
 	return nil, net.ErrClosed
 }
 
-func TestOwnedEarlyConnCloseClosesPacketConnOnce(t *testing.T) {
-	t.Parallel()
-
-	packet := &ownedPacketCloser{}
-	qc := &stubEarlyConn{}
-	owned := ownEarlyConnection(qc, packet)
-
-	if err := owned.CloseWithError(0, ""); err != nil {
-		t.Fatalf("CloseWithError: %v", err)
-	}
-	if err := owned.CloseWithError(0, "again"); err != nil {
-		t.Fatalf("second CloseWithError: %v", err)
-	}
-	if got := packet.closed.Load(); got != 1 {
-		t.Fatalf("packet Close count = %d, want 1", got)
-	}
-	if got := qc.closed.Load(); got != 1 {
-		t.Fatalf("quic CloseWithError count = %d, want 1", got)
-	}
-}
-
 func TestDoQReplaceAndCloseClosesUnderlyingPacketConn(t *testing.T) {
 	t.Parallel()
 
 	firstPacket := &ownedPacketCloser{}
 	secondPacket := &ownedPacketCloser{}
-	first := ownEarlyConnection(&stubEarlyConn{}, firstPacket)
-	second := ownEarlyConnection(&stubEarlyConn{}, secondPacket)
+	first := dnstransport.OwnEarlyConnection(&stubEarlyConn{}, firstPacket)
+	second := dnstransport.OwnEarlyConnection(&stubEarlyConn{}, secondPacket)
 
 	calls := 0
 	d := &DoQ{
@@ -143,8 +123,8 @@ func TestDoQInstallRaceClosesLosingConnection(t *testing.T) {
 
 	winnerPacket := &ownedPacketCloser{}
 	loserPacket := &ownedPacketCloser{}
-	winner := ownEarlyConnection(&stubEarlyConn{}, winnerPacket)
-	loser := ownEarlyConnection(&stubEarlyConn{}, loserPacket)
+	winner := dnstransport.OwnEarlyConnection(&stubEarlyConn{}, winnerPacket)
+	loser := dnstransport.OwnEarlyConnection(&stubEarlyConn{}, loserPacket)
 
 	d := &DoQ{connection: winner}
 	got, err := d.installConnection(loser)

@@ -435,26 +435,6 @@ func TestQueryHTTPSResponseErrorDoesNotReplaceClient(t *testing.T) {
 	}
 }
 
-func TestOwnedEarlyConnCloseClosesPacketConnOnce(t *testing.T) {
-	t.Parallel()
-
-	packet := &countingCloser{}
-	qc := &stubEarlyConn{}
-	owned := ownEarlyConnection(qc, packet)
-	if err := owned.CloseWithError(0, ""); err != nil {
-		t.Fatalf("CloseWithError: %v", err)
-	}
-	if err := owned.CloseWithError(0, "again"); err != nil {
-		t.Fatalf("second CloseWithError: %v", err)
-	}
-	if got := packet.closed.Load(); got != 1 {
-		t.Fatalf("packet Close count = %d, want 1", got)
-	}
-	if got := qc.closed.Load(); got != 1 {
-		t.Fatalf("quic CloseWithError count = %d, want 1", got)
-	}
-}
-
 var (
 	_ io.Closer            = (*countingCloser)(nil)
 	_ quic.EarlyConnection = (*stubEarlyConn)(nil)

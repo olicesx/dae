@@ -8,27 +8,54 @@ package control
 import (
 	"context"
 	stderrors "errors"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/sirupsen/logrus"
 )
 
-const (
-	relayHalfCloseTimeout = 10 * time.Second
+var (
+	// relayHalfCloseTimeout bounds how long the peer of a half-closed relay
+	// may still deliver data after our side sent EOF.
+	relayHalfCloseTimeout = envOverrideDuration("DAE_TCP_RELAY_HALF_CLOSE_TIMEOUT", 10*time.Second)
 	// relayIdleTimeout bounds how long a relay may sit with zero traffic in
 	// both directions before it is force-closed. A half-open peer (vanished
 	// without FIN/RST) otherwise parks the directional read forever and the
 	// relay leaks. Any traffic in either direction refreshes lastActive, so
 	// long-lived but active connections (SSH, gaming) are never touched.
-	relayIdleTimeout = 5 * time.Minute
+	//
+	// Applications that legitimately stay silent for long stretches (idle
+	// database CLI sessions, MQTT keepalives longer than the default, long
+	// CONNECT tunnels) can raise this via DAE_TCP_RELAY_IDLE_TIMEOUT
+	// without recompiling. It is a var rather than a const so deployments
+	// can retune reclaim pressure per environment; the config-file grammar
+	// does not carry this knob.
+	relayIdleTimeout = envOverrideDuration("DAE_TCP_RELAY_IDLE_TIMEOUT", 5*time.Minute)
 	// relayIdleCheckInterval is the watchdog cadence for idle reclamation.
 	relayIdleCheckInterval = 30 * time.Second
 	// relayCancelNudgeInterval only applies after cancellation. At that point,
 	// prompt teardown matters more than avoiding deadline syscalls.
 	relayCancelNudgeInterval = 100 * time.Millisecond
 )
+
+// envOverrideDuration applies an optional process-level override for tunables
+// that are not exposed through the config-file grammar. Invalid or non-positive
+// values fall back to def with a warning instead of silently misbehaving.
+func envOverrideDuration(name string, def time.Duration) time.Duration {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		logrus.StandardLogger().Warnf("invalid %s=%q, using default %s", name, raw, def)
+		return def
+	}
+	return d
+}
 
 type relayCore struct {
 	left  netproxy.Conn

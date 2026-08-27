@@ -219,11 +219,13 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 
 	// Start timing the startup process
 	startTime := time.Now()
-	stageStart := startTime
+	// Reused across phases; each stage resets it right before its work.
+	var stageStart time.Time
 
 	// Resolve subscriptions to nodes.
 	resolvingfailed := false
 	if !conf.Global.DisableWaitingNetwork {
+		networkWaitStart := time.Now()
 		epo := 5 * time.Second
 		client := http.Client{
 			Transport: &http.Transport{
@@ -242,7 +244,9 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 			Timeout: epo,
 		}
 		log.Infoln("Waiting for network...")
+		attempts := 0
 		for i := 0; ; i++ {
+			attempts = i + 1
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -276,6 +280,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 			}
 		}
 		log.Infoln("Network online.")
+		log.Infof("Network check took %v (%d attempt(s))", time.Since(networkWaitStart), attempts)
 	}
 	if len(conf.Subscription) > 0 {
 		log.Infoln("Fetching subscriptions...")
@@ -283,13 +288,18 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	// Parallelize subscription resolution to improve startup performance.
 	// Use a semaphore to limit concurrency and avoid overwhelming the network.
 	type subscriptionResult struct {
-		tag   string
-		nodes []string
-		err   error
-		sub   config.KeyableString
+		tag     string
+		nodes   []string
+		err     error
+		sub     config.KeyableString
+		elapsed time.Duration
 	}
 	numSubscriptions := len(conf.Subscription)
 	if numSubscriptions > 0 {
+		// Reset to cover only the fetch itself; the network-wait phase above is
+		// timed separately, so slow WAN bring-up no longer shows up as
+		// "Subscriptions fetched".
+		stageStart = time.Now()
 		// Limit concurrency to 4 subscriptions at a time to avoid overwhelming network
 		maxConcurrency := min(numSubscriptions, 4)
 		sem := make(chan struct{}, maxConcurrency)
@@ -300,6 +310,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 				sem <- struct{}{}        // Acquire semaphore
 				defer func() { <-sem }() // Release semaphore
 
+				subStart := time.Now()
 				subDialer := direct.SymmetricDirect
 				if daeDNSRouter != nil {
 					wrappedDialer, wrapErr := daeDNSRouter.WrapSubscriptionDialer(subDialer, string(s))
@@ -315,10 +326,11 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 				client := newHTTPClientForDialer(subDialer, 30*time.Second, conf.Global.SoMarkFromDae, conf.Global.Mptcp)
 				tag, nodes, err := subscription.ResolveSubscription(log, &client, filepath.Dir(cfgFile), string(s))
 				results <- subscriptionResult{
-					tag:   tag,
-					nodes: nodes,
-					err:   err,
-					sub:   s,
+					tag:     tag,
+					nodes:   nodes,
+					err:     err,
+					sub:     s,
+					elapsed: time.Since(subStart),
 				}
 			}(sub)
 		}
@@ -327,8 +339,10 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 		for range numSubscriptions {
 			result := <-results
 			if result.err != nil {
-				log.Warnf(`failed to resolve subscription "%v": %v`, result.sub, result.err)
+				log.Warnf(`failed to resolve subscription "%v" after %v: %v`, result.sub, result.elapsed, result.err)
 				resolvingfailed = true
+			} else {
+				log.Infof(`subscription "%v" resolved %d node(s) in %v`, result.tag, len(result.nodes), result.elapsed)
 			}
 			if len(result.nodes) > 0 {
 				tagToNodeList[result.tag] = append(tagToNodeList[result.tag], result.nodes...)

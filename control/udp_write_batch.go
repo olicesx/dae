@@ -112,6 +112,16 @@ func (a *udpWriteBatchAggregator) Append(data []byte, addr string) error {
 // deliberately deferred until after the unlock — handleWriteError can retire
 // the endpoint, whose Close re-enters this aggregator via writeBatch.Close,
 // and Go's mutex is not reentrant.
+//
+// Holding mu across the syscall is a deliberate final design, not an
+// oversight. The contention domain is one endpoint only: dae's per-flow FIFO
+// ingress (UdpTaskPool) funnels each endpoint's writes through its own convoy
+// sender, so there is a single producer goroutine in the steady state, and
+// the underlying socket serializes datagrams in-kernel anyway. Slot-swap or
+// copy-out variants would relocate that same serialization into an atomic
+// handshake (or pay an extra memcpy per packet) while adding tail latency for
+// cross-batch reordering — strictly worse here. Revisit only if a future
+// consumer feeds one aggregator from many goroutines.
 func (a *udpWriteBatchAggregator) flush() {
 	if !a.flushing.CompareAndSwap(false, true) {
 		return

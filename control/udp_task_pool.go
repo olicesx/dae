@@ -37,6 +37,21 @@ type UdpTask interface {
 	Run()
 }
 
+// udpTaskDiscarder is implemented by tasks that own resources released by
+// Run's defers (pool buffers, admission tickets, the pooled task object).
+// Queue teardown must discard those tasks without running them.
+type udpTaskDiscarder interface {
+	Discard()
+}
+
+// discardTask releases the resources a queued-but-never-run task holds.
+// Plain func tasks carry nothing and are dropped for GC.
+func discardTask(task UdpTask) {
+	if d, ok := task.(udpTaskDiscarder); ok {
+		d.Discard()
+	}
+}
+
 // udpTaskFunc adapts a func literal to UdpTask.
 type udpTaskFunc func()
 
@@ -141,6 +156,32 @@ func (q *UdpTaskQueue) popReadyTask() (UdpTask, bool) {
 	return q.popOverflowTask()
 }
 
+// drainAndRelease empties any tasks still queued before the channel returns
+// to the pool, discarding them with their per-packet cleanup. Without this,
+// a convoy teardown (panic recover or pool Close) would both leak the tasks'
+// buffers and admission tickets — hanging closeAndWait — and hand a channel
+// holding stale packets to an unrelated flow. releaseQueueCh's CAS still
+// guards against double-put.
+func (q *UdpTaskQueue) drainAndRelease() {
+	for {
+		select {
+		case task := <-q.ch:
+			discardTask(task)
+			continue
+		default:
+		}
+		break
+	}
+	for {
+		task, ok := q.popOverflowTask()
+		if !ok {
+			break
+		}
+		discardTask(task)
+	}
+	q.p.releaseQueueCh(q)
+}
+
 // safeTimerReset resets the timer following Go best practice.
 // Per Go documentation: "To reuse a Timer, call Reset and drain the channel
 // if it fired." This ensures no stale timer event interferes with the next cycle.
@@ -159,10 +200,14 @@ func (q *UdpTaskQueue) convoy() {
 		if r := recover(); r != nil {
 			reportPacketPathPanic("convoy", "lifecycle", &udpTaskPoolPanicCount, r)
 			if q.p != nil {
-				// Ensure the queue is removed from the pool so a new one can be
-				// created if traffic continues.
+				// Lock out new acquires first, like the idle-GC path does,
+				// so an in-flight EmitTask cannot hand work to a dead convoy
+				// or race the drain below.
+				q.refs.Store(-1000000)
 				q.p.queues.Delete(q.key)
-				q.p.releaseQueueCh(q)
+				// Residual tasks are discarded with their resource cleanup
+				// before the channel is reused.
+				q.drainAndRelease()
 			}
 		}
 	}()
@@ -223,13 +268,13 @@ func (q *UdpTaskQueue) convoy() {
 
 			// Try to delete from pool using CAS-like semantics via sync.Map
 			if q.p.tryDeleteQueue(q.key, q) {
-				q.p.releaseQueueCh(q)
+				q.drainAndRelease()
 				return
 			}
 			// Check if mapping still points to current queue.
 			// If not, this convoy is stale and must exit to prevent goroutine leak.
 			if v, ok := q.p.queues.Load(q.key); !ok || v.(*UdpTaskQueue) != q {
-				q.p.releaseQueueCh(q)
+				q.drainAndRelease()
 				return
 			}
 
@@ -335,7 +380,7 @@ func (p *UdpTaskPool) Close() {
 		if q, ok := p.queues.LoadAndDelete(key); ok {
 			queue := q.(*UdpTaskQueue)
 			queue.close()
-			p.releaseQueueCh(queue)
+			queue.drainAndRelease()
 		}
 		return true
 	})

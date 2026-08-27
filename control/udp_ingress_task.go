@@ -117,6 +117,17 @@ var udpIngressTaskPool = sync.Pool{
 	New: func() any { return &udpIngressTask{} },
 }
 
+// Discard releases the packet resources without executing the task. It is
+// used when queue teardown (convoy panic recovery or pool Close) strands
+// tasks that never ran: their buffer, admission ticket, and pooled object
+// must still be returned, in the same order Run's defers would.
+func (t *udpIngressTask) Discard() {
+	t.pktBuf.Put()
+	t.admission.release()
+	*t = udpIngressTask{}
+	udpIngressTaskPool.Put(t)
+}
+
 // Run executes the ingress packet handling. The buffer and admission gate
 // are released and the task is returned to the pool in all paths.
 func (t *udpIngressTask) Run() {

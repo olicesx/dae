@@ -236,7 +236,7 @@ func (c *DnsController) applyPreferenceWait(respMsg *dnsmessage.Msg) *dnsmessage
 		preferred := wait.waitFor()
 
 		// Clean up wait registry
-		c.prefWaitRegistry.remove(qname)
+		c.prefWaitRegistry.remove(wait)
 
 		if preferred {
 			if c.log.IsLevelEnabled(logrus.TraceLevel) {

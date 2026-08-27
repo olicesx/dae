@@ -30,6 +30,7 @@ const (
 // When a non-preferred response arrives (e.g., A when prefer=6), we wait briefly
 // to see if the preferred response (e.g., AAAA) arrives before responding.
 type preferenceWait struct {
+	qname     string        // Key this wait is registered under (identity for removal)
 	qtype     uint16        // Original query type (A or AAAA)
 	preferred bool          // Whether the preferred response arrived in time
 	done      chan struct{} // Closed when wait is complete (timeout or preferred arrived)
@@ -79,6 +80,7 @@ func (r *preferenceWaitRegistry) registerWait(qname string, qtype uint16, qtypeP
 
 	// Create new wait
 	w := &preferenceWait{
+		qname:    qname,
 		qtype:    qtype,
 		done:     make(chan struct{}),
 		deadline: time.Now().Add(PreferenceResolutionDelay),
@@ -109,18 +111,29 @@ func (r *preferenceWaitRegistry) notifyPreferred(qname string, qtype uint16, qty
 	w, ok := r.waits[qname]
 	if ok {
 		// Mark the preferred response as observed before releasing the waiter.
+		// A newer waiter may already have replaced this entry for the same
+		// qname — notify it but only remove the identity we found.
 		w.preferred = true
 		close(w.done)
-		delete(r.waits, qname)
+		if r.waits[qname] == w {
+			delete(r.waits, qname)
+		}
 	}
 	r.mu.Unlock()
 	return ok
 }
 
-// remove removes a wait from the registry.
-func (r *preferenceWaitRegistry) remove(qname string) {
+// remove removes a specific wait from the registry by identity. Removing by
+// bare qname could delete a newer query's wait that reused the key after this
+// one was replaced via registerWait's existing-wait return path.
+func (r *preferenceWaitRegistry) remove(w *preferenceWait) {
+	if w == nil {
+		return
+	}
 	r.mu.Lock()
-	delete(r.waits, qname)
+	if cur := r.waits[w.qname]; cur == w {
+		delete(r.waits, w.qname)
+	}
 	r.mu.Unlock()
 }
 

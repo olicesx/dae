@@ -111,7 +111,7 @@ func (c *ControlPlane) ChooseDialTarget(outbound consts.OutboundIndex, dst netip
 func (c *ControlPlane) lookupRealDomainCache(domain string) (known bool, real bool) {
 	// Read-mostly fast path.
 	c.muRealDomainSet.RLock()
-	hit := c.realDomainSet.TestString(domain)
+	_, hit := c.realDomainSet[domain]
 	c.muRealDomainSet.RUnlock()
 	if hit {
 		return true, true
@@ -162,7 +162,11 @@ func (c *ControlPlane) probeAndUpdateRealDomain(domain string) bool {
 	defer cancel()
 
 	if len(c.bootstrapResolvers) == 0 {
-		// Fail closed when no bootstrap resolver is configured.
+		// Fail closed when no bootstrap resolver is configured — and memoize
+		// the failure in the negative cache, otherwise every connection to
+		// every unknown domain respawns a goroutine+singleflight probe that
+		// can never succeed.
+		c.realDomainNegSet.Store(domain, time.Now().Add(realDomainNegativeCacheTTL).UnixNano())
 		return false
 	}
 
@@ -183,7 +187,18 @@ func (c *ControlPlane) probeAndUpdateRealDomain(domain string) bool {
 	}
 
 	c.muRealDomainSet.Lock()
-	c.realDomainSet.AddString(domain)
+	if _, exists := c.realDomainSet[domain]; !exists {
+		if len(c.realDomainSet) >= realDomainSetCapacity {
+			// FIFO evict the oldest confirmation. The cost of losing one is
+			// a single re-probe; the alternative (the old unbounded bloom)
+			// turned stale bits into permanent wrong answers.
+			for evict := range c.realDomainSet {
+				delete(c.realDomainSet, evict)
+				break
+			}
+		}
+		c.realDomainSet[domain] = struct{}{}
+	}
 	c.muRealDomainSet.Unlock()
 	c.realDomainNegSet.Delete(domain)
 	return true

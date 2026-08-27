@@ -118,11 +118,11 @@ require (
 // Add on a full send queue (30s timeout -> ErrDatagramQueueFullTimeout).
 // The current revision preserves package Dial's skip-address fast path while
 // restoring sender addresses for explicit transports.
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260825091419-801d72b1bfff
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260827082732-71b82de673ea
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
 
 // Remote outbound fork: Trojan UDP CRLF, sticky role-header dispatch,
 // scoped h2 MarkDead, 8KiB direct small-tier, and TUIC stream-parse bench.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260827065003-9e1febf4f794
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260827081812-6b6531ef9eb4

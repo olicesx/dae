@@ -533,7 +533,11 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 		}
 		return true, nil
 	}
-	RecordUploadTraffic(int64(len(data)))
+	// The retained endpoint still belongs to this plane's connection, so
+	// meter it through the plane-bound recorder like every other egress
+	// write: the global recorder would attribute bytes of a retiring
+	// generation to whichever store is published mid-reload.
+	c.recordUploadTraffic(int64(len(data)))
 	if lifecycle, lifecycleOK := newUdpSessionLifecycleContext(ue, ""); lifecycleOK {
 		lifecycle.reportTrafficSuccess()
 	}

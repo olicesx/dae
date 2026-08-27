@@ -14,7 +14,7 @@ require (
 	github.com/miekg/dns v1.1.72
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
 	github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac
-	github.com/olicesx/quic-go v0.0.0-20260825091419-801d72b1bfff
+	github.com/olicesx/quic-go v0.0.0-20260827105826-c61845789995
 	github.com/panjf2000/ants/v2 v2.11.5
 	github.com/safchain/ethtool v0.7.0
 	github.com/shirou/gopsutil/v4 v4.26.1
@@ -118,7 +118,7 @@ require (
 // Add on a full send queue (30s timeout -> ErrDatagramQueueFullTimeout).
 // The current revision preserves package Dial's skip-address fast path while
 // restoring sender addresses for explicit transports.
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260827082732-71b82de673ea
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260827105826-c61845789995
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config

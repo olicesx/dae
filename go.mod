@@ -7,7 +7,7 @@ require (
 	github.com/antlr/antlr4/runtime/Go/antlr/v4 v4.0.0-20230305170008-8188dc5388df
 	github.com/cilium/ebpf v0.22.0
 	github.com/daeuniverse/dae-config-dist/go/dae_config v0.0.0-20230604120805-1c27619b592d
-	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260825091423-1764decca95b
+	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260827044533-5063ca84c3cc
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/json-iterator/go v1.1.12
 	github.com/mholt/archives v0.1.5
@@ -123,6 +123,6 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260825
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
 
-// Use the remote outbound fork containing hot-path buffer reuse, underlay-
-// first Close, and honest WriteBatch n on top of the HY2/quic-go pins.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260827012226-e030f04c3bb1
+// Remote outbound fork: Trojan UDP CRLF, sticky role-header dispatch,
+// scoped h2 MarkDead, 8KiB direct small-tier, and TUIC stream-parse bench.
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260827044533-5063ca84c3cc

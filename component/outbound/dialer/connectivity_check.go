@@ -151,6 +151,23 @@ func (d *Dialer) MustGetAlive(typ *NetworkType) bool {
 	return d.mustGetCollection(typ).Alive.Load()
 }
 
+// dnsBorrowedLatencyV4/V6 are immutable singletons for the data-UDP latency
+// borrow: allocating a fresh NetworkType per notification served nothing.
+var (
+	dnsBorrowedLatencyV4 = &NetworkType{
+		L4Proto:         consts.L4ProtoStr_UDP,
+		IpVersion:       consts.IpVersionStr_4,
+		IsDns:           true,
+		UdpHealthDomain: UdpHealthDomainDns,
+	}
+	dnsBorrowedLatencyV6 = &NetworkType{
+		L4Proto:         consts.L4ProtoStr_UDP,
+		IpVersion:       consts.IpVersionStr_6,
+		IsDns:           true,
+		UdpHealthDomain: UdpHealthDomainDns,
+	}
+)
+
 func (d *Dialer) SnapshotLastProbe(typ *NetworkType) DialerProbeObservationSnapshot {
 	if d == nil || typ == nil {
 		return DialerProbeObservationSnapshot{}
@@ -195,11 +212,11 @@ func (d *Dialer) snapshotLatencyForPolicy(
 	// health domains.
 	latencyType := typ
 	if typ.L4Proto == consts.L4ProtoStr_UDP && typ.EffectiveUdpHealthDomain() == UdpHealthDomainData {
-		latencyType = &NetworkType{
-			L4Proto:         consts.L4ProtoStr_UDP,
-			IpVersion:       typ.IpVersion,
-			IsDns:           true,
-			UdpHealthDomain: UdpHealthDomainDns,
+		switch typ.IpVersion {
+		case consts.IpVersionStr_6:
+			latencyType = dnsBorrowedLatencyV6
+		default:
+			latencyType = dnsBorrowedLatencyV4
 		}
 	}
 	d.collectionFineMu.RLock()
@@ -709,6 +726,9 @@ func (d *Dialer) aliveBackground() {
 
 		var wg sync.WaitGroup
 		d.submitCheckTasks(workerPool, &wg, opts, checkFamily != "", cycleRes)
+		// Per-cycle waiter goroutine evaluated (round 11) and kept: it runs
+		// microseconds per interval across all dialers; alternatives either
+		// spin or complicate submit/failure accounting.
 		waitDone := make(chan struct{})
 		go func() {
 			wg.Wait()

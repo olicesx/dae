@@ -228,6 +228,8 @@ func relayChunkedSpliceCopy(ctx context.Context, dst, src *net.TCPConn, record f
 	record = normalizeTrafficRecord(record)
 	onActive = normalizeTrafficRecord(onActive)
 	var written int64
+	// One reader reused across chunks: R never changes, only N resets.
+	lr := &io.LimitedReader{R: src}
 	for {
 		if ctx != nil {
 			select {
@@ -237,10 +239,7 @@ func relayChunkedSpliceCopy(ctx context.Context, dst, src *net.TCPConn, record f
 			}
 		}
 
-		lr := &io.LimitedReader{
-			R: src,
-			N: relaySpliceAccountingChunkSize,
-		}
+		lr.N = relaySpliceAccountingChunkSize
 		n, err := io.Copy(dst, lr)
 		if n > 0 {
 			written += n

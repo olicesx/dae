@@ -34,6 +34,14 @@ type AhocorasickSlimtrie struct {
 	toBuildAc   [][][]byte
 	toBuildTrie [][]string
 	err         error
+
+	// matchCache memoizes the most recent qname resolutions. A single DNS
+	// query otherwise recomputes the same domain bitmap up to six times
+	// (request select, response select, and once per ip-version x protocol
+	// dialer iteration). Capacity-bounded, scan on overflow.
+	matchMu       sync.Mutex
+	matchCache    map[string][]uint32
+	matchCacheOrd []string
 }
 
 func NewAhocorasickSlimtrie(log *logrus.Logger, bitLength int) *AhocorasickSlimtrie {
@@ -112,7 +120,40 @@ nextPattern:
 		}
 	}
 }
+
+// matchCacheCap bounds the per-matcher qname->bitmap memo (small: sequential
+// DNS traffic has high temporal locality).
+const matchCacheCap = 512
+
 func (n *AhocorasickSlimtrie) MatchDomainBitmap(domain string) (bitmap []uint32) {
+	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
+	n.matchMu.Lock()
+	if n.matchCache != nil {
+		if cached, ok := n.matchCache[domain]; ok {
+			n.matchMu.Unlock()
+			return cached
+		}
+	}
+	n.matchMu.Unlock()
+	bitmap = n.matchDomainBitmapUncached(domain)
+	n.matchMu.Lock()
+	if n.matchCache == nil {
+		n.matchCache = make(map[string][]uint32, 64)
+	}
+	if _, exists := n.matchCache[domain]; !exists {
+		if len(n.matchCacheOrd) >= matchCacheCap {
+			evict := n.matchCacheOrd[0]
+			n.matchCacheOrd = n.matchCacheOrd[1:]
+			delete(n.matchCache, evict)
+		}
+		n.matchCache[domain] = bitmap
+		n.matchCacheOrd = append(n.matchCacheOrd, domain)
+	}
+	n.matchMu.Unlock()
+	return bitmap
+}
+
+func (n *AhocorasickSlimtrie) matchDomainBitmapUncached(domain string) (bitmap []uint32) {
 	N := len(n.ac) / 32
 	if len(n.ac)%32 != 0 {
 		N++
@@ -182,6 +223,11 @@ func ToSuffixTrieStrings(s []string) []string {
 	return to
 }
 func (n *AhocorasickSlimtrie) Build() (err error) {
+	n.matchMu.Lock()
+	n.matchCache = nil
+	n.matchCacheOrd = nil
+	n.matchMu.Unlock()
+
 	if n.err != nil {
 		return n.err
 	}

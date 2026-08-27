@@ -22,6 +22,34 @@ type RoutingMatcher struct {
 
 	compiledMatches []compiledRoutingMatch
 	predicateGroups []routingMatcherPredicateGroupSpan
+
+	// needs records which fact strings any compiled rule can consume, so the
+	// hot path skips building 128-char binary keys nothing will ever read.
+	needs routingMatcherNeeds
+}
+
+type routingMatcherNeeds struct {
+	ipSetBin     bool
+	sourceIPSetB bool
+	macBin       bool
+	domainBitmap bool
+}
+
+func computeRoutingMatcherNeeds(matches []compiledRoutingMatch) routingMatcherNeeds {
+	var n routingMatcherNeeds
+	for _, m := range matches {
+		switch m.matchType {
+		case consts.MatchType_IpSet:
+			n.ipSetBin = true
+		case consts.MatchType_SourceIpSet:
+			n.sourceIPSetB = true
+		case consts.MatchType_Mac:
+			n.macBin = true
+		case consts.MatchType_DomainSet:
+			n.domainBitmap = true
+		}
+	}
+	return n
 }
 
 // routingMatcherPredicateGroupSpan maps one immutable policy predicate group
@@ -131,21 +159,29 @@ func (m *RoutingMatcher) newFacts(
 	}
 
 	facts := routingMatcherFacts{
-		sourceAddr:     sourceAddr,
-		destAddr:       destAddr,
-		sourcePort:     sourcePort,
-		destPort:       destPort,
-		ipVersion:      ipVersion,
-		l4proto:        l4proto,
-		domain:         domain,
-		pname:          processName,
-		dscp:           dscp,
-		mac:            mac,
-		ipSetBin:       trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(destAddr), 128)),
-		sourceIPSetBin: trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(sourceAddr), 128)),
-		macBin:         trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(mac), 128)),
+		sourceAddr: sourceAddr,
+		destAddr:   destAddr,
+		sourcePort: sourcePort,
+		destPort:   destPort,
+		ipVersion:  ipVersion,
+		l4proto:    l4proto,
+		domain:     domain,
+		pname:      processName,
+		dscp:       dscp,
+		mac:        mac,
 	}
-	if domain != "" {
+	// Gated on the compiled rule inventory: Prefix2bin128 churns a 128-byte
+	// string per call, so skip keys that no rule reads.
+	if m.needs.ipSetBin {
+		facts.ipSetBin = trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(destAddr), 128))
+	}
+	if m.needs.sourceIPSetB {
+		facts.sourceIPSetBin = trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(sourceAddr), 128))
+	}
+	if m.needs.macBin {
+		facts.macBin = trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(mac), 128))
+	}
+	if m.needs.domainBitmap && domain != "" {
 		facts.domainBitmap = m.domainMatcher.MatchDomainBitmap(domain)
 	}
 	return facts, nil

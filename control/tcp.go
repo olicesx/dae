@@ -236,7 +236,7 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 				lRelayConn = probeConn
 			default:
 				// ConnSniffer should be used later, so we cannot close it now.
-				sniffer := sniffing.NewConnSniffer(probeConn, c.sniffingTimeout)
+				sniffer := sniffing.NewConnSniffer(probeConn, c.sniffingTimeout, c.log)
 				defer func() { _ = sniffer.Close() }()
 				lRelayConn = sniffer
 

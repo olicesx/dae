@@ -161,37 +161,15 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 		}
 		responseCacheKey = c.responseCacheKey(baseCacheKey, req, upstreamIndex, upstream)
 
-		if upstreamIndex == consts.DnsRequestOutboundIndex_Reject {
-			c.RemoveDnsRespCacheFamily(baseCacheKey)
-			return c.sendRejectWithResponseWriter_(dnsMessage, req, responseWriter)
+		if handled, herr := c.serveRejectWithWriter_(dnsMessage, req, responseWriter, baseCacheKey, upstreamIndex); handled {
+			return herr
 		}
 
-		// Check cache after routing (non-reject case)
-		if resp, needRefresh := c.LookupDnsRespCache_(dnsMessage, responseCacheKey, false); resp != nil {
-			// Cache hit - return immediately without singleflight
-			// OPTIMISTIC CACHE: resp may be stale, trigger background refresh if needed
-			if needRefresh {
-				// Background refresh - don't block the current request
-				go c.backgroundRefresh(responseCacheKey, dnsMessage, req, upstreamIndex, upstream)
-			}
-
-			if err = c.writeCachedResponse(resp, dnsMessage.Id, req, responseWriter, dnsMessage); err != nil {
-				return err
-			}
-			// Log cache hit with dest addr for CI compatibility.
-			// Format includes "-> dest:port" so CI grep can verify routing.
-			if c.log.IsLevelEnabled(logrus.DebugLevel) && len(dnsMessage.Question) > 0 && req != nil {
-				q := dnsMessage.Question[0]
-				c.log.WithFields(logrus.Fields{
-					"network": "udp(dns)",
-					"_qname":  strings.ToLower(q.Name),
-					"qtype":   QtypeToString(q.Qtype),
-				}).Debugf("%v <-> %v (cache)",
-					RefineSourceToShow(req.realSrc, req.realDst.Addr()),
-					RefineAddrPortToShow(req.realDst),
-				)
-			}
-			return nil
+		// Check cache after routing (non-reject case). Cache hits return
+		// immediately without singleflight; stale entries background-refresh.
+		if handled, herr := c.serveFromRespCacheWithRefresh_(dnsMessage, req, responseWriter,
+			responseCacheKey, upstreamIndex, upstream); handled {
+			return herr
 		}
 
 		// Cache miss - use singleflight to coalesce concurrent requests
@@ -300,6 +278,52 @@ func (c *DnsController) resolveForSingleflight(
 	return respMsg, nil
 }
 
+// serveRejectWithWriter_ applies a routing-reject verdict if one was selected.
+func (c *DnsController) serveRejectWithWriter_(dnsMessage *dnsmessage.Msg, req *udpRequest,
+	responseWriter dnsmessage.ResponseWriter, baseCacheKey string,
+	upstreamIndex consts.DnsRequestOutboundIndex,
+) (bool, error) {
+	if upstreamIndex != consts.DnsRequestOutboundIndex_Reject {
+		return false, nil
+	}
+	c.RemoveDnsRespCacheFamily(baseCacheKey)
+	return true, c.sendRejectWithResponseWriter_(dnsMessage, req, responseWriter)
+}
+
+// serveFromRespCacheWithRefresh_ answers from the response cache when present,
+// scheduling optimistic background refreshes for stale entries.
+func (c *DnsController) serveFromRespCacheWithRefresh_(dnsMessage *dnsmessage.Msg, req *udpRequest,
+	responseWriter dnsmessage.ResponseWriter, responseCacheKey string,
+	upstreamIndex consts.DnsRequestOutboundIndex, upstream *dns.Upstream,
+) (bool, error) {
+	resp, needRefresh := c.LookupDnsRespCache_(dnsMessage, responseCacheKey, false)
+	if resp == nil {
+		return false, nil
+	}
+	if needRefresh {
+		go c.backgroundRefresh(responseCacheKey, dnsMessage, req, upstreamIndex, upstream)
+	}
+	if err := c.writeCachedResponse(resp, dnsMessage.Id, req, responseWriter, dnsMessage); err != nil {
+		return true, err
+	}
+	if c.log.IsLevelEnabled(logrus.DebugLevel) && len(dnsMessage.Question) > 0 {
+		q := dnsMessage.Question[0]
+		l := c.log.WithFields(logrus.Fields{
+			"_qname": strings.ToLower(q.Name),
+			"qtype":  QtypeToString(q.Qtype),
+		})
+		if req != nil {
+			l = l.WithFields(logrus.Fields{
+				"network": "udp(dns)",
+				"source":  RefineSourceToShow(req.realSrc, req.realDst.Addr()),
+				"dest":    RefineAddrPortToShow(req.realDst),
+			})
+		}
+		l.Debug("cache hit")
+	}
+	return true, nil
+}
+
 func (c *DnsController) handleWithResponseWriter_(
 	ctx context.Context,
 	dnsMessage *dnsmessage.Msg,
@@ -338,33 +362,13 @@ func (c *DnsController) handleWithResponseWriter_(
 		responseCacheKey = c.responseCacheKey(baseCacheKey, req, upstreamIndex, upstream)
 	}
 
-	if upstreamIndex == consts.DnsRequestOutboundIndex_Reject {
-		// Reject with empty answer.
-		c.RemoveDnsRespCacheFamily(baseCacheKey)
-		return c.sendRejectWithResponseWriter_(dnsMessage, req, responseWriter)
+	if handled, herr := c.serveRejectWithWriter_(dnsMessage, req, responseWriter, baseCacheKey, upstreamIndex); handled {
+		return herr
 	}
 
-	if resp, needRefresh := c.LookupDnsRespCache_(dnsMessage, responseCacheKey, false); resp != nil {
-		// Send cache to client directly.
-		// OPTIMISTIC CACHE: Trigger background refresh if stale
-		if needRefresh {
-			go c.backgroundRefresh(responseCacheKey, dnsMessage, req, upstreamIndex, upstream)
-		}
-
-		if err = c.writeCachedResponse(resp, dnsMessage.Id, req, responseWriter, dnsMessage); err != nil {
-			return err
-		}
-		if c.log.IsLevelEnabled(logrus.DebugLevel) && len(dnsMessage.Question) > 0 {
-			q := dnsMessage.Question[0]
-			if req != nil {
-				c.log.Debugf("UDP(DNS) %v <-> Cache: %v %v",
-					RefineSourceToShow(req.realSrc, req.realDst.Addr()), strings.ToLower(q.Name), QtypeToString(q.Qtype),
-				)
-			} else {
-				c.log.Debugf("UDP(DNS) Cache: %v %v", strings.ToLower(q.Name), QtypeToString(q.Qtype))
-			}
-		}
-		return nil
+	if handled, herr := c.serveFromRespCacheWithRefresh_(dnsMessage, req, responseWriter,
+		responseCacheKey, upstreamIndex, upstream); handled {
+		return herr
 	}
 
 	if c.log.IsLevelEnabled(logrus.TraceLevel) {

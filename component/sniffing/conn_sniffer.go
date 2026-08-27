@@ -26,14 +26,22 @@ var relayBufPool = sync.Pool{
 }
 
 type ConnSniffer struct {
+	// log defaults to the standard logger; callers owning a configured
+	// control-plane logger should inject it via NewConnSniffer.
+	log *logrus.Logger
 	net.Conn
 	*Sniffer
 }
 
-func NewConnSniffer(conn net.Conn, timeout time.Duration) *ConnSniffer {
+func NewConnSniffer(conn net.Conn, timeout time.Duration, log ...*logrus.Logger) *ConnSniffer {
 	s := &ConnSniffer{
 		Conn:    conn,
 		Sniffer: NewStreamSniffer(conn, timeout),
+	}
+	if len(log) > 0 && log[0] != nil {
+		s.log = log[0]
+	} else {
+		s.log = logrus.StandardLogger()
 	}
 	return s
 }
@@ -88,7 +96,7 @@ func (s *ConnSniffer) TakeRelayPrefix() []byte {
 	select {
 	case <-s.dataReady:
 	default:
-		logrus.Warn("TakeRelayPrefix: dataReady not closed (abnormal sniff state); skipping wait to avoid relay deadlock")
+		s.log.Warn("TakeRelayPrefix: dataReady not closed (abnormal sniff state); skipping wait to avoid relay deadlock")
 	}
 
 	s.readMu.Lock()

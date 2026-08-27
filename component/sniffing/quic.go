@@ -42,6 +42,9 @@ func IsLikelyQuicInitialPacket(buf []byte) bool {
 	}
 	protectedFlag := buf[0]
 
+	// Gate masks only bit0 (header form); sniffQuicBlock below also includes
+	// the Reserved bit in its mask — behaviorally identical for byte 0 today,
+	// kept loose so a future flag widening fails closed here.
 	if ((protectedFlag >> QuicFlag_HeaderForm) & 0b1) != QuicFlag_HeaderForm_LongHeader {
 		return false
 	}
@@ -114,6 +117,8 @@ func sniffQuicBlock(s *Sniffer, cryptos []*quicutils.CryptoFrameOffset, buf []by
 	// Long header: 4 bits masked
 	// High 4 bits are not protected, so we can access QuicFlag_HeaderForm and QuicFlag_LongPacketType without decryption.
 	protectedFlag := buf[0]
+	// 0b11 covers HeaderForm + Reserved so an unexpected high nibble shape
+	// bails early; only bit0 currently matters for this check.
 	if ((protectedFlag >> QuicFlag_HeaderForm) & 0b11) != QuicFlag_HeaderForm_LongHeader {
 		return cryptos, nil, ErrNotApplicable
 	}

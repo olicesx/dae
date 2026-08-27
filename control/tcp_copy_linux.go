@@ -82,7 +82,10 @@ func relayFastCopy(ctx context.Context, dst netproxy.Conn, src netproxy.Conn, re
 		// use an explicit splice loop so we can account exact bytes written while
 		// staying in the kernel zero-copy path. relayCore.forceClose() will
 		// unblock blocked splice calls via SetReadDeadline(past).
-		if record == nil {
+		// The bare io.Copy shortcut is legal only when neither record nor
+		// onActive is set: io.Copy cannot refresh lastActiveNano, and the
+		// idle watchdog is armed unconditionally by relayCore.run.
+		if record == nil && onActive == nil {
 			return io.Copy(dstTCP, srcTCP)
 		}
 		return relaySpliceCopyExact(ctx, dstTCP, srcTCP, record, onActive)
@@ -91,7 +94,7 @@ func relayFastCopy(ctx context.Context, dst netproxy.Conn, src netproxy.Conn, re
 	// Fallback: use WriterTo if available, or buffered copy
 	if dstOk {
 		if _, ok := src.(io.WriterTo); ok {
-			if record == nil {
+			if record == nil && onActive == nil {
 				return io.Copy(dstTCP, src)
 			}
 			bufPtr := relayCopyBufferPool.Get().(*[]byte)

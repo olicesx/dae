@@ -2,6 +2,7 @@ package control
 
 import (
 	"bufio"
+	"context"
 	"io"
 	"net"
 	"sync/atomic"
@@ -175,5 +176,75 @@ func TestBufioConnCopyRelayRemainderInvokesOnActiveViaSplice(t *testing.T) {
 	}
 	if string(got) != string(payload) {
 		t.Fatalf("spliced payload = %q, want %q", got, payload)
+	}
+}
+
+func TestRelayFastCopyNilRecordStillInvokesOnActive(t *testing.T) {
+	lnSrc, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lnSrc.Close() })
+	lnDst, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lnDst.Close() })
+
+	srcClient, err := net.Dial("tcp", lnSrc.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srcClient.Close() })
+	srcAccepted, err := lnSrc.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcTCP := srcAccepted.(*net.TCPConn)
+	t.Cleanup(func() { _ = srcTCP.Close() })
+
+	dstClient, err := net.Dial("tcp", lnDst.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dstTCP := dstClient.(*net.TCPConn)
+	t.Cleanup(func() { _ = dstTCP.Close() })
+	dstAccepted, err := lnDst.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dstPeer := dstAccepted.(*net.TCPConn)
+	t.Cleanup(func() { _ = dstPeer.Close() })
+
+	payload := []byte("fast-copy-no-record")
+	go func() {
+		_, _ = srcClient.Write(payload)
+		_ = srcClient.(*net.TCPConn).CloseWrite()
+	}()
+
+	// record == nil must not disable activity refreshes: the idle watchdog
+	// is armed unconditionally by relayCore.run, so a nil-record relay that
+	// drops onActive would be reclaimed mid-flow.
+	var active atomic.Int64
+	n, err := relayFastCopy(context.Background(), dstTCP, srcTCP, nil, func(v int64) { active.Add(v) })
+	if err != nil && err != io.EOF {
+		t.Fatalf("relayFastCopy: %v", err)
+	}
+	if n != int64(len(payload)) {
+		t.Fatalf("written = %d, want %d", n, len(payload))
+	}
+	if active.Load() == 0 {
+		t.Fatal("onActive was not invoked: nil record must not take the bare io.Copy shortcut")
+	}
+
+	got := make([]byte, len(payload))
+	if err := dstPeer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(dstPeer, got); err != nil {
+		t.Fatalf("read relayed payload: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("relayed payload = %q, want %q", got, payload)
 	}
 }

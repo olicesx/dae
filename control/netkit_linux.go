@@ -45,6 +45,10 @@ func netkitIpLinkAddArgs(name, peerName string, scrubNone bool) []string {
 	// ifname; there is no `peer_scrub` keyword.
 	args := []string{"link", "add", name, "type", "netkit", "mode", "l2"}
 	if scrubNone {
+		// iproute2 accepts `scrub none` on both the primary and the peer
+		// (there is no `peer_scrub` keyword). If a given `ip` rejects the
+		// peer-side `scrub` token, createNetkitDeviceViaIpCmd falls back to
+		// the no-scrub argv below.
 		args = append(args, "scrub", "none", "peer", "scrub", "none", peerName)
 	} else {
 		args = append(args, "peer", peerName)

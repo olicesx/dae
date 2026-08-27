@@ -672,17 +672,14 @@ func (c *bufioConn) CopyRelayRemainder(dst io.Writer, buf []byte, record func(in
 		if dstConn, ok := dst.(netproxy.Conn); ok {
 			if dstTCP, ok := unwrapRelayTCPConn(dstConn); ok {
 				if srcTCP, ok := unwrapRelayTCPConn(c.Conn); ok {
-					if record != nil {
-						return relaySpliceCopyExact(context.Background(), dstTCP, srcTCP, record, nil)
-					}
-					return io.Copy(dstTCP, srcTCP)
+					return relaySpliceCopyExact(context.Background(), dstTCP, srcTCP, record, onActive)
 				}
 			}
 		}
-		return relayCopyDirect(dst, c.Conn, buf, record, nil)
+		return relayCopyDirect(dst, c.Conn, buf, record, onActive)
 	}
 
-	return relayCopyDirect(dst, c.reader, buf, record, nil)
+	return relayCopyDirect(dst, c.reader, buf, record, onActive)
 }
 
 func (c *bufioConn) Read(b []byte) (int, error) {

@@ -125,6 +125,10 @@ nextPattern:
 // DNS traffic has high temporal locality).
 const matchCacheCap = 512
 
+// MatchDomainBitmap returns the routing bitmap for domain. The returned
+// slice is immutable and may alias the memo; callers must not write it
+// in place (an in-place OR would poison every later DnsCache lookup).
+// The hit path does not clone: that would undo the memo.
 func (n *AhocorasickSlimtrie) MatchDomainBitmap(domain string) (bitmap []uint32) {
 	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
 	// Hit path takes only a read lock: concurrent flow establishments must

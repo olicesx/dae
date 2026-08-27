@@ -62,3 +62,19 @@ func TestAhocorasickSlimtrie(t *testing.T) {
 		}
 	}
 }
+
+func TestMatchDomainBitmapHitReturnsSharedAlias(t *testing.T) {
+	actrie := NewAhocorasickSlimtrie(logrus.StandardLogger(), 32)
+	actrie.AddSet(0, []string{"example.com"}, consts.RoutingDomainKey_Full)
+	if err := actrie.Build(); err != nil {
+		t.Fatal(err)
+	}
+	first := actrie.MatchDomainBitmap("example.com")
+	second := actrie.MatchDomainBitmap("example.com")
+	if len(first) == 0 || first[0] == 0 {
+		t.Fatal("expected a hit bit")
+	}
+	if &first[0] != &second[0] {
+		t.Fatal("hit path cloned the memoized bitmap; callers must treat it as immutable")
+	}
+}

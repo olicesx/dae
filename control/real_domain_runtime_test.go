@@ -1,34 +1,43 @@
 package control
 
 import (
+	"strconv"
 	"testing"
 )
 
-// TestRealDomainSetBoundedFIFO verifies the confirmed-real set never exceeds
-// its capacity and evicts oldest-first, eliminating the unbounded false-
-// positive growth of the replaced bloom filter.
 func TestRealDomainSetBoundedFIFO(t *testing.T) {
 	rt := newControlPlaneRealDomainRuntime()
 	if rt.realDomainSet == nil {
 		t.Fatal("realDomainSet not initialized")
 	}
 
-	// Fill past capacity.
-	for i := 0; i < realDomainSetCapacity+10; i++ {
-		domain := "d" + string(rune('a'+i%26)) + ".test"
-		rt.muRealDomainSet.Lock()
-		if _, exists := rt.realDomainSet[domain]; !exists {
-			if len(rt.realDomainSet) >= realDomainSetCapacity {
-				for evict := range rt.realDomainSet {
-					delete(rt.realDomainSet, evict)
-					break
-				}
-			}
-			rt.realDomainSet[domain] = struct{}{}
-		}
-		rt.muRealDomainSet.Unlock()
+	first := "first.example"
+	last := "last.example"
+	rt.muRealDomainSet.Lock()
+	rt.rememberRealDomain(first)
+	for i := 0; i < realDomainSetCapacity-1; i++ {
+		rt.rememberRealDomain("d" + strconv.Itoa(i) + ".test")
 	}
+	if len(rt.realDomainSet) != realDomainSetCapacity {
+		t.Fatalf("set size %d, want %d before overflow", len(rt.realDomainSet), realDomainSetCapacity)
+	}
+	rt.rememberRealDomain(first) // existing confirmation must not re-append
+	rt.rememberRealDomain(last)
+	rt.muRealDomainSet.Unlock()
+
 	if len(rt.realDomainSet) > realDomainSetCapacity {
 		t.Fatalf("set size %d exceeds capacity %d", len(rt.realDomainSet), realDomainSetCapacity)
+	}
+	if _, ok := rt.realDomainSet[first]; ok {
+		t.Fatal("oldest confirmation was not FIFO-evicted")
+	}
+	if _, ok := rt.realDomainSet[last]; !ok {
+		t.Fatal("newest confirmation missing after overflow")
+	}
+	if rt.realDomainOrd[0] == first {
+		t.Fatal("FIFO order still starts at the evicted name")
+	}
+	if rt.realDomainOrd[len(rt.realDomainOrd)-1] != last {
+		t.Fatalf("FIFO tail = %q, want %q", rt.realDomainOrd[len(rt.realDomainOrd)-1], last)
 	}
 }

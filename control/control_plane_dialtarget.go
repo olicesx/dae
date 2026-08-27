@@ -187,18 +187,7 @@ func (c *ControlPlane) probeAndUpdateRealDomain(domain string) bool {
 	}
 
 	c.muRealDomainSet.Lock()
-	if _, exists := c.realDomainSet[domain]; !exists {
-		if len(c.realDomainSet) >= realDomainSetCapacity {
-			// FIFO evict the oldest confirmation. The cost of losing one is
-			// a single re-probe; the alternative (the old unbounded bloom)
-			// turned stale bits into permanent wrong answers.
-			for evict := range c.realDomainSet {
-				delete(c.realDomainSet, evict)
-				break
-			}
-		}
-		c.realDomainSet[domain] = struct{}{}
-	}
+	c.rememberRealDomain(domain)
 	c.muRealDomainSet.Unlock()
 	c.realDomainNegSet.Delete(domain)
 	return true

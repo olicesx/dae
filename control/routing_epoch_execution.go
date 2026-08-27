@@ -18,7 +18,24 @@ import (
 var (
 	errRoutingEpochOwnerUnavailable = stderrors.New("routing epoch execution owner is unavailable")
 	routingEpochPeerLinkMu          sync.Mutex
-	incomingConnectionOwnershipMu   sync.Mutex
+	// incomingConnectionOwnershipMu is an RWMutex, not a plain mutex:
+	//
+	//   - Readers (RLock) are the steady-state connection fast path — lease
+	//     acquire, cross-generation transfer, and release. Each only touches
+	//     state that is internally synchronized (drainTracker's own mutex,
+	//     inConnections sync.Map, atomic gate flags), so readers need no
+	//     mutual exclusion among themselves.
+	//   - Writers (Lock) are rare lifecycle transitions — close/abort flag
+	//     stores, AttachSessionManager, and flow adoption. A writer waiting
+	//     drains all past readers before running, which is exactly the
+	//     happens-before that keeps "admit after idle" impossible: a close
+	//     flag store can never overtake an accept-check + ticket-acquire
+	//     pair that read the previous value.
+	//
+	// Lock order: incomingConnectionOwnershipMu > sessionManagerMu >
+	// generationsMu/shards. No reader path nests another acquisition of this
+	// mutex, so recursive-RRLock writer starvation cannot deadlock.
+	incomingConnectionOwnershipMu sync.RWMutex
 )
 
 // incomingConnectionLease keeps an accepted TCP connection attached to the
@@ -302,13 +319,13 @@ func (c *ControlPlane) acquireRoutingEpochExecutionOwner(result *bpfRoutingResul
 		}
 	}
 
-	incomingConnectionOwnershipMu.Lock()
+	incomingConnectionOwnershipMu.RLock()
 	if !peer.acceptsRoutingEpochExecutionLocked() || !peer.routingEpochExecutionMatches(result) {
-		incomingConnectionOwnershipMu.Unlock()
+		incomingConnectionOwnershipMu.RUnlock()
 		return nil, nil, routingEpochOwnerUnavailableError(result)
 	}
 	release := peer.acquireDrainTicket()
-	incomingConnectionOwnershipMu.Unlock()
+	incomingConnectionOwnershipMu.RUnlock()
 	return peer, release, nil
 }
 
@@ -325,8 +342,8 @@ func (c *ControlPlane) acceptsRoutingEpochExecutionLocked() bool {
 }
 
 func (c *ControlPlane) acquireRoutingEpochExecutionLeaseFor(result *bpfRoutingResult) (func(), bool) {
-	incomingConnectionOwnershipMu.Lock()
-	defer incomingConnectionOwnershipMu.Unlock()
+	incomingConnectionOwnershipMu.RLock()
+	defer incomingConnectionOwnershipMu.RUnlock()
 	if !c.acceptsRoutingEpochExecutionLocked() || !c.routingEpochExecutionMatches(result) {
 		return nil, false
 	}
@@ -337,8 +354,8 @@ func (c *ControlPlane) acquireIncomingConnectionLease(conn net.Conn) (*incomingC
 	if c == nil || conn == nil {
 		return nil, false
 	}
-	incomingConnectionOwnershipMu.Lock()
-	defer incomingConnectionOwnershipMu.Unlock()
+	incomingConnectionOwnershipMu.RLock()
+	defer incomingConnectionOwnershipMu.RUnlock()
 	if !c.acceptsRoutingEpochExecutionLocked() {
 		_ = conn.Close()
 		return nil, false
@@ -356,12 +373,12 @@ func (l *incomingConnectionLease) transferRoutingEpoch(owner *ControlPlane, resu
 	if l == nil || owner == nil || owner == l.owner {
 		return l != nil && owner == l.owner && owner.routingEpochExecutionMatches(result)
 	}
-	incomingConnectionOwnershipMu.Lock()
+	incomingConnectionOwnershipMu.RLock()
 	if l.owner == nil ||
 		!l.owner.acceptsRoutingEpochExecutionLocked() ||
 		!owner.acceptsRoutingEpochExecutionLocked() ||
 		!owner.routingEpochExecutionMatches(result) {
-		incomingConnectionOwnershipMu.Unlock()
+		incomingConnectionOwnershipMu.RUnlock()
 		return false
 	}
 	previous := l.owner
@@ -370,7 +387,7 @@ func (l *incomingConnectionLease) transferRoutingEpoch(owner *ControlPlane, resu
 	previous.inConnections.Delete(l.conn)
 	l.owner = owner
 	l.drainRelease = owner.acquireDrainTicket()
-	incomingConnectionOwnershipMu.Unlock()
+	incomingConnectionOwnershipMu.RUnlock()
 
 	if previousRelease != nil {
 		previousRelease()
@@ -382,9 +399,9 @@ func (l *incomingConnectionLease) release() {
 	if l == nil {
 		return
 	}
-	incomingConnectionOwnershipMu.Lock()
+	incomingConnectionOwnershipMu.RLock()
 	drainRelease := l.releaseLocked()
-	incomingConnectionOwnershipMu.Unlock()
+	incomingConnectionOwnershipMu.RUnlock()
 	if drainRelease != nil {
 		drainRelease()
 	}

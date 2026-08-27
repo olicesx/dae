@@ -119,8 +119,15 @@ func (a *udpWriteBatchAggregator) flush() {
 	defer a.flushing.Store(false)
 
 	a.mu.Lock()
-	items := a.items
-	a.items = nil
+	// Reuse the items backing array instead of dropping it for GC: the next
+	// Append runs under this same mutex only after the transport write below
+	// completes, so nothing can observe half-reset entries. This avoids
+	// reallocating a 32-item slice on every flush window per batched endpoint.
+	var items []netproxy.BatchItem
+	if len(a.items) > 0 {
+		items = a.items
+		a.items = a.items[:0]
+	}
 	a.used = 0
 	if a.timer != nil {
 		a.timer.Stop()

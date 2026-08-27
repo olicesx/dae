@@ -104,10 +104,9 @@ func TestSnapshotPinnedTCPReflectsRetained(t *testing.T) {
 	dst := common.ConvergeAddrPort(netip.MustParseAddrPort("198.51.100.2:80"))
 	key := bpfTuplesKeyFromAddrPorts(src, dst, uint8(unix.IPPROTO_TCP))
 
-	// Directly manipulate pinnedTCP (normally done via adoptTCP)
-	mgr.mu.Lock()
-	mgr.pinnedTCP[key]++
-	mgr.mu.Unlock()
+	// Directly manipulate the pinned shard (normally done via adoptTCP)
+	pinShard := &mgr.pinnedShards[tuplesShardIndex(&key)]
+	pinShard.pin(key)
 
 	snap := mgr.snapshotPinnedTCP()
 	if _, found := snap[key]; !found {
@@ -115,12 +114,7 @@ func TestSnapshotPinnedTCPReflectsRetained(t *testing.T) {
 	}
 
 	// Decrement
-	mgr.mu.Lock()
-	mgr.pinnedTCP[key]--
-	if mgr.pinnedTCP[key] <= 0 {
-		delete(mgr.pinnedTCP, key)
-	}
-	mgr.mu.Unlock()
+	pinShard.unpin(key)
 
 	snap = mgr.snapshotPinnedTCP()
 	if _, found := snap[key]; found {
@@ -201,15 +195,9 @@ func TestSnapshotPinnedTCPConcurrentSafe(t *testing.T) {
 			for i := range iterations {
 				src := common.ConvergeAddrPort(netip.AddrPortFrom(baseSrc.Addr(), uint16(idx*1000+i)))
 				key := bpfTuplesKeyFromAddrPorts(src, baseDst, uint8(unix.IPPROTO_TCP))
-				mgr.mu.Lock()
-				mgr.pinnedTCP[key]++
-				mgr.mu.Unlock()
-				mgr.mu.Lock()
-				mgr.pinnedTCP[key]--
-				if mgr.pinnedTCP[key] <= 0 {
-					delete(mgr.pinnedTCP, key)
-				}
-				mgr.mu.Unlock()
+				shard := &mgr.pinnedShards[tuplesShardIndex(&key)]
+				shard.pin(key)
+				shard.unpin(key)
 			}
 		}(w)
 	}

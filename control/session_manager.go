@@ -50,21 +50,133 @@ type udpFlowSourceSnapshot struct {
 	epochCounts map[routing.PolicyEpoch]int
 }
 
+// sessionPinnedShardCount sizes the per-key refcount shards. Sixteen shards
+// spread concurrent connection setups so adopt/release rarely contend; each
+// key maps to exactly one shard by hash, keeping its refcount authoritative
+// in a single place.
+const sessionPinnedShardCount = 16
+
+type pinnedKeyShard struct {
+	mu   sync.Mutex
+	keys map[bpfTuplesKey]int
+}
+
+type redirectKeyShard struct {
+	mu   sync.Mutex
+	keys map[bpfRedirectTuple]int
+}
+
+// tuplesShardIndex is an allocation-free FNV-1a over the fixed-width tuple.
+func tuplesShardIndex(key *bpfTuplesKey) int {
+	const (
+		fnvOffset uint32 = 2166136261
+		fnvPrime  uint32 = 16777619
+	)
+	h := fnvOffset
+	for i := range key.Sip.U6Addr8 {
+		h ^= uint32(key.Sip.U6Addr8[i])
+		h *= fnvPrime
+	}
+	for i := range key.Dip.U6Addr8 {
+		h ^= uint32(key.Dip.U6Addr8[i])
+		h *= fnvPrime
+	}
+	h ^= uint32(key.Sport)
+	h *= fnvPrime
+	h ^= uint32(key.Dport)
+	h *= fnvPrime
+	h ^= uint32(key.L4proto)
+	h *= fnvPrime
+	return int(h % sessionPinnedShardCount)
+}
+
+func redirectShardIndex(key *bpfRedirectTuple) int {
+	const (
+		fnvOffset uint32 = 2166136261
+		fnvPrime  uint32 = 16777619
+	)
+	h := fnvOffset
+	for i := range key.Sip.U6Addr8 {
+		h ^= uint32(key.Sip.U6Addr8[i])
+		h *= fnvPrime
+	}
+	for i := range key.Dip.U6Addr8 {
+		h ^= uint32(key.Dip.U6Addr8[i])
+		h *= fnvPrime
+	}
+	return int(h % sessionPinnedShardCount)
+}
+
+func (s *pinnedKeyShard) pin(key bpfTuplesKey) {
+	s.mu.Lock()
+	s.keys[key]++
+	s.mu.Unlock()
+}
+
+func (s *pinnedKeyShard) unpin(key bpfTuplesKey) (dropped bool) {
+	s.mu.Lock()
+	if refs := s.keys[key]; refs <= 1 {
+		delete(s.keys, key)
+		dropped = true
+	} else {
+		s.keys[key] = refs - 1
+	}
+	s.mu.Unlock()
+	return dropped
+}
+
+func (s *redirectKeyShard) pin(key bpfRedirectTuple) {
+	s.mu.Lock()
+	s.keys[key]++
+	s.mu.Unlock()
+}
+
+func (s *redirectKeyShard) unpin(key bpfRedirectTuple) {
+	s.mu.Lock()
+	if refs := s.keys[key]; refs <= 1 {
+		delete(s.keys, key)
+	} else {
+		s.keys[key] = refs - 1
+	}
+	s.mu.Unlock()
+}
+
 // SessionManager owns established flow lifecycles independently of any
 // ControlPlane generation. Reload swaps the policy used for new flows while
 // existing runtimes retain their original sockets and immutable bindings.
+//
+// Locking: per-flow registration lives in sync.Maps guarded only by atomic
+// insert/delete; the eBPF refcounts are sharded by tuple hash; generations
+// and the udpBySource snapshot index get dedicated small mutexes. No single
+// global lock serializes the connection data path anymore.
 type SessionManager struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu             sync.RWMutex
-	closed         bool
-	flows          map[net.Conn]*FlowRuntime
-	udpFlows       map[*UdpEndpoint]*UDPFlowRuntime
-	udpBySource    sync.Map // map[netip.AddrPort]*udpFlowSourceSnapshot
-	generations    map[routing.PolicyEpoch]*sessionGenerationState
-	pinnedTCP      map[bpfTuplesKey]int
-	pinnedRedirect map[bpfRedirectTuple]int
+	closed atomic.Bool
+
+	// flows holds adopted-but-unfinished TCP flows keyed by ingress conn;
+	// udpFlows holds UDP endpoint runtimes keyed by their pool endpoint.
+	// Insert uses LoadOrStore so duplicate adoption fails atomically; release
+	// removes an entry only when it still points at the same runtime.
+	flows    sync.Map // map[net.Conn]*FlowRuntime
+	udpFlows sync.Map // map[*UdpEndpoint]*UDPFlowRuntime
+
+	tcpCount atomic.Int64
+	udpCount atomic.Int64
+
+	// generationsMu only guards the small epoch-count table plus flows whose
+	// PolicyEpoch migrates mid-reload. The per-packet data plane never takes it.
+	generationsMu sync.Mutex
+	generations   map[routing.PolicyEpoch]*sessionGenerationState
+
+	// pinnedShards/refShards hold process-level eBPF conn_state_map /
+	// redirect-map refcounts, sharded to avoid cross-core contention on
+	// connection setup and teardown.
+	pinnedShards [sessionPinnedShardCount]pinnedKeyShard
+	refShards    [sessionPinnedShardCount]redirectKeyShard
+
+	udpBySource sync.Map // map[netip.AddrPort]*udpFlowSourceSnapshot; writers serialize under generationsMu
 
 	udpStateMu sync.RWMutex
 	udpBPF     atomic.Pointer[bpfObjects]
@@ -129,16 +241,19 @@ func NewSessionManager(parent context.Context) *SessionManager {
 		parent = context.Background()
 	}
 	ctx, cancel := context.WithCancel(parent)
-	return &SessionManager{
-		ctx:            ctx,
-		cancel:         cancel,
-		flows:          make(map[net.Conn]*FlowRuntime),
-		udpFlows:       make(map[*UdpEndpoint]*UDPFlowRuntime),
-		generations:    make(map[routing.PolicyEpoch]*sessionGenerationState),
-		pinnedTCP:      make(map[bpfTuplesKey]int),
-		pinnedRedirect: make(map[bpfRedirectTuple]int),
-		pinnedUDP:      make(map[bpfTuplesKey]int),
+	m := &SessionManager{
+		ctx:         ctx,
+		cancel:      cancel,
+		generations: make(map[routing.PolicyEpoch]*sessionGenerationState),
+		pinnedUDP:   make(map[bpfTuplesKey]int),
 	}
+	for i := range m.pinnedShards {
+		m.pinnedShards[i].keys = make(map[bpfTuplesKey]int)
+	}
+	for i := range m.refShards {
+		m.refShards[i].keys = make(map[bpfRedirectTuple]int)
+	}
+	return m
 }
 
 // AttachSessionManager installs the process-level session owner used by this
@@ -191,12 +306,9 @@ func (m *SessionManager) prepareControlPlane(c *ControlPlane) error {
 	if m == nil || c == nil {
 		return ErrSessionManagerClosed
 	}
-	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
+	if m.closed.Load() {
 		return ErrSessionManagerClosed
 	}
-	m.mu.Unlock()
 
 	if bpf := c.PeekBpf(); bpf != nil {
 		m.udpBPF.CompareAndSwap(nil, bpf)
@@ -348,30 +460,35 @@ func (m *SessionManager) adoptTCP(
 	}
 	flow.pinKeyCount = uint8(copy(flow.pinKeys[:], pinKeys))
 
-	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
+	if m.closed.Load() {
 		cancel()
 		_ = lease.release()
 		return nil, ErrSessionManagerClosed
 	}
-	if _, exists := m.flows[ingress]; exists {
-		m.mu.Unlock()
+	// Registering the flow and bookkeeping its pins/generation must be
+	// mutually exclusive with releaseFlow and reload-time snapshots (the
+	// old single mutex covered all three; this small critical section keeps
+	// the identical happens-before over a much narrower surface).
+	m.generationsMu.Lock()
+	if _, loaded := m.flows.LoadOrStore(ingress, flow); loaded {
+		m.generationsMu.Unlock()
 		cancel()
 		_ = lease.release()
 		return nil, ErrFlowAlreadyRegistered
 	}
-	m.flows[ingress] = flow
+	m.tcpCount.Add(1)
 	m.retainGenerationLocked(binding.Route.PolicyEpoch)
 	for i := range int(flow.pinKeyCount) {
-		m.pinnedTCP[flow.pinKeys[i]]++
+		shard := &m.pinnedShards[tuplesShardIndex(&flow.pinKeys[i])]
+		shard.pin(flow.pinKeys[i])
 	}
 	if flow.pinKeyCount > 0 {
 		flow.redirectKey = redirectTupleForFlow(flow.pinKeys[0])
 		flow.hasRedirectKey = true
-		m.pinnedRedirect[flow.redirectKey]++
+		refShard := &m.refShards[redirectShardIndex(&flow.redirectKey)]
+		refShard.pin(flow.redirectKey)
 	}
-	m.mu.Unlock()
+	m.generationsMu.Unlock()
 	return flow, nil
 }
 
@@ -397,48 +514,41 @@ func (m *SessionManager) releaseFlow(flow *FlowRuntime) {
 	}
 	deleteKeys := make([]bpfTuplesKey, 0, flow.pinKeyCount)
 	migratedMaps := []*bpfObjects(nil)
-	m.mu.Lock()
-	if current := m.flows[flow.ingress]; current == flow {
-		delete(m.flows, flow.ingress)
-		m.releaseGenerationLocked(flow.binding.Route.PolicyEpoch)
 
-		// For each migrated bpfObjects set, undo the per-map refcount
-		// boost that repinConnStateMapsForRollback applied. After this
-		// loop the pinnedTCP refcounts reflect only the primary map, so
-		// the standard refcount <= 1 logic below produces correct
-		// deleteKeys for the primary (janitor-scanned) map.
+	m.generationsMu.Lock()
+	current, loaded := m.flows.LoadAndDelete(flow.ingress)
+	if loaded && current == flow {
+		// Undo the migrated-map refcount boosts first so the standard
+		// refcount <= 1 logic below produces correct deleteKeys for the
+		// primary (janitor-scanned) map, mirroring the original ordering.
 		for _, bpf := range flow.migratedBpf {
 			if bpf != nil && bpf.ConnStateMap != nil {
 				for i := range int(flow.pinKeyCount) {
 					key := flow.pinKeys[i]
-					if refs := m.pinnedTCP[key]; refs <= 1 {
-						delete(m.pinnedTCP, key)
-					} else {
-						m.pinnedTCP[key] = refs - 1
-					}
+					shard := &m.pinnedShards[tuplesShardIndex(&key)]
+					shard.unpin(key)
 				}
 			}
 		}
 
+		m.tcpCount.Add(-1)
+		m.releaseGenerationLocked(flow.binding.Route.PolicyEpoch)
+
 		for i := range int(flow.pinKeyCount) {
 			key := flow.pinKeys[i]
-			if refs := m.pinnedTCP[key]; refs <= 1 {
-				delete(m.pinnedTCP, key)
+			shard := &m.pinnedShards[tuplesShardIndex(&key)]
+			if shard.unpin(key) {
 				deleteKeys = append(deleteKeys, key)
-			} else {
-				m.pinnedTCP[key] = refs - 1
 			}
 		}
 		if flow.hasRedirectKey {
-			if refs := m.pinnedRedirect[flow.redirectKey]; refs <= 1 {
-				delete(m.pinnedRedirect, flow.redirectKey)
-			} else {
-				m.pinnedRedirect[flow.redirectKey] = refs - 1
-			}
+			refShard := &m.refShards[redirectShardIndex(&flow.redirectKey)]
+			refShard.unpin(flow.redirectKey)
 		}
 		migratedMaps = flow.migratedBpf
 	}
-	m.mu.Unlock()
+	m.generationsMu.Unlock()
+
 	if len(deleteKeys) > 0 {
 		m.udpStateMu.RLock()
 		if bpf := m.udpBPF.Load(); bpf != nil && bpf.ConnStateMap != nil {
@@ -514,24 +624,23 @@ func (m *SessionManager) adoptUDP(endpoint *UdpEndpoint, binding UdpFlowBinding,
 		egressLease: lease,
 	}
 
-	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
+	if m.closed.Load() {
 		cancel()
 		_ = lease.release()
 		return nil, ErrSessionManagerClosed
 	}
-	if _, exists := m.udpFlows[endpoint]; exists {
-		m.mu.Unlock()
+	m.generationsMu.Lock()
+	if _, loaded := m.udpFlows.LoadOrStore(endpoint, flow); loaded {
+		m.generationsMu.Unlock()
 		cancel()
 		_ = lease.release()
 		return nil, ErrFlowAlreadyRegistered
 	}
-	m.udpFlows[endpoint] = flow
+	m.udpCount.Add(1)
 	m.appendUDPFlowSourceLocked(endpoint.poolKey.Src, flow)
 	m.retainGenerationLocked(binding.Route.PolicyEpoch)
+	m.generationsMu.Unlock()
 	endpoint.sessionRuntime = flow
-	m.mu.Unlock()
 	return flow, nil
 }
 
@@ -555,13 +664,14 @@ func (m *SessionManager) releaseUDPFlow(flow *UDPFlowRuntime) {
 	if m == nil || flow == nil {
 		return
 	}
-	m.mu.Lock()
-	if current := m.udpFlows[flow.endpoint]; current == flow {
-		delete(m.udpFlows, flow.endpoint)
+	m.generationsMu.Lock()
+	current, loaded := m.udpFlows.LoadAndDelete(flow.endpoint)
+	if loaded && current == flow {
+		m.udpCount.Add(-1)
 		m.removeUDPFlowSourceLocked(flow.endpoint.poolKey.Src, flow)
 		m.releaseGenerationLocked(flow.binding.Route.PolicyEpoch)
 	}
-	m.mu.Unlock()
+	m.generationsMu.Unlock()
 	if flow.cancel != nil {
 		flow.cancel()
 	}
@@ -639,7 +749,9 @@ func (m *SessionManager) retainedUDPEndpoint(src, dst netip.AddrPort, result *bp
 }
 
 // appendUDPFlowSourceLocked publishes a new immutable per-source index. The
-// caller serializes writers with SessionManager.mu.
+// caller serializes writers with SessionManager.generationsMu (the same mutex
+// that used to guard the old global mu) so same-source snapshots never lose an
+// append or removal.
 func (m *SessionManager) appendUDPFlowSourceLocked(src netip.AddrPort, flow *UDPFlowRuntime) {
 	if m == nil || flow == nil {
 		return
@@ -660,7 +772,7 @@ func (m *SessionManager) appendUDPFlowSourceLocked(src netip.AddrPort, flow *UDP
 }
 
 // removeUDPFlowSourceLocked replaces one immutable per-source index. The
-// caller serializes writers with SessionManager.mu.
+// caller serializes writers with SessionManager.generationsMu.
 func (m *SessionManager) removeUDPFlowSourceLocked(src netip.AddrPort, flow *UDPFlowRuntime) {
 	if m == nil || flow == nil {
 		return
@@ -709,15 +821,14 @@ func udpFlowEpochCounts(flows []*UDPFlowRuntime) map[routing.PolicyEpoch]int {
 	return counts
 }
 
-// ActiveConnections returns all process-owned TCP and UDP flows.
+// ActiveConnections returns all process-owned TCP and UDP flows. The counts
+// are lock-free atomics, so the answer is a close-enough eventual snapshot
+// under concurrent adoption — matching its status-reporting use.
 func (m *SessionManager) ActiveConnections() int {
 	if m == nil {
 		return 0
 	}
-	m.mu.RLock()
-	n := len(m.flows) + len(m.udpFlows)
-	m.mu.RUnlock()
-	return n
+	return int(m.tcpCount.Load() + m.udpCount.Load())
 }
 
 func (f *FlowRuntime) abort() error {
@@ -783,11 +894,13 @@ func (f *FlowRuntime) migrate(m *SessionManager, newBpf *bpfObjects, newLease *e
 		// This is the commit point: after this the flow belongs to the
 		// new generation for tracking purposes, and the old lease can be
 		// released without risking an underflow in the old runtime.
-		m.mu.Lock()
+		// generationsMu keeps this swap atomic against AbortGeneration /
+		// MigrateGeneration epoch filters and the counter table.
+		m.generationsMu.Lock()
 		m.releaseGenerationLocked(oldEpoch)
 		f.binding.Route.PolicyEpoch = newEpoch
 		m.retainGenerationLocked(newEpoch)
-		m.mu.Unlock()
+		m.generationsMu.Unlock()
 
 		// Commit complete: drop the old lease now that the new one is
 		// bound and the flow is tracked by the new generation.
@@ -823,12 +936,13 @@ func (f *FlowRuntime) repinConnStateMapsForRollback(newBpf *bpfObjects) []bpfTup
 		rePinned = append(rePinned, f.pinKeys[i])
 	}
 	if len(rePinned) > 0 {
-		f.manager.mu.Lock()
+		f.manager.generationsMu.Lock()
 		for _, key := range rePinned {
-			f.manager.pinnedTCP[key]++
+			shard := &f.manager.pinnedShards[tuplesShardIndex(&key)]
+			shard.pin(key)
 		}
 		f.migratedBpf = append(f.migratedBpf, newBpf)
-		f.manager.mu.Unlock()
+		f.manager.generationsMu.Unlock()
 	}
 	return rePinned
 }
@@ -838,10 +952,7 @@ func (m *SessionManager) ActiveTCPConnections() int {
 	if m == nil {
 		return 0
 	}
-	m.mu.RLock()
-	n := len(m.flows)
-	m.mu.RUnlock()
-	return n
+	return int(m.tcpCount.Load())
 }
 
 // AbortGeneration closes every flow established under one policy epoch.
@@ -850,20 +961,26 @@ func (m *SessionManager) AbortGeneration(epoch routing.PolicyEpoch) error {
 	if m == nil {
 		return nil
 	}
-	m.mu.RLock()
+	// generationsMu keeps epoch reads mutually exclusive with the migrate()
+	// commit that moves a flow between epochs, exactly like the old global mu.
 	flows := make([]*FlowRuntime, 0)
 	udpFlows := make([]*UDPFlowRuntime, 0)
-	for _, flow := range m.flows {
+	m.generationsMu.Lock()
+	m.flows.Range(func(_, v any) bool {
+		flow := v.(*FlowRuntime)
 		if flow.binding.Route.PolicyEpoch == epoch {
 			flows = append(flows, flow)
 		}
-	}
-	for _, flow := range m.udpFlows {
+		return true
+	})
+	m.udpFlows.Range(func(_, v any) bool {
+		flow := v.(*UDPFlowRuntime)
 		if flow.binding.Route.PolicyEpoch == epoch {
 			udpFlows = append(udpFlows, flow)
 		}
-	}
-	m.mu.RUnlock()
+		return true
+	})
+	m.generationsMu.Unlock()
 	var errs []error
 	for _, flow := range flows {
 		if err := flow.abort(); err != nil {
@@ -896,14 +1013,19 @@ func (m *SessionManager) MigrateGeneration(
 	if m == nil {
 		return 0, 0
 	}
-	m.mu.RLock()
+	// Hold generationsMu while collecting so a concurrent migrate() cannot
+	// move a flow's epoch between the filter and the commit — the same
+	// exclusion the old global mu provided.
+	m.generationsMu.Lock()
 	var flows []*FlowRuntime
-	for _, flow := range m.flows {
+	m.flows.Range(func(_, v any) bool {
+		flow := v.(*FlowRuntime)
 		if flow.binding.Route.PolicyEpoch == oldEpoch {
 			flows = append(flows, flow)
 		}
-	}
-	m.mu.RUnlock()
+		return true
+	})
+	m.generationsMu.Unlock()
 
 	for _, flow := range flows {
 		// Try to acquire an equivalent lease from the new runtime so the
@@ -932,16 +1054,16 @@ func (m *SessionManager) AbortAll() error {
 	if m == nil {
 		return nil
 	}
-	m.mu.RLock()
-	flows := make([]*FlowRuntime, 0, len(m.flows))
-	udpFlows := make([]*UDPFlowRuntime, 0, len(m.udpFlows))
-	for _, flow := range m.flows {
-		flows = append(flows, flow)
-	}
-	for _, flow := range m.udpFlows {
-		udpFlows = append(udpFlows, flow)
-	}
-	m.mu.RUnlock()
+	flows := make([]*FlowRuntime, 0, 16)
+	udpFlows := make([]*UDPFlowRuntime, 0, 16)
+	m.flows.Range(func(_, v any) bool {
+		flows = append(flows, v.(*FlowRuntime))
+		return true
+	})
+	m.udpFlows.Range(func(_, v any) bool {
+		udpFlows = append(udpFlows, v.(*UDPFlowRuntime))
+		return true
+	})
 	var errs []error
 	for _, flow := range flows {
 		if err := flow.abort(); err != nil {
@@ -962,9 +1084,7 @@ func (m *SessionManager) Close() error {
 		return nil
 	}
 	m.closeOnce.Do(func() {
-		m.mu.Lock()
-		m.closed = true
-		m.mu.Unlock()
+		m.closed.Store(true)
 		m.cancel()
 		m.closeErr = m.AbortAll()
 	})

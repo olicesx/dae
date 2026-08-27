@@ -402,11 +402,12 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 
 	// Recheck pins while blocking process-owned flow adoption and release. This
 	// closes the scan-to-delete race without holding the manager locks during a
-	// potentially large map walk.
+	// potentially large map walk. generationsMu guards flow registration and
+	// refcount mutation; pinnedUDP keeps its dedicated lock.
 	if manager != nil && (len(udpKeysToDelete) > 0 || len(tcpKeysToDelete) > 0) {
-		manager.mu.RLock()
+		manager.generationsMu.Lock()
 		manager.udpStateMu.RLock()
-		defer manager.mu.RUnlock()
+		defer manager.generationsMu.Unlock()
 		defer manager.udpStateMu.RUnlock()
 
 		udpPinnedFiltered := udpKeysToDelete[:0]
@@ -419,7 +420,11 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 
 		tcpPinnedFiltered := tcpKeysToDelete[:0]
 		for _, key := range tcpKeysToDelete {
-			if manager.pinnedTCP[key] == 0 {
+			shard := &manager.pinnedShards[tuplesShardIndex(&key)]
+			shard.mu.Lock()
+			refs := shard.keys[key]
+			shard.mu.Unlock()
+			if refs == 0 {
 				tcpPinnedFiltered = append(tcpPinnedFiltered, key)
 			}
 		}

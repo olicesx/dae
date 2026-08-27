@@ -33,10 +33,10 @@ func TestRetainedUDPEndpointEpochGate(t *testing.T) {
 
 	// Two flows under the current epoch: the gate must answer without a
 	// candidate and keep doing so as flows come and go.
-	m.mu.Lock()
+	m.generationsMu.Lock()
 	m.appendUDPFlowSourceLocked(src, newFlow(currentEpoch, dst))
 	m.appendUDPFlowSourceLocked(src, newFlow(currentEpoch, netip.AddrPort{}))
-	m.mu.Unlock()
+	m.generationsMu.Unlock()
 	if _, ok := m.retainedUDPEndpoint(src, dst, &bpfRoutingResult{}, currentEpoch); ok {
 		t.Fatalf("retainedUDPEndpoint found a candidate while every flow is current-epoch")
 	}
@@ -44,18 +44,18 @@ func TestRetainedUDPEndpointEpochGate(t *testing.T) {
 	// A reload adopts a stale-epoch flow for the same source: the gate must
 	// open and the scan must return its endpoint.
 	stale := newFlow(staleEpoch, dst)
-	m.mu.Lock()
+	m.generationsMu.Lock()
 	m.appendUDPFlowSourceLocked(src, stale)
-	m.mu.Unlock()
+	m.generationsMu.Unlock()
 	ue, ok := m.retainedUDPEndpoint(src, dst, &bpfRoutingResult{}, currentEpoch)
 	if !ok || ue != stale.endpoint {
 		t.Fatalf("retainedUDPEndpoint = (%p, %v), want the stale-epoch endpoint %p", ue, ok, stale.endpoint)
 	}
 
 	// Once the stale flow retires, the rebuilt snapshot closes the gate again.
-	m.mu.Lock()
+	m.generationsMu.Lock()
 	m.removeUDPFlowSourceLocked(src, stale)
-	m.mu.Unlock()
+	m.generationsMu.Unlock()
 	if _, ok := m.retainedUDPEndpoint(src, dst, &bpfRoutingResult{}, currentEpoch); ok {
 		t.Fatalf("retainedUDPEndpoint found a candidate after the stale flow retired")
 	}

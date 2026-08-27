@@ -12,17 +12,21 @@ import (
 )
 
 // snapshotPinnedTCP returns a snapshot set of pinned TCP tuples for lock-free
-// batch queries. The snapshot is atomic with respect to retain/release.
+// batch queries. Shards are read one at a time, so the result is a union over
+// a short window rather than one instant — sufficient for janitor scans.
 func (m *SessionManager) snapshotPinnedTCP() map[bpfTuplesKey]struct{} {
 	if m == nil {
 		return nil
 	}
-	m.mu.RLock()
-	snap := make(map[bpfTuplesKey]struct{}, len(m.pinnedTCP))
-	for k := range m.pinnedTCP {
-		snap[k] = struct{}{}
+	snap := make(map[bpfTuplesKey]struct{})
+	for i := range m.pinnedShards {
+		shard := &m.pinnedShards[i]
+		shard.mu.Lock()
+		for k := range shard.keys {
+			snap[k] = struct{}{}
+		}
+		shard.mu.Unlock()
 	}
-	m.mu.RUnlock()
 	return snap
 }
 
@@ -30,9 +34,10 @@ func (m *SessionManager) isRedirectTrackPinned(key bpfRedirectTuple) bool {
 	if m == nil {
 		return false
 	}
-	m.mu.RLock()
-	refs := m.pinnedRedirect[key]
-	m.mu.RUnlock()
+	shard := &m.refShards[redirectShardIndex(&key)]
+	shard.mu.Lock()
+	refs := shard.keys[key]
+	shard.mu.Unlock()
 	return refs > 0
 }
 
@@ -41,14 +46,16 @@ func (m *SessionManager) RetainUdpConnStateTuples(keys []bpfTuplesKey) {
 	if m == nil || len(keys) == 0 {
 		return
 	}
-	m.mu.Lock()
+	m.generationsMu.Lock()
 	m.udpStateMu.Lock()
 	for _, key := range keys {
 		m.pinnedUDP[key]++
-		m.pinnedRedirect[redirectTupleForFlow(key)]++
+		redirectKey := redirectTupleForFlow(key)
+		refShard := &m.refShards[redirectShardIndex(&redirectKey)]
+		refShard.pin(redirectKey)
 	}
 	m.udpStateMu.Unlock()
-	m.mu.Unlock()
+	m.generationsMu.Unlock()
 }
 
 // TransferRetainedUdpConnStateTuplesFrom moves tuple ownership without
@@ -72,7 +79,7 @@ func (m *SessionManager) forgetUdpConnStateTuples(keys []bpfTuplesKey) {
 	if m == nil || len(keys) == 0 {
 		return
 	}
-	m.mu.Lock()
+	m.generationsMu.Lock()
 	m.udpStateMu.Lock()
 	for _, key := range keys {
 		if refs := m.pinnedUDP[key]; refs <= 1 {
@@ -81,14 +88,11 @@ func (m *SessionManager) forgetUdpConnStateTuples(keys []bpfTuplesKey) {
 			m.pinnedUDP[key] = refs - 1
 		}
 		redirectKey := redirectTupleForFlow(key)
-		if refs := m.pinnedRedirect[redirectKey]; refs <= 1 {
-			delete(m.pinnedRedirect, redirectKey)
-		} else {
-			m.pinnedRedirect[redirectKey] = refs - 1
-		}
+		refShard := &m.refShards[redirectShardIndex(&redirectKey)]
+		refShard.unpin(redirectKey)
 	}
 	m.udpStateMu.Unlock()
-	m.mu.Unlock()
+	m.generationsMu.Unlock()
 }
 
 // ReleaseUdpConnStateTuples drops tuple references and removes entries after
@@ -97,7 +101,7 @@ func (m *SessionManager) ReleaseUdpConnStateTuples(keys []bpfTuplesKey) error {
 	if m == nil || len(keys) == 0 {
 		return nil
 	}
-	m.mu.Lock()
+	m.generationsMu.Lock()
 	m.udpStateMu.Lock()
 	deleteKeys := make([]bpfTuplesKey, 0, len(keys))
 	for _, key := range keys {
@@ -109,18 +113,15 @@ func (m *SessionManager) ReleaseUdpConnStateTuples(keys []bpfTuplesKey) error {
 			deleteKeys = append(deleteKeys, key)
 		}
 		redirectKey := redirectTupleForFlow(key)
-		if refs := m.pinnedRedirect[redirectKey]; refs <= 1 {
-			delete(m.pinnedRedirect, redirectKey)
-		} else {
-			m.pinnedRedirect[redirectKey] = refs - 1
-		}
+		refShard := &m.refShards[redirectShardIndex(&redirectKey)]
+		refShard.unpin(redirectKey)
 	}
 	var err error
 	if bpf := m.udpBPF.Load(); bpf != nil && bpf.ConnStateMap != nil && len(deleteKeys) > 0 {
 		_, err = BpfMapBatchDelete(bpf.ConnStateMap, deleteKeys)
 	}
 	m.udpStateMu.Unlock()
-	m.mu.Unlock()
+	m.generationsMu.Unlock()
 	return err
 }
 

@@ -60,7 +60,7 @@ func TestBufioConnCopyRelayRemainderInvokesOnActive(t *testing.T) {
 	}
 	c := &bufioConn{Conn: src, reader: reader}
 	var active atomic.Int64
-	n, err := c.CopyRelayRemainder(io.Discard, make([]byte, 64), nil, func(v int64) { active.Add(v) })
+	n, err := c.CopyRelayRemainder(context.Background(), io.Discard, make([]byte, 64), nil, func(v int64) { active.Add(v) })
 	if err != nil && err != io.EOF {
 		t.Fatalf("CopyRelayRemainder: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestBufioConnCopyRelayRemainderInvokesOnActiveAfterDrain(t *testing.T) {
 
 	c := &bufioConn{Conn: src, reader: reader}
 	var active atomic.Int64
-	n, err := c.CopyRelayRemainder(io.Discard, make([]byte, 64), nil, func(v int64) { active.Add(v) })
+	n, err := c.CopyRelayRemainder(context.Background(), io.Discard, make([]byte, 64), nil, func(v int64) { active.Add(v) })
 	if err != nil && err != io.EOF {
 		t.Fatalf("CopyRelayRemainder: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestBufioConnCopyRelayRemainderInvokesOnActiveViaSplice(t *testing.T) {
 	c := &bufioConn{Conn: srcTCP, reader: reader}
 	var active atomic.Int64
 	var recorded atomic.Int64
-	n, err := c.CopyRelayRemainder(dstTCP, make([]byte, 64), func(v int64) { recorded.Add(v) }, func(v int64) { active.Add(v) })
+	n, err := c.CopyRelayRemainder(context.Background(), dstTCP, make([]byte, 64), func(v int64) { recorded.Add(v) }, func(v int64) { active.Add(v) })
 	if err != nil && err != io.EOF {
 		t.Fatalf("CopyRelayRemainder: %v", err)
 	}

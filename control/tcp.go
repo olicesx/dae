@@ -658,12 +658,12 @@ func (c *bufioConn) TakeRelayPrefix() []byte {
 	return prefix
 }
 
-func (c *bufioConn) CopyRelayRemainder(dst io.Writer, buf []byte, record func(int64), onActive func(int64)) (int64, error) {
+func (c *bufioConn) CopyRelayRemainder(ctx context.Context, dst io.Writer, buf []byte, record func(int64), onActive func(int64)) (int64, error) {
 	if c == nil {
 		return 0, nil
 	}
 	if c.reader == nil {
-		return relayCopyDirect(dst, c.Conn, buf, record, onActive)
+		return relayCopyDirect(ctx, dst, c.Conn, buf, record, onActive)
 	}
 
 	// Once buffered bytes are drained we can resume directly on the underlying
@@ -672,14 +672,14 @@ func (c *bufioConn) CopyRelayRemainder(dst io.Writer, buf []byte, record func(in
 		if dstConn, ok := dst.(netproxy.Conn); ok {
 			if dstTCP, ok := unwrapRelayTCPConn(dstConn); ok {
 				if srcTCP, ok := unwrapRelayTCPConn(c.Conn); ok {
-					return relaySpliceCopyExact(context.Background(), dstTCP, srcTCP, record, onActive)
+					return relaySpliceCopyExact(ctx, dstTCP, srcTCP, record, onActive)
 				}
 			}
 		}
-		return relayCopyDirect(dst, c.Conn, buf, record, onActive)
+		return relayCopyDirect(ctx, dst, c.Conn, buf, record, onActive)
 	}
 
-	return relayCopyDirect(dst, c.reader, buf, record, onActive)
+	return relayCopyDirect(ctx, dst, c.reader, buf, record, onActive)
 }
 
 func (c *bufioConn) Read(b []byte) (int, error) {
@@ -745,6 +745,12 @@ func (c *ControlPlane) handleTCPDnsFastPathOwned(
 	if msg.Response {
 		// The valid frame was already consumed, so it cannot fall back to the
 		// ordinary TCP relay without losing bytes.
+		if c.log.IsLevelEnabled(logrus.DebugLevel) {
+			c.log.WithFields(logrus.Fields{
+				"src": src.String(),
+				"dst": dst.String(),
+			}).Debug("TCP DNS fast path consumed a response-shaped frame on port 53; closing the flow")
+		}
 		return true, nil
 	}
 	// This is DNS-over-TCP traffic - handle all queries on this connection

@@ -6,6 +6,7 @@
 package control
 
 import (
+	"context"
 	"io"
 	"net"
 
@@ -18,7 +19,10 @@ type relaySegmentSource interface {
 }
 
 type relayContinuationSource interface {
-	CopyRelayRemainder(dst io.Writer, buf []byte, record func(int64), onActive func(int64)) (int64, error)
+	// CopyRelayRemainder receives the owning relay's ctx so long-running
+	// fast paths inside implementers observe cancellation instead of
+	// outliving the flow.
+	CopyRelayRemainder(ctx context.Context, dst io.Writer, buf []byte, record func(int64), onActive func(int64)) (int64, error)
 }
 
 type relayPrefixSource interface {

@@ -7,6 +7,7 @@ package control
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -87,8 +88,8 @@ func (c *prefixedConn) TakeRelaySegments() [][]byte {
 	return [][]byte{prefix}
 }
 
-func (c *prefixedConn) CopyRelayRemainder(dst io.Writer, buf []byte, record func(int64), onActive func(int64)) (int64, error) {
-	return relayCopyDirect(dst, c.Conn, buf, record, onActive)
+func (c *prefixedConn) CopyRelayRemainder(ctx context.Context, dst io.Writer, buf []byte, record func(int64), onActive func(int64)) (int64, error) {
+	return relayCopyDirect(ctx, dst, c.Conn, buf, record, onActive)
 }
 
 // TakeRelayPrefix returns the remaining prefetched bytes and marks them as

@@ -132,7 +132,7 @@ func tryRelayGatherWrite(ctx context.Context, dst netproxy.Conn, src netproxy.Co
 		if cerr := ctx.Err(); cerr != nil {
 			return written, cerr, true
 		}
-		n, err := continuationSource.CopyRelayRemainder(dst, buf, record, onActive)
+		n, err := continuationSource.CopyRelayRemainder(ctx, dst, buf, record, onActive)
 		return written + n, err, true
 	}
 

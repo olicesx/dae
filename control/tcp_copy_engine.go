@@ -92,12 +92,21 @@ func relayCopyLoop(ctx context.Context, dst netproxy.Conn, src netproxy.Conn, bu
 	}
 }
 
-// relayCopyDirect copies from src to dst using the provided buf.
+// relayCopyDirect copies from src to dst using the provided buf. ctx carries
+// the owning relay's cancellation so continuation slow paths observe it like
+// relayCopyLoop does instead of relying solely on socket close.
 // buf must be non-empty and is typically obtained from relayCopyBufferPool.
-func relayCopyDirect(dst io.Writer, src io.Reader, buf []byte, record func(int64), onActive func(int64)) (written int64, err error) {
+func relayCopyDirect(ctx context.Context, dst io.Writer, src io.Reader, buf []byte, record func(int64), onActive func(int64)) (written int64, err error) {
 	record = normalizeTrafficRecord(record)
 	onActive = normalizeTrafficRecord(onActive)
 	for {
+		// relayCore.run guarantees a non-nil ctx at the interface boundary;
+		// tolerate nil defensively for direct callers.
+		if ctx != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return written, cerr
+			}
+		}
 		nr, er := src.Read(buf)
 		if nr > 0 {
 			onActive(int64(nr))

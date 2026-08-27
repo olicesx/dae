@@ -18,24 +18,36 @@ import (
 var (
 	errRoutingEpochOwnerUnavailable = stderrors.New("routing epoch execution owner is unavailable")
 	routingEpochPeerLinkMu          sync.Mutex
-	// incomingConnectionOwnershipMu is an RWMutex, not a plain mutex:
+	// incomingConnectionOwnershipMu serializes lifecycle writers only:
+	// AttachSessionManager, flow adoption, and the close/abort transitions.
 	//
-	//   - Readers (RLock) are the steady-state connection fast path — lease
-	//     acquire, cross-generation transfer, and release. Each only touches
-	//     state that is internally synchronized (drainTracker's own mutex,
-	//     inConnections sync.Map, atomic gate flags), so readers need no
-	//     mutual exclusion among themselves.
-	//   - Writers (Lock) are rare lifecycle transitions — close/abort flag
-	//     stores, AttachSessionManager, and flow adoption. A writer waiting
-	//     drains all past readers before running, which is exactly the
-	//     happens-before that keeps "admit after idle" impossible: a close
-	//     flag store can never overtake an accept-check + ticket-acquire
-	//     pair that read the previous value.
+	// The steady-state read path is fully lock-free via a double-checked
+	// atomic protocol instead. Every admission follows
 	//
-	// Lock order: incomingConnectionOwnershipMu > sessionManagerMu >
-	// generationsMu/shards. No reader path nests another acquisition of this
-	// mutex, so recursive-RRLock writer starvation cannot deadlock.
-	incomingConnectionOwnershipMu sync.RWMutex
+	//	check(gates) -> drainTracker.Add -> recheck(gates) -> commit map state
+	//
+	// and every close first stores its flag. Under Go's sequentially
+	// consistent atomics these operations share one total order, so for any
+	// racing pair exactly one of the following holds:
+	//
+	//	ticket < closer.store(flag): the closer's count observation sees the
+	//	                             ticket and waits for its release;
+	//	closer.store(flag) < ticket: the recheck load follows the store,
+	//	                             sees the gate closed, releases the
+	//	                             ticket, and rejects.
+	//
+	// Admit-after-idle is therefore impossible without any shared reader
+	// synchronization. Failed validations are backed out by releasing the
+	// just-added ticket (or rolling a cross-generation move back); because
+	// both gates are monotone (once closed they never reopen before the next
+	// generation takes over fresh flags), retry converges to rejection
+	// instead of livelocking.
+	//
+	// Residual nuance kept deliberately: an abort that snapshots conns can
+	// miss a lease whose map entry lands moments later — such a straggler is
+	// unknown to the wipe but exits through normal relay error paths and the
+	// idle watchdogs, which bound its lifetime.
+	incomingConnectionOwnershipMu sync.Mutex
 )
 
 // incomingConnectionLease keeps an accepted TCP connection attached to the
@@ -257,7 +269,7 @@ func publishedRoutingEpochExecutionOwner(source *ControlPlane, result *bpfRoutin
 	defer activeControlPlanePublication.mu.RUnlock()
 
 	owner := activeControlPlanePublication.plane.Load()
-	if owner != nil && owner != source && owner.acceptsRoutingEpochExecutionLocked() && owner.routingEpochExecutionMatches(result) {
+	if owner != nil && owner != source && owner.acceptsRoutingEpochExecution() && owner.routingEpochExecutionMatches(result) {
 		return owner
 	}
 	for candidate, publication := range activeControlPlanePublication.owners {
@@ -267,7 +279,7 @@ func publishedRoutingEpochExecutionOwner(source *ControlPlane, result *bpfRoutin
 		if candidate == nil || candidate == source || candidate == owner {
 			continue
 		}
-		if candidate.acceptsRoutingEpochExecutionLocked() && candidate.routingEpochExecutionMatches(result) {
+		if candidate.acceptsRoutingEpochExecution() && candidate.routingEpochExecutionMatches(result) {
 			return candidate
 		}
 	}
@@ -296,9 +308,9 @@ func (c *ControlPlane) routingEpochExecutionOwner(result *bpfRoutingResult) (*Co
 
 // acquireRoutingEpochExecutionOwner resolves an attributed BPF result and,
 // when it targets a staged peer, acquires that peer's execution lease before
-// releasing the peer-link lock. StopRoutingEpochExecution closes admission
-// under the same ownership lock, so a selected peer cannot begin work after
-// retirement has committed to closing it.
+// releasing the peer-link lock. StopRoutingEpochExecution closes admission by
+// storing its gate flag; the ticket double-check below keeps a selected peer
+// from beginning work after retirement has committed to closing it.
 func (c *ControlPlane) acquireRoutingEpochExecutionOwner(result *bpfRoutingResult) (*ControlPlane, func(), error) {
 	if c == nil {
 		return nil, nil, errRoutingEpochOwnerUnavailable
@@ -319,13 +331,12 @@ func (c *ControlPlane) acquireRoutingEpochExecutionOwner(result *bpfRoutingResul
 		}
 	}
 
-	incomingConnectionOwnershipMu.RLock()
-	if !peer.acceptsRoutingEpochExecutionLocked() || !peer.routingEpochExecutionMatches(result) {
-		incomingConnectionOwnershipMu.RUnlock()
+	release, ok := peer.acquireDrainTicketIfAdmitting(func() bool {
+		return peer.acceptsRoutingEpochExecution() && peer.routingEpochExecutionMatches(result)
+	})
+	if !ok {
 		return nil, nil, routingEpochOwnerUnavailableError(result)
 	}
-	release := peer.acquireDrainTicket()
-	incomingConnectionOwnershipMu.RUnlock()
 	return peer, release, nil
 }
 
@@ -337,33 +348,48 @@ func (c *ControlPlane) ownsActiveRoutingEpoch() bool {
 	return err == nil && active == c.core.RoutingEpochSlot()
 }
 
-func (c *ControlPlane) acceptsRoutingEpochExecutionLocked() bool {
+// acceptsRoutingEpochExecution reports whether this generation still admits
+// new connection work. It is called without any lock; callers that need
+// admission commit pair it with acquireDrainTicketIfAdmitting's recheck.
+func (c *ControlPlane) acceptsRoutingEpochExecution() bool {
 	return c != nil && !c.rejectNewConnections.Load() && !c.routingEpochExecutionClosed.Load()
 }
 
-func (c *ControlPlane) acquireRoutingEpochExecutionLeaseFor(result *bpfRoutingResult) (func(), bool) {
-	incomingConnectionOwnershipMu.RLock()
-	defer incomingConnectionOwnershipMu.RUnlock()
-	if !c.acceptsRoutingEpochExecutionLocked() || !c.routingEpochExecutionMatches(result) {
+// acquireDrainTicketIfAdmitting implements the admission protocol from the
+// incomingConnectionOwnershipMu documentation: pre-check, ticket add,
+// recheck. A failed recheck releases the just-added ticket so a closer can
+// never observe an orphaned count.
+func (c *ControlPlane) acquireDrainTicketIfAdmitting(recheck func() bool) (func(), bool) {
+	if !c.acceptsRoutingEpochExecution() {
 		return nil, false
 	}
-	return c.acquireDrainTicket(), true
+	release := c.acquireDrainTicket()
+	if !recheck() {
+		release()
+		return nil, false
+	}
+	return release, true
+}
+
+func (c *ControlPlane) acquireRoutingEpochExecutionLeaseFor(result *bpfRoutingResult) (func(), bool) {
+	return c.acquireDrainTicketIfAdmitting(func() bool {
+		return c.acceptsRoutingEpochExecution() && c.routingEpochExecutionMatches(result)
+	})
 }
 
 func (c *ControlPlane) acquireIncomingConnectionLease(conn net.Conn) (*incomingConnectionLease, bool) {
 	if c == nil || conn == nil {
 		return nil, false
 	}
-	incomingConnectionOwnershipMu.RLock()
-	defer incomingConnectionOwnershipMu.RUnlock()
-	if !c.acceptsRoutingEpochExecutionLocked() {
+	release, ok := c.acquireDrainTicketIfAdmitting(c.acceptsRoutingEpochExecution)
+	if !ok {
 		_ = conn.Close()
 		return nil, false
 	}
 	lease := &incomingConnectionLease{
 		conn:         conn,
 		owner:        c,
-		drainRelease: c.acquireDrainTicket(),
+		drainRelease: release,
 	}
 	c.inConnections.Store(conn, struct{}{})
 	return lease, true
@@ -373,21 +399,34 @@ func (l *incomingConnectionLease) transferRoutingEpoch(owner *ControlPlane, resu
 	if l == nil || owner == nil || owner == l.owner {
 		return l != nil && owner == l.owner && owner.routingEpochExecutionMatches(result)
 	}
-	incomingConnectionOwnershipMu.RLock()
+	// The swap is optimistic and rollback-safe: both gates are monotone
+	// (closed stays closed within a generation), so a failed recheck means
+	// the move must not stand and one rollback converges to rejection.
 	if l.owner == nil ||
-		!l.owner.acceptsRoutingEpochExecutionLocked() ||
-		!owner.acceptsRoutingEpochExecutionLocked() ||
+		!l.owner.acceptsRoutingEpochExecution() ||
+		!owner.acceptsRoutingEpochExecution() ||
 		!owner.routingEpochExecutionMatches(result) {
-		incomingConnectionOwnershipMu.RUnlock()
 		return false
 	}
 	previous := l.owner
 	previousRelease := l.drainRelease
+	newRelease := owner.acquireDrainTicket()
 	owner.inConnections.Store(l.conn, struct{}{})
 	previous.inConnections.Delete(l.conn)
 	l.owner = owner
-	l.drainRelease = owner.acquireDrainTicket()
-	incomingConnectionOwnershipMu.RUnlock()
+	l.drainRelease = newRelease
+
+	if !previous.acceptsRoutingEpochExecution() || !owner.acceptsRoutingEpochExecution() {
+		// A generation closed underneath the move: undo it atomically from
+		// this lease's point of view (its fields are private to the single
+		// handler goroutine driving the lease).
+		l.owner = previous
+		l.drainRelease = previousRelease
+		newRelease()
+		previous.inConnections.Store(l.conn, struct{}{})
+		owner.inConnections.Delete(l.conn)
+		return false
+	}
 
 	if previousRelease != nil {
 		previousRelease()
@@ -399,17 +438,16 @@ func (l *incomingConnectionLease) release() {
 	if l == nil {
 		return
 	}
-	incomingConnectionOwnershipMu.RLock()
 	drainRelease := l.releaseLocked()
-	incomingConnectionOwnershipMu.RUnlock()
 	if drainRelease != nil {
 		drainRelease()
 	}
 }
 
-// releaseLocked detaches the generation-owned ingress while the caller holds
-// incomingConnectionOwnershipMu. The returned drain release must run after the
-// ownership mutex is unlocked.
+// releaseLocked detaches the generation-owned ingress. It needs no lock: the
+// lease fields belong to the connection's single handler goroutine, and its
+// only shared effects (the inConnections entry and one drain ticket) are
+// internally synchronized.
 func (l *incomingConnectionLease) releaseLocked() (drainRelease func()) {
 	if l == nil {
 		return nil

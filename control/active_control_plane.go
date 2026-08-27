@@ -60,13 +60,13 @@ func (c *ControlPlane) RegisterProvisionalRoutingEpochExecutionOwner() error {
 	if uint16(c.core.datapathGeneration.Load()) == 0 {
 		return fmt.Errorf("register provisional routing epoch owner: datapath generation is unknown")
 	}
-	if !c.acceptsRoutingEpochExecutionLocked() {
+	if !c.acceptsRoutingEpochExecution() {
 		return fmt.Errorf("register provisional routing epoch owner: execution gate is closed")
 	}
 
 	activeControlPlanePublication.mu.Lock()
 	defer activeControlPlanePublication.mu.Unlock()
-	if !c.acceptsRoutingEpochExecutionLocked() {
+	if !c.acceptsRoutingEpochExecution() {
 		return fmt.Errorf("register provisional routing epoch owner: execution gate is closed")
 	}
 	if activeControlPlanePublication.owners == nil {

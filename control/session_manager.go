@@ -373,8 +373,14 @@ func (c *ControlPlane) adoptTCPFlow(
 		bpfTuplesKeyFromAddrPorts(src, dst, uint8(unix.IPPROTO_TCP)),
 		bpfTuplesKeyFromAddrPorts(dst, src, uint8(unix.IPPROTO_TCP)),
 	}
+	// Writer-side adoption: the ownership mutex only serializes writers now
+	// (adoption, attach, close, abort snapshots); steady-state readers run
+	// lock-free with their own gate rechecks. A transfer migrating this lease
+	// out concurrently is self-guarding (it revalidates both gates after its
+	// swap), while a straggler adopted moments after an abort snapshot ran
+	// exits through normal relay error paths bounded by the relay watchdogs.
 	incomingConnectionOwnershipMu.Lock()
-	if !c.acceptsRoutingEpochExecutionLocked() || (ownership != nil && ownership.owner != c) {
+	if !c.acceptsRoutingEpochExecution() || (ownership != nil && ownership.owner != c) {
 		incomingConnectionOwnershipMu.Unlock()
 		return nil, errRoutingEpochOwnerUnavailable
 	}

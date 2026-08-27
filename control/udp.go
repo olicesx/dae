@@ -565,7 +565,7 @@ func (c *ControlPlane) prepareUnownedUDPCurrentPolicyFallback(src, dst netip.Add
 	// packets would otherwise be dropped once the cut-over moves the active
 	// epoch away, even though this generation's outbound runtime is still
 	// alive until Close. Closed generations keep the conservative drop path.
-	if c == nil || !c.acceptsRoutingEpochExecutionLocked() {
+	if c == nil || !c.acceptsRoutingEpochExecution() {
 		return nil, false, nil
 	}
 	manager, _ := c.controlPlaneSessionManager()

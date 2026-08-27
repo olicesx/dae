@@ -39,7 +39,7 @@ type AhocorasickSlimtrie struct {
 	// query otherwise recomputes the same domain bitmap up to six times
 	// (request select, response select, and once per ip-version x protocol
 	// dialer iteration). Capacity-bounded, scan on overflow.
-	matchMu       sync.Mutex
+	matchMu       sync.RWMutex
 	matchCache    map[string][]uint32
 	matchCacheOrd []string
 }
@@ -127,15 +127,19 @@ const matchCacheCap = 512
 
 func (n *AhocorasickSlimtrie) MatchDomainBitmap(domain string) (bitmap []uint32) {
 	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
-	n.matchMu.Lock()
-	if n.matchCache != nil {
-		if cached, ok := n.matchCache[domain]; ok {
-			n.matchMu.Unlock()
-			return cached
-		}
+	// Hit path takes only a read lock: concurrent flow establishments must
+	// not serialize behind this cache (that regressed CPU once already).
+	n.matchMu.RLock()
+	if cached, ok := n.matchCache[domain]; ok {
+		n.matchMu.RUnlock()
+		return cached
 	}
-	n.matchMu.Unlock()
+	n.matchMu.RUnlock()
+
 	bitmap = n.matchDomainBitmapUncached(domain)
+
+	// Insert under the write lock; a concurrent builder of the same domain
+	// (stampede) kept its own result, last writer wins, values are identical.
 	n.matchMu.Lock()
 	if n.matchCache == nil {
 		n.matchCache = make(map[string][]uint32, 64)

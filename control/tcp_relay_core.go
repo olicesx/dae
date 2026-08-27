@@ -168,8 +168,19 @@ func (c *relayCore) run(ctx context.Context) error {
 	}()
 
 	runDirection := func(dir relayDirection) {
+		// Coalesce activity refreshes to ~4Hz per direction: the watchdog
+		// only needs second-level granularity, and per-chunk atomic stores
+		// on the shared lastActiveNano word showed measurable cross-core
+		// contention under multi-core relaying.
+		var lastRefreshNano int64
+		const refreshInterval = int64(250 * time.Millisecond)
 		onActive := func(_ int64) {
-			c.lastActiveNano.Store(time.Now().UnixNano())
+			now := time.Now().UnixNano()
+			if now-lastRefreshNano < refreshInterval {
+				return
+			}
+			lastRefreshNano = now
+			c.lastActiveNano.Store(now)
 		}
 		_, err := c.copyEngine.Copy(ctx, dir.dst, dir.src, dir.record, onActive)
 

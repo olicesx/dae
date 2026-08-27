@@ -5,7 +5,6 @@ go 1.26.0
 require (
 	github.com/adrg/xdg v0.5.3
 	github.com/antlr/antlr4/runtime/Go/antlr/v4 v4.0.0-20230305170008-8188dc5388df
-	github.com/bits-and-blooms/bloom/v3 v3.7.1
 	github.com/cilium/ebpf v0.22.0
 	github.com/daeuniverse/dae-config-dist/go/dae_config v0.0.0-20230604120805-1c27619b592d
 	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260825091423-1764decca95b
@@ -88,7 +87,6 @@ require (
 )
 
 require (
-	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/dgryski/go-camellia v0.0.0-20191119043421-69a8a13fb23d // indirect
 	github.com/dgryski/go-idea v0.0.0-20170306091226-d2fb45a411fb // indirect
 	github.com/dgryski/go-metro v0.0.0-20250106013310-edb8663e5e33 // indirect
@@ -127,4 +125,4 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260825
 
 // Use the remote outbound fork containing hot-path buffer reuse, underlay-
 // first Close, and honest WriteBatch n on top of the HY2/quic-go pins.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260826235355-63b6477da714
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260827012226-e030f04c3bb1

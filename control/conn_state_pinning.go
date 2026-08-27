@@ -42,11 +42,16 @@ func (m *SessionManager) isRedirectTrackPinned(key bpfRedirectTuple) bool {
 }
 
 // RetainUdpConnStateTuples pins established UDP state against reload cleanup.
+//
+// Only udpStateMu is taken: pinnedUDP is its exclusive domain, the redirect
+// refcounts synchronize through their own shards, and generationsMu guards
+// nothing this path reads or writes. Endpoint writes re-Retain tuples, so
+// these spans must stay mutually exclusive with the delete inside
+// ReleaseUdpConnStateTuples — udpStateMu provides exactly that.
 func (m *SessionManager) RetainUdpConnStateTuples(keys []bpfTuplesKey) {
 	if m == nil || len(keys) == 0 {
 		return
 	}
-	m.generationsMu.Lock()
 	m.udpStateMu.Lock()
 	for _, key := range keys {
 		m.pinnedUDP[key]++
@@ -55,7 +60,6 @@ func (m *SessionManager) RetainUdpConnStateTuples(keys []bpfTuplesKey) {
 		refShard.pin(redirectKey)
 	}
 	m.udpStateMu.Unlock()
-	m.generationsMu.Unlock()
 }
 
 // TransferRetainedUdpConnStateTuplesFrom moves tuple ownership without
@@ -79,7 +83,7 @@ func (m *SessionManager) forgetUdpConnStateTuples(keys []bpfTuplesKey) {
 	if m == nil || len(keys) == 0 {
 		return
 	}
-	m.generationsMu.Lock()
+	// udpStateMu alone: see RetainUdpConnStateTuples.
 	m.udpStateMu.Lock()
 	for _, key := range keys {
 		if refs := m.pinnedUDP[key]; refs <= 1 {
@@ -92,16 +96,18 @@ func (m *SessionManager) forgetUdpConnStateTuples(keys []bpfTuplesKey) {
 		refShard.unpin(redirectKey)
 	}
 	m.udpStateMu.Unlock()
-	m.generationsMu.Unlock()
 }
 
 // ReleaseUdpConnStateTuples drops tuple references and removes entries after
 // the final process-owned endpoint releases them.
+//
+// The BpfMapBatchDelete intentionally stays inside udpStateMu: a concurrent
+// Retain (endpoint writes re-pin tuples) must not slip between the refcount
+// dropping to zero and the physical delete, or it would lose a live entry.
 func (m *SessionManager) ReleaseUdpConnStateTuples(keys []bpfTuplesKey) error {
 	if m == nil || len(keys) == 0 {
 		return nil
 	}
-	m.generationsMu.Lock()
 	m.udpStateMu.Lock()
 	deleteKeys := make([]bpfTuplesKey, 0, len(keys))
 	for _, key := range keys {
@@ -121,7 +127,6 @@ func (m *SessionManager) ReleaseUdpConnStateTuples(keys []bpfTuplesKey) error {
 		_, err = BpfMapBatchDelete(bpf.ConnStateMap, deleteKeys)
 	}
 	m.udpStateMu.Unlock()
-	m.generationsMu.Unlock()
 	return err
 }
 

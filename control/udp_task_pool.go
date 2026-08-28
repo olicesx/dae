@@ -20,6 +20,9 @@ const (
 	// chosen as a safe ceiling that is still 25× larger than the typical sniff
 	// window but reduces per-flow channel allocation by 32× vs the old 4096.
 	UdpTaskQueueLength = 128
+	// UdpTaskQueueMaxOverflow keeps a hot flow bounded without blocking other
+	// flows. Once both tiers are full, new UDP work is dropped explicitly.
+	UdpTaskQueueMaxOverflow = 128
 )
 
 var (
@@ -64,6 +67,7 @@ type UdpTaskQueue struct {
 	p         *UdpTaskPool
 	ch        chan UdpTask
 	wake      chan struct{}
+	done      chan struct{}
 	overflow  []UdpTask
 	enqueueMu sync.Mutex
 
@@ -76,7 +80,8 @@ type UdpTaskQueue struct {
 	// 1-byte fields
 	overflowLen  atomic.Int32 // track overflow length for lock-free idle check
 	overflowMode bool
-	chReturned   atomic.Bool // guards queueChPool.Put so Close and convoy cannot double-put
+	closed       bool        // guarded by enqueueMu
+	chReturned   atomic.Bool // guards queueChPool.Put against defensive double cleanup
 
 	key UdpFlowKey
 }
@@ -88,30 +93,34 @@ func (q *UdpTaskQueue) notifyWake() {
 	}
 }
 
-func (q *UdpTaskQueue) enqueue(task UdpTask) {
+func (q *UdpTaskQueue) enqueue(task UdpTask) bool {
 	q.enqueueMu.Lock()
 	defer q.enqueueMu.Unlock()
 
+	if q.closed {
+		return false
+	}
 	if q.overflowMode {
+		if len(q.overflow) >= UdpTaskQueueMaxOverflow {
+			return false
+		}
 		q.overflow = append(q.overflow, task)
 		q.overflowLen.Store(int32(len(q.overflow)))
 		q.notifyWake()
-		return
+		return true
 	}
 
 	select {
 	case q.ch <- task:
-		return
+		return true
 	default:
-		// Hot-key degradation protection:
-		// when the per-key channel is saturated, switch this key into
-		// overflow mode so EmitTask stays non-blocking.
-		// convoy() drains channel first and then overflow FIFO, preserving
-		// in-order execution for this key.
+		// Keep accepted work FIFO without blocking producers. UDP overload
+		// drops the newest task once the bounded overflow tier is full.
 		q.overflowMode = true
 		q.overflow = append(q.overflow, task)
-		q.overflowLen.Store(int32(len(q.overflow)))
+		q.overflowLen.Store(1)
 		q.notifyWake()
+		return true
 	}
 }
 
@@ -199,22 +208,22 @@ func (q *UdpTaskQueue) convoy() {
 	defer func() {
 		if r := recover(); r != nil {
 			reportPacketPathPanic("convoy", "lifecycle", &udpTaskPoolPanicCount, r)
-			if q.p != nil {
-				// Lock out new acquires first, like the idle-GC path does,
-				// so an in-flight EmitTask cannot hand work to a dead convoy
-				// or race the drain below.
-				q.refs.Store(-1000000)
-				q.p.queues.Delete(q.key)
-				// Residual tasks are discarded with their resource cleanup
-				// before the channel is reused.
-				q.drainAndRelease()
-			}
+			q.refs.Store(-1000000)
+			q.p.queues.CompareAndDelete(q.key, q)
 		}
+		// The convoy is the sole queue cleanup owner. Close waits for done,
+		// so the channel cannot be reused while this goroutine still reads it.
+		q.drainAndRelease()
+		close(q.done)
+		q.p.convoys.Done()
 	}()
 	timer := time.NewTimer(q.agingTime)
 	defer timer.Stop()
 
 	for {
+		if q.refs.Load() < 0 {
+			return
+		}
 		// Batch drain: process every immediately-ready task in a tight loop
 		// without touching the timer between iterations. This replaces the
 		// legacy per-task safeTimerReset (Stop + drain + Reset) that
@@ -222,6 +231,9 @@ func (q *UdpTaskQueue) convoy() {
 		// only armed once the queue goes quiet.
 		drainedAny := false
 		for {
+			if q.refs.Load() < 0 {
+				return
+			}
 			if task, ok := q.popReadyTask(); ok {
 				runConvoyTask(task)
 				drainedAny = true
@@ -240,6 +252,9 @@ func (q *UdpTaskQueue) convoy() {
 			// Drain follow-up tasks that arrived while we were running the
 			// first one, then re-arm the timer once.
 			for {
+				if q.refs.Load() < 0 {
+					return
+				}
 				if task, ok := q.popReadyTask(); ok {
 					runConvoyTask(task)
 					continue
@@ -268,13 +283,11 @@ func (q *UdpTaskQueue) convoy() {
 
 			// Try to delete from pool using CAS-like semantics via sync.Map
 			if q.p.tryDeleteQueue(q.key, q) {
-				q.drainAndRelease()
 				return
 			}
 			// Check if mapping still points to current queue.
 			// If not, this convoy is stale and must exit to prevent goroutine leak.
 			if v, ok := q.p.queues.Load(q.key); !ok || v.(*UdpTaskQueue) != q {
-				q.drainAndRelease()
 				return
 			}
 
@@ -288,7 +301,10 @@ func (q *UdpTaskQueue) convoy() {
 type UdpTaskPool struct {
 	queueChPool sync.Pool
 	queues      sync.Map // map[UdpFlowKey]*UdpTaskQueue
+	createMu    sync.Mutex
+	convoys     sync.WaitGroup
 	closed      atomic.Bool
+	dropped     atomic.Uint64
 }
 
 func NewUdpTaskPool() *UdpTaskPool {
@@ -299,16 +315,30 @@ func NewUdpTaskPool() *UdpTaskPool {
 	}
 }
 
-// EmitTask makes sure packets with the same UDP flow key are sent in order.
+// EmitTask makes sure accepted packets with the same UDP flow key run in order.
+// It returns false when the pool is closed or that flow's bounded queue is full;
+// the caller retains ownership and must discard the rejected task.
 func (p *UdpTaskPool) EmitTask(key UdpFlowKey, task UdpTask) bool {
 	q := p.acquireQueue(key)
 	if q == nil {
 		return false
 	}
-	q.enqueue(task)
+	accepted := q.enqueue(task)
 	q.refs.Add(-1)
-	return true
+	if !accepted {
+		count := p.dropped.Add(1)
+		if shouldReportEveryPow2(count) {
+			logrus.WithFields(logrus.Fields{
+				"dropped_tasks": count,
+				"queue_limit":   UdpTaskQueueLength + UdpTaskQueueMaxOverflow,
+			}).Warn("dropping UDP task from saturated per-flow queue")
+		}
+	}
+	return accepted
 }
+
+// DroppedTasks reports overload drops since the pool was created.
+func (p *UdpTaskPool) DroppedTasks() uint64 { return p.dropped.Load() }
 
 func (p *UdpTaskPool) acquireQueue(key UdpFlowKey) *UdpTaskQueue {
 	// Reject new queue creation after Close
@@ -331,59 +361,73 @@ func (p *UdpTaskPool) acquireQueue(key UdpFlowKey) *UdpTaskQueue {
 
 createNew:
 
-	// Slow path: create new queue using LoadOrStore to avoid race condition
+	// Serialize only queue creation with Close. Existing flows keep the
+	// lock-free sync.Map/refcount fast path.
+	p.createMu.Lock()
+	if p.closed.Load() {
+		p.createMu.Unlock()
+		return nil
+	}
 	ch := p.queueChPool.Get().(chan UdpTask)
 	newQ := &UdpTaskQueue{
 		key:       key,
 		p:         p,
 		ch:        ch,
 		wake:      make(chan struct{}, 1),
+		done:      make(chan struct{}),
 		agingTime: UdpTaskPoolAgingTime,
 	}
 
-	// LoadOrStore ensures atomic create-or-get semantics without explicit locks
 	actual, loaded := p.queues.LoadOrStore(key, newQ)
 	if loaded {
-		// Another goroutine created the queue first, put our channel back
+		// Another goroutine created the queue first, put our channel back.
 		p.queueChPool.Put(ch)
 		q := actual.(*UdpTaskQueue)
 		for {
 			refs := q.refs.Load()
 			if refs < 0 {
-				// Use CompareAndDelete to only delete if still the same draining queue
 				p.queues.CompareAndDelete(key, q)
+				p.createMu.Unlock()
 				goto createNew
 			}
 			if q.refs.CompareAndSwap(refs, refs+1) {
+				p.createMu.Unlock()
 				return q
 			}
 		}
 	}
 	q := actual.(*UdpTaskQueue)
 	q.refs.Add(1)
-
-	// Only start the convoy goroutine for newly created queues
-	if !loaded {
-		go q.convoy()
-	}
-
+	p.convoys.Add(1)
+	go q.convoy()
+	p.createMu.Unlock()
 	return q
 }
 
 // Close stops all convoy goroutines and releases resources.
 // After Close, the pool must not be reused (shutdown-only path).
 func (p *UdpTaskPool) Close() {
+	p.createMu.Lock()
 	if p.closed.Swap(true) {
+		p.createMu.Unlock()
 		return
 	}
+	var done []<-chan struct{}
 	p.queues.Range(func(key, value any) bool {
 		if q, ok := p.queues.LoadAndDelete(key); ok {
 			queue := q.(*UdpTaskQueue)
 			queue.close()
-			queue.drainAndRelease()
+			done = append(done, queue.done)
 		}
 		return true
 	})
+	p.createMu.Unlock()
+	for _, ch := range done {
+		<-ch
+	}
+	// An idle convoy may have removed itself from queues immediately before
+	// Close took the snapshot. Wait for those already-retiring convoys too.
+	p.convoys.Wait()
 }
 
 // releaseQueueCh returns the queue channel to the pool exactly once. Close
@@ -396,15 +440,18 @@ func (p *UdpTaskPool) releaseQueueCh(q *UdpTaskQueue) {
 	}
 }
 
-// close signals the convoy goroutine to exit by setting refs to a sentinel value
-// and waking it. The convoy goroutine will detect this and return.
+// close rejects future enqueues and wakes the convoy. Cleanup remains owned by
+// the convoy so Close can wait for done before the channel is reused.
 func (q *UdpTaskQueue) close() {
-	q.refs.Store(-1000000)
-	// Non-blocking wake to unblock convoy from timer wait
-	select {
-	case q.wake <- struct{}{}:
-	default:
+	q.enqueueMu.Lock()
+	if q.closed {
+		q.enqueueMu.Unlock()
+		return
 	}
+	q.closed = true
+	q.refs.Store(-1000000)
+	q.enqueueMu.Unlock()
+	q.notifyWake()
 }
 
 // tryDeleteQueue attempts to delete the queue if it's still the same instance.

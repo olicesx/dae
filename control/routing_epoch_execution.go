@@ -21,8 +21,10 @@ var (
 	// incomingConnectionOwnershipMu serializes lifecycle writers only:
 	// AttachSessionManager, flow adoption, and the close/abort transitions.
 	//
-	// The steady-state read path is fully lock-free via a double-checked
-	// atomic protocol instead. Every admission follows
+	// The ownership gate uses a double-checked atomic protocol. Admission also
+	// acquires the generation drain tracker, whose coarse mutex accounts one
+	// ticket per live flow; this path is therefore not fully lock-free. Every
+	// admission follows
 	//
 	//	check(gates) -> drainTracker.Add -> recheck(gates) -> commit map state
 	//

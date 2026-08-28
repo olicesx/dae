@@ -14,7 +14,7 @@ require (
 	github.com/miekg/dns v1.1.72
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
 	github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac
-	github.com/olicesx/quic-go v0.0.0-20260827105826-c61845789995
+	github.com/olicesx/quic-go v0.0.0-20260828002944-0d8eb6220722
 	github.com/panjf2000/ants/v2 v2.11.5
 	github.com/safchain/ethtool v0.7.0
 	github.com/shirou/gopsutil/v4 v4.26.1
@@ -66,7 +66,7 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.25 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
-	github.com/quic-go/qpack v0.5.1 // indirect
+	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/sagernet/sing v0.6.0 // indirect
 	github.com/sagernet/sing-shadowtls v0.2.0 // indirect
 	github.com/samber/lo v1.52.0 // indirect
@@ -111,18 +111,15 @@ require (
 	google.golang.org/grpc v1.79.1 // indirect
 )
 
-// Use optimized quic-go with B-tree node pooling + upstream cherry-picks on enhanced-with-fixes baseline.
-// Latest perf/datagram-pool: GC-stable bounded channel pools for STREAM and
-// DATAGRAM frames (sync.Pool was cleared on every GC cycle, causing an
-// allocation spiral that showed up as 80% GC CPU in production), plus bounded
-// Add on a full send queue (30s timeout -> ErrDatagramQueueFullTimeout).
-// The current revision preserves package Dial's skip-address fast path while
-// restoring sender addresses for explicit transports.
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260827105826-c61845789995
+// Use the custom quic-go fork for the verified GSO, key-update, congestion-
+// control, and explicit-transport address behavior. Performance and security
+// claims are enforced in the fork's own unit/race gates; no GC behavior is
+// inferred from pool implementation choice here.
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260828002944-0d8eb6220722
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
 
 // Remote outbound fork: Trojan UDP CRLF, sticky role-header dispatch,
 // scoped h2 MarkDead, 8KiB direct small-tier, and TUIC stream-parse bench.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260827081812-6b6531ef9eb4
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260828003409-e7ba75ea5efd

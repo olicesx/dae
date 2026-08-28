@@ -708,8 +708,10 @@ dialSuccess:
 			}
 		}(),
 	}
-	if _, ok := packetConn.(netproxy.PacketBatchWriter); ok {
-		ue.writeBatch = newUDPWriteBatchAggregator(ue)
+	if udpWriteBatchOptedIn() {
+		if _, ok := packetConn.(netproxy.PacketBatchWriter); ok {
+			ue.writeBatch = newUDPWriteBatchAggregator(ue)
+		}
 	}
 	if createOption.sessionManager != nil {
 		if _, err := createOption.sessionManager.adoptUDP(ue, dialOption.Binding, createOption.egressRuntime); err != nil {

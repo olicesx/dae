@@ -1,0 +1,49 @@
+name: Fork Regression
+
+on:
+  pull_request:
+    paths:
+      - "go.mod"
+      - "go.sum"
+      - "scripts/fork-cross-repo-test.sh"
+      - ".github/workflows/fork-cross-repo.yml"
+  push:
+    branches:
+      - main
+      - kdae
+    paths:
+      - "go.mod"
+      - "go.sum"
+      - "scripts/fork-cross-repo-test.sh"
+      - ".github/workflows/fork-cross-repo.yml"
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  fork-tests:
+    name: Fork ${{ matrix.mode }} tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: unit
+            test_args: ""
+          - mode: race
+            test_args: "-race"
+    steps:
+      - name: Checkout dae
+        uses: actions/checkout@v6
+
+      - name: Set up Go 1.26
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+          cache: true
+
+      - name: Test pinned fork revisions
+        env:
+          FORK_TEST_TIMEOUT: "1800"
+        run: bash scripts/fork-cross-repo-test.sh --clone-missing --short --strict -- ${{ matrix.test_args }}

@@ -50,10 +50,10 @@ type udpFlowSourceSnapshot struct {
 	epochCounts map[routing.PolicyEpoch]int
 }
 
-// sessionPinnedShardCount sizes the per-key refcount shards. Sixteen shards
-// spread concurrent connection setups so adopt/release rarely contend; each
-// key maps to exactly one shard by hash, keeping its refcount authoritative
-// in a single place.
+// sessionPinnedShardCount sizes the per-key refcount shards. Each key maps to
+// one authoritative shard. Adoption and release still serialize generation
+// bookkeeping with generationsMu, so sharding must not be treated as an
+// end-to-end connection setup concurrency claim.
 const sessionPinnedShardCount = 16
 
 type pinnedKeyShard struct {
@@ -145,10 +145,10 @@ func (s *redirectKeyShard) unpin(key bpfRedirectTuple) {
 // ControlPlane generation. Reload swaps the policy used for new flows while
 // existing runtimes retain their original sockets and immutable bindings.
 //
-// Locking: per-flow registration lives in sync.Maps guarded only by atomic
-// insert/delete; the eBPF refcounts are sharded by tuple hash; generations
-// and the udpBySource snapshot index get dedicated small mutexes. No single
-// global lock serializes the connection data path anymore.
+// Locking: per-flow registration lives in sync.Maps, while generation
+// bookkeeping and lifecycle snapshots serialize setup and teardown with
+// generationsMu. Refcount maps are sharded by tuple hash. Established packet
+// forwarding does not take these lifecycle locks.
 type SessionManager struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -171,8 +171,8 @@ type SessionManager struct {
 	generations   map[routing.PolicyEpoch]*sessionGenerationState
 
 	// pinnedShards/refShards hold process-level eBPF conn_state_map /
-	// redirect-map refcounts, sharded to avoid cross-core contention on
-	// connection setup and teardown.
+	// redirect-map refcounts. The shards isolate map ownership, while
+	// generationsMu still serializes lifecycle transactions.
 	pinnedShards [sessionPinnedShardCount]pinnedKeyShard
 	refShards    [sessionPinnedShardCount]redirectKeyShard
 

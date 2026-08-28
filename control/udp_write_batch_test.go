@@ -20,6 +20,21 @@ import (
 
 // batchRecorder implements PacketConn + PacketBatchWriter and records every
 // batch (with deep-copied payloads so reuse of the aggregator buffer is safe).
+func TestUDPWriteBatchRequiresExplicitOptIn(t *testing.T) {
+	t.Setenv(udpWriteBatchOptInEnv, "")
+	if udpWriteBatchOptedIn() {
+		t.Fatal("batching enabled without explicit opt-in")
+	}
+	t.Setenv(udpWriteBatchOptInEnv, "1")
+	if !udpWriteBatchOptedIn() {
+		t.Fatal("batching disabled with explicit opt-in")
+	}
+	t.Setenv(udpWriteBatchOptInEnv, "true")
+	if udpWriteBatchOptedIn() {
+		t.Fatal("ambiguous opt-in value enabled batching")
+	}
+}
+
 type batchRecorder struct {
 	mu      sync.Mutex
 	batches [][]netproxy.BatchItem
@@ -574,5 +589,66 @@ func TestAggregatorFlushNotCorruptedByConcurrentAppend(t *testing.T) {
 	}
 	if got := rec.sentItem(1); !bytes.Equal(got, second) {
 		t.Fatalf("second datagram corrupted: got % x…, want all 0xBB", got[:min(8, len(got))])
+	}
+}
+
+func TestEndpointCloseBatchErrorDoesNotReenterClose(t *testing.T) {
+	rec := &batchRecorder{err: net.ErrClosed}
+	ue := newBatchTestEndpoint(rec)
+	ue.writeBatch = newUDPWriteBatchAggregator(ue)
+	if err := ue.writeBatch.Append([]byte("pending"), "10.0.0.1:53"); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		_ = ue.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("endpoint Close deadlocked after batch write error")
+	}
+}
+
+func TestAggregatorCloseWaitsForActiveFlush(t *testing.T) {
+	rec := &gatingBatchRecorder{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	agg := newUDPWriteBatchAggregator(&UdpEndpoint{conn: rec})
+	if err := agg.Append([]byte("pending"), "10.0.0.1:53"); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	go agg.flush()
+	select {
+	case <-rec.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("WriteBatch did not start")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		agg.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("Close returned while WriteBatch was active")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(rec.release)
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not finish after WriteBatch returned")
+	}
+	if got := rec.sentCount(); got != 1 {
+		t.Fatalf("Close delivered %d datagrams, want 1", got)
+	}
+	if err := agg.Append([]byte("late"), "10.0.0.1:53"); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Append after Close = %v, want net.ErrClosed", err)
 	}
 }

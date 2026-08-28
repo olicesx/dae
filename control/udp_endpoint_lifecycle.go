@@ -665,6 +665,11 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 // (non-QUIC transports) for a transport that stopped draining, and the
 // bidirectional-silence rebuild check for a reaped remote session.
 func (ue *UdpEndpoint) handleWriteError(err error) error {
+	// Close marks the endpoint dead before synchronously flushing its batch.
+	// A flush error on that stack must not re-enter Close's sync.Once.
+	if ue.dead.Load() {
+		return err
+	}
 	// Connection-refused is a hard failure: evict the bad upstream now.
 	if ue.isConnectionRefused(err) {
 		ue.retire()

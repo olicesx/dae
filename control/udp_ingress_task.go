@@ -137,8 +137,8 @@ func (t *udpIngressTask) Run() {
 	convergeSrc := t.convergeSrc
 	flowDecision := t.flowDecision
 
-	// Release order: buffer, admission, then the task itself (the pool must
-	// not see the task before its deferred cleanup completes).
+	// Defers run in LIFO order: admission, buffer, then the task itself (the
+	// pool must not see the task before its deferred cleanup completes).
 	defer udpIngressTaskPool.Put(t)
 	defer data.Put()
 	defer t.admission.release()

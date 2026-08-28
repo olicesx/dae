@@ -198,3 +198,120 @@ func TestUdpTaskPoolConcurrentSubmitAndClose(t *testing.T) {
 	require.False(t, pool.EmitTask(udpTaskPoolTestKey(), udpTaskFunc(func() {})),
 		"EmitTask accepted work after Close")
 }
+
+type ownedUdpTask struct {
+	runs     *atomic.Int32
+	discards *atomic.Int32
+	started  chan struct{}
+	release  <-chan struct{}
+}
+
+func (t *ownedUdpTask) Run() {
+	t.runs.Add(1)
+	if t.started != nil {
+		close(t.started)
+	}
+	if t.release != nil {
+		<-t.release
+	}
+}
+
+func (t *ownedUdpTask) Discard() { t.discards.Add(1) }
+
+type blockingDiscardUdpTask struct {
+	started chan struct{}
+	release <-chan struct{}
+}
+
+func (*blockingDiscardUdpTask) Run() {}
+
+func (t *blockingDiscardUdpTask) Discard() {
+	close(t.started)
+	<-t.release
+}
+
+func TestUdpTaskPoolCloseWaitsForAlreadyRetiringConvoy(t *testing.T) {
+	pool := NewUdpTaskPool()
+	release := make(chan struct{})
+	started := make(chan struct{})
+	queue := &UdpTaskQueue{
+		p: pool, ch: make(chan UdpTask, 1), wake: make(chan struct{}, 1),
+		done: make(chan struct{}),
+	}
+	queue.refs.Store(-1000000)
+	queue.ch <- &blockingDiscardUdpTask{started: started, release: release}
+	pool.convoys.Add(1)
+	go queue.convoy()
+	<-started
+
+	closed := make(chan struct{})
+	go func() {
+		pool.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("Close did not wait for the already-retiring convoy")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not finish after retiring convoy cleanup")
+	}
+}
+
+func TestUdpTaskPoolBoundsHotFlowAndDiscardsExactlyOnce(t *testing.T) {
+	pool := NewUdpTaskPool()
+	key := udpTaskPoolTestKey()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var blockerRuns atomic.Int32
+	var blockerDiscards atomic.Int32
+	require.True(t, pool.EmitTask(key, &ownedUdpTask{
+		runs: &blockerRuns, discards: &blockerDiscards,
+		started: started, release: release,
+	}))
+	<-started
+
+	accepted := make([]*ownedUdpTask, 0, UdpTaskQueueLength+UdpTaskQueueMaxOverflow)
+	for range UdpTaskQueueLength + UdpTaskQueueMaxOverflow {
+		task := &ownedUdpTask{runs: new(atomic.Int32), discards: new(atomic.Int32)}
+		require.True(t, pool.EmitTask(key, task))
+		accepted = append(accepted, task)
+	}
+	rejected := &ownedUdpTask{runs: new(atomic.Int32), discards: new(atomic.Int32)}
+	require.False(t, pool.EmitTask(key, rejected))
+	discardTask(rejected)
+	require.Equal(t, uint64(1), pool.DroppedTasks())
+
+	value, ok := pool.queues.Load(key)
+	require.True(t, ok)
+	queue := value.(*UdpTaskQueue)
+	closed := make(chan struct{})
+	go func() {
+		pool.Close()
+		close(closed)
+	}()
+	require.Eventually(t, func() bool {
+		queue.enqueueMu.Lock()
+		defer queue.enqueueMu.Unlock()
+		return queue.closed
+	}, time.Second, time.Millisecond)
+	close(release)
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not wait for convoy cleanup")
+	}
+
+	require.Equal(t, int32(1), blockerRuns.Load())
+	require.Zero(t, blockerDiscards.Load())
+	require.Zero(t, rejected.runs.Load())
+	require.Equal(t, int32(1), rejected.discards.Load())
+	for i, task := range accepted {
+		require.Zero(t, task.runs.Load(), "queued task %d ran after Close", i)
+		require.Equal(t, int32(1), task.discards.Load(), "queued task %d discard count", i)
+	}
+}

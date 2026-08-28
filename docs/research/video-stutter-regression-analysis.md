@@ -122,7 +122,7 @@
 |----|------|
 | fork pin 完整性 | ca082f24（rcvQueue 满归还池缓冲）与 e4982907（sorter double-put 修复）**均在** pin 9d6cbf7c 内 |
 | TCP relay copy buffer 池摇摆 | c1cd6f74（channel 池，实测 CPU 2.1×）已被 5f019933 干净 revert 回 sync.Pool（字节级） |
-| UDP 批写（sendmmsg） | 真实内核实测无收益也无害（real-kernel-revalidation.md）；scratch 池化并发安全；Linux 上部分成功必带 error（dae 的 ErrShortWrite 退役链只在真实部分写时触发） |
+| UDP 批写（sendmmsg） | 真实内核实测无吞吐收益，聚合会引入最多 1ms 策略延迟，因此默认关闭、仅显式 opt-in；scratch 池化并发安全；Linux 上部分成功必带 error（dae 的 ErrShortWrite 退役链只在真实部分写时触发） |
 | ingress task 池化（f7b27fcd） | 原闭包同样 `defer data.Put()`，buffer 生命周期语义未变；handlePkt 同步消费 |
 | hy2 redundant-send | 已彻底 revert，零残留 |
 | 池摇摆（outbound） | 终态为干净 sync.Pool，Get cap-guard 正确 |

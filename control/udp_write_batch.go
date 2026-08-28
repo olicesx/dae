@@ -10,8 +10,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
@@ -19,15 +19,11 @@ import (
 )
 
 const (
-	// udpWriteBatchMaxItems is the number of datagrams accumulated before a
-	// batched flush. 32 amortizes the per-datagram UDP write syscall (the
-	// dominant hot-path cost under saturated multi-flow UDP: pprof showed
-	// ~31% CPU in the write syscall alone) while bounding flush latency.
+	// udpWriteBatchMaxItems bounds the explicitly enabled experimental batch.
+	// Real-kernel validation found no end-to-end throughput gain, so batching
+	// stays off unless an operator has workload-specific evidence.
 	udpWriteBatchMaxItems = 32
-	// udpWriteBatchWindow is the maximum time a datagram waits in the batch
-	// buffer before being flushed. 1ms adds a bounded tail-latency cost that
-	// is negligible for game UDP (tens of ms tolerance) but lets low-rate
-	// flows still benefit from batching.
+	// udpWriteBatchWindow is the opt-in batch's hard tail-latency budget.
 	udpWriteBatchWindow = time.Millisecond
 	// udpWriteBatchItemSize sizes the batch backing buffer (32 x MTU).
 	udpWriteBatchItemSize = consts.EthernetMtu
@@ -38,13 +34,16 @@ const (
 // direct synchronous write for that datagram.
 var errUDPWriteBatchOversized = stderrors.New("udp write batch: datagram too large")
 
+const udpWriteBatchOptInEnv = "DAE_ENABLE_UDP_WRITE_BATCH"
+
+func udpWriteBatchOptedIn() bool { return os.Getenv(udpWriteBatchOptInEnv) == "1" }
+
 // udpWriteBatchAggregator accumulates datagrams for one UdpEndpoint and
 // flushes them through the transport's batched writer (sendmmsg on direct
 // UDP, per the netproxy.PacketBatchWriter extension). Flush triggers: batch
 // full (udpWriteBatchMaxItems) or udpWriteBatchWindow timer, whichever comes
 // first. Write errors are routed through the endpoint's existing retirement
-// policy asynchronously, so the synchronous Append path stays allocation-
-// light and lock-free for the common case.
+// policy asynchronously, after releasing the endpoint-local mutex.
 //
 // Per-flow ordering is preserved: the per-flow convoy task pool funnels each
 // flow's WriteTo calls through a single producer, Append preserves order, and
@@ -58,8 +57,7 @@ type udpWriteBatchAggregator struct {
 	used  int
 	timer *time.Timer
 
-	flushing atomic.Bool
-	closed   atomic.Bool
+	closed bool // guarded by mu
 }
 
 func newUDPWriteBatchAggregator(ue *UdpEndpoint) *udpWriteBatchAggregator {
@@ -72,11 +70,12 @@ func newUDPWriteBatchAggregator(ue *UdpEndpoint) *udpWriteBatchAggregator {
 // do not fit the backing buffer (caller falls back to a direct write); other
 // errors mean the aggregator is closed.
 func (a *udpWriteBatchAggregator) Append(data []byte, addr string) error {
-	if a.closed.Load() {
-		return net.ErrClosed
-	}
 	for {
 		a.mu.Lock()
+		if a.closed {
+			a.mu.Unlock()
+			return net.ErrClosed
+		}
 		if len(a.items) >= udpWriteBatchMaxItems || (a.used+len(data) > len(a.buf) && len(a.buf) > 0) {
 			a.mu.Unlock()
 			a.flush()
@@ -123,11 +122,6 @@ func (a *udpWriteBatchAggregator) Append(data []byte, addr string) error {
 // cross-batch reordering — strictly worse here. Revisit only if a future
 // consumer feeds one aggregator from many goroutines.
 func (a *udpWriteBatchAggregator) flush() {
-	if !a.flushing.CompareAndSwap(false, true) {
-		return
-	}
-	defer a.flushing.Store(false)
-
 	a.mu.Lock()
 	// Reuse the items backing array instead of dropping it for GC: the next
 	// Append runs under this same mutex only after the transport write below
@@ -200,9 +194,19 @@ func (a *udpWriteBatchAggregator) flush() {
 	a.ue.lastSendNano.Store(time.Now().UnixNano())
 }
 
-// Close flushes any pending batch and disables further appends.
+// Close prevents future appends, waits for any active write, and flushes the
+// remaining batch before the endpoint closes its transport.
 func (a *udpWriteBatchAggregator) Close() {
-	if a.closed.CompareAndSwap(false, true) {
-		a.flush()
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return
 	}
+	a.closed = true
+	if a.timer != nil {
+		a.timer.Stop()
+		a.timer = nil
+	}
+	a.mu.Unlock()
+	a.flush()
 }

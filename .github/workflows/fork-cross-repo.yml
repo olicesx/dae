@@ -32,7 +32,7 @@ jobs:
           - mode: unit
             test_args: ""
           - mode: race
-            test_args: "-race"
+            test_args: "-race -p=1"
     steps:
       - name: Checkout dae
         uses: actions/checkout@v6

@@ -14,7 +14,7 @@ require (
 	github.com/miekg/dns v1.1.72
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
 	github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac
-	github.com/olicesx/quic-go v0.0.0-20260828014140-ab3c3fd538a6
+	github.com/olicesx/quic-go v0.0.0-20260828020343-08e975ef39de
 	github.com/panjf2000/ants/v2 v2.11.5
 	github.com/safchain/ethtool v0.7.0
 	github.com/shirou/gopsutil/v4 v4.26.1
@@ -115,11 +115,11 @@ require (
 // control, and explicit-transport address behavior. Performance and security
 // claims are enforced in the fork's own unit/race gates; no GC behavior is
 // inferred from pool implementation choice here.
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260828014140-ab3c3fd538a6
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260828020343-08e975ef39de
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
 
 // Remote outbound fork: Trojan UDP CRLF, sticky role-header dispatch,
 // scoped h2 MarkDead, 8KiB direct small-tier, and TUIC stream-parse bench.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260828014327-77708f96e384
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260828020533-ae9f25d31dcf

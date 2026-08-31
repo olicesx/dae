@@ -432,7 +432,20 @@ build_routing_meta(__u8 outbound, __u32 mark, __u8 must, __u8 dscp)
 static __always_inline void
 publish_routing_meta(union routing_meta *dst, union routing_meta meta)
 {
-	/* Publish routing only after side fields (mac/pname/pid) are ready. */
+	/* Publish routing only after side fields (mac/pname/pid) are ready.
+	 *
+	 * barrier() is a COMPILER-ONLY fence: it orders the generated machine
+	 * code but emits no CPU fence, so the store-release guarantee is
+	 * architecture-dependent. On strongly ordered targets (x86 TSO) the
+	 * prior writes to mac/pname/pid are observed before has_routing=1.
+	 * On weakly ordered targets a reader that observes has_routing=1 may
+	 * briefly read stale side fields. This is an accepted trade-off: the
+	 * side fields are advisory per-flow metadata consumed through the
+	 * conn_state cache domain, the window is a single first-packet
+	 * publication, and a full __sync_synchronize() fence in this hot path
+	 * would need verification across the whole kernel matrix before it
+	 * could be considered.
+	 */
 	barrier();
 	*(volatile __u64 *)&dst->raw = meta.raw;
 }

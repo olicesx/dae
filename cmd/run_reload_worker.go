@@ -111,12 +111,16 @@ func (w *reloadWorker) run() {
 			}
 			w.log.Infof("Include config files: [%v]", strings.Join(includes, ", "))
 		}
-		// New logger.
+		// Re-apply the new log level/formatter in place instead of swapping the
+		// w.log pointer: the signal loop and the fast-exit path read w.log
+		// concurrently with this worker, while the logrus mutators used by
+		// SetLogger (SetLevel/SetFormatter) are mutex-safe on a shared
+		// *logrus.Logger. Keeping one logger instance also propagates the new
+		// level to every component that already captured the pointer, which a
+		// fresh logger silently left on the old one.
 		oldLogOutput := w.log.Out
-		w.log = logrus.New()
 		logger.SetLogger(w.log, newConf.Global.LogLevel, disableTimestamp, nil)
 		logger.SetLogger(logrus.StandardLogger(), newConf.Global.LogLevel, disableTimestamp, nil)
-		w.log.SetOutput(oldLogOutput) // NOTE: Restore log output after creating new logger during reload.
 		logrus.SetOutput(oldLogOutput)
 		if !req.isSuspend {
 			if deferred := preserveReloadInterfaceBindings(w.conf, newConf); len(deferred) > 0 {

@@ -469,11 +469,17 @@ loop:
 							default:
 							}
 						}()
-						w.listener, err = listenControlPlaneInDaeNetns(w.c, w.conf.Global.TproxyPort)
-						if err != nil {
-							w.log.Errorln("Listen:", err)
-						} else if err = serveControlPlaneFunc(w.c, readyChan, w.listener); err != nil {
-							w.log.Errorln("Serve:", err)
+						// Keep all errors local: this goroutine can outlive the
+						// readiness wait below and must never write Run's named
+						// return, which the main loop reads on every exit path.
+						listener, listenErr := listenControlPlaneInDaeNetns(w.c, w.conf.Global.TproxyPort)
+						if listenErr != nil {
+							w.log.Errorln("Listen:", listenErr)
+						} else {
+							w.listener = listener
+							if serveErr := serveControlPlaneFunc(w.c, readyChan, listener); serveErr != nil {
+								w.log.Errorln("Serve:", serveErr)
+							}
 						}
 						notifyRunStateChange(runStateChanges)
 					}()

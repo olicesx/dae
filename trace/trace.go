@@ -349,6 +349,24 @@ func handleEvents(ctx context.Context, objs *bpfObjects, outputFile string, kfre
 	// a map to save slices of bpfEvent of the Skb
 	skb2symNames := make(map[uint64][]string)
 	// a map to save slices of function name called with the Skb
+	// Terminal kfree events normally delete each skb's entries. When they go
+	// missing (ringbuf sample loss above, or a failed kfree_skbmem attach),
+	// the tracking maps would grow without bound for the rest of the trace,
+	// so cap the live set and shed a quarter of it on overflow. Eviction is
+	// random (Go map order); a shed skb only loses its report, and shedding
+	// only starts once tracking is already pathological.
+	const traceMaxTrackedSkbs = 1 << 16
+	evictTrackedSkbs := func() {
+		n := len(skb2events) / 4
+		for skb := range skb2events {
+			delete(skb2events, skb)
+			delete(skb2symNames, skb)
+			n--
+			if n == 0 {
+				return
+			}
+		}
+	}
 	var readEvents uint64
 	writeEvents := func(writer io.Writer, events []bpfEvent, complete bool) {
 		for _, skbEv := range events {
@@ -440,6 +458,9 @@ func handleEvents(ctx context.Context, objs *bpfObjects, outputFile string, kfre
 			skb2events[event.Skb] = []bpfEvent{}
 		}
 		skb2events[event.Skb] = append(skb2events[event.Skb], event)
+		if len(skb2events) > traceMaxTrackedSkbs {
+			evictTrackedSkbs()
+		}
 
 		sym := NearestSymbol(event.Pc)
 		if skb2symNames[event.Skb] == nil {

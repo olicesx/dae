@@ -50,6 +50,7 @@ func NewHTTPTransport(hostname string, dialContext func(ctx context.Context, net
 		MaxIdleConnsPerHost:   20,
 		IdleConnTimeout:       httpIdleConnTimeout,
 		TLSHandshakeTimeout:   httpTLSHandshakeTimeout,
+		ResponseHeaderTimeout: httpTLSHandshakeTimeout,
 		ExpectContinueTimeout: httpExpectContinueTimeout,
 		TLSClientConfig: &tls.Config{
 			ServerName:         hostname,

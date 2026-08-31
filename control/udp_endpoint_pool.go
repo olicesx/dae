@@ -531,19 +531,17 @@ func (p *UdpEndpointPool) Reset() {
 	for i := range udpEndpointCreateShardCount {
 		shard := &p.shards[i]
 		shard.mu.Lock()
-		// Phase 1: Collect keys to avoid modifying map during iteration
-		var keys []UdpEndpointKey
-		for key := range shard.pool {
-			keys = append(keys, key)
-		}
-		// Phase 2: Delete and close each entry
-		for _, key := range keys {
-			if ue, ok := shard.pool[key]; ok {
-				delete(shard.pool, key)
-				_ = ue.Close()
+		toClose := make([]*UdpEndpoint, 0, len(shard.pool))
+		for key, ue := range shard.pool {
+			delete(shard.pool, key)
+			if ue != nil {
+				toClose = append(toClose, ue)
 			}
 		}
 		shard.mu.Unlock()
+		for _, ue := range toClose {
+			_ = ue.Close()
+		}
 	}
 	// Clear index maps by deleting entries rather than reassigning a new
 	// sync.Map struct. Struct assignment races with background goroutines
@@ -582,15 +580,15 @@ func (p *UdpEndpointPool) Close() {
 func (p *UdpEndpointPool) Remove(key UdpEndpointKey, udpEndpoint *UdpEndpoint) (err error) {
 	shard := p.shardFor(key)
 	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
 	if ue, ok := shard.pool[key]; !ok || ue != udpEndpoint {
+		shard.mu.Unlock()
 		_ = udpEndpoint.Close()
 		return fmt.Errorf("target udp endpoint is not in the pool")
 	}
 	delete(shard.pool, key)
-	_ = udpEndpoint.Close()
-	return nil
+	shard.mu.Unlock()
+	// Close waits for the reply sender; never hold shard.mu across it.
+	return udpEndpoint.Close()
 }
 
 // udpEndpointPoolGetObserver, when non-nil, is invoked on every Get. Tests

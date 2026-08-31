@@ -32,9 +32,17 @@ func (c *DnsController) backgroundRefresh(cacheKey string, dnsMessage *dnsmessag
 	}
 	ctx, cancel := c.newWorkContext(5 * time.Second)
 	defer cancel()
+	// Always clear the refreshing flag. Do not look the entry up through
+	// LookupDnsRespCache: that helper evicts expired-but-stale entries, which
+	// would turn a refresh miss into a hard failure for every later query.
 	defer func() {
-		if cache := c.LookupDnsRespCache(cacheKey, false); cache != nil && cache.IsRefreshing() {
-			cache.MarkRefreshed()
+		if cacheKey == "" {
+			return
+		}
+		if val, ok := c.dnsCache.Load(cacheKey); ok {
+			if cache, ok := val.(*DnsCache); ok && cache.IsRefreshing() {
+				cache.MarkRefreshed()
+			}
 		}
 	}()
 

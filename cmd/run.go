@@ -126,6 +126,7 @@ type retirementDrainPlane interface {
 	AbortConnections() error
 	AbortPendingConnections() error
 	StopRoutingEpochExecution()
+	StopRoutingEpochExecutionWithTimeout(time.Duration)
 }
 
 type controlPlaneDrainWaitResult uint8

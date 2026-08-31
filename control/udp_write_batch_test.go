@@ -612,7 +612,7 @@ func TestEndpointCloseBatchErrorDoesNotReenterClose(t *testing.T) {
 	}
 }
 
-func TestAggregatorCloseWaitsForActiveFlush(t *testing.T) {
+func TestAggregatorCloseWaitsForActiveTimerFlush(t *testing.T) {
 	rec := &gatingBatchRecorder{
 		entered: make(chan struct{}),
 		release: make(chan struct{}),
@@ -622,11 +622,12 @@ func TestAggregatorCloseWaitsForActiveFlush(t *testing.T) {
 	if err := agg.Append([]byte("pending"), "10.0.0.1:53"); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
-	go agg.flush()
+	// Wait for the real AfterFunc callback to enter WriteBatch. Its Timer.C is
+	// nil, so Close must synchronize with the active callback through a.mu.
 	select {
 	case <-rec.entered:
 	case <-time.After(2 * time.Second):
-		t.Fatal("WriteBatch did not start")
+		t.Fatal("timer WriteBatch did not start")
 	}
 
 	closed := make(chan struct{})

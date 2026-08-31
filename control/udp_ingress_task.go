@@ -162,9 +162,11 @@ func (t *udpIngressTask) Run() {
 						"src":        convergeSrc.String(),
 						"dst":        realDst.String(),
 						"listenAddr": listenAddr,
-					}).Trace("Skipping DNS fast path for local traffic to our own DNS listener")
+					}).Trace("Local traffic to our own DNS listener; handling via DNS fast path instead of NAT-tracking")
 				}
-				return
+				// Fall through: kernel already TC_ACT_OKs unmarked local
+				// sockets, but a packet that reached TProxy must still be
+				// answered. Dropping here black-holes 127.0.0.1:53.
 			}
 		}
 

@@ -187,7 +187,7 @@ func newDnsForwarder(upstream *dns.Upstream, dialArgument dialArgument, log *log
 	return forwarder, nil
 }
 
-type doHSendFunc func(*http.Client, string, *dns.Upstream, []byte) (*dnsmessage.Msg, error)
+type doHSendFunc func(ctx context.Context, client *http.Client, target string, upstream *dns.Upstream, data []byte) (*dnsmessage.Msg, error)
 
 type DoH struct {
 	dns.Upstream
@@ -202,11 +202,11 @@ type DoH struct {
 	sendFunc          doHSendFunc
 }
 
-func (d *DoH) sendDNS(client *http.Client, data []byte) (*dnsmessage.Msg, error) {
+func (d *DoH) sendDNS(ctx context.Context, client *http.Client, data []byte) (*dnsmessage.Msg, error) {
 	if d.sendFunc != nil {
-		return d.sendFunc(client, d.dialArgument.bestTarget.String(), &d.Upstream, data)
+		return d.sendFunc(ctx, client, d.dialArgument.bestTarget.String(), &d.Upstream, data)
 	}
-	return dnstransport.SendHTTPDNS(context.Background(), client, d.dialArgument.bestTarget.String(), &d.Upstream, data)
+	return dnstransport.SendHTTPDNS(ctx, client, d.dialArgument.bestTarget.String(), &d.Upstream, data)
 }
 
 func (d *DoH) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, error) {
@@ -216,7 +216,7 @@ func (d *DoH) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, err
 	}
 	defer func() { d.releaseClient(generation) }()
 
-	msg, err := d.sendDNS(generation.Client, data)
+	msg, err := d.sendDNS(ctx, generation.Client, data)
 	if err == nil || ctx.Err() != nil || !dnstransport.ShouldReplaceHTTPClient(err) {
 		return msg, err
 	}
@@ -228,7 +228,7 @@ func (d *DoH) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, err
 	if generation == nil {
 		return nil, net.ErrClosed
 	}
-	return d.sendDNS(generation.Client, data)
+	return d.sendDNS(ctx, generation.Client, data)
 }
 
 func (d *DoH) ensureClientGenerationsLocked() {
@@ -672,10 +672,16 @@ func (d *DoTLS) getPool() *connPool {
 				InsecureSkipVerify: false,
 				ServerName:         d.Hostname,
 			})
-			if err = tlsConn.Handshake(); err != nil {
+			if deadline, ok := ctx.Deadline(); ok {
+				_ = tlsConn.SetDeadline(deadline)
+			} else {
+				_ = tlsConn.SetDeadline(time.Now().Add(consts.DefaultDialTimeout))
+			}
+			if err = tlsConn.HandshakeContext(ctx); err != nil {
 				_ = conn.Close()
 				return nil, err
 			}
+			_ = tlsConn.SetDeadline(time.Time{})
 			return tlsConn, nil
 		})
 	})
@@ -1331,8 +1337,14 @@ func (pc *pipelinedConn) RoundTrip(ctx context.Context, data []byte) (*dnsmessag
 		return nil, err
 	}
 
+	deadline, hasDeadline := ctx.Deadline()
+	if !hasDeadline {
+		deadline = time.Now().Add(consts.DefaultDialTimeout)
+	}
 	pc.writeMu.Lock()
+	_ = pc.conn.SetWriteDeadline(deadline)
 	_, err = pc.conn.Write(buf)
+	_ = pc.conn.SetWriteDeadline(time.Time{})
 	pc.writeMu.Unlock()
 
 	if err != nil {

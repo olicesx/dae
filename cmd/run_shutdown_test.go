@@ -1428,6 +1428,10 @@ type blockingStopRetirementPlane struct {
 }
 
 func (r *blockingStopRetirementPlane) StopRoutingEpochExecution() {
+	r.StopRoutingEpochExecutionWithTimeout(0)
+}
+
+func (r *blockingStopRetirementPlane) StopRoutingEpochExecutionWithTimeout(time.Duration) {
 	close(r.stopStarted)
 	<-r.stopRelease
 	r.retirementBehaviorPlane.StopRoutingEpochExecution()
@@ -1445,6 +1449,10 @@ func (r *retirementBehaviorPlane) AbortPendingConnections() error {
 
 func (r *retirementBehaviorPlane) StopRoutingEpochExecution() {
 	r.stopExecutionCalled.Store(true)
+}
+
+func (r *retirementBehaviorPlane) StopRoutingEpochExecutionWithTimeout(time.Duration) {
+	r.StopRoutingEpochExecution()
 }
 
 func TestReloadRetirementBehavior(t *testing.T) {

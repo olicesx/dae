@@ -63,6 +63,15 @@ const (
 
 var errTCPRelayOffloadUnavailable = errors.New("tcp relay eBPF offload unavailable")
 
+// epollCtlAddIgnoreExist adds fd to epfd. EEXIST means the fd is already a
+// member (fuse recovery re-ADD); that is not a fatal error.
+func epollCtlAddIgnoreExist(epfd int, fd int, event *unix.EpollEvent) error {
+	if err := unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, fd, event); err != nil && err != unix.EEXIST {
+		return err
+	}
+	return nil
+}
+
 // tcpRelayOffloadSession wires one relay pair into the fast_sock SOCKHASH.
 //
 // Keying convention (shared with tcp_offload_redirect in tproxy.c): a socket
@@ -110,6 +119,11 @@ type tcpRelayOffloadSession struct {
 
 	forceCloseOnce sync.Once
 	closeOnce      sync.Once
+
+	// epollArmed is true while both fds are in the session epoll set.
+	// Run is the only writer, so a plain bool is enough. Fuse recovery
+	// must not EPOLL_CTL_ADD an already-armed fd (EEXIST is not fatal).
+	epollArmed bool
 }
 
 func (c *ControlPlane) tryOffloadTCPRelay(ctx context.Context, left, right netproxy.Conn, leftRecord, rightRecord func(int64)) (offloaded bool, reason string, err error) {
@@ -413,16 +427,28 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 		{fd: s.rightFD, index: 1},
 	}
 	addFds := func() error {
+		if s.epollArmed {
+			return nil
+		}
 		for _, reg := range fds {
 			event := &unix.EpollEvent{
 				Events: unix.EPOLLRDHUP | unix.EPOLLHUP | unix.EPOLLERR | unix.EPOLLIN,
 				Fd:     reg.index,
 			}
-			if err := unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, reg.fd, event); err != nil {
+			if err := epollCtlAddIgnoreExist(epfd, reg.fd, event); err != nil {
 				return fmt.Errorf("epoll_ctl add fd %d: %w", reg.fd, err)
 			}
 		}
+		s.epollArmed = true
 		return nil
+	}
+	delFds := func() {
+		if !s.epollArmed {
+			return
+		}
+		_ = unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, s.leftFD, nil)
+		_ = unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, s.rightFD, nil)
+		s.epollArmed = false
 	}
 	if err := addFds(); err != nil {
 		s.forceClose()
@@ -463,8 +489,7 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 				// Drop the fds from epoll while the kernel drains the
 				// already-redirected skbs; level-triggered IN would
 				// busy-loop otherwise.
-				_ = unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, s.leftFD, nil)
-				_ = unix.EpollCtl(epfd, unix.EPOLL_CTL_DEL, s.rightFD, nil)
+				delFds()
 			} else if lift || (!s.fuseDrainUntil.IsZero() && time.Now().After(s.fuseDrainUntil)) {
 				s.fuseDrainUntil = time.Time{}
 				if err := addFds(); err != nil {

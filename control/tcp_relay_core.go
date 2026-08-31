@@ -211,9 +211,7 @@ func (c *relayCore) run(ctx context.Context) error {
 		}
 		_, err := c.copyEngine.Copy(ctx, dir.dst, dir.src, dir.record, onActive)
 
-		if wc, ok := dir.dst.(WriteCloser); ok {
-			_ = wc.CloseWrite()
-		}
+		closeWriteRelayConn(dir.dst)
 
 		if err != nil {
 			// Any directional copy error is treated as terminal for this relay:

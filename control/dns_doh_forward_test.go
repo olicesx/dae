@@ -31,7 +31,7 @@ func TestDoH_ForwardDNS_RetriesOnClosedConnection(t *testing.T) {
 		dialArgument: dialArgument{bestTarget: netip.MustParseAddrPort("223.5.5.5:443")},
 	}
 	d.clientFactory = func() *http.Client { return &http.Client{} }
-	d.sendFunc = func(_ *http.Client, _ string, _ *dns.Upstream, _ []byte) (*dnsmessage.Msg, error) {
+	d.sendFunc = func(_ context.Context, _ *http.Client, _ string, _ *dns.Upstream, _ []byte) (*dnsmessage.Msg, error) {
 		attempts++
 		if attempts == 1 {
 			return nil, net.ErrClosed
@@ -73,7 +73,7 @@ func TestDoH_CloseForceClosesInflightGeneration(t *testing.T) {
 	d.clientFactory = func() *http.Client {
 		return &http.Client{Transport: transport}
 	}
-	d.sendFunc = func(*http.Client, string, *dns.Upstream, []byte) (*dnsmessage.Msg, error) {
+	d.sendFunc = func(context.Context, *http.Client, string, *dns.Upstream, []byte) (*dnsmessage.Msg, error) {
 		started <- struct{}{}
 		<-release
 		return &dnsmessage.Msg{}, nil
@@ -122,7 +122,7 @@ func TestDoH_ResponseErrorDoesNotReplaceClient(t *testing.T) {
 		created.Add(1)
 		return &http.Client{}
 	}
-	d.sendFunc = func(*http.Client, string, *dns.Upstream, []byte) (*dnsmessage.Msg, error) {
+	d.sendFunc = func(context.Context, *http.Client, string, *dns.Upstream, []byte) (*dnsmessage.Msg, error) {
 		return nil, responseErr
 	}
 
@@ -187,7 +187,7 @@ func TestDoH_CloseWaitsForRetiredGeneration(t *testing.T) {
 		}
 		return &http.Client{Transport: second}
 	}
-	d.sendFunc = func(_ *http.Client, _ string, _ *dns.Upstream, data []byte) (*dnsmessage.Msg, error) {
+	d.sendFunc = func(_ context.Context, _ *http.Client, _ string, _ *dns.Upstream, data []byte) (*dnsmessage.Msg, error) {
 		if string(data) == "slow" {
 			slowStarted <- struct{}{}
 			<-releaseSlow
@@ -271,7 +271,7 @@ func TestDoH_ReplacementWaitsForInflightGeneration(t *testing.T) {
 		}
 		return &http.Client{Transport: second}
 	}
-	d.sendFunc = func(_ *http.Client, _ string, _ *dns.Upstream, data []byte) (*dnsmessage.Msg, error) {
+	d.sendFunc = func(_ context.Context, _ *http.Client, _ string, _ *dns.Upstream, data []byte) (*dnsmessage.Msg, error) {
 		switch string(data) {
 		case "slow":
 			select {

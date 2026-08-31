@@ -105,8 +105,10 @@ func retireControlPlaneConnections(
 		}
 	}
 	// Seal generation admission on every retirement path and wait for any lease
-	// acquired before abort/drain committed to closing the owner.
-	c.StopRoutingEpochExecution()
+	// acquired before abort/drain committed to closing the owner. Bound the
+	// IdleCh wait with the same maxDrain used above so a stuck ticket cannot
+	// pin retirement forever.
+	c.StopRoutingEpochExecutionWithTimeout(maxDrain)
 }
 
 func shutdownAfterSignalWithHandoff(

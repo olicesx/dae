@@ -11,6 +11,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
 )
@@ -60,6 +61,7 @@ type incomingConnectionLease struct {
 	owner        *ControlPlane
 	drainRelease func()
 	once         sync.Once
+	egress       atomic.Pointer[netproxy.Conn]
 }
 
 const routingEpochIngressClosed uint64 = 1 << 63
@@ -393,8 +395,26 @@ func (c *ControlPlane) acquireIncomingConnectionLease(conn net.Conn) (*incomingC
 		owner:        c,
 		drainRelease: release,
 	}
-	c.inConnections.Store(conn, struct{}{})
+	c.inConnections.Store(conn, lease)
 	return lease, true
+}
+
+func (l *incomingConnectionLease) storePendingEgress(egress netproxy.Conn) {
+	if l == nil || egress == nil {
+		return
+	}
+	l.egress.Store(&egress)
+}
+
+func (l *incomingConnectionLease) takePendingEgress() netproxy.Conn {
+	if l == nil {
+		return nil
+	}
+	ptr := l.egress.Swap(nil)
+	if ptr == nil || *ptr == nil {
+		return nil
+	}
+	return *ptr
 }
 
 func (l *incomingConnectionLease) transferRoutingEpoch(owner *ControlPlane, result *bpfRoutingResult) bool {
@@ -413,7 +433,7 @@ func (l *incomingConnectionLease) transferRoutingEpoch(owner *ControlPlane, resu
 	previous := l.owner
 	previousRelease := l.drainRelease
 	newRelease := owner.acquireDrainTicket()
-	owner.inConnections.Store(l.conn, struct{}{})
+	owner.inConnections.Store(l.conn, l)
 	previous.inConnections.Delete(l.conn)
 	l.owner = owner
 	l.drainRelease = newRelease
@@ -425,7 +445,7 @@ func (l *incomingConnectionLease) transferRoutingEpoch(owner *ControlPlane, resu
 		l.owner = previous
 		l.drainRelease = previousRelease
 		newRelease()
-		previous.inConnections.Store(l.conn, struct{}{})
+		previous.inConnections.Store(l.conn, l)
 		owner.inConnections.Delete(l.conn)
 		return false
 	}
@@ -455,6 +475,9 @@ func (l *incomingConnectionLease) releaseLocked() (drainRelease func()) {
 		return nil
 	}
 	l.once.Do(func() {
+		if egress := l.takePendingEgress(); egress != nil {
+			_ = egress.Close()
+		}
 		owner := l.owner
 		drainRelease = l.drainRelease
 		l.owner = nil
@@ -480,13 +503,39 @@ func (c *ControlPlane) closeRoutingEpochExecution() {
 // for work that acquired an execution lease before the gate closed. It is used
 // immediately before a retired generation is canceled and closed.
 func (c *ControlPlane) StopRoutingEpochExecution() {
+	c.StopRoutingEpochExecutionWithTimeout(0)
+}
+
+// StopRoutingEpochExecutionWithTimeout seals admission and waits for drain
+// tickets. A positive timeout bounds the IdleCh wait so a stuck ticket cannot
+// pin retirement forever; timeout still proceeds to cancel the generation.
+func (c *ControlPlane) StopRoutingEpochExecutionWithTimeout(timeout time.Duration) {
 	if c == nil {
 		return
 	}
 	c.closeRoutingEpochExecution()
 	c.udpIngressAdmission.closeAndWait()
-	if c.drainTracker != nil {
-		<-c.drainTracker.IdleCh()
+	if c.drainTracker == nil {
+		return
+	}
+	idle := c.drainTracker.IdleCh()
+	if timeout <= 0 {
+		<-idle
+		return
+	}
+	timer := time.NewTimer(timeout)
+	select {
+	case <-idle:
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	case <-timer.C:
+		if c.log != nil {
+			c.log.Warnln("routing epoch drain wait timed out; continuing retirement")
+		}
 	}
 }
 
@@ -504,8 +553,15 @@ func (c *ControlPlane) takeIncomingConnectionsForAbort() ([]net.Conn, []netproxy
 		conn, ok := key.(net.Conn)
 		if ok {
 			connections = append(connections, conn)
-			if egress, flowOK := value.(netproxy.Conn); flowOK && egress != nil {
-				flows = append(flows, egress)
+			switch stored := value.(type) {
+			case *incomingConnectionLease:
+				if egress := stored.takePendingEgress(); egress != nil {
+					flows = append(flows, egress)
+				}
+			case netproxy.Conn:
+				if stored != nil {
+					flows = append(flows, stored)
+				}
 			}
 		} else {
 			errs = append(errs, fmt.Errorf("unexpected type %T in inConnections", key))

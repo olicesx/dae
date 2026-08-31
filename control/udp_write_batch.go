@@ -58,6 +58,11 @@ type udpWriteBatchAggregator struct {
 	timer *time.Timer
 
 	closed bool // guarded by mu
+
+	// unflushedFirst is true while the first datagram of this endpoint is
+	// queued but not yet flushed. Health-invalidation must treat that as
+	// an in-flight first write, not an unused session.
+	unflushedFirst bool
 }
 
 func newUDPWriteBatchAggregator(ue *UdpEndpoint) *udpWriteBatchAggregator {
@@ -97,9 +102,22 @@ func (a *udpWriteBatchAggregator) Append(data []byte, addr string) error {
 		if len(a.items) == 1 {
 			a.timer = time.AfterFunc(udpWriteBatchWindow, a.flush)
 		}
+		if a.ue != nil && !a.ue.hasSent.Load() && !a.ue.hasReply.Load() {
+			a.unflushedFirst = true
+		}
 		a.mu.Unlock()
 		return nil
 	}
+}
+
+func (a *udpWriteBatchAggregator) hasUnflushedFirst() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.Lock()
+	pending := a.unflushedFirst && !a.closed
+	a.mu.Unlock()
+	return pending
 }
 
 // flush drains the current batch through the batched writer. It is safe to
@@ -138,9 +156,11 @@ func (a *udpWriteBatchAggregator) flush() {
 		a.timer = nil
 	}
 	if len(items) == 0 {
+		a.unflushedFirst = false
 		a.mu.Unlock()
 		return
 	}
+	a.unflushedFirst = false
 	a.ue.armWriteDeadline(time.Now())
 	bw, ok := a.ue.conn.(netproxy.PacketBatchWriter)
 	if !ok {
@@ -203,10 +223,14 @@ func (a *udpWriteBatchAggregator) Close() {
 		return
 	}
 	a.closed = true
-	if a.timer != nil {
-		a.timer.Stop()
-		a.timer = nil
-	}
+	a.unflushedFirst = false
+	timer := a.timer
+	a.timer = nil
 	a.mu.Unlock()
+	if timer != nil {
+		// AfterFunc timers have a nil C. Stop(false) means the callback has
+		// started; flush and Close synchronize through a.mu instead.
+		timer.Stop()
+	}
 	a.flush()
 }

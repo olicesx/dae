@@ -947,7 +947,10 @@ func (p *UdpEndpointPool) endpointSurvivesDialerInvalidation(ue *UdpEndpoint) bo
 }
 
 func (ue *UdpEndpoint) survivesDialerHealthInvalidation() bool {
-	return ue.hasSent.Load() || ue.hasReply.Load() || ue.initialWritesPending.Load() != 0
+	if ue.hasSent.Load() || ue.hasReply.Load() || ue.initialWritesPending.Load() != 0 {
+		return true
+	}
+	return ue.writeBatch != nil && ue.writeBatch.hasUnflushedFirst()
 }
 
 // retireIfUnforwardedForDialerHealth retires only an endpoint that is still

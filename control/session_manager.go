@@ -365,8 +365,17 @@ func (c *ControlPlane) adoptTCPFlow(
 	src netip.AddrPort,
 	dst netip.AddrPort,
 ) (*FlowRuntime, error) {
+	takeFailedEgress := func() netproxy.Conn {
+		if ownership != nil {
+			return ownership.takePendingEgress()
+		}
+		return egress
+	}
 	manager := c.sessionManagerForFlow(parent)
 	if manager == nil {
+		if failedEgress := takeFailedEgress(); failedEgress != nil {
+			_ = failedEgress.Close()
+		}
 		return nil, ErrSessionManagerClosed
 	}
 	keys := []bpfTuplesKey{
@@ -381,7 +390,11 @@ func (c *ControlPlane) adoptTCPFlow(
 	// exits through normal relay error paths bounded by the relay watchdogs.
 	incomingConnectionOwnershipMu.Lock()
 	if !c.acceptsRoutingEpochExecution() || (ownership != nil && ownership.owner != c) {
+		failedEgress := takeFailedEgress()
 		incomingConnectionOwnershipMu.Unlock()
+		if failedEgress != nil {
+			_ = failedEgress.Close()
+		}
 		return nil, errRoutingEpochOwnerUnavailable
 	}
 	var runtime *egressRuntime
@@ -390,12 +403,19 @@ func (c *ControlPlane) adoptTCPFlow(
 	}
 	flow, err := manager.adoptTCP(ingress, egress, binding, runtime, keys)
 	var drainRelease func()
+	var failedEgress netproxy.Conn
 	if err == nil && ownership != nil {
+		_ = ownership.takePendingEgress()
 		drainRelease = ownership.releaseLocked()
+	} else if err != nil {
+		failedEgress = takeFailedEgress()
 	}
 	incomingConnectionOwnershipMu.Unlock()
 	if drainRelease != nil {
 		drainRelease()
+	}
+	if failedEgress != nil {
+		_ = failedEgress.Close()
 	}
 	return flow, err
 }

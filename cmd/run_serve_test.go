@@ -33,6 +33,10 @@ func (m *mockRetirementPlane) AbortPendingConnections() error {
 
 func (m *mockRetirementPlane) StopRoutingEpochExecution() { m.stopRoutingCalls++ }
 
+func (m *mockRetirementPlane) StopRoutingEpochExecutionWithTimeout(time.Duration) {
+	m.stopRoutingCalls++
+}
+
 // TestRetireDrainIdlePreservesConnections guards the zero-downtime reload
 // guarantee: when the old control plane drains its routing-epoch leases
 // normally (idle path), retirement must NOT call AbortConnections — that

@@ -144,8 +144,6 @@ func withActiveDNSController(
 		return fmt.Errorf("active DNS controller handler is nil")
 	}
 	activeControlPlanePublication.mu.RLock()
-	defer activeControlPlanePublication.mu.RUnlock()
-
 	plane := activeControlPlanePublication.plane.Load()
 	if fallback != nil {
 		manager, managerOwned := fallback.controlPlaneSessionManager()
@@ -154,14 +152,32 @@ func withActiveDNSController(
 		}
 	}
 	if plane == nil {
+		activeControlPlanePublication.mu.RUnlock()
 		return fmt.Errorf("active control plane is not available")
 	}
 	controller := plane.ActiveDnsController()
 	if controller == nil {
+		activeControlPlanePublication.mu.RUnlock()
 		return fmt.Errorf("dns controller is not available")
 	}
 	if ctx == nil {
 		ctx = plane.ctx
 	}
-	return handle(plane.dnsRequestContext(ctx, controller), controller)
+	queryCtx := plane.dnsRequestContext(ctx, controller)
+	// Admit through the controller's handle gate while still under the
+	// publication lock: the controller must be counted before a reload's
+	// publish can unpublish and close it. The lock itself is released before
+	// the query runs so a slow upstream can no longer head-of-line block the
+	// reload publish (and, with Go's RWMutex, every new reader behind it);
+	// the gate drain in DnsController.Close preserves the old lifetime
+	// guarantee for the in-flight query instead.
+	if !controller.acquireHandleGate() {
+		activeControlPlanePublication.mu.RUnlock()
+		return fmt.Errorf("dns controller is shutting down")
+	}
+	activeControlPlanePublication.mu.RUnlock()
+
+	err := handle(queryCtx, controller)
+	controller.releaseHandleGate()
+	return err
 }

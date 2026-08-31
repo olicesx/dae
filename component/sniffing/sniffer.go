@@ -432,8 +432,18 @@ func (s *Sniffer) Close() (err error) {
 		// touches s.buf and s.quicPlaintexts under the same lock.
 		s.readMu.Lock()
 		if s.buf != nil {
-			pool.PutBuffer(s.buf)
-			s.buf = nil
+			if s.readerLingering {
+				// The lingering async reader still holds this bytes.Buffer and
+				// may write into it after Close returns (it never takes
+				// readMu). Recycle neither the buffer nor the struct; dropping
+				// only the struct would let the stale write corrupt the next
+				// connection that checks the buffer out of the pool. GC
+				// claims both once the reader exits.
+				s.buf = nil
+			} else {
+				pool.PutBuffer(s.buf)
+				s.buf = nil
+			}
 		}
 		for _, p := range s.quicPlaintexts {
 			p.Put()

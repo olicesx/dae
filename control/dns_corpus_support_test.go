@@ -270,7 +270,6 @@ func installCorpusCache(t testing.TB, ctrl *DnsController, cacheKey, qname strin
 	if err := cache.prepackResponseBeforeStore(qname, qtype, ttl, now); err != nil {
 		t.Fatalf("prepack deterministic DNS cache response: %v", err)
 	}
-	cache.deadlineNano.Store(deadline.UnixNano())
 	// Keep the fixture's explicitly packed TTL stable for its entire synthetic
 	// cache lifetime. Production entries continue to refresh from wall clock.
 	cache.packedResponseCreatedAt.Store(deadline.UnixNano())

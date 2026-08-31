@@ -345,6 +345,11 @@ func (c *DnsCache) prepackResponseBeforeStore(qname string, qtype uint16, ttl ui
 	c.packedResponse.Store(&packed)
 	c.packedResponseTTL.Store(ttl)
 	c.packedResponseCreatedAt.Store(now.UnixNano())
+	// deadlineNano gates the packed fast path and stale-while-revalidate
+	// lookups; leaving it zero makes both treat a freshly stored entry as
+	// already expired. Entries are prepacked before they become visible to
+	// concurrent readers, so a plain store is sufficient here.
+	c.deadlineNano.Store(c.Deadline.UnixNano())
 	return nil
 }
 

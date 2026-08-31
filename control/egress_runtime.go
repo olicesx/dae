@@ -155,7 +155,7 @@ func (r *egressRuntime) transferLease(oldLease *egressRuntimeLease) (*egressRunt
 		if matched == nil {
 			return nil, nil
 		}
-		r.dialerRefs[matched] = r.dialerRefs[matched] + 1
+		r.dialerRefs[matched]++
 	}
 	r.refs++
 	return &egressRuntimeLease{runtime: r, dialer: matched}, nil

@@ -134,7 +134,7 @@ func TestCloseWriteRelayConnUnwrapsBufioConn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	accepted := make(chan net.Conn, 1)
 	go func() {
@@ -150,13 +150,13 @@ func TestCloseWriteRelayConnUnwrapsBufioConn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	server := <-accepted
 	if server == nil {
 		t.Fatal("Accept failed")
 	}
-	defer server.Close()
+	defer func() { _ = server.Close() }()
 
 	tcpClient, ok := client.(*net.TCPConn)
 	if !ok {
@@ -214,6 +214,7 @@ func TestUdpEndpointPoolRemoveUnlocksBeforeClose(t *testing.T) {
 	go func() {
 		defer close(lockDone)
 		shard.mu.Lock()
+		_ = shard.pool
 		shard.mu.Unlock()
 	}()
 	select {

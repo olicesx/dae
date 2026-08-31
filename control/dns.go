@@ -33,8 +33,22 @@ import (
 
 // responseSlot represents a pending DNS request response slot.
 // It uses a reusable one-element channel to avoid per-request channel reallocation.
+//
+// Recycling discipline: a slot checked out by RoundTrip is returned to the
+// pool by exactly one actor. RoundTrip recycles it itself when the pending
+// entry was still registered (no setter can reach the slot) or when the
+// response was already delivered (the setter finished and never touches the
+// slot again). In every other case the pending entry was claimed by
+// readLoop/closeWithErr, so recycle responsibility is transferred to that
+// setter via abandon. mu serializes set with abandon/recycle so a late
+// delivery can never leak into the slot's next pool cycle and cross-answer
+// a different request.
 type responseSlot struct {
 	result chan *dnsmessage.Msg
+
+	mu        sync.Mutex
+	settled   bool // a setter completed delivery for this checkout
+	abandoned bool // the waiter is gone; the completing setter must recycle
 }
 
 // responseSlotPool is a pool of responseSlot objects to reduce allocations.
@@ -50,24 +64,59 @@ var responseSlotPool = sync.Pool{
 var sendStreamDNSFunc = dnstransport.SendStreamDNS
 
 func newResponseSlot() *responseSlot {
-	return responseSlotPool.Get().(*responseSlot)
+	s := responseSlotPool.Get().(*responseSlot)
+	s.mu.Lock()
+	s.settled = false
+	s.abandoned = false
+	s.mu.Unlock()
+	return s
+}
+
+// recycleLocked resets and returns the slot to the pool. It unlocks mu.
+func (s *responseSlot) recycleLocked() {
+	s.settled = false
+	s.abandoned = false
+	// Drain stale result before putting back.
+	select {
+	case <-s.result:
+	default:
+	}
+	s.mu.Unlock()
+	responseSlotPool.Put(s)
 }
 
 func putResponseSlot(slot *responseSlot) {
-	// Drain stale result before putting back.
-	select {
-	case <-slot.result:
-	default:
-	}
-	responseSlotPool.Put(slot)
+	slot.mu.Lock()
+	slot.recycleLocked()
 }
 
 func (s *responseSlot) set(msg *dnsmessage.Msg) {
+	s.mu.Lock()
+	s.settled = true
 	// Never block read loop on duplicated/late responses.
 	select {
 	case s.result <- msg:
 	default:
 	}
+	recycle := s.abandoned
+	s.abandoned = false
+	s.mu.Unlock()
+	if recycle {
+		putResponseSlot(s)
+	}
+}
+
+// abandon hands recycle responsibility to the setter that claimed the pending
+// entry. If that setter already delivered, recycle immediately; otherwise the
+// next (and only) set recycles the slot.
+func (s *responseSlot) abandon() {
+	s.mu.Lock()
+	if s.settled {
+		s.recycleLocked()
+		return
+	}
+	s.abandoned = true
+	s.mu.Unlock()
 }
 
 func (s *responseSlot) get(ctx context.Context) (*dnsmessage.Msg, error) {
@@ -815,6 +864,13 @@ const (
 	// Each socket serves one in-flight request at a time in this implementation, so
 	// requests beyond this budget should fail fast instead of queueing in userspace.
 	dnsUdpPoolMaxActive = 64
+	// dnsUdpMaxResponseSize sizes the DoUDP reply read buffer. DNS replies
+	// over UDP can legally reach 65507 bytes when the client advertises
+	// EDNS0; an MTU-sized buffer lets the kernel clip the datagram, and the
+	// unpack below then fails, turning large replies into hard errors rather
+	// than a TC-triggered TCP retry. The shared power-of-two buffer pool
+	// buckets this at 64KiB and caps Put() retention at the same size.
+	dnsUdpMaxResponseSize = 65536
 	// Proxy-backed UDP DNS sockets go stale more easily because they sit behind an
 	// upstream relay session rather than a raw UDP socket.
 	dnsUdpProxyPoolMaxIdleTime  = 10 * time.Second
@@ -1118,8 +1174,10 @@ func (d *DoUDP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 		return nil, err
 	}
 
-	// Wait for response
-	respBuf := pool.GetFullCap(consts.EthernetMtu)
+	// Wait for response. The buffer must cover the full UDP DNS payload
+	// range (see dnsUdpMaxResponseSize) so EDNS0-sized replies are never
+	// silently truncated by the receive buffer.
+	respBuf := pool.GetFullCap(dnsUdpMaxResponseSize)
 	defer pool.Put(respBuf)
 	const maxStaleResponses = 8
 	staleResponses := 0
@@ -1307,9 +1365,17 @@ func (pc *pipelinedConn) RoundTrip(ctx context.Context, data []byte) (*dnsmessag
 		return nil, fmt.Errorf("failed to allocate ID: %w", err)
 	}
 
-	// Get response slot from pool
+	// Get response slot from pool. The slot must be recycled exactly once per
+	// checkout: by the outer defer below when no setter can reach it, or by
+	// the setter (readLoop/closeWithErr) after the cleanup defer transfers
+	// ownership via abandon.
 	slot := newResponseSlot()
-	defer putResponseSlot(slot)
+	setterRecycles := false
+	defer func() {
+		if !setterRecycles {
+			putResponseSlot(slot)
+		}
+	}()
 
 	// Store the pending request
 	if !pc.pending[id].CompareAndSwap(nil, slot) {
@@ -1318,8 +1384,21 @@ func (pc *pipelinedConn) RoundTrip(ctx context.Context, data []byte) (*dnsmessag
 	}
 	pc.pendingCount.Add(1)
 
+	var responseDelivered bool
 	defer func() {
-		pc.pending[id].CompareAndSwap(slot, nil)
+		switch {
+		case pc.pending[id].CompareAndSwap(slot, nil):
+			// Nobody claimed the slot; the outer defer recycles it.
+		case responseDelivered:
+			// The setter already finished; nothing will touch the slot again
+			// and the outer defer recycles it.
+		default:
+			// readLoop or closeWithErr owns the slot and will (or just did)
+			// call set; transfer recycling to that setter so a late delivery
+			// cannot write into a slot that already re-entered the pool.
+			slot.abandon()
+			setterRecycles = true
+		}
 		pc.idAlloc.Release(id)
 		pc.pendingCount.Add(-1)
 	}()
@@ -1352,6 +1431,7 @@ func (pc *pipelinedConn) RoundTrip(ctx context.Context, data []byte) (*dnsmessag
 	}
 
 	msg, err := slot.get(ctx)
+	responseDelivered = err == nil
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			// Avoid stale-response cross-delivery after ID reuse.

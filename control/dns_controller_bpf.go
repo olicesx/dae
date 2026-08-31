@@ -389,6 +389,17 @@ func (c *DnsController) reconcileCurrentBpfProjections() (failed bool) {
 // via bpfUpdateStop, which is closed during DnsController.Close().
 func (c *DnsController) bpfUpdateWorker() {
 	defer c.bpfUpdateWg.Done()
+	// Snapshot the queue once under the mutex that also guards its
+	// lifecycle. The channel is created before this goroutine starts, but
+	// Close may nil the field after the graceful timeout while a stuck
+	// worker is still selecting on it; reading the field once here keeps
+	// every later receive race-free.
+	c.bpfUpdateStopMu.Lock()
+	bpfUpdateCh := c.bpfUpdateCh
+	c.bpfUpdateStopMu.Unlock()
+	if bpfUpdateCh == nil {
+		return
+	}
 	retries := newBpfProjectionRetryScheduler()
 	retryTimer := time.NewTimer(time.Hour)
 	if !retryTimer.Stop() {
@@ -443,9 +454,9 @@ func (c *DnsController) bpfUpdateWorker() {
 
 	for {
 		select {
-		case task := <-c.bpfUpdateCh:
+		case task := <-bpfUpdateCh:
 			c.processBpfUpdateTask(task, false)
-			c.drainBpfUpdateTasks(false)
+			c.drainBpfUpdateTasks(bpfUpdateCh, false)
 		case <-c.bpfRetryWake:
 			tasks, overflow := c.takeBpfProjectionRetryIntents()
 			if overflow {
@@ -479,7 +490,7 @@ func (c *DnsController) bpfUpdateWorker() {
 			}
 			resetRetryTimer()
 		case <-c.bpfUpdateStop:
-			c.drainBpfUpdateTasks(true)
+			c.drainBpfUpdateTasks(bpfUpdateCh, true)
 			return
 		}
 	}
@@ -490,10 +501,10 @@ const bpfUpdateDrainBatch = 64
 // drainBpfUpdateTasks processes a bounded primary-task batch. Returning to the
 // worker select between batches prevents a sustained cache-write stream from
 // starving delayed retries or shutdown.
-func (c *DnsController) drainBpfUpdateTasks(draining bool) {
+func (c *DnsController) drainBpfUpdateTasks(bpfUpdateCh <-chan *bpfUpdateTask, draining bool) {
 	for range bpfUpdateDrainBatch {
 		select {
-		case task := <-c.bpfUpdateCh:
+		case task := <-bpfUpdateCh:
 			c.processBpfUpdateTask(task, draining)
 		default:
 			return

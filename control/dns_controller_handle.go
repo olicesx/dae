@@ -223,6 +223,12 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 		if len(data) >= 2 {
 			binary.BigEndian.PutUint16(data[:2], dnsMessage.Id)
 		}
+		// Apply the client's UDP size limit (512 or its EDNS0 advertisement)
+		// with the TC bit so an oversized reply triggers a TCP retry instead
+		// of an unsendable datagram; every other UDP send path already does.
+		// truncateDNSResponse unpacks into a fresh message, so the shared
+		// singleflight result is never mutated.
+		data = truncateDNSResponse(data, dnsUDPResponseSizeLimit(dnsMessage))
 		if req == nil || req.lConn == nil {
 			return fmt.Errorf("dns request connection is nil for singleflight response")
 		}
@@ -412,6 +418,20 @@ func (c *DnsController) resolveDNSUpstream(
 		return nil, fmt.Errorf("too deep DNS lookup invoking (depth: %v); there may be infinite loop in your DNS response routing", MaxDnsLookupDepth)
 	}
 
+	// Question echo (RFC 5452): transaction IDs are only 16 bits, so a
+	// matching ID does not prove the reply belongs to this request. Capture
+	// the request question once; every transport funnel (UDP, TCP pipeline,
+	// DoH, DoQ) converges here, so validating the reply here guards the
+	// response cache and clients from spoofed or cross-talked answers on all
+	// upstream hops including recursive fallback.
+	var reqQuestion dnsmessage.Question
+	{
+		var reqMsg dnsmessage.Msg
+		if err := reqMsg.Unpack(data); err == nil && len(reqMsg.Question) > 0 {
+			reqQuestion = reqMsg.Question[0]
+		}
+	}
+
 	upstreamName := "asis"
 	if upstream == nil {
 		// As-is.
@@ -445,6 +465,9 @@ func (c *DnsController) resolveDNSUpstream(
 	respMsg, usedDialArg, err = c.forwardWithFallback(ctx, req, upstream, dialArg, data)
 	if err != nil {
 		return nil, err
+	}
+	if reqQuestion.Name != "" && !questionEchoMatches(reqQuestion, respMsg) {
+		return nil, fmt.Errorf("upstream %v reply does not echo the request question (possible spoofing or upstream cross-talk); dropped", upstreamName)
 	}
 
 	networkType := &dialer.NetworkType{

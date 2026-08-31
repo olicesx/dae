@@ -34,6 +34,24 @@ func dnsUDPResponseSizeLimit(req *dnsmessage.Msg) int {
 	return limit
 }
 
+// questionEchoMatches reports whether an upstream response echoes the
+// request question. Transaction IDs are only 16 bits, so ID equality alone
+// cannot prove a response belongs to a request: a hijacked upstream, a
+// cross-talked connection, or an off-path spoofer that collides with the ID
+// must not reach the response cache or the client (RFC 5452). The question
+// section is the mandatory second factor; compliant upstreams echo it
+// verbatim, including on CNAME-chased and pipelined replies.
+func questionEchoMatches(req dnsmessage.Question, resp *dnsmessage.Msg) bool {
+	if len(resp.Question) == 0 {
+		return false
+	}
+	rq := resp.Question[0]
+	// CanonicalName lowercases and FQDN-terminates, giving the
+	// case-insensitive name equality DNS requires.
+	return req.Qtype == rq.Qtype && req.Qclass == rq.Qclass &&
+		dnsmessage.CanonicalName(req.Name) == dnsmessage.CanonicalName(rq.Name)
+}
+
 // truncateDNSResponse returns packed unchanged if it fits within limit;
 // otherwise it returns a truncated repack with the TC bit set (RFC 1035
 // section 4.2.1) so the client retries over TCP. On unpack/pack failure the

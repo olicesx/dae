@@ -7,6 +7,7 @@ package control
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net/netip"
 	"runtime"
@@ -723,7 +724,34 @@ func buildRoutingKernspaceForSlot(
 		}
 	}
 
+	// Roll back the LPM ring entries this build installs if any later stage
+	// fails (including a mid-batch insertion failure): usedIndices is what
+	// tells the owner which entries to delete on close, so returning it empty
+	// on error would strand the already-installed entries until the global
+	// ring cursor wraps all the way around. Indices that were never installed
+	// delete with ErrKeyNotExist and are ignored. Deleting within this slot
+	// is safe by construction: slot ownership transfers to this build before
+	// it is populated, and each slot hosts exactly one build per generation.
+	lpmInstallStarted := false
+	defer func() {
+		if err == nil || !lpmInstallStarted {
+			return
+		}
+		seen := make(map[uint32]struct{}, len(results))
+		for _, r := range results {
+			idx := slotBase + r.lpmIndex
+			if _, dup := seen[idx]; dup {
+				continue
+			}
+			seen[idx] = struct{}{}
+			if delErr := bpf.LpmArrayMap.Delete(idx); delErr != nil && !errors.Is(delErr, ebpf.ErrKeyNotExist) {
+				log.Warnf("roll back lpm_array_map[%d] after failed build: %v", idx, delErr)
+			}
+		}
+	}()
+
 	// Create and update LPM maps in parallel
+	lpmInstallStarted = true
 	if numWorkers > 1 && len(results) > 1 {
 		// Parallel path
 		sem := make(chan struct{}, numWorkers)

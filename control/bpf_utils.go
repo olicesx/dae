@@ -470,6 +470,12 @@ func fullLoadBpfObjects(
 	opts *loadBpfOptions,
 	soMarkFromDae uint32,
 ) (err error) {
+	// incompatibleMapRetries caps how many pinned-map rejections may trigger a
+	// reload attempt. Each retry removes one incompatible pinned map, so more
+	// than a couple of rounds means removal is failing and retrying the same
+	// load would spin forever.
+	const incompatibleMapRetries = 3
+	retries := 0
 retryLoadBpf:
 	netnsID, err := GetDaeNetns().NetnsID()
 	if err != nil {
@@ -561,7 +567,15 @@ retryLoadBpf:
 				return fmt.Errorf("loading objects: bad format: %w", err)
 			}
 			mapName, _, _ := strings.Cut(after, ":")
-			_ = os.Remove(filepath.Join(opts.PinPath, mapName))
+			if retries >= incompatibleMapRetries {
+				return fmt.Errorf("loading objects: incompatible pinned map %q persisted after %d removal attempts: %w", mapName, retries, err)
+			}
+			// A failed removal makes the next load fail identically; surface
+			// it instead of spinning on the same error forever.
+			if rmErr := os.Remove(filepath.Join(opts.PinPath, mapName)); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+				return fmt.Errorf("remove incompatible pinned map %q: %w", mapName, rmErr)
+			}
+			retries++
 			log.Infof("Incompatible new map format with existing map %v detected; removed the old one.", mapName)
 			goto retryLoadBpf
 		}

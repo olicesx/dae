@@ -290,6 +290,11 @@ func (d UdpFlowDecision) DispatchStrategy() UdpDispatchStrategy {
 type UdpDispatchStrategy int
 
 const (
+	// udpDirectDispatchConcurrency caps concurrently running direct-dispatch
+	// tasks per control-plane generation. See controlPlaneUDPRuntime for the
+	// rationale; each task is short-lived, so the cap is sized far above any
+	// legitimate low-latency workload.
+	udpDirectDispatchConcurrency = 4096
 	// StrategyDirectGoroutine uses direct goroutine spawn.
 	// Lowest latency, no drops, but no concurrency control.
 	StrategyDirectGoroutine UdpDispatchStrategy = iota

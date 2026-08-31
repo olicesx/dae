@@ -111,10 +111,24 @@ type udpIngressTask struct {
 	realDst      netip.AddrPort
 	convergeSrc  netip.AddrPort
 	flowDecision UdpFlowDecision
+	// dispatchSem, when non-nil, is the direct-dispatch concurrency slot this
+	// task holds; Run releases it together with the other resources. It must
+	// be assigned on every pool checkout (nil for queued dispatch) so a stale
+	// pointer left by a previous use can never release a slot that was never
+	// acquired.
+	dispatchSem chan struct{}
 }
 
 var udpIngressTaskPool = sync.Pool{
 	New: func() any { return &udpIngressTask{} },
+}
+
+// releaseDispatchSem returns the direct-dispatch concurrency slot, if any.
+// It must run before the task object returns to the pool.
+func (t *udpIngressTask) releaseDispatchSem() {
+	if sem := t.dispatchSem; sem != nil {
+		<-sem
+	}
 }
 
 // Discard releases the packet resources without executing the task. It is
@@ -122,6 +136,7 @@ var udpIngressTaskPool = sync.Pool{
 // tasks that never ran: their buffer, admission ticket, and pooled object
 // must still be returned, in the same order Run's defers would.
 func (t *udpIngressTask) Discard() {
+	t.releaseDispatchSem()
 	t.pktBuf.Put()
 	t.admission.release()
 	*t = udpIngressTask{}
@@ -137,11 +152,14 @@ func (t *udpIngressTask) Run() {
 	convergeSrc := t.convergeSrc
 	flowDecision := t.flowDecision
 
-	// Defers run in LIFO order: admission, buffer, then the task itself (the
-	// pool must not see the task before its deferred cleanup completes).
+	// Defers run in LIFO order: dispatch slot, admission, buffer, then the
+	// task itself (the pool must not see the task before its deferred cleanup
+	// completes, and the dispatch slot must be read before the task returns
+	// to the pool).
 	defer udpIngressTaskPool.Put(t)
 	defer data.Put()
 	defer t.admission.release()
+	defer t.releaseDispatchSem()
 	var routingResult *bpfRoutingResult
 	var freshRoutingResult *bpfRoutingResult
 

@@ -732,7 +732,8 @@ func NewControlPlaneWithContextOptions(
 		mptcp:                         global.Mptcp,
 		udpRouteScopeSensitive:        builder.UsesPacketMetadataRouting(),
 		controlPlaneUDPRuntime: controlPlaneUDPRuntime{
-			failedQuicDcidCache: newFailedQuicDcidCache(failedQuicDcidCacheMaxEntries),
+			failedQuicDcidCache:  newFailedQuicDcidCache(failedQuicDcidCacheMaxEntries),
+			udpDirectDispatchSem: make(chan struct{}, udpDirectDispatchConcurrency),
 		},
 	}
 	SetFailedQuicDcidCache(plane.failedQuicDcidCache)
@@ -2320,6 +2321,10 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			task.realDst = realDst
 			task.convergeSrc = convergeSrc
 			task.flowDecision = flowDecision
+			// Reset on every checkout: a stale slot pointer from a previous
+			// use would make Run or Discard release a semaphore this packet
+			// never acquired. The direct path reassigns it after acquiring.
+			task.dispatchSem = nil
 
 			// Session FIFO now takes precedence for generic UDP forwarding.
 			// Ordered ingress keeps same-flow packets in the order they were read
@@ -2328,9 +2333,20 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			// exceptions where queue handoff is less valuable than minimal overhead
 			// (DNS, SIP/RTP, STUN).
 			if flowDecision.DispatchStrategy() == StrategyDirectGoroutine {
-				// DNS, VoIP, and other low-latency exception traffic bypasses the
-				// ordered per-flow queue and runs immediately.
-				go task.Run()
+				// DNS, VoIP, and other low-latency exception traffic bypasses
+				// the ordered per-flow queue and runs immediately, but under
+				// a generous concurrency cap: an unbounded `go` here would
+				// turn a UDP flood on any exception port into unbounded
+				// goroutine and buffer growth. Saturation drops the packet
+				// like ordinary UDP loss (clients retransmit) and recycles
+				// the task inline.
+				select {
+				case c.udpDirectDispatchSem <- struct{}{}:
+					task.dispatchSem = c.udpDirectDispatchSem
+					go task.Run()
+				default:
+					task.Discard()
+				}
 			} else if !DefaultUdpTaskPool.EmitTask(flowDecision.Key, task) {
 				// Rejected: the pool does not own the buffer or the admission,
 				// so release both inline and return the task to the pool (it

@@ -18,7 +18,6 @@ import (
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/protocol/direct"
 	"github.com/sirupsen/logrus"
 )
 
@@ -211,7 +210,7 @@ func (c *ControlPlane) resolveIp46WithBootstrapResolvers(
 	var lastNoRecordErr4 error
 	var lastNoRecordErr6 error
 	for _, resolver := range c.bootstrapResolvers {
-		ip46, err4, err6 := resolve(ctx, direct.SymmetricDirect, resolver, host, network, race)
+		ip46, err4, err6 := resolve(ctx, c.directDialer, resolver, host, network, race)
 		if ip46 == nil {
 			ip46 = &netutils.Ip46{}
 		}

@@ -29,7 +29,11 @@ func NewFromLinkWithProxyCacheContext(ctx context.Context, gOption *GlobalOption
 	}
 
 	normalizedLink := normalizeShadowTLSPluginOptions(link)
-	baseDialer := newDefaultNetworkDialer(direct.SymmetricDirect, gOption.SoMarkFromDae, gOption.Mptcp)
+	baseDirectDialer := gOption.DirectDialer
+	if baseDirectDialer == nil {
+		baseDirectDialer = direct.SymmetricDirect
+	}
+	baseDialer := newDefaultNetworkDialer(baseDirectDialer, gOption.SoMarkFromDae, gOption.Mptcp)
 	scopedBaseDialer := scopeTransportCacheDialer(baseDialer, gOption.TransportCacheNamespace)
 
 	// First, create the protocol dialer with direct dialer to get the property

@@ -78,6 +78,9 @@ func buildControlPlaneRuntime(
 	routing *config.Routing,
 	global *config.Global,
 	dns *config.Dns,
+	directDialer netproxy.Dialer,
+	fullconeDirectDialer netproxy.Dialer,
+	systemDNSResolver *netutils.SystemDNSResolver,
 	externGeoDataDirs []string,
 	prepareOnly bool,
 	dnsRoutingUnchanged bool,
@@ -99,6 +102,9 @@ func buildControlPlaneRuntime(
 			DelayDNSListenerStart: prepareOnly,
 			DNSRoutingUnchanged:   dnsRoutingUnchanged,
 			IsReload:              isReloadBuild || bpf != nil,
+			DirectDialer:          directDialer,
+			FullconeDirectDialer:  fullconeDirectDialer,
+			SystemDNSResolver:     systemDNSResolver,
 		},
 	)
 }
@@ -205,11 +211,14 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 		}
 	}
 
-	/// Init Direct Dialers.
-	direct.InitDirectDialers(conf.Global.FallbackResolver)
-	netutils.FallbackDns = netip.MustParseAddrPort(conf.Global.FallbackResolver)
+	/// Build generation-scoped direct dialers.
+	directDialers := direct.NewDirectDialers(conf.Global.FallbackResolver)
+	systemDNSResolver := netutils.NewSystemDNSResolver(netip.MustParseAddrPort(conf.Global.FallbackResolver))
 	locationFinder := assets.NewLocationFinder(externGeoDataDirs)
-	daeDNSRouter, err := daedns.NewWithOption(log, &conf.Global, &conf.Dns, &daedns.NewOption{LocationFinder: locationFinder})
+	daeDNSRouter, err := daedns.NewWithOption(log, &conf.Global, &conf.Dns, &daedns.NewOption{
+		LocationFinder: locationFinder,
+		DirectDialer:   directDialers.Symmetric,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -230,7 +239,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 		client := http.Client{
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, network, addr string) (c net.Conn, err error) {
-					conn, err := direct.SymmetricDirect.DialContext(ctx, common.MagicNetwork("tcp", conf.Global.SoMarkFromDae, conf.Global.Mptcp), addr)
+					conn, err := directDialers.Symmetric.DialContext(ctx, common.MagicNetwork("tcp", conf.Global.SoMarkFromDae, conf.Global.Mptcp), addr)
 					if err != nil {
 						return nil, err
 					}
@@ -311,7 +320,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 				defer func() { <-sem }() // Release semaphore
 
 				subStart := time.Now()
-				subDialer := direct.SymmetricDirect
+				subDialer := directDialers.Symmetric
 				if daeDNSRouter != nil {
 					wrappedDialer, wrapErr := daeDNSRouter.WrapSubscriptionDialer(subDialer, string(s))
 					if wrapErr != nil {
@@ -411,6 +420,9 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 		&conf.Routing,
 		&conf.Global,
 		&conf.Dns,
+		directDialers.Symmetric,
+		directDialers.Fullcone,
+		systemDNSResolver,
 		externGeoDataDirs,
 		prepareOnly,
 		dnsRoutingUnchanged,

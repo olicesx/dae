@@ -175,17 +175,26 @@ type DialerHealthSnapshot struct {
 	Recovery    [3]DialerRecoveryHealthSnapshot
 }
 
+// SystemDNSResolver provides generation-scoped bootstrap DNS state.
+type SystemDNSResolver interface {
+	SystemDNS() (netip.AddrPort, error)
+	TryUpdateElapse(time.Duration) error
+}
+
 type GlobalOption struct {
 	D.ExtraOption
-	Log               *logrus.Logger
-	DaeDNS            *daedns.Router
-	TcpCheckOptionRaw TcpCheckOptionRaw // Lazy parse
-	CheckDnsOptionRaw CheckDnsOptionRaw // Lazy parse
-	CheckInterval     time.Duration
-	CheckTolerance    time.Duration
-	CheckDnsTcp       bool
-	SoMarkFromDae     uint32
-	Mptcp             bool
+	Log                  *logrus.Logger
+	DaeDNS               *daedns.Router
+	DirectDialer         netproxy.Dialer
+	FullconeDirectDialer netproxy.Dialer
+	SystemDNSResolver    SystemDNSResolver
+	TcpCheckOptionRaw    TcpCheckOptionRaw // Lazy parse
+	CheckDnsOptionRaw    CheckDnsOptionRaw // Lazy parse
+	CheckInterval        time.Duration
+	CheckTolerance       time.Duration
+	CheckDnsTcp          bool
+	SoMarkFromDae        uint32
+	Mptcp                bool
 	// TransportCacheNamespace isolates process-global transport caches
 	// across reload generations so a replacement control plane never reuses
 	// transports bound to the previous generation's dialer lifecycle.
@@ -252,6 +261,17 @@ func NewGlobalOption(global *config.Global, log *logrus.Logger) *GlobalOption {
 		Mptcp:                   global.Mptcp,
 		TransportCacheNamespace: newTransportCacheNamespace(),
 	}
+}
+
+// SetRuntimeDependencies installs generation-scoped direct and DNS dependencies.
+func (o *GlobalOption) SetRuntimeDependencies(directDialer, fullconeDirectDialer netproxy.Dialer, systemDNSResolver SystemDNSResolver) {
+	o.DirectDialer = directDialer
+	o.FullconeDirectDialer = fullconeDirectDialer
+	o.SystemDNSResolver = systemDNSResolver
+	o.TcpCheckOptionRaw.DirectDialer = directDialer
+	o.TcpCheckOptionRaw.SystemDNSResolver = systemDNSResolver
+	o.CheckDnsOptionRaw.DirectDialer = directDialer
+	o.CheckDnsOptionRaw.SystemDNSResolver = systemDNSResolver
 }
 
 // NewDialer is for register in general.

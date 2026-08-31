@@ -74,12 +74,13 @@ func parseGroupOverrideOptionWithRuntime(
 
 // inheritGroupOptionRuntime preserves dependencies that are assembled while
 // building the control plane rather than derived from config.Global. Group
-// health-check overrides rebuild GlobalOption from config, so dropping these
-// fields would make the cloned node dialers bypass dae's internal DNS router.
+// health-check overrides rebuild GlobalOption from config, so every runtime
+// dependency must move together with the generation.
 func inheritGroupOptionRuntime(dst, src *dialer.GlobalOption) {
 	if dst == nil || src == nil {
 		return
 	}
 	dst.DaeDNS = src.DaeDNS
 	dst.TransportCacheNamespace = src.TransportCacheNamespace
+	dst.SetRuntimeDependencies(src.DirectDialer, src.FullconeDirectDialer, src.SystemDNSResolver)
 }

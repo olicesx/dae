@@ -36,14 +36,17 @@ import (
 	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/config"
 	internal "github.com/daeuniverse/dae/pkg/ebpf_internal"
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
+	"github.com/daeuniverse/outbound/protocol/direct"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
 type ControlPlane struct {
-	log *logrus.Logger
+	log          *logrus.Logger
+	directDialer netproxy.Dialer
 
 	runtimeStats *runtimeStats
 
@@ -126,6 +129,9 @@ type ControlPlaneBuildOptions struct {
 	DelayDNSListenerStart bool
 	DNSRoutingUnchanged   bool
 	IsReload              bool
+	DirectDialer          netproxy.Dialer
+	FullconeDirectDialer  netproxy.Dialer
+	SystemDNSResolver     *netutils.SystemDNSResolver
 }
 
 var (
@@ -452,9 +458,26 @@ func NewControlPlaneWithContextOptions(
 	if global.AllowInsecure {
 		log.Warnln("AllowInsecure is enabled, but it is not recommended. Please make sure you have to turn it on.")
 	}
+	directDialer := buildOpts.DirectDialer
+	if directDialer == nil {
+		directDialer = direct.SymmetricDirect
+	}
+	fullconeDirectDialer := buildOpts.FullconeDirectDialer
+	if fullconeDirectDialer == nil {
+		fullconeDirectDialer = direct.FullconeDirect
+	}
+	systemDNSResolver := buildOpts.SystemDNSResolver
+	if systemDNSResolver == nil {
+		systemDNSResolver = netutils.NewSystemDNSResolver(netip.MustParseAddrPort(global.FallbackResolver))
+	}
+
 	locationFinder := assets.NewLocationFinder(externGeoDataDirs)
 	option := dialer.NewGlobalOption(global, log)
-	option.DaeDNS, err = daedns.NewWithOption(log, global, dnsConfig, &daedns.NewOption{LocationFinder: locationFinder})
+	option.SetRuntimeDependencies(directDialer, fullconeDirectDialer, systemDNSResolver)
+	option.DaeDNS, err = daedns.NewWithOption(log, global, dnsConfig, &daedns.NewOption{
+		LocationFinder: locationFinder,
+		DirectDialer:   directDialer,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -673,6 +696,7 @@ func NewControlPlaneWithContextOptions(
 	cctx, cancel := context.WithCancel(context.Background())
 	plane = &ControlPlane{
 		log:           log,
+		directDialer:  directDialer,
 		runtimeStats:  newRuntimeStats(),
 		core:          core,
 		deferFuncs:    planeDeferFuncs,

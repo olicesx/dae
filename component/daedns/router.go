@@ -59,6 +59,7 @@ type Router struct {
 	nodeMatcher           *compiledMatcher[NodeMeta]
 	subNodeMatcher        *compiledMatcher[NodeMeta]
 	bootstrapDns          []netip.AddrPort
+	directDialer          netproxy.Dialer
 	soMark                uint32
 	mptcp                 bool
 	lookupMu              sync.Mutex
@@ -81,6 +82,7 @@ type lookupCall struct {
 
 type NewOption struct {
 	LocationFinder *assets.LocationFinder
+	DirectDialer   netproxy.Dialer
 }
 
 type compiledMatcher[T any] struct {
@@ -117,8 +119,14 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 	}
 
 	locationFinder := assets.NewLocationFinder(nil)
-	if opt != nil && opt.LocationFinder != nil {
-		locationFinder = opt.LocationFinder
+	directDialer := direct.SymmetricDirect
+	if opt != nil {
+		if opt.LocationFinder != nil {
+			locationFinder = opt.LocationFinder
+		}
+		if opt.DirectDialer != nil {
+			directDialer = opt.DirectDialer
+		}
 	}
 	requestProgram, err := componentdns.NewNormalizedRequestRoutingProgram(dnsCfg.Routing.Request.Rules, dnsCfg.Routing.Request.Fallback,
 		&routing.DatReaderOptimizer{Logger: log, LocationFinder: locationFinder},
@@ -138,6 +146,7 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 	router := &Router{
 		log:                   log,
 		upstreams:             make(map[string]*componentdns.UpstreamResolver),
+		directDialer:          directDialer,
 		soMark:                common.EffectiveSoMarkFromDae(global.SoMarkFromDae),
 		mptcp:                 global.Mptcp,
 		lookupCalls:           make(map[string]*lookupCall),
@@ -659,7 +668,7 @@ func (r *Router) resolveBootstrap(ctx context.Context, host string, network stri
 	var lastNoRecordErr4 error
 	var lastNoRecordErr6 error
 	for _, resolver := range r.bootstrapDns {
-		ip46, err4, err6 := netutils.ResolveIp46(ctx, direct.SymmetricDirect, resolver, host, network, false)
+		ip46, err4, err6 := netutils.ResolveIp46(ctx, r.directDialer, resolver, host, network, false)
 		if ip46 == nil {
 			ip46 = &netutils.Ip46{}
 		}

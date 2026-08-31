@@ -5,7 +5,10 @@
 
 package control
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestActiveControlPlanePublicationHandoff(t *testing.T) {
 	resetActiveControlPlanePublicationForTest(t)
@@ -61,4 +64,29 @@ func resetActiveControlPlanePublicationForTest(t *testing.T) {
 		activeControlPlanePublication.owners = previousOwners
 		activeControlPlanePublication.mu.Unlock()
 	})
+}
+
+func TestActiveDNSControllerReleasesGateOnPanic(t *testing.T) {
+	resetActiveControlPlanePublicationForTest(t)
+
+	controller := &DnsController{dnsControllerStore: newDnsControllerStore()}
+	plane := &ControlPlane{
+		controlPlaneDNSRuntime: controlPlaneDNSRuntime{dnsController: controller},
+	}
+	plane.publishActiveControlPlane()
+
+	func() {
+		defer func() {
+			if recovered := recover(); recovered == nil {
+				t.Fatal("handler panic was not propagated")
+			}
+		}()
+		_ = withActiveDNSController(nil, context.Background(), func(context.Context, *DnsController) error {
+			panic("test handler panic")
+		})
+	}()
+
+	if got := controller.handleInflight.Load(); got != 0 {
+		t.Fatalf("handle inflight count = %d, want 0 after panic", got)
+	}
 }

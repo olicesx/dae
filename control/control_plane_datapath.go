@@ -220,7 +220,11 @@ func (c *ControlPlane) CommitPreparedDatapath() error {
 		if err != nil {
 			return fmt.Errorf("routing kernspace snapshot: %w", err)
 		}
-		c.core.lpmTrieIndices = lpmIndices
+		// Route through the locked setter: Close and concurrent index
+		// replacement for this core all synchronize on core.mu, so an
+		// unlocked write here would race the drain path of a failed staged
+		// reload (the rollback path below already uses the setter).
+		c.core.ReplaceLpmIndices(lpmIndices)
 		if err := c.core.StageRoutingEpoch(); err != nil {
 			return fmt.Errorf("stage routing epoch: %w", err)
 		}

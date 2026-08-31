@@ -63,14 +63,20 @@ func InitDaeNetns(log *logrus.Logger) {
 			daeNs:  netns.None(),
 		}
 	})
-	daeNetns.log = log
+	ns := GetDaeNetns()
+	// The shared instance stays reachable by the previous control-plane
+	// generation while a reload builds the next one, so every mutable field
+	// is written under ns.mu and all readers take the same mutex.
 	// Initialize kernel version for Netkit support detection
 	kernelVersion, err := internal.KernelVersion()
 	if err != nil {
 		log.WithError(err).Warn("Failed to get kernel version, Netkit support disabled")
 		kernelVersion = internal.Version{0, 0, 0}
 	}
-	daeNetns.kernelVersion = &kernelVersion
+	ns.mu.Lock()
+	ns.log = log
+	ns.kernelVersion = &kernelVersion
+	ns.mu.Unlock()
 }
 
 func GetDaeNetns() *DaeNetns {
@@ -78,20 +84,30 @@ func GetDaeNetns() *DaeNetns {
 }
 
 func (ns *DaeNetns) NetnsID() (int, error) {
-	return netlink.GetNetNsIdByFd(int(ns.daeNs))
+	ns.mu.Lock()
+	daeNs := ns.daeNs
+	ns.mu.Unlock()
+	return netlink.GetNetNsIdByFd(int(daeNs))
 }
 
 func (ns *DaeNetns) Dae0() netlink.Link {
+	ns.mu.Lock()
+	defer ns.mu.Unlock()
 	return ns.dae0
 }
 
 func (ns *DaeNetns) Dae0Peer() netlink.Link {
+	ns.mu.Lock()
+	defer ns.mu.Unlock()
 	return ns.dae0peer
 }
 
 // DeviceType returns the type of the dae0 device ("netkit" or "veth").
 func (ns *DaeNetns) DeviceType() string {
-	if ns.useNetkit {
+	ns.mu.Lock()
+	useNetkit := ns.useNetkit
+	ns.mu.Unlock()
+	if useNetkit {
 		return "netkit"
 	}
 	return "veth"
@@ -99,6 +115,8 @@ func (ns *DaeNetns) DeviceType() string {
 
 // IsUsingNetkit returns true if Netkit device is being used.
 func (ns *DaeNetns) IsUsingNetkit() bool {
+	ns.mu.Lock()
+	defer ns.mu.Unlock()
 	return ns.useNetkit
 }
 
@@ -306,13 +324,21 @@ func (ns *DaeNetns) WithRequired(op string, f func() error) error {
 
 // WithBestEffort runs f in dae netns and only logs debug info on failure.
 func (ns *DaeNetns) WithBestEffort(op string, f func() error) {
-	if err := ns.With(f); err != nil && ns.log != nil {
-		if op == "" {
-			ns.log.WithError(err).Debug("best-effort dae netns operation failed")
-			return
-		}
-		ns.log.WithError(err).Debugf("best-effort dae netns operation failed: %s", op)
+	err := ns.With(f)
+	if err == nil {
+		return
 	}
+	ns.mu.Lock()
+	log := ns.log
+	ns.mu.Unlock()
+	if log == nil {
+		return
+	}
+	if op == "" {
+		log.WithError(err).Debug("best-effort dae netns operation failed")
+		return
+	}
+	log.WithError(err).Debugf("best-effort dae netns operation failed: %s", op)
 }
 
 // supportsNetkit checks if the kernel supports Netkit devices (requires 6.7+).

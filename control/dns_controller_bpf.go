@@ -389,15 +389,18 @@ func (c *DnsController) reconcileCurrentBpfProjections() (failed bool) {
 // via bpfUpdateStop, which is closed during DnsController.Close().
 func (c *DnsController) bpfUpdateWorker() {
 	defer c.bpfUpdateWg.Done()
-	// Snapshot the queue once under the mutex that also guards its
-	// lifecycle. The channel is created before this goroutine starts, but
-	// Close may nil the field after the graceful timeout while a stuck
-	// worker is still selecting on it; reading the field once here keeps
-	// every later receive race-free.
+	// Snapshot all lifecycle channels under the mutexes that guard their
+	// fields. Close may nil the fields after the graceful timeout while a
+	// stuck worker is still selecting on them; reading them once here keeps
+	// later receives race-free and preserves the stop signal.
 	c.bpfUpdateStopMu.Lock()
 	bpfUpdateCh := c.bpfUpdateCh
+	bpfUpdateStop := c.bpfUpdateStop
 	c.bpfUpdateStopMu.Unlock()
-	if bpfUpdateCh == nil {
+	c.bpfRetryMu.Lock()
+	bpfRetryWake := c.bpfRetryWake
+	c.bpfRetryMu.Unlock()
+	if bpfUpdateCh == nil || bpfUpdateStop == nil {
 		return
 	}
 	retries := newBpfProjectionRetryScheduler()
@@ -457,7 +460,7 @@ func (c *DnsController) bpfUpdateWorker() {
 		case task := <-bpfUpdateCh:
 			c.processBpfUpdateTask(task, false)
 			c.drainBpfUpdateTasks(bpfUpdateCh, false)
-		case <-c.bpfRetryWake:
+		case <-bpfRetryWake:
 			tasks, overflow := c.takeBpfProjectionRetryIntents()
 			if overflow {
 				scheduleReconcile(time.Now())
@@ -489,7 +492,7 @@ func (c *DnsController) bpfUpdateWorker() {
 				}
 			}
 			resetRetryTimer()
-		case <-c.bpfUpdateStop:
+		case <-bpfUpdateStop:
 			c.drainBpfUpdateTasks(bpfUpdateCh, true)
 			return
 		}

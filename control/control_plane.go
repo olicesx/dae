@@ -630,14 +630,12 @@ func NewControlPlaneWithContextOptions(
 	kernspaceSnapshot := builder.KernspaceSnapshot()
 	if !buildOpts.DelayDatapathCommit {
 		log.Infoln("Loading routing rules into kernel space (BPF)...")
-		var lpmIndices []uint32
-		if lpmIndices, err = kernspaceSnapshot.BuildKernspaceForSlot(log, core.bpf.Load(), core.RoutingEpochSlot()); err != nil {
+		if _, err = core.buildRoutingKernspaceForSlot(log, kernspaceSnapshot); err != nil {
 			return nil, fmt.Errorf("routing kernspace snapshot: %w", err)
 		}
 		if err = core.StageRoutingEpoch(); err != nil {
 			return nil, fmt.Errorf("stage routing epoch: %w", err)
 		}
-		core.lpmTrieIndices = lpmIndices
 	} else {
 		log.Infoln("Prepared routing matcher; kernel-space routing commit deferred until listener cutover")
 	}

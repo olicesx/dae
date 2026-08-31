@@ -177,7 +177,6 @@ func withActiveDNSController(
 	}
 	activeControlPlanePublication.mu.RUnlock()
 
-	err := handle(queryCtx, controller)
-	controller.releaseHandleGate()
-	return err
+	defer controller.releaseHandleGate()
+	return handle(queryCtx, controller)
 }

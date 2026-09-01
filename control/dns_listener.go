@@ -285,6 +285,15 @@ func (h *dnsHandler) ServeDNS(w dnsmessage.ResponseWriter, r *dnsmessage.Msg) {
 	if w == nil || r == nil {
 		return
 	}
+	// A message with the QR bit set is a response, not a query. The UDP and
+	// TCP fast paths reject these before routing; without the same gate here
+	// a client could feed a response-formed message to the listener and have
+	// its question section misrouted through request routing (a Reject
+	// verdict would even evict a live cache family). Drop it silently, same
+	// as the fast paths.
+	if r.Response {
+		return
+	}
 	controller := h.listener.Controller()
 	uploadRecord := RecordUploadTraffic
 	downloadRecord := RecordDownloadTraffic

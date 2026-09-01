@@ -93,7 +93,10 @@ type controlPlaneCore struct {
 	mu      sync.Mutex
 	deferMu sync.Mutex
 
-	log        *logrus.Logger
+	log *logrus.Logger
+	// deferFuncs is guarded by deferMu (addDeferFunc appends; Close drains it
+	// under the same lock). The seed value is written only during construction,
+	// before the core is published.
 	deferFuncs []func() error
 	// bpfHookDetachFuncs contains only BPF hook detachment functions (FilterDel, tc detach)
 	// These are tracked separately so they can be detached immediately on SIGTERM
@@ -104,7 +107,10 @@ type controlPlaneCore struct {
 	bpfHookDetachMu    sync.Mutex
 	bpfHookAttachWg    sync.WaitGroup
 	bpf                atomic.Pointer[bpfObjects]
-	outboundId2Name    map[uint8]string
+	// outboundId2Name is populated during NewControlPlane before the control
+	// plane is published and is read-only afterwards, so concurrent readers
+	// (health callbacks, logging) need no lock.
+	outboundId2Name map[uint8]string
 	// tcpSockmapOffloadReady is set once setupTCPRelayOffload attaches the
 	// sk_skb stream-verdict program to fast_sock (kernel passes the
 	// CVE-2025-38165 gate). tryOffloadTCPRelay consults it per relay.
@@ -112,17 +118,29 @@ type controlPlaneCore struct {
 
 	kernelVersion *internal.Version
 
-	flip             int
-	flipBase         int32
-	flipPending      bool
-	isReload         bool
-	bpfEjected       bool
+	// Reload flip state. flip and isReload are fixed at construction and
+	// read-only afterwards (bind paths read them under mu to derive TC
+	// handles). flipBase/flipPending track whether the reload's TC-handle
+	// swap has been committed; they are mutated only by the serialized reload
+	// handoff steps (commitBpfHookFlip, rollbackCommittedBpfHookFlip,
+	// activateBpfHookFlip), which run outside mu.
+	flip        int
+	flipBase    int32
+	flipPending bool
+	isReload    bool
+	// bpfEjected/bpfOwned are the BPF ownership flags; both are guarded by mu
+	// (EjectBpf, InjectBpf, Close).
+	bpfEjected bool
+	// bpfHooksDetached and bpfHooksQuiesced are guarded by bpfHookMu (not mu):
+	// hook registration and SIGTERM detaching run outside mu to avoid deadlock
+	// with _bindLan/_bindWan callers holding mu.
 	bpfHooksDetached bool // Track if BPF hooks were already detached
 	bpfHooksQuiesced bool
 	retired          atomic.Bool
 	// outboundConnectivityMu serializes shared BPF connectivity-map ownership
 	// with health callbacks while a prepared generation is cut over or rolled back.
-	outboundConnectivityMu     sync.Mutex
+	outboundConnectivityMu sync.Mutex
+	// outboundConnectivityPaused is guarded by outboundConnectivityMu.
 	outboundConnectivityPaused bool
 
 	closed                context.Context
@@ -142,9 +160,14 @@ type controlPlaneCore struct {
 	routingEpochRollbackOff   atomic.Bool
 	routingEpochPolicyEpoch   atomic.Uint64
 	datapathGeneration        atomic.Uint32
-	routingEpochStaged        bool
-	routingEpochStagedSlot    uint32
-	routingEpochStagedEpoch   uint64
+	// routingEpochStaged* records the slot/epoch prepared by StageRoutingEpoch
+	// for cutover or rollback decisions. All three fields are guarded by
+	// routingEpochMu (see the *RoutingEpochLocked helpers and their callers);
+	// routingEpochStagedSlot is also seeded during construction before the
+	// core is published.
+	routingEpochStaged      bool
+	routingEpochStagedSlot  uint32
+	routingEpochStagedEpoch uint64
 	// routingEpochActiveSlotCache short-circuits readActiveRoutingEpochSlot.
 	// The active slot only changes on PublishRoutingEpoch/RollbackRoutingEpoch,
 	// so the per-packet eBPF lookup on the UDP hot path is pure waste
@@ -152,8 +175,12 @@ type controlPlaneCore struct {
 	routingEpochActiveSlotCachedAt    atomic.Int64
 	routingEpochActiveSlotCached      atomic.Uint32
 	routingEpochActiveSlotCachedValid atomic.Bool
-	lpmTrieIndices                    []uint32
-	bpfOwned                          bool
+	// lpmTrieIndices holds the LPM array-map slot indices owned by this
+	// generation. Guarded by mu: Close deletes them, and
+	// buildRoutingKernspaceForSlot/ReplaceLpmIndices rewrite them under the
+	// same lock so map rollback and slot cleanup cannot interleave.
+	lpmTrieIndices []uint32
+	bpfOwned       bool
 }
 
 func newControlPlaneCore(log *logrus.Logger,

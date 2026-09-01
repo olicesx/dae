@@ -295,8 +295,12 @@ const (
 	// rationale; each task is short-lived, so the cap is sized far above any
 	// legitimate low-latency workload.
 	udpDirectDispatchConcurrency = 4096
-	// StrategyDirectGoroutine uses direct goroutine spawn.
-	// Lowest latency, no drops, but no concurrency control.
+	// StrategyDirectGoroutine spawns one goroutine per packet, bounded by the
+	// udpDirectDispatchConcurrency semaphore (see controlPlaneUDPRuntime).
+	// It skips per-flow queue handoff for the lowest latency, but when the
+	// semaphore is saturated the packet is discarded inline: dispatch relies
+	// on ordinary UDP loss semantics (senders retransmit), so there is no
+	// strict no-drop guarantee despite the latency-sensitive classification.
 	StrategyDirectGoroutine UdpDispatchStrategy = iota
 
 	// StrategyOrderedIngress uses ordered task pool.

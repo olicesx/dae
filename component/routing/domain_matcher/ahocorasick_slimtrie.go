@@ -58,6 +58,14 @@ func (n *AhocorasickSlimtrie) AddSet(bitIndex int, patterns []string, typ consts
 	if n.err != nil {
 		return
 	}
+	// Rule indices come from len(builder.rules) and index the per-rule slices
+	// allocated with bitLength (= consts.MaxMatchSetLen). An out-of-range
+	// index would panic on the slice writes below; record it as a build error
+	// so oversized configurations fail with a message instead of crashing.
+	if bitIndex < 0 || bitIndex >= len(n.toBuildTrie) {
+		n.err = fmt.Errorf("domain rule index %d is out of range [0, %d): too many routing rules", bitIndex, len(n.toBuildTrie))
+		return
+	}
 	// Pre-grow slices to avoid repeated growslice when appending many patterns.
 	maxTrieEntries := 0
 	maxAcEntries := 0

@@ -86,6 +86,14 @@ func (n *AhocorasickSlimtrie) AddSet(bitIndex int, patterns []string, typ consts
 nextPattern:
 	for _, d := range patterns {
 		switch typ {
+		case consts.RoutingDomainKey_Full,
+			consts.RoutingDomainKey_Suffix,
+			consts.RoutingDomainKey_Keyword:
+			// DNS names are case-insensitive, matching the normalization used
+			// by MatchDomainBitmap. Regex patterns keep their original case.
+			d = strings.ToLower(d)
+		}
+		switch typ {
 		case consts.RoutingDomainKey_Full:
 			for _, r := range []byte(d) {
 				if !ValidDomainChars.IsValidChar(r) {

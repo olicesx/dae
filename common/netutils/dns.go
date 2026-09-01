@@ -282,7 +282,9 @@ func resolve(ctx context.Context, d netproxy.Dialer, dns netip.AddrPort, host st
 	}()
 	select {
 	case <-ctx.Done():
-		return nil, fmt.Errorf("timeout")
+		// Wrap ctx.Err() so callers can distinguish cancellation from a
+		// real deadline via errors.Is while the message stays readable.
+		return nil, fmt.Errorf("timeout: %w", ctx.Err())
 	case res := <-ch:
 		if res.err != nil {
 			return nil, res.err

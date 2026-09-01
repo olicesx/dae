@@ -53,9 +53,11 @@ type Anyfrom struct {
 // afterWrite handles post-write logic (GSO error tracking and TTL refresh).
 // This is thread-safe because gotGSOError is atomic and refreshTtl uses atomics.
 func (a *Anyfrom) afterWrite(err error) {
-	// CAS-style: only pay the atomic-store cost when transitioning false→true.
-	if !a.gotGSOError.Load() && isGSOError(err) {
-		a.gotGSOError.Store(true)
+	// Only a GSO-related failure flips the flag, and CompareAndSwap keeps the
+	// transition strictly false→true so concurrent writers pay the store cost
+	// at most once per connection.
+	if isGSOError(err) {
+		a.gotGSOError.CompareAndSwap(false, true)
 	}
 	a.refreshTtl()
 }
@@ -366,10 +368,6 @@ func (p *AnyfromPool) Close() {
 	p.Reset()
 }
 
-func (p *AnyfromPool) GetOrCreate(lAddr netip.AddrPort, ttl time.Duration) (conn *Anyfrom, isNew bool, err error) {
-	return p.getOrCreateWithMark(lAddr, soMarkFromDae.Load(), ttl)
-}
-
 func (p *AnyfromPool) getOrCreateWithMark(lAddr netip.AddrPort, soMark uint32, ttl time.Duration) (conn *Anyfrom, isNew bool, err error) {
 	key := anyfromPoolKey{lAddr: lAddr, soMark: soMark}
 	shard := p.shardForKey(key)
@@ -476,10 +474,6 @@ func (p *AnyfromPool) createAnyfromSocket(lAddr netip.AddrPort, soMark uint32, t
 		af.RefreshTtl()
 	}
 	return af, nil
-}
-
-func (p *AnyfromPool) shardFor(lAddr netip.AddrPort) *anyfromPoolShard {
-	return p.shardForKey(anyfromPoolKey{lAddr: lAddr})
 }
 
 func (p *AnyfromPool) shardForKey(key anyfromPoolKey) *anyfromPoolShard {

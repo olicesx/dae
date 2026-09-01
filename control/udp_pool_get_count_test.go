@@ -195,7 +195,7 @@ func scenarioCacheTotalMissThenCreateGets(t *testing.T) []UdpEndpointKey {
 	// concrete outbound and creates the endpoint. Cache lookup still misses.
 	return countPoolGets(t, func() {
 		flowDecision := ClassifyUdpFlow(src, dst, payload)
-		if err := cp.handlePkt(nil, payload, src, dst, routingResult, flowDecision, false); err != nil {
+		if err := cp.handlePktWithPrefetch(nil, payload, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false); err != nil {
 			t.Fatalf("handlePkt create: %v", err)
 		}
 		if ue := routingCacheOwnerEndpoint(flowDecision); ue != nil {
@@ -230,7 +230,7 @@ func newGetCountDialingControlPlane(t *testing.T) (*ControlPlane, *bpfRoutingRes
 func primeUdpEndpointViaHandlePkt(t *testing.T, cp *ControlPlane, src, dst netip.AddrPort, payload []byte, routingResult *bpfRoutingResult) {
 	t.Helper()
 	flowDecision := ClassifyUdpFlow(src, dst, payload)
-	if err := cp.handlePkt(nil, payload, src, dst, routingResult, flowDecision, false); err != nil {
+	if err := cp.handlePktWithPrefetch(nil, payload, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("prime handlePkt: %v", err)
 	}
 }

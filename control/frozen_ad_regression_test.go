@@ -245,13 +245,13 @@ func TestTransferLeaseMatchesDialerIdentityNotPointer(t *testing.T) {
 		},
 		SubscriptionTag: "sub-1",
 	}
-	oldDialer := componentdialer.NewDialer(
+	oldDialer := componentdialer.NewDialerContext(context.Background(),
 		&errorDialer{err: errors.New("unused")},
 		&componentdialer.GlobalOption{Log: discardLogger(), CheckInterval: time.Second},
 		componentdialer.InstanceOption{DisableCheck: true},
 		prop,
 	)
-	newDialer := componentdialer.NewDialer(
+	newDialer := componentdialer.NewDialerContext(context.Background(),
 		&errorDialer{err: errors.New("unused")},
 		&componentdialer.GlobalOption{Log: discardLogger(), CheckInterval: time.Second},
 		componentdialer.InstanceOption{DisableCheck: true},

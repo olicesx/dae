@@ -127,14 +127,6 @@ func (c *ControlPlane) unpublishActiveControlPlane() {
 	activeControlPlanePublication.mu.Unlock()
 }
 
-func (c *ControlPlane) isPublishedActiveControlPlane() bool {
-	if c == nil {
-		return false
-	}
-	active := activeControlPlanePublication.plane.Load()
-	return active == nil || active == c
-}
-
 func withActiveDNSController(
 	fallback *ControlPlane,
 	ctx context.Context,

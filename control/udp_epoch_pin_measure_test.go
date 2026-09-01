@@ -73,7 +73,12 @@ func TestPrepareUnownedUDPCurrentPolicyFallback_PinBlocksFallback(t *testing.T) 
 		DatapathGeneration: 1,
 	}
 
-	if !cp.isPublishedActiveControlPlane() || !cp.ownsActiveRoutingEpoch() {
+	// Mirror the removed isPublishedActiveControlPlane helper: the plane must
+	// be the published active plane (or none published) to exercise the path.
+	if published := activeControlPlanePublication.plane.Load(); published != nil && published != cp {
+		t.Fatal("test plane must be active to exercise the fallback path")
+	}
+	if !cp.ownsActiveRoutingEpoch() {
 		t.Fatal("test plane must be active to exercise the fallback path")
 	}
 
@@ -128,7 +133,7 @@ func TestHandlePkt_EpochOwnerUnavailableWhenTuplePinned(t *testing.T) {
 	manager.RetainUdpConnStateTuples([]bpfTuplesKey{key})
 	defer func() { _ = manager.ReleaseUdpConnStateTuples([]bpfTuplesKey{key}) }()
 
-	err := cp.handlePkt(nil, payload, src, dst, routingResult, flowDecision, false)
+	err := cp.handlePktWithPrefetch(nil, payload, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false)
 	if !errors.Is(err, errRoutingEpochOwnerUnavailable) {
 		t.Fatalf("handlePkt err = %v, want errRoutingEpochOwnerUnavailable", err)
 	}
@@ -276,7 +281,7 @@ func TestHandlePkt_EpochOwnerUnavailable_RetiringPlaneClosedDrops(t *testing.T) 
 	// Execution closed: the fallback stays unavailable (conservative drop).
 	cp.rejectNewConnections.Store(true)
 
-	if cp.isPublishedActiveControlPlane() {
+	if published := activeControlPlanePublication.plane.Load(); published == cp {
 		t.Fatal("test plane must not be the published active plane")
 	}
 
@@ -290,7 +295,7 @@ func TestHandlePkt_EpochOwnerUnavailable_RetiringPlaneClosedDrops(t *testing.T) 
 	}
 	flowDecision := ClassifyUdpFlow(src, dst, payload)
 
-	err := cp.handlePkt(nil, payload, src, dst, routingResult, flowDecision, false)
+	err := cp.handlePktWithPrefetch(nil, payload, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false)
 	if !errors.Is(err, errRoutingEpochOwnerUnavailable) {
 		t.Fatalf("handlePkt err = %v, want errRoutingEpochOwnerUnavailable", err)
 	}

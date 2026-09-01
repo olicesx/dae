@@ -724,7 +724,7 @@ func TestBuildRunShutdownHandoffFastExitBypassesSupervisorFreeze(t *testing.T) {
 	if handoff := buildRunShutdownHandoff(manager, supervisor, active, true); handoff != nil {
 		t.Fatal("fast-exit shutdown unexpectedly built supervisor cleanup handoff")
 	}
-	if snapshot := supervisor.snapshot(); snapshot.active != active {
+	if snapshot := supervisorSnapshotForTest(supervisor); snapshot.active != active {
 		t.Fatal("fast-exit shutdown froze the active supervisor generation")
 	}
 	if !manager.beginReloadTransition() {
@@ -1150,7 +1150,7 @@ func TestReloadManagerStartControlPlaneRetirementCompletesAndCancelsOldContext(t
 	default:
 		t.Fatal("expected old generation cancel function to be called")
 	}
-	if snapshot := supervisor.snapshot(); snapshot.retiring != nil {
+	if snapshot := supervisorSnapshotForTest(supervisor); snapshot.retiring != nil {
 		t.Fatal("expected retirement completion to release the exact supervisor generation")
 	}
 }
@@ -1200,7 +1200,7 @@ func TestReloadManagerRepeatedRetirementLifecycleReclaimsGeneration(t *testing.T
 		default:
 			t.Fatalf("iteration %d old generation context was not canceled", iteration)
 		}
-		if snapshot := supervisor.snapshot(); snapshot.active != newGeneration || snapshot.prepared != nil || snapshot.retiring != nil {
+		if snapshot := supervisorSnapshotForTest(supervisor); snapshot.active != newGeneration || snapshot.prepared != nil || snapshot.retiring != nil {
 			t.Fatalf("iteration %d supervisor retained stale ownership: %#v", iteration, snapshot)
 		}
 		manager.lastRetirementMu.Lock()

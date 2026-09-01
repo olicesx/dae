@@ -215,17 +215,6 @@ func (s *runtimeSupervisor) ownsRetiring(retiring *runtimeGeneration) bool {
 	return !s.closed && s.retiring == retiring
 }
 
-func (s *runtimeSupervisor) snapshot() runtimeSupervisorSnapshot {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return runtimeSupervisorSnapshot{
-		active:   s.active,
-		prepared: s.prepared,
-		retiring: s.retiring,
-	}
-}
-
 // shutdown atomically transfers all generation cleanup ownership to the
 // caller and rejects future state transitions.
 func (s *runtimeSupervisor) shutdown() runtimeSupervisorSnapshot {

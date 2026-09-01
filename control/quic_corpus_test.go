@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 	"github.com/daeuniverse/outbound/netproxy"
@@ -86,7 +87,7 @@ func replayQuicSniffingCorpusFixture(t *testing.T, fixture quicSniffingCorpusFix
 	primeQuicRegressionAnyfrom(src, dst)
 	routingResult := &bpfRoutingResult{Outbound: uint8(consts.OutboundControlPlaneRouting)}
 
-	if err := cp.handlePkt(nil, first, src, dst, routingResult, firstDecision, false); err != nil {
+	if err := cp.handlePktWithPrefetch(nil, first, src, dst, routingResult, firstDecision, false, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("handlePkt(first): %v", err)
 	}
 	if got := fallbackUnderlay.calls.Load(); got != 0 {
@@ -97,7 +98,7 @@ func replayQuicSniffingCorpusFixture(t *testing.T, fixture quicSniffingCorpusFix
 	}
 
 	secondDecision := ClassifyUdpFlow(src, dst, second).EnsureSnifferSession()
-	if err := cp.handlePkt(nil, second, src, dst, routingResult, secondDecision, false); err != nil {
+	if err := cp.handlePktWithPrefetch(nil, second, src, dst, routingResult, secondDecision, false, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("handlePkt(second): %v", err)
 	}
 
@@ -149,7 +150,7 @@ func replayQuicSniffingCorpusFixture(t *testing.T, fixture quicSniffingCorpusFix
 	}
 
 	thirdDecision := ClassifyUdpFlow(src, dst, second)
-	if err := cp.handlePkt(nil, second, src, dst, routingResult, thirdDecision, false); err != nil {
+	if err := cp.handlePktWithPrefetch(nil, second, src, dst, routingResult, thirdDecision, false, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("handlePkt(third): %v", err)
 	}
 	if got := sniffedUnderlay.calls.Load(); got != 1 {
@@ -162,8 +163,7 @@ func replayQuicSniffingCorpusFixture(t *testing.T, fixture quicSniffingCorpusFix
 
 func newQuicSniffingCorpusMatcher(t *testing.T, fixture quicSniffingCorpusFixture) *RoutingMatcher {
 	t.Helper()
-	builder, err := NewRoutingMatcherBuilder(
-		logrus.New(),
+	program, err := routing.NewNormalizedProgram(
 		[]*config_parser.RoutingRule{{
 			AndFunctions: []*config_parser.Function{{
 				Name: consts.Function_Domain,
@@ -180,15 +180,22 @@ func newQuicSniffingCorpusMatcher(t *testing.T, fixture quicSniffingCorpusFixtur
 				},
 			},
 		}},
+		config.FunctionOrString("fallback"),
+	)
+	if err != nil {
+		t.Fatalf("NewNormalizedProgram() error = %v", err)
+	}
+	builder, err := NewRoutingMatcherBuilderFromProgram(
+		logrus.New(),
+		program,
 		map[string]uint8{
 			"fallback": uint8(consts.OutboundUserDefinedMin),
 			"sniffed":  uint8(fixture.expectedOutbound),
 		},
 		nil,
-		config.FunctionOrString("fallback"),
 	)
 	if err != nil {
-		t.Fatalf("NewRoutingMatcherBuilder() error = %v", err)
+		t.Fatalf("NewRoutingMatcherBuilderFromProgram() error = %v", err)
 	}
 	matcher, err := builder.BuildUserspace()
 	if err != nil {

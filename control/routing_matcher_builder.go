@@ -135,14 +135,6 @@ func prefixesEqual(a, b []netip.Prefix) bool {
 	return true
 }
 
-func NewRoutingMatcherBuilder(log *logrus.Logger, rules []*config_parser.RoutingRule, outboundName2Id map[string]uint8, bpf *bpfObjects, fallback config.FunctionOrString) (b *RoutingMatcherBuilder, err error) {
-	program, err := routing.NewNormalizedProgram(rules, fallback)
-	if err != nil {
-		return nil, err
-	}
-	return NewRoutingMatcherBuilderFromProgram(log, program, outboundName2Id, bpf)
-}
-
 func NewRoutingMatcherBuilderFromProgram(log *logrus.Logger, program *routing.NormalizedProgram, outboundName2Id map[string]uint8, bpf *bpfObjects) (b *RoutingMatcherBuilder, err error) {
 	if program == nil {
 		return nil, fmt.Errorf("routing program is nil")

@@ -7,6 +7,19 @@ package cmd
 
 import "testing"
 
+// supervisorSnapshotForTest reads the supervisor's generation pointers under
+// its lock for test assertions. The production snapshot accessor was removed
+// as dead code; tests observe supervisor state through this helper instead.
+func supervisorSnapshotForTest(s *runtimeSupervisor) runtimeSupervisorSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return runtimeSupervisorSnapshot{
+		active:   s.active,
+		prepared: s.prepared,
+		retiring: s.retiring,
+	}
+}
+
 func FuzzRuntimeSupervisorOperations(f *testing.F) {
 	f.Add([]byte{0, 1, 2, 3, 4, 5})
 	f.Add([]byte{1, 0, 1, 3, 0, 2, 5, 1})
@@ -18,7 +31,7 @@ func FuzzRuntimeSupervisorOperations(f *testing.F) {
 		candidates := make([]*runtimeGeneration, 0, len(operations))
 
 		assertState := func() {
-			snapshot := supervisor.snapshot()
+			snapshot := supervisorSnapshotForTest(supervisor)
 			if snapshot.active != nil && snapshot.active == snapshot.prepared {
 				t.Fatal("active and prepared generations alias")
 			}
@@ -34,7 +47,7 @@ func FuzzRuntimeSupervisorOperations(f *testing.F) {
 		}
 
 		for _, operation := range operations {
-			snapshot := supervisor.snapshot()
+			snapshot := supervisorSnapshotForTest(supervisor)
 			switch operation % 7 {
 			case 0:
 				candidate := newTestRuntimeGeneration()

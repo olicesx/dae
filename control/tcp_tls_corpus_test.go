@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/component/sniffing"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/pkg/config_parser"
@@ -159,8 +160,7 @@ func replayPhase0TCPTLSCorpusFixture(t *testing.T, fixture phase0TCPTLSCorpusFix
 
 func newPhase0TCPTLSLegacyMatcher(t *testing.T, fixture phase0TCPTLSCorpusFixture) *RoutingMatcher {
 	t.Helper()
-	builder, err := NewRoutingMatcherBuilder(
-		logrus.New(),
+	program, err := routing.NewNormalizedProgram(
 		[]*config_parser.RoutingRule{{
 			AndFunctions: []*config_parser.Function{{
 				Name: consts.Function_Domain,
@@ -177,15 +177,22 @@ func newPhase0TCPTLSLegacyMatcher(t *testing.T, fixture phase0TCPTLSCorpusFixtur
 				},
 			},
 		}},
+		config.FunctionOrString("direct"),
+	)
+	if err != nil {
+		t.Fatalf("NewNormalizedProgram() error = %v", err)
+	}
+	builder, err := NewRoutingMatcherBuilderFromProgram(
+		logrus.New(),
+		program,
 		map[string]uint8{
 			"direct": uint8(consts.OutboundDirect),
 			"proxy":  uint8(fixture.expectedOutbound),
 		},
 		nil,
-		config.FunctionOrString("direct"),
 	)
 	if err != nil {
-		t.Fatalf("NewRoutingMatcherBuilder() error = %v", err)
+		t.Fatalf("NewRoutingMatcherBuilderFromProgram() error = %v", err)
 	}
 	matcher, err := builder.BuildUserspace()
 	if err != nil {

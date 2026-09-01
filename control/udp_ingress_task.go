@@ -155,8 +155,12 @@ func (t *udpIngressTask) Run() {
 	// Defers run in LIFO order: dispatch slot, admission, buffer, then the
 	// task itself (the pool must not see the task before its deferred cleanup
 	// completes, and the dispatch slot must be read before the task returns
-	// to the pool).
-	defer udpIngressTaskPool.Put(t)
+	// to the pool). The final defer zeroes the task before Put so no stale
+	// field can leak into the next checkout, matching Discard.
+	defer func() {
+		*t = udpIngressTask{}
+		udpIngressTaskPool.Put(t)
+	}()
 	defer data.Put()
 	defer t.admission.release()
 	defer t.releaseDispatchSem()

@@ -281,6 +281,10 @@ func takeUdpEndpointReply(data pool.PB, from netip.AddrPort) *udpEndpointReply {
 	reply := udpEndpointReplyObjects.Get().(*udpEndpointReply)
 	reply.data = data
 	reply.from = from
+	// Clear any stale release callback explicitly instead of relying solely
+	// on recycleUdpEndpointReply's whole-struct zeroing: recycled objects must
+	// never inherit transport-owned buffer ownership from a previous use.
+	reply.release = nil
 	return reply
 }
 

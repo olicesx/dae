@@ -35,7 +35,12 @@ var errPassthroughToBaseResolver = errors.New("dns request routing selected pass
 var udpDNSBufPool = sync.Pool{
 	// Keep the full UDP DNS payload budget so oversized replies still unpack
 	// correctly instead of failing before TCP fallback decisions are made.
-	New: func() any { return make([]byte, 65535) },
+	// Buffers are stored as *[]byte so Put hands the pool a pointer instead
+	// of boxing the slice header on every Put (SA6002).
+	New: func() any {
+		buf := make([]byte, 65535)
+		return &buf
+	},
 }
 
 const lookupSharedTimeout = 10 * time.Second
@@ -245,9 +250,9 @@ func (r *Router) lookupType(ctx context.Context, upstream *componentdns.Upstream
 	// r.exchange consumes data synchronously across every scheme
 	// (queryUDP writes inline; queryTCP/TLS/QUIC/HTTPS copy data before use),
 	// so recycling buf after exchange returns is safe.
-	poolBuf := udpDNSBufPool.Get().([]byte)
-	defer udpDNSBufPool.Put(poolBuf) //nolint:staticcheck
-	data, err := msg.PackBuffer(poolBuf[:cap(poolBuf)])
+	poolBuf := udpDNSBufPool.Get().(*[]byte)
+	defer udpDNSBufPool.Put(poolBuf)
+	data, err := msg.PackBuffer((*poolBuf)[:cap(*poolBuf)])
 	if err != nil {
 		return nil, err
 	}
@@ -345,8 +350,9 @@ func (r *Router) queryUDP(ctx context.Context, target netip.AddrPort, data []byt
 	if _, err = netutils.WriteUDPConn(conn, target.String(), data); err != nil {
 		return nil, err
 	}
-	buf := udpDNSBufPool.Get().([]byte)
-	defer udpDNSBufPool.Put(buf) //nolint:staticcheck
+	bufPtr := udpDNSBufPool.Get().(*[]byte)
+	defer udpDNSBufPool.Put(bufPtr)
+	buf := *bufPtr
 	for range 8 {
 		n, readErr := netutils.ReadUDPConn(conn, buf)
 		if readErr != nil {

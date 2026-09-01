@@ -100,7 +100,7 @@ func StartTrace(ctx context.Context, ipVersion int, l4ProtoNo uint16, port int, 
 func rewriteAndLoadBpf(ipVersion int, l4ProtoNo uint16, port int) (_ *bpfObjects, err error) {
 	spec, err := loadBpf()
 	if err != nil {
-		return nil, fmt.Errorf("failed to load BPF: %+v", err)
+		return nil, fmt.Errorf("failed to load BPF: %w", err)
 	}
 	tracingCfg := spec.Variables["tracing_cfg"]
 	if tracingCfg == nil {
@@ -117,7 +117,7 @@ func rewriteAndLoadBpf(ipVersion int, l4ProtoNo uint16, port int) (_ *bpfObjects
 		ipVersion: uint8(ipVersion),
 		pad:       0,
 	}); err != nil {
-		return nil, fmt.Errorf("failed to rewrite constants: %+v", err)
+		return nil, fmt.Errorf("failed to rewrite constants: %w", err)
 	}
 	var opts ebpf.CollectionOptions
 	opts.Programs.LogLevel = ebpf.LogLevelInstruction
@@ -130,7 +130,7 @@ func rewriteAndLoadBpf(ipVersion int, l4ProtoNo uint16, port int) (_ *bpfObjects
 		if errors.As(err, &ve) {
 			verifierLog = fmt.Sprintf("Verifier error: %+v\n", ve)
 		}
-		return nil, fmt.Errorf("failed to load BPF: %+v\n%s", err, verifierLog)
+		return nil, fmt.Errorf("failed to load BPF: %w\n%s", err, verifierLog)
 	}
 
 	return &objs, nil
@@ -141,7 +141,7 @@ func searchAvailableTargets() (targets map[string]int, kfreeSkbReasons map[uint6
 
 	btfSpec, err := btf.LoadKernelSpec()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to load kernel BTF: %+v", err)
+		return nil, nil, fmt.Errorf("failed to load kernel BTF: %w", err)
 	}
 
 	if kfreeSkbReasons, err = getKFreeSKBReasons(btfSpec); err != nil {
@@ -185,7 +185,7 @@ func getKFreeSKBReasons(spec *btf.Spec) (map[uint64]string, error) {
 
 	var dropReasonsEnum *btf.Enum
 	if err := spec.TypeByName("skb_drop_reason", &dropReasonsEnum); err != nil {
-		return nil, fmt.Errorf("failed to find 'skb_drop_reason' enum: %v", err)
+		return nil, fmt.Errorf("failed to find 'skb_drop_reason' enum: %w", err)
 	}
 
 	ret := map[uint64]string{}
@@ -316,7 +316,7 @@ func handleEvents(ctx context.Context, objs *bpfObjects, outputFile string, kfre
 
 	eventsReader, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
-		return fmt.Errorf("failed to create ringbuf reader: %+v", err)
+		return fmt.Errorf("failed to create ringbuf reader: %w", err)
 	}
 	defer func() { _ = eventsReader.Close() }()
 

@@ -60,7 +60,7 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 		var u *url.URL
 		u, err = url.Parse(link)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrBadUpstreamFormat, err)
+			return nil, fmt.Errorf("%w: %w", ErrBadUpstreamFormat, err)
 		}
 		r := &UpstreamResolver{
 			Raw:         u,

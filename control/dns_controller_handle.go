@@ -85,7 +85,7 @@ func (c *DnsController) forwardWithFallback(
 
 	fallbackDialArg, chooseErr := c.runtime().chooseBestDnsDialer(ctx, dnsRequestSnapshotFromUDPRequest(req), &fallbackUpstream)
 	if chooseErr != nil {
-		return nil, primaryDialArg, fmt.Errorf("udp forward failed: %w; tcp fallback select failed: %v", primaryErr, chooseErr)
+		return nil, primaryDialArg, fmt.Errorf("udp forward failed: %w; tcp fallback select failed: %w", primaryErr, chooseErr)
 	}
 	if fallbackDialArg == nil || fallbackDialArg.l4proto != consts.L4ProtoStr_TCP {
 		return nil, primaryDialArg, fmt.Errorf("udp forward failed: %w; tcp fallback select returned invalid network", primaryErr)
@@ -104,7 +104,7 @@ func (c *DnsController) forwardWithFallback(
 
 	respMsg, err = c.forwardWithDialArg(fallbackCtx, upstream, fallbackDialArg, data)
 	if err != nil {
-		return nil, fallbackDialArg, fmt.Errorf("udp forward failed: %w; tcp fallback failed: %v", primaryErr, err)
+		return nil, fallbackDialArg, fmt.Errorf("udp forward failed: %w; tcp fallback failed: %w", primaryErr, err)
 	}
 
 	return respMsg, fallbackDialArg, nil

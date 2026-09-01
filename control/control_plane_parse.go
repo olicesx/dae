@@ -21,7 +21,7 @@ func ParseFixedDomainTtl(ks []config.KeyableString) (map[string]int, error) {
 		key, value, _ := strings.Cut(string(k), ":")
 		ttl, err := strconv.ParseInt(strings.TrimSpace(value), 0, strconv.IntSize)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse ttl: %v", err)
+			return nil, fmt.Errorf("failed to parse ttl: %w", err)
 		}
 		m[strings.TrimSpace(key)] = int(ttl)
 	}

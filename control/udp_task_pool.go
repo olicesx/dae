@@ -275,7 +275,7 @@ func (q *UdpTaskQueue) convoy() {
 				continue
 			}
 
-			// CAS refs to lock out new acquireQueue and avoid time.Sleep
+			// CAS refs to lock out new acquireQueue while the queue is removed
 			if !q.refs.CompareAndSwap(0, -1000000) {
 				q.safeTimerReset(timer)
 				continue

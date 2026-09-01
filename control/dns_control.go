@@ -146,7 +146,14 @@ type DnsController struct {
 	concurrencyLimiter chan struct{}
 
 	dnsForwarderIdleTTL time.Duration
-	log                 *logrus.Logger
+	// log is swapped in place by updateRuntime during reload while request
+	// handlers and the janitor may still be running. Readers take the field
+	// without a lock and may observe either generation's logger; that is
+	// tolerated because logrus.Logger is treated as immutable once in use
+	// and the write is a single word. Never store nil: several call sites
+	// branch on log != nil. If this contract ever weakens (e.g. per-request
+	// derived loggers), convert this field to atomic.Pointer[logrus.Logger].
+	log *logrus.Logger
 }
 
 func newDnsControllerStore() *dnsControllerStore {
@@ -243,7 +250,7 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 
 	controller := &DnsController{
 		dnsControllerStore:  newDnsControllerStore(),
-		concurrencyLimiter:  make(chan struct{}, limit), // 0 means no limit (unbuffered channel, always non-blocking)
+		concurrencyLimiter:  make(chan struct{}, limit),
 		log:                 option.Log,
 		dnsForwarderIdleTTL: dnsForwarderIdleTTL, // Use package-level default
 	}

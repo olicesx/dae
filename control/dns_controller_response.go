@@ -204,13 +204,16 @@ func (c *DnsController) sendRejectWithResponseWriter_(dnsMessage *dnsmessage.Msg
 
 // applyPreferenceWait implements RFC 8305 Happy Eyeballs Resolution Delay.
 // When ip_version_prefer is set and a non-preferred A/AAAA response is received,
-// wait briefly (50ms) for the preferred response to arrive before using this one.
+// wait briefly (50ms) for the preferred response to arrive before proceeding.
 //
 // This function handles two scenarios:
 // 1. Non-preferred response arrives (e.g., A when prefer=6): Register wait and wait for preferred
 // 2. Preferred response arrives (e.g., AAAA when prefer=6): Notify any waiting requests
 //
-// The function returns the response to use (preferred if arrived during wait, otherwise original).
+// The original response is always returned unchanged. The wait only delays
+// when the caller releases this response downstream, giving a preferred
+// response a chance to arrive first; the preferred message itself is never
+// substituted here.
 func (c *DnsController) applyPreferenceWait(respMsg *dnsmessage.Msg) *dnsmessage.Msg {
 	c.requireStore()
 	// Fast path: preference not enabled

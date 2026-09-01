@@ -69,9 +69,12 @@ func SendHTTPDNS(ctx context.Context, client *http.Client, target string, upstre
 	if contentType := resp.Header.Get("Content-Type"); contentType != "application/dns-message" {
 		return nil, fmt.Errorf("unexpected content-type: %v", contentType)
 	}
-	// io.ReadAll(LimitReader(body, 64KiB)) is equivalent to ReadFull into a
-	// 64KiB buffer: short reads return io.ErrUnexpectedEOF with the partial
-	// payload, which we treat as success to match ReadAll semantics.
+	// Read the response with io.ReadFull into a 64KiB pooled buffer. A
+	// partial short read terminated by EOF returns io.ErrUnexpectedEOF and is
+	// deliberately treated as success, keeping the partial payload. Note this
+	// diverges from io.ReadAll for the empty body: ReadFull returns io.EOF
+	// when zero bytes were read, which is surfaced as an error here (ReadAll
+	// would have reported an empty, successful message).
 	poolBuf := dnsBufPool.Get().(*[]byte)
 	defer dnsBufPool.Put(poolBuf) //nolint:staticcheck
 	n, err := io.ReadFull(io.LimitReader(resp.Body, maxDNSMessageSize), *poolBuf)

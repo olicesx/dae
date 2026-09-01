@@ -56,6 +56,22 @@ func TestAhocorasickSlimtrie(t *testing.T) {
 	}
 }
 
+func TestAddSetRejectsOutOfBoundsBitIndex(t *testing.T) {
+	// An index equal to bitLength used to panic on the toBuildTrie write;
+	// it must surface as a Build error instead.
+	actrie := NewAhocorasickSlimtrie(logrus.StandardLogger(), 8)
+	actrie.AddSet(8, []string{"example.com"}, consts.RoutingDomainKey_Full)
+	if err := actrie.Build(); err == nil {
+		t.Fatal("Build() error = nil, want out-of-range error for bitIndex == bitLength")
+	}
+
+	negative := NewAhocorasickSlimtrie(logrus.StandardLogger(), 8)
+	negative.AddSet(-1, []string{"example.com"}, consts.RoutingDomainKey_Suffix)
+	if err := negative.Build(); err == nil {
+		t.Fatal("Build() error = nil, want out-of-range error for negative bitIndex")
+	}
+}
+
 func TestMatchDomainBitmapHitReturnsSharedAlias(t *testing.T) {
 	actrie := NewAhocorasickSlimtrie(logrus.StandardLogger(), 32)
 	actrie.AddSet(0, []string{"example.com"}, consts.RoutingDomainKey_Full)

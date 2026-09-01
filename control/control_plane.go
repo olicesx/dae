@@ -303,7 +303,7 @@ func NewControlPlaneWithContextOptions(
 
 	/// Allow the current process to lock memory for eBPF resources.
 	if err = rlimit.RemoveMemlock(); err != nil {
-		return nil, fmt.Errorf("rlimit.RemoveMemlock:%v", err)
+		return nil, fmt.Errorf("rlimit.RemoveMemlock: %w", err)
 	}
 
 	InitDaeNetns(log)
@@ -2351,6 +2351,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				// was never queued, so Run() will not run).
 				c.udpIngressAdmission.release()
 				pktBuf.Put()
+				*task = udpIngressTask{}
 				udpIngressTaskPool.Put(task)
 			}
 			// if d := time.Since(t); d > 100*time.Millisecond {

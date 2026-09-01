@@ -77,7 +77,7 @@ func ParseRawUpstream(raw *url.URL) (scheme UpstreamScheme, hostname string, por
 	}
 	_port, err := strconv.ParseUint(__port, 10, 16)
 	if err != nil {
-		return "", "", 0, "", fmt.Errorf("failed to parse dns_upstream port: %v", err)
+		return "", "", 0, "", fmt.Errorf("failed to parse dns_upstream port: %w", err)
 	}
 	port = uint16(_port)
 	hostname = raw.Hostname()
@@ -95,7 +95,7 @@ type Upstream struct {
 func NewUpstream(ctx context.Context, upstream *url.URL, resolverNetwork string, resolveIp46 resolveUpstreamIp46Func) (up *Upstream, err error) {
 	scheme, hostname, port, path, err := ParseRawUpstream(upstream)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrFormat, err)
+		return nil, fmt.Errorf("%w: %w", ErrFormat, err)
 	}
 
 	ip46 := &netutils.Ip46{}

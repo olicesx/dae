@@ -152,7 +152,7 @@ func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn, ownership
 				}).WithError(err).Debug("Routing tuple missing; fallback to userspace routing")
 			}
 		} else {
-			return fmt.Errorf("failed to retrieve target info %v: %v", dst.String(), err)
+			return fmt.Errorf("failed to retrieve target info %v: %w", dst.String(), err)
 		}
 	}
 	owner, ownerErr := c.routingEpochExecutionOwner(routingResult)

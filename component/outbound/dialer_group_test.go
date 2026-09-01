@@ -52,7 +52,7 @@ func init() {
 
 func newDirectDialer(option *dialer.GlobalOption, fullcone bool) *dialer.Dialer {
 	_d, p := dialer.NewDirectDialer(option, true)
-	d := dialer.NewDialer(_d, option, dialer.InstanceOption{DisableCheck: false}, p)
+	d := dialer.NewDialerContext(context.Background(), _d, option, dialer.InstanceOption{DisableCheck: false}, p)
 	return d
 }
 
@@ -71,7 +71,7 @@ func (noopTestDialer) DialContext(context.Context, string, string) (netproxy.Con
 }
 
 func newNoopDialer(option *dialer.GlobalOption) *dialer.Dialer {
-	return dialer.NewDialer(
+	return dialer.NewDialerContext(context.Background(),
 		noopTestDialer{},
 		option,
 		dialer.InstanceOption{DisableCheck: true},

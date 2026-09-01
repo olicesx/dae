@@ -7,7 +7,6 @@ package control
 
 import (
 	"encoding/binary"
-	"fmt"
 	"maps"
 	"net/netip"
 	"sync"
@@ -386,6 +385,7 @@ type PacketSniffer struct {
 	// Mutex for protecting sniffing operations
 	Mu sync.Mutex
 
+	// All fields below are guarded by Mu, same discipline as ObserveQuicInitial.
 	// Soft negative cache for UDP sniffing: after repeated no-SNI attempts
 	// (timeouts / need-more / not-applicable), bypass sniffing temporarily.
 	noSniStreak      int
@@ -420,10 +420,14 @@ func (ps *PacketSniffer) IsExpired(nowNano int64) bool {
 	return expiresAt > 0 && nowNano >= expiresAt
 }
 
+// ShouldBypassSniff reports whether sniffing is currently soft-bypassed for
+// this flow. The caller must hold ps.Mu.
 func (ps *PacketSniffer) ShouldBypassSniff(now time.Time) bool {
 	return now.Before(ps.bypassSniffUntil)
 }
 
+// RecordSniffNoSni advances the no-SNI streak and arms the temporary bypass
+// once the threshold is reached. The caller must hold ps.Mu.
 func (ps *PacketSniffer) RecordSniffNoSni(now time.Time) {
 	ps.noSniStreak++
 	if ps.noSniStreak >= udpSniffNoSniThreshold {
@@ -432,6 +436,8 @@ func (ps *PacketSniffer) RecordSniffNoSni(now time.Time) {
 	}
 }
 
+// RecordSniffSuccess clears the no-SNI streak and any armed bypass. The
+// caller must hold ps.Mu.
 func (ps *PacketSniffer) RecordSniffSuccess() {
 	ps.noSniStreak = 0
 	ps.bypassSniffUntil = time.Time{}
@@ -656,18 +662,6 @@ func (p *PacketSnifferPool) Close() {
 		<-p.janitorDone
 	}
 	p.Reset()
-}
-
-func (p *PacketSnifferPool) Remove(key PacketSnifferKey, sniffer *PacketSniffer) (err error) {
-	// Use CompareAndDelete for atomic CAS semantics (Go 1.20+ best practice)
-	if !p.pool.CompareAndDelete(key, sniffer) {
-		_ = sniffer.Close()
-		return fmt.Errorf("target udp endpoint is not in the pool")
-	}
-	p.deleteFlowFamilyMember(key, sniffer)
-	p.releaseFlowFamily(key)
-	_ = sniffer.Close()
-	return nil
 }
 
 func (p *PacketSnifferPool) Get(key PacketSnifferKey) *PacketSniffer {

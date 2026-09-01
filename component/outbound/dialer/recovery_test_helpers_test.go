@@ -1,6 +1,7 @@
 package dialer
 
 import (
+	"context"
 	"io"
 	"testing"
 	"time"
@@ -29,7 +30,8 @@ func newNamedTestDialer(t *testing.T, name string) *Dialer {
 	log := logrus.New()
 	log.SetOutput(io.Discard)
 
-	d := NewDialer(
+	d := NewDialerContext(
+		context.Background(),
 		direct.SymmetricDirect,
 		&GlobalOption{
 			Log:            log,

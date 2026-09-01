@@ -576,10 +576,6 @@ func (c *ControlPlane) prepareUnownedUDPCurrentPolicyFallback(src, dst netip.Add
 	return currentPolicyUDPRoutingResult(stale), true, err
 }
 
-func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision, skipSniffing bool) (err error) {
-	return c.handlePktWithPrefetch(lConn, data, src, realDst, routingResult, flowDecision, skipSniffing, nil, UdpEndpointKey{}, false)
-}
-
 func (c *ControlPlane) handlePktWithPrefetch(lConn *net.UDPConn, data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision, skipSniffing bool, prefetched *UdpEndpoint, prefetchKey UdpEndpointKey, prefetchOK bool) (err error) {
 	if handled, retainedErr := c.handleRetainedUDPEndpoint(data, src, realDst, routingResult, flowDecision); handled {
 		return retainedErr
@@ -961,9 +957,10 @@ afterSniffing:
 		routingResult.Mark = c.soMarkFromDae
 	}
 	// Dial and send.
-	// TODO: Rewritten domain should not use full-cone (such as VMess Packet Addr).
-	// 		Maybe we should set up a mapping for UDP: Dialer + Target Domain => Remote Resolved IP.
-	//		However, games may not use QUIC for communication, thus we cannot use domain to dial, which is fine.
+	// Rewritten domains already avoid full-cone endpoints (see
+	// UdpFlowDecision.EndpointKeyForDial). Still open: a mapping of
+	// Dialer + Target Domain => remotely resolved IP so flows whose target is
+	// only known by domain could reuse one endpoint even without QUIC.
 
 	// Get udp endpoint.
 	// foundUeKey captures the endpoint key that the initial Get succeeded with.

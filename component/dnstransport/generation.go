@@ -57,16 +57,3 @@ func ReleaseHTTPClientGeneration(mu *sync.Mutex, g *HTTPClientGeneration, forget
 		mu.Unlock()
 	}
 }
-
-// RetireHTTPClientGeneration marks g retired under mu and reports whether it
-// already drained and must be closed (and forgotten) by the caller.
-func RetireHTTPClientGeneration(mu *sync.Mutex, g *HTTPClientGeneration) bool {
-	if g == nil {
-		return false
-	}
-	mu.Lock()
-	g.Retired = true
-	drained := g.Active == 0
-	mu.Unlock()
-	return drained
-}

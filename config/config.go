@@ -56,10 +56,6 @@ type Global struct {
 	BpfConnStateMapSize    uint32        `mapstructure:"bpf_conn_state_map_size" default:"262144"`
 }
 
-type Utls struct {
-	Imitate string `mapstructure:"imitate"`
-}
-
 type FunctionOrString any
 
 // ParseFunctionOrString converts a config value that may be either a string or
@@ -80,17 +76,6 @@ func ParseFunctionOrString(fs FunctionOrString) (*config_parser.Function, error)
 	}
 }
 
-// FunctionOrStringToFunction converts a function-or-string config value into a
-// function. It preserves the historical panic-on-invalid-input API for external
-// callers; new internal call sites should use ParseFunctionOrString.
-func FunctionOrStringToFunction(fs FunctionOrString) *config_parser.Function {
-	f, err := ParseFunctionOrString(fs)
-	if err != nil {
-		panic(err)
-	}
-	return f
-}
-
 type FunctionListOrString any
 
 // ParseFunctionListOrString converts a config value that may be either a string
@@ -106,18 +91,6 @@ func ParseFunctionListOrString(fs FunctionListOrString) ([]*config_parser.Functi
 	default:
 		return nil, fmt.Errorf("unsupported function-list-or-string value type: %T", fs)
 	}
-}
-
-// FunctionListOrStringToFunctionList converts a function-list-or-string config
-// value into a function list. It preserves the historical panic-on-invalid-input
-// API for external callers; new internal call sites should use
-// ParseFunctionListOrString.
-func FunctionListOrStringToFunctionList(fs FunctionListOrString) []*config_parser.Function {
-	f, err := ParseFunctionListOrString(fs)
-	if err != nil {
-		panic(err)
-	}
-	return f
 }
 
 type Group struct {

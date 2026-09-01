@@ -279,10 +279,6 @@ type TcpCheckOption struct {
 	Method string
 }
 
-func ParseTcpCheckOption(ctx context.Context, rawURL []string, method string, resolverNetwork string) (opt *TcpCheckOption, err error) {
-	return parseTcpCheckOption(ctx, rawURL, method, resolverNetwork, direct.SymmetricDirect, nil)
-}
-
 func parseTcpCheckOption(ctx context.Context, rawURL []string, method string, resolverNetwork string, directDialer netproxy.Dialer, systemDNSResolver SystemDNSResolver) (opt *TcpCheckOption, err error) {
 	if directDialer == nil {
 		directDialer = direct.SymmetricDirect
@@ -339,10 +335,6 @@ type CheckDnsOption struct {
 	*netutils.Ip46
 }
 
-func ParseCheckDnsOption(ctx context.Context, dnsHostPort []string, resolverNetwork string) (opt *CheckDnsOption, err error) {
-	return parseCheckDNSOption(ctx, dnsHostPort, resolverNetwork, direct.SymmetricDirect, nil)
-}
-
 func parseCheckDNSOption(ctx context.Context, dnsHostPort []string, resolverNetwork string, directDialer netproxy.Dialer, systemDNSResolver SystemDNSResolver) (opt *CheckDnsOption, err error) {
 	if directDialer == nil {
 		directDialer = direct.SymmetricDirect
@@ -377,7 +369,7 @@ func parseCheckDNSOption(ctx context.Context, dnsHostPort []string, resolverNetw
 	}
 	port, err := strconv.ParseUint(_port, 10, 16)
 	if err != nil {
-		return nil, fmt.Errorf("bad port: %v", err)
+		return nil, fmt.Errorf("bad port: %w", err)
 	}
 	var ip46 *netutils.Ip46
 	if len(dnsHostPort) > 1 {
@@ -977,7 +969,9 @@ func (d *Dialer) logUnavailable(
 		if commonerrors.IsNetworkUnreachable(err) {
 			err = fmt.Errorf("network is unreachable")
 		} else if commonerrors.IsAddressNotSuitable(err) {
-			err = fmt.Errorf("IPv%v is not supported", network.IpVersion)
+			// EADDRNOTAVAIL means no usable source address of this family on
+			// the host, not that the family is unsupported per se.
+			err = fmt.Errorf("no usable IPv%v source address", network.IpVersion)
 		}
 		d.Log.WithFields(logrus.Fields{
 			"network": network.String(),

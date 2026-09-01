@@ -110,6 +110,7 @@ type Dialer struct {
 	httpClients  map[string]*http.Client
 	httpClientMu sync.Mutex
 
+	// failCount is guarded by collectionFineMu (markUnavailableInternal/markAvailable/RestoreHealthSnapshot).
 	failCount        [8]int
 	trafficFailCount [8]atomic.Int32
 
@@ -183,7 +184,13 @@ type SystemDNSResolver interface {
 
 type GlobalOption struct {
 	D.ExtraOption
-	Log                  *logrus.Logger
+	Log *logrus.Logger
+	// DaeDNS optionally wraps node dialers for dae-DNS-backed resolution.
+	// It is nulled by retireForEstablishedFlows (under metadataMu) when the
+	// owning generation retires. Readers such as the dialer registration path
+	// access it without metadataMu; that is safe because retirement strictly
+	// post-dates dialer construction, so a reader either sees the live router
+	// or has already finished constructing against it.
 	DaeDNS               *daedns.Router
 	DirectDialer         netproxy.Dialer
 	FullconeDirectDialer netproxy.Dialer
@@ -272,11 +279,6 @@ func (o *GlobalOption) SetRuntimeDependencies(directDialer, fullconeDirectDialer
 	o.TcpCheckOptionRaw.SystemDNSResolver = systemDNSResolver
 	o.CheckDnsOptionRaw.DirectDialer = directDialer
 	o.CheckDnsOptionRaw.SystemDNSResolver = systemDNSResolver
-}
-
-// NewDialer is for register in general.
-func NewDialer(dialer netproxy.Dialer, option *GlobalOption, iOption InstanceOption, property *Property) *Dialer {
-	return NewDialerContext(context.Background(), dialer, option, iOption, property)
 }
 
 // NewDialerContext is for internal use with lifecycle management.

@@ -126,10 +126,6 @@ var (
 
 	CheckBatchDeleteFeatureOnce sync.Once
 	SimulateBatchDelete         bool
-
-	bpfMapBatchLookup = func(m *ebpf.Map, cursor *ebpf.MapBatchCursor, keysOut interface{}, valuesOut interface{}) (int, error) {
-		return m.BatchLookup(cursor, keysOut, valuesOut, nil)
-	}
 )
 
 func initBatchDeleteFeatureFlags() {

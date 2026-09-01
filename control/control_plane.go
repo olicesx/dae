@@ -603,6 +603,22 @@ func NewControlPlaneWithContextOptions(
 		return nil, fmt.Errorf("ApplyRulesOptimizers error:\n%w", err)
 	}
 	routingA.Rules = nil // Release.
+	// Device-scoped whitelists (selector && domain -> group followed by a
+	// selector-only -> direct/block line) cannot match in kernel space when
+	// the client's DNS bypasses dae: the domain half has no bitmap and every
+	// connection of the device falls to the fallback. With sniffing
+	// available, inject kernel-space-only sniff-punt lines so those
+	// connections are re-routed userspace-side from the sniffed domain.
+	// Runs before the policy identity is derived so the injected lines are
+	// part of the policy hash.
+	if sniffingTimeout > 0 && global.AutoSniffPunt {
+		var injections []routing.SniffPuntInjection
+		routingProgram.Rules, injections = routing.InferSniffPunt(routingProgram.Rules)
+		for _, inj := range injections {
+			log.Infof("Auto sniff-punt: injected %v -> %v before rule #%v; connections of this selector without kernel-space domain knowledge are sniffed and re-routed from the sniffed domain",
+				inj.Selector, consts.OutboundControlPlaneRouting.String(), inj.FallbackRuleIndex)
+		}
+	}
 	policyEpoch := routing.PolicyEpoch(policyEpochSequence.Add(1))
 	policyIdentity, err := routing.NewPolicyIdentity(policyEpoch, routingProgram)
 	if err != nil {

@@ -41,19 +41,25 @@ type Global struct {
 	// Deprecated: not used as of https://github.com/daeuniverse/dae/pull/458.
 	AutoConfigFirewallRule bool          `mapstructure:"auto_config_firewall_rule" default:"false"`
 	SniffingTimeout        time.Duration `mapstructure:"sniffing_timeout" default:"30ms"`
-	TlsImplementation      string        `mapstructure:"tls_implementation" default:"tls"`
-	UtlsImitate            string        `mapstructure:"utls_imitate" default:"chrome_auto"`
-	TlsFragment            bool          `mapstructure:"tls_fragment" default:"false"`
-	TlsFragmentLength      string        `mapstructure:"tls_fragment_length" default:"50-100"`
-	TlsFragmentInterval    string        `mapstructure:"tls_fragment_interval" default:"10-20"`
-	PprofPort              uint16        `mapstructure:"pprof_port" default:"0"`
-	Mptcp                  bool          `mapstructure:"mptcp" default:"false"`
-	BootstrapResolver      string        `mapstructure:"bootstrap_resolver"`
-	FallbackResolver       string        `mapstructure:"fallback_resolver" default:"8.8.8.8:53"`
-	BandwidthMaxTx         string        `mapstructure:"bandwidth_max_tx" default:"0"`
-	BandwidthMaxRx         string        `mapstructure:"bandwidth_max_rx" default:"0"`
-	UDPHopInterval         time.Duration `mapstructure:"udphop_interval" default:"30s"`
-	BpfConnStateMapSize    uint32        `mapstructure:"bpf_conn_state_map_size" default:"262144"`
+	// AutoSniffPunt injects kernel-space-only sniff-punt lines for
+	// device-scoped whitelist shapes (selector && domain -> group with a
+	// later selector -> direct/block fallback) so the whitelist still
+	// applies when the client's DNS bypasses dae. Requires sniffing to be
+	// enabled (sniffing_timeout > 0 and dial_mode != ip).
+	AutoSniffPunt       bool          `mapstructure:"auto_sniff_punt" default:"true"`
+	TlsImplementation   string        `mapstructure:"tls_implementation" default:"tls"`
+	UtlsImitate         string        `mapstructure:"utls_imitate" default:"chrome_auto"`
+	TlsFragment         bool          `mapstructure:"tls_fragment" default:"false"`
+	TlsFragmentLength   string        `mapstructure:"tls_fragment_length" default:"50-100"`
+	TlsFragmentInterval string        `mapstructure:"tls_fragment_interval" default:"10-20"`
+	PprofPort           uint16        `mapstructure:"pprof_port" default:"0"`
+	Mptcp               bool          `mapstructure:"mptcp" default:"false"`
+	BootstrapResolver   string        `mapstructure:"bootstrap_resolver"`
+	FallbackResolver    string        `mapstructure:"fallback_resolver" default:"8.8.8.8:53"`
+	BandwidthMaxTx      string        `mapstructure:"bandwidth_max_tx" default:"0"`
+	BandwidthMaxRx      string        `mapstructure:"bandwidth_max_rx" default:"0"`
+	UDPHopInterval      time.Duration `mapstructure:"udphop_interval" default:"30s"`
+	BpfConnStateMapSize uint32        `mapstructure:"bpf_conn_state_map_size" default:"262144"`
 }
 
 type FunctionOrString any

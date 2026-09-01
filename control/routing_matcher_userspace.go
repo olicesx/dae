@@ -304,6 +304,14 @@ func (m *RoutingMatcher) Match(
 					must = true
 					continue
 				}
+				if outbound == consts.OutboundControlPlaneRouting {
+					// Implicit sniff-punt lines exist only in the kernel-space
+					// projection: once a connection has been punted and
+					// sniffed, userspace must re-route over the remaining
+					// rules as if this line did not exist.
+					badRule = false
+					continue
+				}
 				return outbound, match.mark, match.must || must, nil
 			}
 			badRule = false

@@ -51,6 +51,25 @@ ipversion(6) -> ipv6_group
 ### Source MAC rule
 mac('02:42:ac:11:00:02') -> direct
 
+#### Device-scoped domain whitelist (auto sniff-punt)
+
+```shell
+mac('aa:bb:cc:dd:ee:ff') && domain(geosite:docker, suffix:quay.io, geosite:github) -> my_group
+mac('aa:bb:cc:dd:ee:ff') -> direct
+```
+
+Domain conditions need domain knowledge that only exists when the device's DNS
+goes through dae. If the device uses encrypted DNS (DoH/DoT), the whitelist
+would silently degrade and all of its traffic would land on the fallback. dae
+detects this shape (single-host `mac`/`sip` selector + positive `domain`
+conditions + a later selector-only `direct`/`block` fallback) and automatically
+inserts a kernel-space-only sniff-punt line before the fallback: connections
+without domain knowledge are sent to userspace, sniffed (TLS SNI / HTTP host /
+QUIC), and re-routed over the same rule set with the sniffed domain.
+Non-whitelisted traffic of that device still lands on the fallback, relayed
+through userspace. Requires sniffing to be enabled (`sniffing_timeout > 0`,
+`dial_mode != ip`); disable with `auto_sniff_punt: false`.
+
 ### Process Name rule (only support localhost process when binding to WAN)
 pname(curl) -> direct
 

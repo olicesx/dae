@@ -122,7 +122,12 @@ func (c *DnsController) updateRuntime(option *DnsControllerOption, routing *dns.
 	c.optimisticCacheEnabled.Store(optimisticCacheEnabled)
 	c.optimisticCacheTtl.Store(int64(optimisticCacheTtl))
 	c.maxCacheSize.Store(int64(maxCacheSize))
-	c.log = option.Log
+	// c.log is deliberately NOT reassigned here: the controller is published
+	// while request handlers and the janitor run, and an unlocked field write
+	// would be a data race. Reloads never introduce a new logger instance
+	// anyway — the daemon mutates the single shared logger in place (see
+	// cmd/run_reload_worker.go logger.SetLogger), so the construction-time
+	// pointer stays correct across generations.
 	lifecycleCtx := option.LifecycleContext
 	if lifecycleCtx == nil {
 		lifecycleCtx = context.Background()

@@ -206,6 +206,11 @@ func (b *RoutingMatcherBuilder) outboundToId(outbound string) (uint8, error) {
 		outboundId = uint8(consts.OutboundLogicalAnd)
 	case consts.OutboundMustRules.String():
 		outboundId = uint8(consts.OutboundMustRules)
+	case consts.OutboundControlPlaneRouting.String():
+		// Implicit sniff-punt lines steer unknown-domain traffic of a device
+		// whitelist to userspace for sniffed-domain re-routing. They carry no
+		// group and must never register as a health-checked reference.
+		outboundId = uint8(consts.OutboundControlPlaneRouting)
 	default:
 		var ok bool
 		outboundId, ok = b.outboundName2Id[outbound]

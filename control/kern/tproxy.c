@@ -2690,6 +2690,15 @@ static __noinline bool
 wan_outbound_is_alive(struct __sk_buff *skb, __u8 outbound, __u8 l4proto,
 		      __be16 dport)
 {
+	/* Reserved outbounds (must_rules, control-plane routing, logical
+	 * markers) have no connectivity entries: the map below is sized for
+	 * user-defined ids only, so a reserved id would read a zeroed entry
+	 * and silently drop the flow. This includes the control-plane punt
+	 * outbound used by implicit sniff-punt rules; DNS bypasses below for
+	 * the same reason. */
+	if (outbound >= OUTBOUND_MUST_RULES)
+		return true;
+
 	/* DNS must always reach control plane; userspace handles fallback. */
 	if (dport == bpf_htons(53))
 		return true;

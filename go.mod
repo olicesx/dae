@@ -123,4 +123,4 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260831
 // Remote outbound fork: Trojan UDP CRLF, sticky role-header dispatch,
 // scoped h2 MarkDead, 8KiB direct small-tier, TUIC stream-parse bench,
 // and protocol lifecycle/framing/short-write hardening.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260901044624-e36e8ff8dcbe
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260901074714-c3d799e1815d

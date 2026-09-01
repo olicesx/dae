@@ -146,13 +146,16 @@ type DnsController struct {
 	concurrencyLimiter chan struct{}
 
 	dnsForwarderIdleTTL time.Duration
-	// log is swapped in place by updateRuntime during reload while request
-	// handlers and the janitor may still be running. Readers take the field
-	// without a lock and may observe either generation's logger; that is
-	// tolerated because logrus.Logger is treated as immutable once in use
-	// and the write is a single word. Never store nil: several call sites
-	// branch on log != nil. If this contract ever weakens (e.g. per-request
-	// derived loggers), convert this field to atomic.Pointer[logrus.Logger].
+	// log is assigned only at construction (NewDnsController) and never
+	// rewritten afterwards, so lock-free readers are race-free. Reloads keep
+	// it valid without reassignment: the daemon builds exactly one
+	// logrus.Logger (cmd/run.go) and mutates it in place on reload via
+	// logger.SetLogger (SetLevel/SetFormatter are mutex-safe), so the
+	// construction-time pointer stays correct across generations. Never store
+	// nil: several call sites branch on log != nil. If per-generation loggers
+	// are ever introduced (e.g. per-generation log files), convert this field
+	// to atomic.Pointer[logrus.Logger] and re-add the updateRuntime
+	// assignment.
 	log *logrus.Logger
 }
 

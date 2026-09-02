@@ -14,8 +14,8 @@ import (
 
 func newCapacityTestDnsController(maxEntries int) *DnsController {
 	controller := newTestDnsController()
-	controller.maxCacheSize.Store(int64(maxEntries))
 	setTestDnsControllerRuntime(controller, func(rt *dnsControllerRuntimeState) {
+		rt.maxCacheSize = maxEntries
 		rt.routeProjectionEpoch = 1
 		rt.newCache = func(_ string, answers, ns, extra []dnsmessage.RR, deadline, originalDeadline time.Time) (*DnsCache, error) {
 			return &DnsCache{

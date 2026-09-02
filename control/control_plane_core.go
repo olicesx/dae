@@ -35,10 +35,12 @@ type cgroupAttachment interface {
 	io.Closer
 }
 
-var detectCgroupPathFunc = detectCgroupPath
-var attachCgroupFunc = func(opts ciliumLink.CgroupOptions) (cgroupAttachment, error) {
-	return ciliumLink.AttachCgroup(opts)
-}
+var (
+	detectCgroupPathFunc = detectCgroupPath
+	attachCgroupFunc     = func(opts ciliumLink.CgroupOptions) (cgroupAttachment, error) {
+		return ciliumLink.AttachCgroup(opts)
+	}
+)
 
 type sharedUdpConnStateTrackerEntry struct {
 	tracker *udpConnStateTracker
@@ -180,10 +182,9 @@ type controlPlaneCore struct {
 	// routingEpochActiveSlotCache short-circuits readActiveRoutingEpochSlot.
 	// The active slot only changes on PublishRoutingEpoch/RollbackRoutingEpoch,
 	// so the per-packet eBPF lookup on the UDP hot path is pure waste
-	// (measured ~15% CPU under saturated UDP ingress).
-	routingEpochActiveSlotCachedAt    atomic.Int64
-	routingEpochActiveSlotCached      atomic.Uint32
-	routingEpochActiveSlotCachedValid atomic.Bool
+	// (measured ~15% CPU under saturated UDP ingress). One immutable snapshot
+	// also keeps the slot and freshness metadata generation-consistent.
+	routingEpochActiveSlotCache atomic.Pointer[routingEpochActiveSlotSnapshot]
 	// lpmTrieIndices holds the LPM array-map slot indices owned by this
 	// generation. Guarded by mu: Close deletes them, and
 	// buildRoutingKernspaceForSlot/ReplaceLpmIndices rewrite them under the

@@ -84,16 +84,12 @@ type DnsControllerOption struct {
 
 type dnsControllerStore struct {
 	// dnsCache uses sync.Map for lock-free concurrent access
-	dnsCache               sync.Map // map[string]*DnsCache
-	dnsCacheSize           atomic.Int64
-	dnsKnowledge           sync.Map // map[string]int64 (base cache key -> original deadline unix nano)
-	dnsKnowledgeMu         sync.Mutex
-	qtypePrefer            atomic.Uint32
-	optimisticCacheEnabled atomic.Bool
-	optimisticCacheTtl     atomic.Int64 // seconds, 0 means never expire
-	maxCacheSize           atomic.Int64 // maximum number of cache entries (0 = unlimited)
-	// runtimeState belongs to the shared store so long-lived workers always
-	// observe the latest reload facade instead of the facade that started them.
+	dnsCache       sync.Map // map[string]*DnsCache
+	dnsCacheSize   atomic.Int64
+	dnsKnowledge   sync.Map // map[string]int64 (base cache key -> original deadline unix nano)
+	dnsKnowledgeMu sync.Mutex
+	// runtimeState owns the complete immutable runtime and behavior snapshot so
+	// one load cannot combine fields from different reload generations.
 	runtimeState      atomic.Pointer[dnsControllerRuntimeState]
 	runtimeMu         sync.RWMutex // Serializes runtime publication with reload cache projection.
 	cacheProjectionMu sync.RWMutex // Serializes cache membership with BPF projection callbacks.
@@ -212,11 +208,6 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 		option = &DnsControllerOption{}
 	}
 
-	prefer, optimisticCacheEnabled, optimisticCacheTtl, maxCacheSize, err := normalizeDnsRuntimeBehavior(option)
-	if err != nil {
-		return nil, err
-	}
-
 	// Set concurrency limit for DNS queries
 	// This prevents resource exhaustion from DNS query storms.
 	//
@@ -257,10 +248,6 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 		log:                 option.Log,
 		dnsForwarderIdleTTL: dnsForwarderIdleTTL, // Use package-level default
 	}
-	controller.qtypePrefer.Store(uint32(prefer))
-	controller.optimisticCacheEnabled.Store(optimisticCacheEnabled)
-	controller.optimisticCacheTtl.Store(int64(optimisticCacheTtl))
-	controller.maxCacheSize.Store(int64(maxCacheSize))
 	if err := controller.TryUpdateRuntime(option, routing); err != nil {
 		return nil, err
 	}
@@ -420,17 +407,15 @@ func (c *DnsController) closeHandleGate() {
 	}
 }
 
-var (
-	// Pre-computed strings for common DNS query types to reduce allocations
-	// in the hot path. Fallback to strconv.Itoa for uncommon types.
-	qtypeStrCache = map[uint16]string{
-		dnsmessage.TypeA:     "1",
-		dnsmessage.TypeNS:    "2",
-		dnsmessage.TypeCNAME: "5",
-		dnsmessage.TypePTR:   "12",
-		dnsmessage.TypeMX:    "15",
-		dnsmessage.TypeTXT:   "16",
-		dnsmessage.TypeAAAA:  "28",
-		dnsmessage.TypeSRV:   "33",
-	}
-)
+// Pre-computed strings for common DNS query types to reduce allocations
+// in the hot path. Fallback to strconv.Itoa for uncommon types.
+var qtypeStrCache = map[uint16]string{
+	dnsmessage.TypeA:     "1",
+	dnsmessage.TypeNS:    "2",
+	dnsmessage.TypeCNAME: "5",
+	dnsmessage.TypePTR:   "12",
+	dnsmessage.TypeMX:    "15",
+	dnsmessage.TypeTXT:   "16",
+	dnsmessage.TypeAAAA:  "28",
+	dnsmessage.TypeSRV:   "33",
+}

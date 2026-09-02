@@ -244,12 +244,12 @@ func (c *ControlPlane) CommitPreparedDatapath() error {
 	// succeeds the kernel keeps routing through the previous slot, so a
 	// failure above leaves the old policy serving rather than a half-written
 	// new one.
-	if err := c.core.PublishRoutingEpoch(); err != nil {
+	if err := c.publishRoutingEpoch(); err != nil {
 		return fmt.Errorf("publish routing epoch: %w", err)
 	}
 	if c.bpfMaintenance != nil {
 		if err := c.activateBpfMaintenance(); err != nil {
-			if rollbackErr := c.core.RollbackRoutingEpoch(); rollbackErr != nil {
+			if rollbackErr := c.rollbackRoutingEpoch(); rollbackErr != nil {
 				return stderrors.Join(err, rollbackErr)
 			}
 			return err
@@ -304,7 +304,7 @@ func (c *ControlPlane) RebuildReloadDatapath() error {
 		return nil
 	}
 	c.log.Warnln("[Reload] Rolling back to the previous routing epoch after staged handoff failure")
-	if err := c.core.PublishRoutingEpoch(); err != nil {
+	if err := c.publishRoutingEpoch(); err != nil {
 		return fmt.Errorf("publish previous routing epoch: %w", err)
 	}
 	c.core.activateBpfHookFlip()
@@ -338,7 +338,7 @@ func (c *ControlPlane) RestoreDatapathForReloadRollback() error {
 	if err := c.replayDnsReloadCache(); err != nil {
 		return fmt.Errorf("restore DNS reload cache: %w", err)
 	}
-	if err := c.core.PublishRoutingEpoch(); err != nil {
+	if err := c.publishRoutingEpoch(); err != nil {
 		return fmt.Errorf("restore publish routing epoch: %w", err)
 	}
 	c.core.activateBpfHookFlip()

@@ -5,6 +5,11 @@ on:
     paths:
       - "**/*.c"
       - "**/*.h"
+      - "control/**/*.go"
+      - "pkg/ebpf_internal/**"
+      - "trace/**"
+      - "scripts/ebpf-audit.sh"
+      - "Makefile"
       - "go.mod"
       - "go.sum"
       - ".github/workflows/bpf-test.yml"
@@ -15,6 +20,11 @@ on:
     paths:
       - "**/*.c"
       - "**/*.h"
+      - "control/**/*.go"
+      - "pkg/ebpf_internal/**"
+      - "trace/**"
+      - "scripts/ebpf-audit.sh"
+      - "Makefile"
       - "go.mod"
       - "go.sum"
       - ".github/workflows/bpf-test.yml"
@@ -25,7 +35,6 @@ jobs:
   bpf_tests:
     name: BPF Unit Test
     runs-on: ubuntu-latest
-    continue-on-error: true
     strategy:
       matrix:
         env:
@@ -46,10 +55,35 @@ jobs:
         env: ${{ matrix.env }}
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y clang-$VERSION llvm-$VERSION
+          sudo apt-get install -y clang-$VERSION llvm-$VERSION iproute2 iputils-ping
 
       - name: Run BPF tests
         env: ${{ matrix.env }}
         run: |
           git submodule update --init
           sudo CLANG=clang-$VERSION make ebpf-test || (echo "Run 'make ebpf-test' locally to investigate failures"; exit 1)
+          if [ "$VERSION" = 19 ]; then
+            sudo CLANG=clang-$VERSION make ebpf
+            go test -c ./control -o /tmp/dae-control-hookset.test
+            sudo /tmp/dae-control-hookset.test -test.run '^TestTCHookSetKernelUpdateAndRollback$' -test.count=1
+          fi
+
+  bpf_abi_big_endian:
+    name: BPF ABI (s390x)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d632683dd7b4114ad314bca15554477dd762a938 # v4.2.0
+        with:
+          persist-credentials: false
+
+      - name: Install s390x emulator
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y qemu-user-static
+
+      - name: Run BPF ABI tests on big-endian target
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=s390x go test -tags dae_stub_ebpf -c ./control -o /tmp/dae-control-s390x.test
+          qemu-s390x-static /tmp/dae-control-s390x.test -test.run 'Test(NativeBpfABI|BpfHostABI|ParseDaeEvent)' -test.count=1

@@ -6,7 +6,6 @@
 package control
 
 import (
-	"encoding/binary"
 	"fmt"
 	"net"
 	"net/netip"
@@ -112,7 +111,7 @@ func compileRoutingMatch(match bpfMatchSet) (compiledRoutingMatch, error) {
 
 	switch compiled.matchType {
 	case consts.MatchType_IpSet, consts.MatchType_SourceIpSet, consts.MatchType_Mac:
-		compiled.lpmIndex = binary.LittleEndian.Uint32(match.Value[:4])
+		compiled.lpmIndex = nativeBpfABI.uint32(match.Value[:4])
 	case consts.MatchType_Port, consts.MatchType_SourcePort:
 		compiled.portStart, compiled.portEnd = ParsePortRange(match.Value[:])
 	case consts.MatchType_IpVersion, consts.MatchType_L4Proto:

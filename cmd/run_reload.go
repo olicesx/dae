@@ -19,6 +19,8 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+var errTCHookOwnershipRestore = errors.New("TC HookSet ownership restore failed")
+
 func canRecoverReloadReadinessFailure(result reloadReadyWaitResult) bool {
 	return result == reloadReadyWaitFailed
 }
@@ -189,11 +191,28 @@ func rollbackFreshDatapathReloadHandoff(log *logrus.Logger, handoff *stagedReloa
 			handoff.flowDatapathAdopted = false
 		}
 	}
+	if handoff.tcHookSetAdopted && handoff.newControlPlane != nil {
+		if err := restoreTCHookSetOwnershipFunc(handoff.newControlPlane, handoff.oldControlPlane); err != nil {
+			rollbackCleanupErrs = append(rollbackCleanupErrs,
+				errTCHookOwnershipRestore,
+				fmt.Errorf("restore previous TC HookSet owner: %w", err),
+			)
+			return nil, errors.Join(rollbackCleanupErrs...)
+		}
+		handoff.tcHookSetAdopted = false
+	}
 	if handoff.hookFlipCommitted && handoff.newControlPlane != nil {
 		if err := handoff.newControlPlane.RollbackPreparedBpfHookFlip(); err != nil {
 			rollbackCleanupErrs = append(rollbackCleanupErrs, fmt.Errorf("restore previous BPF hook flip: %w", err))
 		} else {
 			handoff.hookFlipCommitted = false
+		}
+	}
+	if handoff.tcHookHandoffPrepared && !handoff.tcHookSetAdopted && !handoff.hookFlipCommitted && handoff.newControlPlane != nil {
+		if err := handoff.newControlPlane.ClearPreparedTCHookHandoff(); err != nil {
+			rollbackCleanupErrs = append(rollbackCleanupErrs, fmt.Errorf("clear prepared TC HookSet handoff: %w", err))
+		} else {
+			handoff.tcHookHandoffPrepared = false
 		}
 	}
 	if handoff.newControlPlane != nil {
@@ -289,6 +308,9 @@ func restoreStagedReloadHandoff(log *logrus.Logger, handoff *stagedReloadHandoff
 
 	var errs []error
 	if err := rollbackStagedReloadHandoff(log, handoff); err != nil {
+		if errors.Is(err, errTCHookOwnershipRestore) {
+			return err
+		}
 		errs = append(errs, err)
 	}
 	if handoff.oldControlPlane == nil {
@@ -335,6 +357,31 @@ func rollbackStagedReloadHandoff(log *logrus.Logger, handoff *stagedReloadHandof
 			handoff.dnsControllerMoved = false
 			handoff.dnsListenerMoved = false
 			handoff.oldDNSListenerActive = listenerActive
+		}
+	}
+
+	if handoff.tcHookSetAdopted && handoff.newControlPlane != nil {
+		if err := restoreTCHookSetOwnershipFunc(handoff.newControlPlane, handoff.oldControlPlane); err != nil {
+			errs = append(errs,
+				errTCHookOwnershipRestore,
+				fmt.Errorf("restore previous TC HookSet owner: %w", err),
+			)
+			return errors.Join(errs...)
+		}
+		handoff.tcHookSetAdopted = false
+	}
+	if handoff.hookFlipCommitted && handoff.newControlPlane != nil {
+		if err := handoff.newControlPlane.RollbackPreparedBpfHookFlip(); err != nil {
+			errs = append(errs, fmt.Errorf("restore previous BPF hooks: %w", err))
+		} else {
+			handoff.hookFlipCommitted = false
+		}
+	}
+	if handoff.tcHookHandoffPrepared && !handoff.tcHookSetAdopted && !handoff.hookFlipCommitted && handoff.newControlPlane != nil {
+		if err := handoff.newControlPlane.ClearPreparedTCHookHandoff(); err != nil {
+			errs = append(errs, fmt.Errorf("clear prepared TC HookSet handoff: %w", err))
+		} else {
+			handoff.tcHookHandoffPrepared = false
 		}
 	}
 

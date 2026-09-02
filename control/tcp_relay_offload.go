@@ -21,6 +21,19 @@ var tcpRelayOffloadPrograms = []string{
 	"tcp_offload_sent_account_kprobe",
 }
 
+func tcpRelayOffloadProgramsForArch(goarch string) []string {
+	if tcpOffloadKprobeFallbackSupported(goarch) {
+		return tcpRelayOffloadPrograms
+	}
+	programs := make([]string, 0, len(tcpRelayOffloadPrograms)-1)
+	for _, name := range tcpRelayOffloadPrograms {
+		if name != "tcp_offload_sent_account_kprobe" {
+			programs = append(programs, name)
+		}
+	}
+	return programs
+}
+
 var tcpRelayOffloadMaps = []string{
 	"fast_sock",
 	"tcp_offload_pause",

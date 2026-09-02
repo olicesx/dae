@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"runtime"
 
 	"github.com/cilium/ebpf"
 	ciliumLink "github.com/cilium/ebpf/link"
@@ -105,6 +106,67 @@ func (c *controlPlaneCore) delQdisc(link netlink.Link) error {
 	return nil
 }
 
+func makeTCHookSpec(scope tcHookScope, link netlink.Link, direction tcHookDirection, priority uint16, major uint16, program *ebpf.Program, name string, run func(func() error) error) tcHookSpec {
+	return tcHookSpec{
+		Scope:     scope,
+		Ifindex:   link.Attrs().Index,
+		Ifname:    link.Attrs().Name,
+		Direction: direction,
+		Priority:  priority,
+		Handle:    netlink.MakeHandle(major, priority*2),
+		Name:      name,
+		Program:   program,
+		Run:       run,
+	}
+}
+
+func (c *controlPlaneCore) configureTCHookPatterns(lanPatterns, wanPatterns []string) {
+	c.interfacePatternMu.Lock()
+	c.tcHookLanPatterns = append(c.tcHookLanPatterns[:0], lanPatterns...)
+	c.tcHookWanPatterns = append(c.tcHookWanPatterns[:0], wanPatterns...)
+	c.interfacePatternMu.Unlock()
+}
+
+func (c *controlPlaneCore) isDualRoleTCInterface(ifname string) bool {
+	c.interfacePatternMu.Lock()
+	defer c.interfacePatternMu.Unlock()
+	return matchesAnyInterfacePattern(c.tcHookLanPatterns, ifname) &&
+		matchesAnyInterfacePattern(c.tcHookWanPatterns, ifname)
+}
+
+func matchesAnyInterfacePattern(patterns []string, ifname string) bool {
+	for _, pattern := range patterns {
+		if matched, err := path.Match(pattern, ifname); err == nil && matched {
+			return true
+		}
+	}
+	return false
+}
+
+type dualRoleTCHookPrograms struct {
+	ingress     *ebpf.Program
+	ingressName string
+	egress      *ebpf.Program
+	egressName  string
+}
+
+func selectDualRoleTCHookPrograms(bpf *bpfObjects, layer2 bool) dualRoleTCHookPrograms {
+	if layer2 {
+		return dualRoleTCHookPrograms{
+			ingress:     bpf.TproxyWanLanIngressL2,
+			ingressName: consts.AppName + "_wan_lan_ingress_l2",
+			egress:      bpf.TproxyLanWanEgressL2,
+			egressName:  consts.AppName + "_lan_wan_egress_l2",
+		}
+	}
+	return dualRoleTCHookPrograms{
+		ingress:     bpf.TproxyWanLanIngressL3,
+		ingressName: consts.AppName + "_wan_lan_ingress_l3",
+		egress:      bpf.TproxyLanWanEgressL3,
+		egressName:  consts.AppName + "_lan_wan_egress_l3",
+	}
+}
+
 // bindLan automatically configures kernel parameters and bind to lan interface `ifname`.
 // bindLan supports lazy-bind if interface `ifname` is not found.
 // bindLan supports rebinding when the interface `ifname` is detected in the future.
@@ -137,6 +199,9 @@ func (c *controlPlaneCore) bindLan(ifname string, autoConfigKernelParameter bool
 			return
 		}
 		c.log.Warnf("Link deletion of '%v' is detected. Bind LAN program to it once it is re-created.", link.Attrs().Name)
+		if err := c.removeTCHooksForInterface(tcHookScopeHost, link.Attrs().Index); err != nil {
+			c.log.Errorf("remove TC hooks: %v", err)
+		}
 		if err := c.delQdisc(link); err != nil {
 			c.log.Errorf("delQdisc: %v", err)
 		}
@@ -186,82 +251,30 @@ func (c *controlPlaneCore) _bindLan(ifname string) error {
 		return err
 	}
 
-	// Insert filters.
-	filterIngress := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: link.Attrs().Index,
-			Parent:    netlink.HANDLE_MIN_INGRESS,
-			Handle:    netlink.MakeHandle(0x2023, 0b100+uint16(c.flip)),
-			Protocol:  unix.ETH_P_ALL,
-			// Priority should be behind of WAN's
-			Priority: 2,
-		},
-		Name:         consts.AppName + "_lan_ingress",
-		DirectAction: true,
+	ingressProgram := bpf.TproxyLanIngressL3
+	ingressName := consts.AppName + "_lan_ingress_l3"
+	ingressPriority := uint16(2)
+	egressProgram := bpf.TproxyLanEgressL3
+	egressName := consts.AppName + "_lan_egress_l3"
+	if c.isDualRoleTCInterface(ifname) {
+		programs := selectDualRoleTCHookPrograms(bpf, linkHdrLen > 0)
+		ingressProgram = programs.ingress
+		ingressName = programs.ingressName
+		ingressPriority = 1
+		egressProgram = programs.egress
+		egressName = programs.egressName
+	} else if linkHdrLen > 0 {
+		ingressProgram = bpf.TproxyLanIngressL2
+		ingressName = consts.AppName + "_lan_ingress_l2"
+		egressProgram = bpf.TproxyLanEgressL2
+		egressName = consts.AppName + "_lan_egress_l2"
 	}
-	if linkHdrLen > 0 {
-		filterIngress.Fd = bpf.TproxyLanIngressL2.FD()
-		filterIngress.Name += "_l2"
-	} else {
-		filterIngress.Fd = bpf.TproxyLanIngressL3.FD()
-		filterIngress.Name += "_l3"
+	if err := c.stageTCHook(makeTCHookSpec(tcHookScopeHost, link, tcHookIngress, ingressPriority, 0x2023, ingressProgram, ingressName, nil)); err != nil {
+		return fmt.Errorf("install LAN ingress hook: %w", err)
 	}
-	if err := deleteTCFiltersByHandle(link, filterIngress.Parent, filterIngress.Handle); err != nil {
-		return fmt.Errorf("cannot remove existing LAN ingress filter: %w", err)
+	if err := c.stageTCHook(makeTCHookSpec(tcHookScopeHost, link, tcHookEgress, 1, 0x2023, egressProgram, egressName, nil)); err != nil {
+		return fmt.Errorf("install LAN egress hook: %w", err)
 	}
-	if !c.isReload {
-		if err := deleteTCFiltersByHandle(link, filterIngress.Parent, filterIngress.Handle^1); err != nil {
-			return fmt.Errorf("cannot remove flipped LAN ingress filter: %w", err)
-		}
-	}
-	if err := netlink.FilterAdd(filterIngress); err != nil {
-		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
-	}
-	detachFunc := func() error {
-		if err := deleteTCFiltersByHandle(link, filterIngress.Parent, filterIngress.Handle); err != nil {
-			return fmt.Errorf("FilterDel(%v:%v): %w", ifname, filterIngress.Name, err)
-		}
-		return nil
-	}
-	c.addManagedBpfHookCleanup(detachFunc)
-
-	filterEgress := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: link.Attrs().Index,
-			Parent:    netlink.HANDLE_MIN_EGRESS,
-			Handle:    netlink.MakeHandle(0x2023, 0b010+uint16(c.flip)),
-			Protocol:  unix.ETH_P_ALL,
-			// Priority should be front of WAN's
-			Priority: 1,
-		},
-		Name:         consts.AppName + "_lan_egress",
-		DirectAction: true,
-	}
-	if linkHdrLen > 0 {
-		filterEgress.Fd = bpf.TproxyLanEgressL2.FD()
-		filterEgress.Name += "_l2"
-	} else {
-		filterEgress.Fd = bpf.TproxyLanEgressL3.FD()
-		filterEgress.Name += "_l3"
-	}
-	if err := deleteTCFiltersByHandle(link, filterEgress.Parent, filterEgress.Handle); err != nil {
-		return fmt.Errorf("cannot remove existing LAN egress filter: %w", err)
-	}
-	if !c.isReload {
-		if err := deleteTCFiltersByHandle(link, filterEgress.Parent, filterEgress.Handle^1); err != nil {
-			return fmt.Errorf("cannot remove flipped LAN egress filter: %w", err)
-		}
-	}
-	if err := netlink.FilterAdd(filterEgress); err != nil {
-		return fmt.Errorf("cannot attach ebpf object to filter egress: %w", err)
-	}
-	egressDetachFunc := func() error {
-		if err := deleteTCFiltersByHandle(link, filterEgress.Parent, filterEgress.Handle); err != nil {
-			return fmt.Errorf("FilterDel(%v:%v): %w", ifname, filterEgress.Name, err)
-		}
-		return nil
-	}
-	c.addManagedBpfHookCleanup(egressDetachFunc)
 
 	return nil
 }
@@ -392,7 +405,10 @@ func (c *controlPlaneCore) setupTCPRelayOffload() error {
 				Program:    bpf.TcpOffloadSentAccount,
 				AttachType: ebpf.AttachTraceFEntry,
 			})
-			if err != nil && bpf.TcpOffloadSentAccountKprobe != nil {
+			if err != nil && bpf.TcpOffloadSentAccountKprobe != nil && !tcpOffloadKprobeFallbackSupported(runtime.GOARCH) {
+				c.log.WithError(err).Debugf("TCP relay eBPF offload kprobe fallback is unavailable on GOARCH=%s; the embedded fallback uses x86 pt_regs", runtime.GOARCH)
+			}
+			if err != nil && bpf.TcpOffloadSentAccountKprobe != nil && tcpOffloadKprobeFallbackSupported(runtime.GOARCH) {
 				// fentry requires a 5-byte NOP entry (an ftrace mcount point).
 				// Kernels without CONFIG_DYNAMIC_FTRACE (common in trimmed router
 				// builds such as ImmortalWrt) leave tail-call wrapper functions
@@ -440,6 +456,10 @@ func (c *controlPlaneCore) setupTCPRelayOffload() error {
 // is espintcp.
 const tcpRelayOffloadAccountTarget = "skb_send_sock"
 
+func tcpOffloadKprobeFallbackSupported(goarch string) bool {
+	return goarch == "amd64"
+}
+
 // bindWan supports lazy-bind if interface `ifname` is not found.
 // bindWan supports rebinding when the interface `ifname` is detected in the future.
 func (c *controlPlaneCore) bindWan(ifname string) error {
@@ -467,6 +487,9 @@ func (c *controlPlaneCore) bindWan(ifname string) error {
 			return
 		}
 		c.log.Warnf("Link deletion of '%v' is detected. Bind WAN program to it once it is re-created.", link.Attrs().Name)
+		if err := c.removeTCHooksForInterface(tcHookScopeHost, link.Attrs().Index); err != nil {
+			c.log.Errorf("remove TC hooks: %v", err)
+		}
 		if err := c.delQdisc(link); err != nil {
 			c.log.Errorf("delQdisc: %v", err)
 		}
@@ -565,81 +588,30 @@ func (c *controlPlaneCore) _bindWan(ifname string) error {
 		return err
 	}
 
-	/// Set-up WAN ingress/egress TC programs.
-	// Insert TC filters
-	filterEgress := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: link.Attrs().Index,
-			Parent:    netlink.HANDLE_MIN_EGRESS,
-			Handle:    netlink.MakeHandle(0x2023, 0b100+uint16(c.flip)),
-			Protocol:  unix.ETH_P_ALL,
-			Priority:  2,
-		},
-		Name:         consts.AppName + "_wan_egress",
-		DirectAction: true,
+	egressProgram := bpf.TproxyWanEgressL3
+	egressName := consts.AppName + "_wan_egress_l3"
+	egressPriority := uint16(2)
+	ingressProgram := bpf.TproxyWanIngressL3
+	ingressName := consts.AppName + "_wan_ingress_l3"
+	if c.isDualRoleTCInterface(ifname) {
+		programs := selectDualRoleTCHookPrograms(bpf, linkHdrLen > 0)
+		egressProgram = programs.egress
+		egressName = programs.egressName
+		egressPriority = 1
+		ingressProgram = programs.ingress
+		ingressName = programs.ingressName
+	} else if linkHdrLen > 0 {
+		egressProgram = bpf.TproxyWanEgressL2
+		egressName = consts.AppName + "_wan_egress_l2"
+		ingressProgram = bpf.TproxyWanIngressL2
+		ingressName = consts.AppName + "_wan_ingress_l2"
 	}
-	if linkHdrLen > 0 {
-		filterEgress.Fd = bpf.TproxyWanEgressL2.FD()
-		filterEgress.Name += "_l2"
-	} else {
-		filterEgress.Fd = bpf.TproxyWanEgressL3.FD()
-		filterEgress.Name += "_l3"
+	if err := c.stageTCHook(makeTCHookSpec(tcHookScopeHost, link, tcHookEgress, egressPriority, 0x2023, egressProgram, egressName, nil)); err != nil {
+		return fmt.Errorf("install WAN egress hook: %w", err)
 	}
-	if err := deleteTCFiltersByHandle(link, filterEgress.Parent, filterEgress.Handle); err != nil {
-		return fmt.Errorf("cannot remove existing WAN egress filter: %w", err)
+	if err := c.stageTCHook(makeTCHookSpec(tcHookScopeHost, link, tcHookIngress, 1, 0x2023, ingressProgram, ingressName, nil)); err != nil {
+		return fmt.Errorf("install WAN ingress hook: %w", err)
 	}
-	if !c.isReload {
-		if err := deleteTCFiltersByHandle(link, filterEgress.Parent, filterEgress.Handle^1); err != nil {
-			return fmt.Errorf("cannot remove flipped WAN egress filter: %w", err)
-		}
-	}
-	if err := netlink.FilterAdd(filterEgress); err != nil {
-		return fmt.Errorf("cannot attach ebpf object to filter egress: %w", err)
-	}
-	egressDetachFunc := func() error {
-		if err := deleteTCFiltersByHandle(link, filterEgress.Parent, filterEgress.Handle); err != nil {
-			return fmt.Errorf("FilterDel(%v:%v): %w", ifname, filterEgress.Name, err)
-		}
-		return nil
-	}
-	c.addManagedBpfHookCleanup(egressDetachFunc)
-
-	filterIngress := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: link.Attrs().Index,
-			Parent:    netlink.HANDLE_MIN_INGRESS,
-			Handle:    netlink.MakeHandle(0x2023, 0b010+uint16(c.flip)),
-			Protocol:  unix.ETH_P_ALL,
-			Priority:  1,
-		},
-		Name:         consts.AppName + "_wan_ingress",
-		DirectAction: true,
-	}
-	if linkHdrLen > 0 {
-		filterIngress.Fd = bpf.TproxyWanIngressL2.FD()
-		filterIngress.Name += "_l2"
-	} else {
-		filterIngress.Fd = bpf.TproxyWanIngressL3.FD()
-		filterIngress.Name += "_l3"
-	}
-	if err := deleteTCFiltersByHandle(link, filterIngress.Parent, filterIngress.Handle); err != nil {
-		return fmt.Errorf("cannot remove existing WAN ingress filter: %w", err)
-	}
-	if !c.isReload {
-		if err := deleteTCFiltersByHandle(link, filterIngress.Parent, filterIngress.Handle^1); err != nil {
-			return fmt.Errorf("cannot remove flipped WAN ingress filter: %w", err)
-		}
-	}
-	if err := netlink.FilterAdd(filterIngress); err != nil {
-		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
-	}
-	ingressDetachFunc := func() error {
-		if err := deleteTCFiltersByHandle(link, filterIngress.Parent, filterIngress.Handle); err != nil {
-			return fmt.Errorf("FilterDel(%v:%v): %w", ifname, filterIngress.Name, err)
-		}
-		return nil
-	}
-	c.addManagedBpfHookCleanup(ingressDetachFunc)
 
 	return nil
 }
@@ -657,92 +629,36 @@ func (c *controlPlaneCore) bindDaens() (err error) {
 		}
 		return err
 	})
-	filterDae0peerIngress := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: daens.Dae0Peer().Attrs().Index,
-			Parent:    netlink.HANDLE_MIN_INGRESS,
-			Handle:    netlink.MakeHandle(0x2022, 0b010+uint16(c.flip)),
-			Protocol:  unix.ETH_P_ALL,
-			Priority:  1,
-		},
-		Fd:           bpf.TproxyDae0peerIngress.FD(),
-		Name:         consts.AppName + "_dae0peer_ingress",
-		DirectAction: true,
+	runInDaeNetns := func(operation func() error) error {
+		return daens.WithRequired("manage dae0peer TC hook", operation)
 	}
-	if err = daens.WithRequired("delete old dae0peer ingress filter", func() error {
-		return deleteTCFiltersByHandle(
-			daens.Dae0Peer(),
-			filterDae0peerIngress.Parent,
-			filterDae0peerIngress.Handle,
-		)
-	}); err != nil {
-		return fmt.Errorf("cannot remove existing dae0peer ingress filter: %w", err)
+	if err = c.stageTCHook(makeTCHookSpec(
+		tcHookScopeDae,
+		daens.Dae0Peer(),
+		tcHookIngress,
+		1,
+		0x2022,
+		bpf.TproxyDae0peerIngress,
+		consts.AppName+"_dae0peer_ingress",
+		runInDaeNetns,
+	)); err != nil {
+		return fmt.Errorf("install dae0peer ingress hook: %w", err)
 	}
-	// Remove and add.
-	if !c.isReload {
-		// Clean up thoroughly: delete the filter with the flipped handle.
-		if err = daens.WithRequired("delete flipped dae0peer ingress filter", func() error {
-			return deleteTCFiltersByHandle(
-				daens.Dae0Peer(),
-				filterDae0peerIngress.Parent,
-				filterDae0peerIngress.Handle^1,
-			)
-		}); err != nil {
-			return fmt.Errorf("cannot remove flipped dae0peer ingress filter: %w", err)
-		}
-	}
-	if err = daens.WithRequired("add dae0peer ingress filter", func() error {
-		return netlink.FilterAdd(filterDae0peerIngress)
-	}); err != nil {
-		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
-	}
-	detachFunc := func() error {
-		return daens.WithRequired("delete dae0peer ingress filter", func() error {
-			if err := deleteTCFiltersByHandle(
-				daens.Dae0Peer(),
-				filterDae0peerIngress.Parent,
-				filterDae0peerIngress.Handle,
-			); err != nil {
-				return fmt.Errorf("FilterDel(%v:%v): %w", daens.Dae0Peer().Attrs().Name, filterDae0peerIngress.Name, err)
-			}
-			return nil
-		})
-	}
-	c.addManagedBpfHookCleanup(detachFunc)
 
 	// tproxy_dae0_ingress@dae0 at host netns
 	// Best effort to add qdisc; it may already exist.
 	_ = c.addQdisc(daens.Dae0())
-	filterDae0Ingress := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: daens.Dae0().Attrs().Index,
-			Parent:    netlink.HANDLE_MIN_INGRESS,
-			Handle:    netlink.MakeHandle(0x2022, 0b010+uint16(c.flip)),
-			Protocol:  unix.ETH_P_ALL,
-			Priority:  1,
-		},
-		Fd:           bpf.TproxyDae0Ingress.FD(),
-		Name:         consts.AppName + "_dae0_ingress",
-		DirectAction: true,
+	if err = c.stageTCHook(makeTCHookSpec(
+		tcHookScopeHost,
+		daens.Dae0(),
+		tcHookIngress,
+		1,
+		0x2022,
+		bpf.TproxyDae0Ingress,
+		consts.AppName+"_dae0_ingress",
+		nil,
+	)); err != nil {
+		return fmt.Errorf("install dae0 ingress hook: %w", err)
 	}
-	if err := deleteTCFiltersByHandle(daens.Dae0(), filterDae0Ingress.Parent, filterDae0Ingress.Handle); err != nil {
-		return fmt.Errorf("cannot remove existing dae0 ingress filter: %w", err)
-	}
-	// Remove and add.
-	if !c.isReload {
-		if err := deleteTCFiltersByHandle(daens.Dae0(), filterDae0Ingress.Parent, filterDae0Ingress.Handle^1); err != nil {
-			return fmt.Errorf("cannot remove flipped dae0 ingress filter: %w", err)
-		}
-	}
-	if err := netlink.FilterAdd(filterDae0Ingress); err != nil {
-		return fmt.Errorf("cannot attach ebpf object to filter ingress: %w", err)
-	}
-	dae0DetachFunc := func() error {
-		if err := deleteTCFiltersByHandle(daens.Dae0(), filterDae0Ingress.Parent, filterDae0Ingress.Handle); err != nil {
-			return fmt.Errorf("FilterDel(%v:%v): %w", daens.Dae0().Attrs().Name, filterDae0Ingress.Name, err)
-		}
-		return nil
-	}
-	c.addManagedBpfHookCleanup(dae0DetachFunc)
 	return
 }

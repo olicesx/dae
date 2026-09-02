@@ -6,6 +6,7 @@
 package control
 
 import (
+	stderrors "errors"
 	"fmt"
 
 	"github.com/cilium/ebpf"
@@ -76,7 +77,15 @@ func (c *ControlPlane) AdoptProcessFlowDatapath(previous *ControlPlane) error {
 	if manager == nil || manager != previousManager {
 		return fmt.Errorf("adopt process flow datapath: control planes do not share a session manager")
 	}
-	return manager.adoptUDPDatapath(previous.PeekBpf(), c.PeekBpf())
+	previousBpf, successorBpf := previous.PeekBpf(), c.PeekBpf()
+	if err := manager.adoptUDPDatapath(previousBpf, successorBpf); err != nil {
+		return err
+	}
+	if err := c.adoptBpfMaintenanceCleanup(previous); err != nil {
+		rollbackErr := manager.adoptUDPDatapath(successorBpf, previousBpf)
+		return stderrors.Join(err, rollbackErr)
+	}
+	return nil
 }
 
 func (m *SessionManager) adoptUDPDatapath(previous, successor *bpfObjects) error {

@@ -18,9 +18,11 @@
 #include "headers/bpf_helpers.h"
 /* bpf_tracing.h (kprobe arg accessors) needs a target arch; mirror the
  * vmlinux.h fallback (x86) unless the build already selects one. */
-#if !defined(__TARGET_ARCH_x86) && !defined(__TARGET_ARCH_arm64) && \
-	!defined(__TARGET_ARCH_riscv) && !defined(__TARGET_ARCH_loongarch) && \
-	!defined(__TARGET_ARCH_powerpc)
+#if !defined(__TARGET_ARCH_x86) && !defined(__TARGET_ARCH_arm) && \
+	!defined(__TARGET_ARCH_arm64) && !defined(__TARGET_ARCH_riscv) && \
+	!defined(__TARGET_ARCH_loongarch) &&                              \
+	!defined(__TARGET_ARCH_powerpc) && !defined(__TARGET_ARCH_s390) && \
+	!defined(__TARGET_ARCH_mips)
 #define __TARGET_ARCH_x86
 #endif
 #include "headers/bpf_tracing.h"
@@ -40,6 +42,9 @@
 // #define unlikely(x) x
 #define likely(x) __builtin_expect((x), 1)
 #define unlikely(x) __builtin_expect((x), 0)
+// TC_ACT_UNSPEC and TCX_NEXT are both -1: the shared continuation action for
+// classic cls_bpf and TCX multiprogram attachment.
+#define DAE_TC_CONTINUE TC_ACT_UNSPEC
 #ifndef BIT
 #define BIT(nr) (1UL << (nr))
 #endif
@@ -2222,7 +2227,7 @@ static __noinline int do_tproxy_lan_egress(struct __sk_buff *skb, __u32 link_h_l
 			      0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 	} else if (ctx->l4proto == IPPROTO_UDP) {
 		if (ctx->udph.source == bpf_htons(53) || ctx->udph.dest == bpf_htons(53))
-			return TC_ACT_PIPE;
+			return DAE_TC_CONTINUE;
 
 		struct tuples tuples;
 		struct tuples_key reversed_tuples_key;
@@ -2235,7 +2240,7 @@ static __noinline int do_tproxy_lan_egress(struct __sk_buff *skb, __u32 link_h_l
 			      0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 	}
 
-	return TC_ACT_PIPE;
+	return DAE_TC_CONTINUE;
 }
 
 SEC("tc/lan_egress_l2")
@@ -2656,7 +2661,7 @@ static __noinline int do_tproxy_wan_ingress(struct __sk_buff *skb, __u32 link_h_
 			      0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 	} else if (ctx->l4proto == IPPROTO_UDP) {
 		if (ctx->udph.source == bpf_htons(53) || ctx->udph.dest == bpf_htons(53))
-			return TC_ACT_PIPE;
+			return DAE_TC_CONTINUE;
 
 		struct tuples tuples;
 		struct tuples_key reversed_tuples_key;
@@ -2669,7 +2674,7 @@ static __noinline int do_tproxy_wan_ingress(struct __sk_buff *skb, __u32 link_h_
 			      0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 	}
 
-	return TC_ACT_PIPE;
+	return DAE_TC_CONTINUE;
 }
 
 SEC("tc/wan_ingress_l2")
@@ -2682,6 +2687,28 @@ SEC("tc/wan_ingress_l3")
 int tproxy_wan_ingress_l3(struct __sk_buff *skb)
 {
 	return do_tproxy_wan_ingress(skb, 0);
+}
+
+static __noinline int
+do_tproxy_wan_lan_ingress(struct __sk_buff *skb, __u32 link_h_len)
+{
+	int ret = do_tproxy_wan_ingress(skb, link_h_len);
+
+	if (ret != DAE_TC_CONTINUE)
+		return ret;
+	return do_tproxy_lan_ingress(skb, link_h_len);
+}
+
+SEC("tc/wan_lan_ingress_l2")
+int tproxy_wan_lan_ingress_l2(struct __sk_buff *skb)
+{
+	return do_tproxy_wan_lan_ingress(skb, 14);
+}
+
+SEC("tc/wan_lan_ingress_l3")
+int tproxy_wan_lan_ingress_l3(struct __sk_buff *skb)
+{
+	return do_tproxy_wan_lan_ingress(skb, 0);
 }
 
 // Routing and redirect the packet back.
@@ -2754,7 +2781,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 			scratch->flag[1] = IpVersionType_6;
 		scratch->flag[6] = tuples->dscp;
 		if (pid_is_control_plane(skb, &pid_pname))
-			return TC_ACT_PIPE;
+			return DAE_TC_CONTINUE;
 		if (pid_pname)
 			__builtin_memcpy(&scratch->flag[2], pid_pname->pname,
 					 TASK_COMM_LEN);
@@ -2814,7 +2841,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 
 		if (!tcp_conn) {
 			if (outbound == OUTBOUND_DIRECT && mark == 0)
-				return TC_ACT_PIPE;
+				return DAE_TC_CONTINUE;
 			return TC_ACT_SHOT;
 		}
 
@@ -2836,7 +2863,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 			0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 
 		if (!tcp_conn || !tcp_conn->meta.data.has_routing)
-			return TC_ACT_PIPE;
+			return DAE_TC_CONTINUE;
 
 		outbound = tcp_conn->meta.data.outbound;
 		mark = tcp_conn->meta.data.mark;
@@ -2855,7 +2882,7 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 		bpf_printk("GO OUTBOUND_DIRECT");
 #endif
 		skb->mark = mark;
-		return TC_ACT_PIPE;
+		return DAE_TC_CONTINUE;
 	} else if (unlikely(outbound == OUTBOUND_BLOCK)) {
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
 		bpf_printk("SHOT OUTBOUND_BLOCK");
@@ -2918,7 +2945,7 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 		scratch->flag[1] = IpVersionType_6;
 	scratch->flag[6] = tuples->dscp;
 	if (pid_is_control_plane(skb, &pid_pname))
-		return TC_ACT_PIPE;
+		return DAE_TC_CONTINUE;
 
 	if (!is_short_lived_udp_traffic(&tuples->five)) {
 		udp_conn_state = mark_udp_seen(&tuples->five, false,
@@ -2926,7 +2953,7 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 					       0, NULL, 0,
 					       ROUTING_EPOCH_SLOT_UNKNOWN);
 		if (udp_conn_state && udp_conn_state->is_wan_ingress_direction)
-			return TC_ACT_PIPE;
+			return DAE_TC_CONTINUE;
 
 		if (udp_conn_state && udp_conn_state->meta.data.has_routing) {
 			outbound = udp_conn_state->meta.data.outbound;
@@ -3009,7 +3036,7 @@ fast_path_skip_routing:
 #endif
 
 	if (!wan_egress_needs_control_plane(outbound, mark))
-		return TC_ACT_PIPE;
+		return DAE_TC_CONTINUE;
 	else if (unlikely(outbound == OUTBOUND_BLOCK))
 		return TC_ACT_SHOT;
 
@@ -3039,15 +3066,12 @@ fast_path_skip_routing:
 
 // Per-CPU scratch to stay under 512-byte stack limit across the call chain.
 //
-// Pass-through paths return TC_ACT_PIPE, not TC_ACT_OK, so that other filters
-// attached to the same clsact qdisc still get to see the packet: cls_bpf maps
-// TC_ACT_PIPE to TC_ACT_UNSPEC, which is the only return value that lets
-// __tcf_classify() continue down the filter chain. This matches what
-// wan_ingress and lan_egress already do.
+// Pass-through returns DAE_TC_CONTINUE, not TC_ACT_OK, so later programs see
+// the packet under both classic cls_bpf and TCX multiprogram attachment.
 static __noinline int do_tproxy_wan_egress(struct __sk_buff *skb, __u32 link_h_len)
 {
 	if (skb->ingress_ifindex != NOWHERE_IFINDEX)
-		return TC_ACT_PIPE;
+		return DAE_TC_CONTINUE;
 
 	__u32 scratch_key = 0;
 	struct parsed_packet *pkt =
@@ -3065,7 +3089,7 @@ static __noinline int do_tproxy_wan_egress(struct __sk_buff *skb, __u32 link_h_l
 			bpf_printk("wan_egress parse error: %d, dropping", ret);
 			return TC_ACT_SHOT;
 		}
-		return TC_ACT_PIPE;
+		return DAE_TC_CONTINUE;
 	}
 
 	if (pkt->l4proto == IPPROTO_TCP)
@@ -3074,7 +3098,7 @@ static __noinline int do_tproxy_wan_egress(struct __sk_buff *skb, __u32 link_h_l
 	if (pkt->l4proto == IPPROTO_UDP)
 		return do_tproxy_wan_egress_udp(skb, link_h_len, &pkt->tuples,
 						&pkt->ethh, &pkt->udph);
-	return TC_ACT_PIPE;
+	return DAE_TC_CONTINUE;
 }
 
 SEC("tc/wan_egress_l2")
@@ -3087,6 +3111,28 @@ SEC("tc/wan_egress_l3")
 int tproxy_wan_egress_l3(struct __sk_buff *skb)
 {
 	return do_tproxy_wan_egress(skb, 0);
+}
+
+static __noinline int
+do_tproxy_lan_wan_egress(struct __sk_buff *skb, __u32 link_h_len)
+{
+	int ret = do_tproxy_lan_egress(skb, link_h_len);
+
+	if (ret != DAE_TC_CONTINUE)
+		return ret;
+	return do_tproxy_wan_egress(skb, link_h_len);
+}
+
+SEC("tc/lan_wan_egress_l2")
+int tproxy_lan_wan_egress_l2(struct __sk_buff *skb)
+{
+	return do_tproxy_lan_wan_egress(skb, 14);
+}
+
+SEC("tc/lan_wan_egress_l3")
+int tproxy_lan_wan_egress_l3(struct __sk_buff *skb)
+{
+	return do_tproxy_lan_wan_egress(skb, 0);
 }
 
 SEC("tc/dae0peer_ingress")

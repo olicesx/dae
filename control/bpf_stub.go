@@ -8,7 +8,6 @@
 package control
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -322,6 +321,8 @@ type bpfPrograms struct {
 	TproxyLanEgressL3           *ebpf.Program `ebpf:"tproxy_lan_egress_l3"`
 	TproxyLanIngressL2          *ebpf.Program `ebpf:"tproxy_lan_ingress_l2"`
 	TproxyLanIngressL3          *ebpf.Program `ebpf:"tproxy_lan_ingress_l3"`
+	TproxyLanWanEgressL2        *ebpf.Program `ebpf:"tproxy_lan_wan_egress_l2"`
+	TproxyLanWanEgressL3        *ebpf.Program `ebpf:"tproxy_lan_wan_egress_l3"`
 	TcpOffloadRedirect          *ebpf.Program `ebpf:"tcp_offload_redirect"`
 	TcpOffloadSentAccount       *ebpf.Program `ebpf:"tcp_offload_sent_account"`
 	TcpOffloadSentAccountKprobe *ebpf.Program `ebpf:"tcp_offload_sent_account_kprobe"`
@@ -335,6 +336,8 @@ type bpfPrograms struct {
 	TproxyWanEgressL3           *ebpf.Program `ebpf:"tproxy_wan_egress_l3"`
 	TproxyWanIngressL2          *ebpf.Program `ebpf:"tproxy_wan_ingress_l2"`
 	TproxyWanIngressL3          *ebpf.Program `ebpf:"tproxy_wan_ingress_l3"`
+	TproxyWanLanIngressL2       *ebpf.Program `ebpf:"tproxy_wan_lan_ingress_l2"`
+	TproxyWanLanIngressL3       *ebpf.Program `ebpf:"tproxy_wan_lan_ingress_l3"`
 }
 
 func (p *bpfPrograms) Close() error {
@@ -345,6 +348,8 @@ func (p *bpfPrograms) Close() error {
 		p.TproxyLanEgressL3,
 		p.TproxyLanIngressL2,
 		p.TproxyLanIngressL3,
+		p.TproxyLanWanEgressL2,
+		p.TproxyLanWanEgressL3,
 		p.TcpOffloadRedirect,
 		p.TcpOffloadSentAccount,
 		p.TproxyWanCgConnect4,
@@ -357,6 +362,8 @@ func (p *bpfPrograms) Close() error {
 		p.TproxyWanEgressL3,
 		p.TproxyWanIngressL2,
 		p.TproxyWanIngressL3,
+		p.TproxyWanLanIngressL2,
+		p.TproxyWanLanIngressL3,
 	)
 }
 
@@ -422,21 +429,6 @@ func BpfMapBatchDelete(m *ebpf.Map, keys interface{}) (n int, err error) {
 
 func BpfMapBatchUpdate(m *ebpf.Map, keys interface{}, values interface{}, opts *ebpf.BatchOptions) (n int, err error) {
 	return 0, errBpfObjectsUnavailable
-}
-
-func (r bpfPortRange) Encode() (b [16]byte) {
-	binary.LittleEndian.PutUint16(b[:2], r.PortStart)
-	binary.LittleEndian.PutUint16(b[2:], r.PortEnd)
-	return
-}
-
-func ParsePortRange(b []byte) (portStart, portEnd uint16) {
-	if len(b) < 4 {
-		return 0, 0
-	}
-	portStart = binary.LittleEndian.Uint16(b[:2])
-	portEnd = binary.LittleEndian.Uint16(b[2:])
-	return portStart, portEnd
 }
 
 func cidrToBpfLpmKey(prefix any) _bpfLpmKey {

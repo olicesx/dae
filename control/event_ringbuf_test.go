@@ -13,14 +13,14 @@ import (
 
 func TestParseDaeEventBlockedAlive(t *testing.T) {
 	b := make([]byte, 72)
-	binary.LittleEndian.PutUint64(b[0:8], 12345)
-	binary.LittleEndian.PutUint32(b[8:12], daeEventBlockedAlive)
-	binary.LittleEndian.PutUint32(b[12:16], 42)
+	nativeBpfABI.putUint64(b[0:8], 12345)
+	nativeBpfABI.putUint32(b[8:12], daeEventBlockedAlive)
+	nativeBpfABI.putUint32(b[12:16], 42)
 	copy(b[16:32], "someproc")
 	b[32] = 3 // outbound
 	b[33] = unix.IPPROTO_UDP
-	binary.LittleEndian.PutUint16(b[68:70], 12345)
-	binary.LittleEndian.PutUint16(b[70:72], 53)
+	nativeBpfABI.putUint16(b[68:70], 12345)
+	nativeBpfABI.putUint16(b[70:72], 53)
 
 	ev := parseDaeEvent(b)
 	if ev.Type != daeEventBlockedAlive {
@@ -43,6 +43,41 @@ func TestParseDaeEventBlockedAlive(t *testing.T) {
 	}
 }
 
+func TestParseDaeEventBothHostByteOrders(t *testing.T) {
+	for name, order := range map[string]binary.ByteOrder{
+		"little": binary.LittleEndian,
+		"big":    binary.BigEndian,
+	} {
+		t.Run(name, func(t *testing.T) {
+			abi := bpfHostABI{order: order}
+			b := make([]byte, 72)
+			abi.putUint64(b[0:8], 0x0102030405060708)
+			abi.putUint32(b[8:12], daeEventBlockedAlive)
+			abi.putUint32(b[12:16], 0x11223344)
+			copy(b[16:32], "native-order")
+			b[32] = 7
+			b[33] = unix.IPPROTO_TCP
+			for i := 0; i < 4; i++ {
+				abi.putUint32(b[36+4*i:40+4*i], uint32(i+1))
+				abi.putUint32(b[52+4*i:56+4*i], uint32(i+11))
+			}
+			abi.putUint16(b[68:70], 0x1234)
+			abi.putUint16(b[70:72], 0xabcd)
+
+			ev := parseDaeEventWithABI(abi, b)
+			if ev.Timestamp != 0x0102030405060708 || ev.Type != daeEventBlockedAlive || ev.Pid != 0x11223344 {
+				t.Fatalf("unexpected event header: %+v", ev)
+			}
+			if ev.Sip != [4]uint32{1, 2, 3, 4} || ev.Dip != [4]uint32{11, 12, 13, 14} {
+				t.Fatalf("unexpected addresses: sip=%v dip=%v", ev.Sip, ev.Dip)
+			}
+			if ev.Sport != 0x1234 || ev.Dport != 0xabcd {
+				t.Fatalf("unexpected ports: %#x/%#x", ev.Sport, ev.Dport)
+			}
+		})
+	}
+}
+
 func TestParseDaeEventShort(t *testing.T) {
 	// Buffer shorter than the 72-byte struct must parse to a zero event
 	// (type 0 = daeEventBlocked, which the switch ignores).
@@ -58,7 +93,7 @@ func TestParseDaeEventExactBoundary(t *testing.T) {
 	for i := range b {
 		b[i] = 0xff
 	}
-	binary.LittleEndian.PutUint32(b[8:12], daeEventBlockedAlive)
+	nativeBpfABI.putUint32(b[8:12], daeEventBlockedAlive)
 	ev := parseDaeEvent(b)
 	if ev.Type != daeEventBlockedAlive {
 		t.Fatalf("expected type %d, got %d", daeEventBlockedAlive, ev.Type)

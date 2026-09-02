@@ -98,15 +98,23 @@ type controlPlaneCore struct {
 	// under the same lock). The seed value is written only during construction,
 	// before the core is published.
 	deferFuncs []func() error
-	// bpfHookDetachFuncs contains only BPF hook detachment functions (FilterDel, tc detach)
-	// These are tracked separately so they can be detached immediately on SIGTERM
+	// bpfHookDetachFuncs contains non-TC BPF hook detachments. tcHooks owns TC
+	// links and filters as one transferable Module. Both are detached immediately
 	// before other cleanup that might take longer (like dialer shutdown).
 	// Protected by bpfHookMu to avoid deadlock with c.mu in _bindLan/_bindWan.
 	bpfHookDetachFuncs []func() error
 	bpfHookMu          sync.Mutex
 	bpfHookDetachMu    sync.Mutex
 	bpfHookAttachWg    sync.WaitGroup
-	bpf                atomic.Pointer[bpfObjects]
+	// tcHooks is the single owner of TCX links or classic filters. A prepared
+	// handoff borrows the active set for commit, then swaps this pointer between
+	// generations before supervisor publication.
+	tcHookMu            sync.Mutex
+	tcHooks             *tcHookSet
+	tcHookStage         *tcHookSet
+	tcHookStageDeferred bool
+	preparedTCHooks     *preparedTCHookHandoff
+	bpf                 atomic.Pointer[bpfObjects]
 	// outboundId2Name is populated during NewControlPlane before the control
 	// plane is published and is read-only afterwards, so concurrent readers
 	// (health callbacks, logging) need no lock.
@@ -118,10 +126,9 @@ type controlPlaneCore struct {
 
 	kernelVersion *internal.Version
 
-	// Reload flip state. flip and isReload are fixed at construction and
-	// read-only afterwards (bind paths read them under mu to derive TC
-	// handles). flipBase/flipPending track whether the reload's TC-handle
-	// swap has been committed; they are mutated only by the serialized reload
+	// Reload generation state. flip and isReload are fixed at construction.
+	// flipBase/flipPending reject stale serialized handoffs independently of
+	// the HookSet's fixed classic handles; they are mutated only by reload
 	// handoff steps (commitBpfHookFlip, rollbackCommittedBpfHookFlip,
 	// activateBpfHookFlip), which run outside mu.
 	flip        int
@@ -149,6 +156,8 @@ type controlPlaneCore struct {
 	interfacePatternMu    sync.Mutex
 	registeredLanPatterns map[string]struct{}
 	registeredWanPatterns map[string]struct{}
+	tcHookLanPatterns     []string
+	tcHookWanPatterns     []string
 
 	udpConnStateTracker       atomic.Pointer[udpConnStateTracker]
 	domainRouting             *domainRoutingTracker
@@ -214,6 +223,7 @@ func newControlPlaneCore(log *logrus.Logger,
 		log:                   log,
 		deferFuncs:            deferFuncs,
 		bpfHookDetachFuncs:    make([]func() error, 0),
+		tcHooks:               newTCHookSet(log),
 		outboundId2Name:       outboundId2Name,
 		kernelVersion:         kernelVersion,
 		flip:                  flip,
@@ -239,6 +249,7 @@ func newControlPlaneCore(log *logrus.Logger,
 	core.datapathGeneration.Store(uint32(bpfDatapathGeneration(bpf)))
 	core.bpf.Store(bpf)
 	core.udpConnStateTracker.Store(acquireSharedUdpConnStateTracker(bpf))
+	core.addDeferFunc(core.closeOwnedTCHookSet)
 	core.startIfindexWatcher()
 	return core
 }
@@ -383,6 +394,7 @@ func (c *controlPlaneCore) addManagedBpfHookCleanup(detachFunc func() error) {
 }
 
 func (c *controlPlaneCore) resetBpfHookDetachForReattach() {
+	c.resetTCHookSetForReattach()
 	c.bpfHookMu.Lock()
 	c.bpfHookDetachFuncs = nil
 	c.bpfHooksDetached = false
@@ -402,10 +414,9 @@ func (c *controlPlaneCore) resetBpfHookDetachForReattach() {
 	c.addDeferFunc(newIfmgr.Close)
 }
 
-// DetachBpfHooks immediately detaches all BPF hooks from the system.
-// This should be called first when receiving SIGTERM to ensure network is restored
-// even if the rest of the shutdown process takes too long and gets SIGKILL'd.
-// This is safe to call multiple times - subsequent calls will be no-ops.
+// DetachBpfHooks quiesces hook attachment and synchronously detaches every hook
+// owned by this core. Shutdown and failed staged commits both use this operation.
+// It is safe to call multiple times; later calls are no-ops after full success.
 func (c *controlPlaneCore) DetachBpfHooks() error {
 	c.bpfHookDetachMu.Lock()
 	defer c.bpfHookDetachMu.Unlock()
@@ -425,14 +436,18 @@ func (c *controlPlaneCore) DetachBpfHooks() error {
 	c.bpfHookMu.Lock()
 	defer c.bpfHookMu.Unlock()
 
-	c.log.Infoln("[Shutdown] Detaching BPF hooks immediately to restore network")
+	c.log.Infoln("[BPF] Detaching owned hooks")
 
 	var errs []error
+	if e := c.closeOwnedTCHookSet(); e != nil {
+		c.log.WithError(e).Warnln("[BPF] Failed to detach owned TC HookSet")
+		errs = append(errs, e)
+	}
 	// Execute in reverse order (last attached, first detached)
 	for i := len(c.bpfHookDetachFuncs) - 1; i >= 0; i-- {
 		if e := c.bpfHookDetachFuncs[i](); e != nil {
 			// Log but continue detaching other hooks
-			c.log.WithError(e).Warnln("[Shutdown] Failed to detach BPF hook")
+			c.log.WithError(e).Warnln("[BPF] Failed to detach owned hook")
 			errs = append(errs, e)
 		}
 	}
@@ -441,8 +456,9 @@ func (c *controlPlaneCore) DetachBpfHooks() error {
 		c.bpfHooksDetached = false
 		return errors.Join(errs...)
 	}
+	c.bpfHookDetachFuncs = nil
 	c.bpfHooksDetached = true
-	c.log.Infoln("[Shutdown] BPF hooks detached, network should be restored")
+	c.log.Infoln("[BPF] Owned hooks detached")
 	return nil
 }
 
@@ -481,6 +497,7 @@ func (c *controlPlaneCore) Close() (err error) {
 	}
 
 	if c.bpfOwned && bpf != nil {
+		stopBpfMaintenanceRuntime(bpf)
 		if e := bpf.Close(); e != nil {
 			errs = append(errs, e)
 		}

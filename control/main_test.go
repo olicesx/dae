@@ -27,9 +27,6 @@ func TestMain(m *testing.M) {
 	// the top of the leaked goroutine is `startJanitor.func1.1`. We ignore the
 	// loop-body entry point (`.func1.1`), which is the frame actually on top.
 	goleak.VerifyTestMain(m,
-		// ControlPlane conn-state janitor + its event ringbuf reader.
-		goleak.IgnoreAnyFunction("github.com/daeuniverse/dae/control.(*ControlPlane).startConnStateJanitor.func1"),
-		goleak.IgnoreAnyFunction("github.com/daeuniverse/dae/control.(*ControlPlane).startEventRingbufReader.func1"),
 		// PacketSnifferPool / UDP endpoint pool / AnyfromPool expiry janitors
 		// (loop body = .func1.1). Under -race the runtime name gains a
 		// constructor prefix (e.g. NewPacketSnifferPool.(*PacketSnifferPool).…),

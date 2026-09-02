@@ -82,6 +82,9 @@ var (
 	restoreDNSListenerFunc = func(c *control.ControlPlane) error {
 		return c.RestartDNSListener()
 	}
+	restoreTCHookSetOwnershipFunc = func(candidate, previous *control.ControlPlane) error {
+		return candidate.RestorePreparedTCHookSet(previous)
+	}
 	withDaeNetnsRequiredFunc = func(op string, f func() error) error {
 		return control.GetDaeNetns().WithRequired(op, f)
 	}
@@ -168,6 +171,8 @@ type stagedReloadHandoff struct {
 	dnsControllerMoved    bool
 	dnsListenerMoved      bool
 	oldDNSListenerActive  bool
+	tcHookHandoffPrepared bool
+	tcHookSetAdopted      bool
 	hookFlipCommitted     bool
 	provisionalOwner      bool
 }
@@ -651,18 +656,34 @@ loop:
 				dnsHandoffActive := reloadManager.pendingDNSHandoffActive(serveControlPlane)
 				if handoff := reloadManager.currentPendingStagedHandoff(); handoff != nil {
 					var publishErr error
+					if !handoff.tcHookHandoffPrepared {
+						publishErr = handoff.newControlPlane.PrepareTCHookHandoff(handoff.oldControlPlane)
+						if publishErr == nil {
+							handoff.tcHookHandoffPrepared = true
+						}
+					}
 					if handoff.freshDatapath && !handoff.provisionalOwner {
-						publishErr = handoff.newControlPlane.RegisterProvisionalRoutingEpochExecutionOwner()
+						if publishErr == nil {
+							publishErr = handoff.newControlPlane.RegisterProvisionalRoutingEpochExecutionOwner()
+						}
 						if publishErr == nil {
 							handoff.provisionalOwner = true
 						}
 					}
-					if handoff.freshDatapath && !handoff.hookFlipCommitted {
+					if !handoff.hookFlipCommitted {
 						if publishErr == nil {
 							publishErr = handoff.newControlPlane.CommitPreparedBpfHookFlip()
 						}
 						if publishErr == nil {
 							handoff.hookFlipCommitted = true
+						}
+					}
+					if !handoff.tcHookSetAdopted {
+						if publishErr == nil {
+							publishErr = handoff.newControlPlane.AdoptPreparedTCHookSet(handoff.oldControlPlane)
+						}
+						if publishErr == nil {
+							handoff.tcHookSetAdopted = true
 						}
 					}
 					if handoff.freshDatapath && !handoff.flowDatapathAdopted {
@@ -704,6 +725,16 @@ loop:
 						reloadManager.failPublishedReloadAttempt(reloadErr)
 						continue
 					}
+
+					if err := handoff.newControlPlane.FinalizePreparedTCHooks(); err != nil {
+						finalizeErr := fmt.Errorf("finalize published TC HookSet: %w", err)
+						reloadManager.setReloadError(finalizeErr)
+						failRun(finalizeErr)
+						break loop
+					}
+					handoff.tcHookHandoffPrepared = false
+					handoff.tcHookSetAdopted = false
+					handoff.hookFlipCommitted = false
 
 					oldListener := handoff.oldListener
 					oldC := handoff.oldControlPlane

@@ -36,7 +36,8 @@ func TestParsePortRangeShortInput(t *testing.T) {
 			t.Fatalf("len=%d: expected (0,0), got (%d,%d)", n, start, end)
 		}
 	}
-	start, end := ParsePortRange([]byte{0x01, 0x00, 0xFF, 0x00})
+	encoded := (bpfPortRange{PortStart: 1, PortEnd: 0xFF}).Encode()
+	start, end := ParsePortRange(encoded[:])
 	if start != 1 || end != 0xFF {
 		t.Fatalf("expected (1,255), got (%d,%d)", start, end)
 	}

@@ -2,6 +2,7 @@ package control
 
 import (
 	"os"
+	"slices"
 	"testing"
 )
 
@@ -29,6 +30,35 @@ func TestOffloadGateDisabled(t *testing.T) {
 		t.Error("opt-in with DAE_ALLOW_TCP_SOCKMAP=1 must enable")
 	}
 	_ = os.Unsetenv("DAE_ALLOW_TCP_SOCKMAP")
+}
+
+// TestTCPRelayOffloadKprobeFallbackArchitecture verifies that a mismatched
+// pt_regs program is neither loaded nor attached on non-x86 kernels.
+func TestTCPRelayOffloadKprobeFallbackArchitecture(t *testing.T) {
+	for goarch, want := range map[string]bool{
+		"amd64":   true,
+		"arm64":   false,
+		"mips64":  false,
+		"ppc64":   false,
+		"riscv64": false,
+		"s390x":   false,
+	} {
+		if got := tcpOffloadKprobeFallbackSupported(goarch); got != want {
+			t.Errorf("GOARCH=%s: supported=%t, want %t", goarch, got, want)
+		}
+	}
+	if programs := tcpRelayOffloadProgramsForArch("amd64"); !slices.Contains(programs, "tcp_offload_sent_account_kprobe") {
+		t.Fatal("amd64 offload collection omitted its compatible kprobe fallback")
+	}
+	for _, goarch := range []string{"arm64", "ppc64", "s390x"} {
+		programs := tcpRelayOffloadProgramsForArch(goarch)
+		if slices.Contains(programs, "tcp_offload_sent_account_kprobe") {
+			t.Fatalf("GOARCH=%s offload collection retained the x86 kprobe fallback", goarch)
+		}
+		if !slices.Contains(programs, "tcp_offload_sent_account") {
+			t.Fatalf("GOARCH=%s offload collection omitted portable fentry accounting", goarch)
+		}
+	}
 }
 
 // TestOffloadProgramsAndMapsComplete checks that the hard-coded offload program

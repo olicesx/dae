@@ -55,6 +55,28 @@ func TestNetkitIpLinkAddArgsScrubNoneUsesNamedValues(t *testing.T) {
 	}
 }
 
+func TestNetkitScrubNoneRequiresAttributesOnBothEnds(t *testing.T) {
+	tests := []struct {
+		name     string
+		supports bool
+		primary  netlink.NetkitScrub
+		peer     netlink.NetkitScrub
+		want     bool
+	}{
+		{name: "attributes absent", primary: netlink.NETKIT_SCRUB_NONE, peer: netlink.NETKIT_SCRUB_NONE},
+		{name: "both none", supports: true, primary: netlink.NETKIT_SCRUB_NONE, peer: netlink.NETKIT_SCRUB_NONE, want: true},
+		{name: "primary default", supports: true, primary: netlink.NETKIT_SCRUB_DEFAULT, peer: netlink.NETKIT_SCRUB_NONE},
+		{name: "peer default", supports: true, primary: netlink.NETKIT_SCRUB_NONE, peer: netlink.NETKIT_SCRUB_DEFAULT},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := netkitScrubNone(test.supports, test.primary, test.peer); got != test.want {
+				t.Fatalf("netkitScrubNone() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestRequireNetkitL2WithMAC(t *testing.T) {
 	macA := net.HardwareAddr{0x0e, 0xee, 0xee, 0xee, 0xee, 0xee}
 	macB := net.HardwareAddr{0x0e, 0xee, 0xee, 0xee, 0xee, 0xef}

@@ -26,7 +26,13 @@ func (c *ControlPlane) RollbackPreparedRoutingEpoch() error {
 	if c == nil || c.core == nil {
 		return nil
 	}
-	return c.core.RollbackRoutingEpoch()
+	if err := c.core.RollbackRoutingEpoch(); err != nil {
+		return err
+	}
+	if c.bpfMaintenance != nil {
+		return c.bpfMaintenance.rollback()
+	}
+	return nil
 }
 
 //go:generate go run -mod=mod github.com/cilium/ebpf/cmd/bpf2go -cc "$BPF_CLANG" "$BPF_STRIP_FLAG" -cflags "$BPF_CFLAGS" -tags "!dae_stub_ebpf" -target "$BPF_TARGET" -type port_range -type tuples_key bpf kern/tproxy.c -- -I./headers

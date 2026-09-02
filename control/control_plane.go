@@ -78,6 +78,7 @@ type ControlPlane struct {
 
 	controlPlaneRealDomainRuntime
 	controlPlaneDatapathJanitor
+	bpfMaintenance *bpfMaintenanceBinding
 
 	// Track last alert time to avoid spamming logs
 	lastBpfOverflowAlertTime atomic.Int64
@@ -724,8 +725,10 @@ func NewControlPlaneWithContextOptions(
 			routingMatcher:      routingMatcher,
 			bootstrapResolvers:  bootstrapResolvers,
 		},
-		controlPlaneDNSRuntime:        newControlPlaneDNSRuntime(buildOpts.DelayDNSListenerStart),
-		controlPlaneDatapathJanitor:   newControlPlaneDatapathJanitor(),
+		controlPlaneDNSRuntime: newControlPlaneDNSRuntime(buildOpts.DelayDNSListenerStart),
+		controlPlaneDatapathJanitor: controlPlaneDatapathJanitor{
+			stop: make(chan struct{}),
+		},
 		onceNetworkReady:              sync.Once{},
 		drainTracker:                  newControlPlaneDrainTracker(),
 		ctx:                           cctx,
@@ -754,9 +757,6 @@ func NewControlPlaneWithContextOptions(
 	SetAnyfromSoMark(global.SoMarkFromDae)
 	plane.deferFuncs = append(plane.deferFuncs, plane.closePublishedListenerFiles)
 	plane.startRealDomainNegJanitor()
-	if !buildOpts.DelayDatapathCommit {
-		plane.startConnStateJanitor()
-	}
 
 	var upstreamHostResolver func(ctx context.Context, host string, network string) (*netutils.Ip46, error, error)
 	if len(bootstrapResolvers) > 0 {
@@ -818,6 +818,7 @@ func NewControlPlaneWithContextOptions(
 	}()
 
 	if buildOpts.DelayDatapathCommit {
+		plane.bpfMaintenance = bindBpfMaintenanceRuntime(core.PeekBpf(), plane)
 		plane.preparedDatapathCommit = true
 	} else {
 		if err = plane.commitInterfaceBindings(); err != nil {
@@ -835,6 +836,8 @@ func NewControlPlaneWithContextOptions(
 			}
 			return nil, err
 		}
+		plane.bpfMaintenance = bindBpfMaintenanceRuntime(core.PeekBpf(), plane)
+		plane.startConnStateJanitor()
 		plane.releaseCommittedDNSReloadState()
 		plane.markReady()
 	}
@@ -1470,6 +1473,17 @@ func (c *ControlPlane) RunReloadRetirementCleanup(staleBeforeNs uint64) {
 	if c == nil {
 		return
 	}
+	if c.bpfMaintenance == nil || c.bpfMaintenance.runtime == nil {
+		c.runReloadRetirementCleanup(staleBeforeNs)
+		return
+	}
+	c.bpfMaintenance.runtime.request(c, staleBeforeNs)
+}
+
+func (c *ControlPlane) runReloadRetirementCleanup(staleBeforeNs uint64) {
+	if c == nil {
+		return
+	}
 	if c.core != nil {
 		err := retryPreviousRoutingEpochCleanup(c.ctx, c.core.finalizePreviousRoutingEpoch, nil)
 		if err != nil && c.log != nil {
@@ -1480,12 +1494,13 @@ func (c *ControlPlane) RunReloadRetirementCleanup(staleBeforeNs uint64) {
 		return
 	}
 
-	c.connStateCleanupMu.Lock()
+	cleanupMu, _ := c.maintenanceState()
+	cleanupMu.Lock()
 	redirectDeleted := c.cleanupRedirectTrackMapBeforeLocked(staleBeforeNs)
 	cookieDeleted := c.cleanupCookiePidMapBeforeLocked(staleBeforeNs)
 	routingHandoffDeleted := c.cleanupRoutingHandoffMapBeforeLocked(staleBeforeNs)
 	udpStats, tcpStats := c.cleanupConnStateMapBeforeLocked(true, staleBeforeNs)
-	c.connStateCleanupMu.Unlock()
+	cleanupMu.Unlock()
 
 	if c.log == nil {
 		return
@@ -1517,15 +1532,16 @@ const redirectTrackTimeout = 5 * time.Minute
 // This is necessary because redirect_track uses HASH (not LRU) to avoid
 // the problem where long-lived connections prevent cleanup of other entries.
 func (c *ControlPlane) cleanupRedirectTrackMap() int {
-	c.connStateCleanupMu.Lock()
-	defer c.connStateCleanupMu.Unlock()
+	cleanupMu, _ := c.maintenanceState()
+	cleanupMu.Lock()
+	defer cleanupMu.Unlock()
 	return c.cleanupRedirectTrackMapBeforeLocked(0)
 }
 
 func (c *ControlPlane) cleanupRedirectTrackMapBeforeLocked(staleBeforeNs uint64) int {
 	// Check if we're shutting down - if stop signal is sent, skip cleanup
 	select {
-	case <-c.connStateJanitorStop:
+	case <-c.stop:
 		return 0
 	default:
 	}
@@ -1615,14 +1631,15 @@ func (c *ControlPlane) cleanupRedirectTrackMapBeforeLocked(staleBeforeNs uint64)
 // cleanupCookiePidMap removes stale cookie->pid metadata that escaped the
 // cgroup sock_release backstop. Active sockets refresh last_seen_ns in BPF.
 func (c *ControlPlane) cleanupCookiePidMap() int {
-	c.connStateCleanupMu.Lock()
-	defer c.connStateCleanupMu.Unlock()
+	cleanupMu, _ := c.maintenanceState()
+	cleanupMu.Lock()
+	defer cleanupMu.Unlock()
 	return c.cleanupCookiePidMapBeforeLocked(0)
 }
 
 func (c *ControlPlane) cleanupCookiePidMapBeforeLocked(staleBeforeNs uint64) int {
 	select {
-	case <-c.connStateJanitorStop:
+	case <-c.stop:
 		return 0
 	default:
 	}
@@ -1693,14 +1710,15 @@ func (c *ControlPlane) cleanupCookiePidMapBeforeLocked(staleBeforeNs uint64) int
 // The handoff map is a short-lived bridge for userspace consumers that miss the
 // authoritative conn-state publication window.
 func (c *ControlPlane) cleanupRoutingHandoffMap() int {
-	c.connStateCleanupMu.Lock()
-	defer c.connStateCleanupMu.Unlock()
+	cleanupMu, _ := c.maintenanceState()
+	cleanupMu.Lock()
+	defer cleanupMu.Unlock()
 	return c.cleanupRoutingHandoffMapBeforeLocked(0)
 }
 
 func (c *ControlPlane) cleanupRoutingHandoffMapBeforeLocked(staleBeforeNs uint64) int {
 	select {
-	case <-c.connStateJanitorStop:
+	case <-c.stop:
 		return 0
 	default:
 	}
@@ -2810,7 +2828,7 @@ func (c *ControlPlane) releaseRetainedState() {
 	if handoff, owned := c.takeDNSHandoffController(); owned && handoff != nil {
 		_ = handoff.Close()
 	}
-	c.controlPlaneDatapathJanitor.releaseRetainedState()
+	c.bpfMaintenance = nil
 	c.ClearReloadDnsCacheSource()
 }
 

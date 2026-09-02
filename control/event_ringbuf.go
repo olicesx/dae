@@ -1,7 +1,6 @@
 package control
 
 import (
-	"encoding/binary"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -19,8 +18,8 @@ const (
 	daeEventBlockedAlive
 )
 
-// daeEvent mirrors struct dae_event in control/kern/tproxy.c (72 bytes,
-// little-endian). Parsed manually to avoid struct-padding surprises.
+// daeEvent mirrors struct dae_event in control/kern/tproxy.c. The kernel writes
+// native-endian scalars into the 72-byte ringbuf record.
 type daeEvent struct {
 	Timestamp uint64
 	Type      uint32
@@ -34,97 +33,107 @@ type daeEvent struct {
 	Dport     uint16
 }
 
-func parseDaeEvent(b []byte) (e daeEvent) {
+func parseDaeEvent(b []byte) daeEvent {
+	return parseDaeEventWithABI(nativeBpfABI, b)
+}
+
+func parseDaeEventWithABI(abi bpfHostABI, b []byte) (e daeEvent) {
 	if len(b) < 72 {
 		return e
 	}
-	e.Timestamp = binary.LittleEndian.Uint64(b[0:8])
-	e.Type = binary.LittleEndian.Uint32(b[8:12])
-	e.Pid = binary.LittleEndian.Uint32(b[12:16])
+	e.Timestamp = abi.uint64(b[0:8])
+	e.Type = abi.uint32(b[8:12])
+	e.Pid = abi.uint32(b[12:16])
 	copy(e.Pname[:], b[16:32])
 	e.Outbound = b[32]
 	e.L4proto = b[33]
 	for i := 0; i < 4; i++ {
-		e.Sip[i] = binary.LittleEndian.Uint32(b[36+4*i : 40+4*i])
-		e.Dip[i] = binary.LittleEndian.Uint32(b[52+4*i : 56+4*i])
+		e.Sip[i] = abi.uint32(b[36+4*i : 40+4*i])
+		e.Dip[i] = abi.uint32(b[52+4*i : 56+4*i])
 	}
-	e.Sport = binary.LittleEndian.Uint16(b[68:70])
-	e.Dport = binary.LittleEndian.Uint16(b[70:72])
+	e.Sport = abi.uint16(b[68:70])
+	e.Dport = abi.uint16(b[70:72])
 	return e
 }
 
 // startEventRingbufReader consumes kernel ringbuf events and forwards
 // conn-state overflow events to the conn state janitor, making the janitor
 // event-driven instead of purely polling. The reader blocks in ReadInto; it
-// is woken by Close (from stopConnStateJanitor or on its own exit path).
+// is woken by Close when the owning BPF runtime stops.
 //
-// The reader re-opens on error so a datapath reload (which replaces the
-// ringbuf map) does not strand it on a dead map. When the eBPF objects are
-// unavailable (stub builds) it simply parks: the janitor's polling backoff
-// remains the fallback.
-func (c *ControlPlane) startEventRingbufReader(overflowEvent chan<- struct{}) {
-	if c == nil {
-		return
-	}
-	go func() {
-		var reader *ringbuf.Reader
-		defer func() {
-			if reader != nil {
-				_ = reader.Close()
+// The reader re-opens the same runtime-owned map after transient errors. A
+// fresh BPF object set gets a separate runtime; shared reloads keep this reader
+// alive. Stub builds simply park and retain periodic cleanup as the fallback.
+func (r *bpfMaintenanceRuntime) readEvents() {
+	var reader *ringbuf.Reader
+	defer func() {
+		if reader != nil {
+			_ = reader.Close()
+		}
+	}()
+	for {
+		select {
+		case <-r.stop:
+			return
+		default:
+		}
+		if reader == nil {
+			if r.bpf == nil || r.bpf.EventRingbuf == nil {
+				select {
+				case <-r.stop:
+					return
+				case <-time.After(100 * time.Millisecond):
+					continue
+				}
 			}
-		}()
-		for {
+			opened, err := ringbuf.NewReader(r.bpf.EventRingbuf)
+			if err != nil {
+				select {
+				case <-r.stop:
+					return
+				case <-time.After(100 * time.Millisecond):
+					continue
+				}
+			}
+			reader = opened
+			r.reader.Store(opened)
 			select {
-			case <-c.connStateJanitorStop:
-				return
-			case <-c.ctx.Done():
+			case <-r.stop:
+				_ = reader.Close()
+				r.reader.Store(nil)
+				reader = nil
 				return
 			default:
 			}
-			if reader == nil {
-				bpf := c.currentBpf()
-				if bpf == nil || bpf.EventRingbuf == nil {
-					time.Sleep(100 * time.Millisecond)
-					continue
-				}
-				r, err := ringbuf.NewReader(bpf.EventRingbuf)
-				if err != nil {
-					time.Sleep(100 * time.Millisecond)
-					continue
-				}
-				reader = r
-				c.connEventReader.Store(r)
-			}
-			record := ringbuf.Record{}
-			if err := reader.ReadInto(&record); err != nil {
-				// Datapath replaced (reload) or closed: re-open on the
-				// current map, or park until one exists.
-				_ = reader.Close()
-				reader = nil
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-			ev := parseDaeEvent(record.RawSample)
-			switch ev.Type {
-			case daeEventUdpConnOverflow, daeEventTcpConnOverflow:
-				select {
-				case overflowEvent <- struct{}{}:
-				default: // janitor busy; its own polling will catch up
-				}
-			case daeEventBlockedAlive:
-				// Kernel blocked a packet because the selected outbound is
-				// not alive (wan_outbound_is_alive == false). Userspace never
-				// sees this flow (it is dropped before tproxy), so the normal
-				// dial-error path can't trigger resuscitation here. Trigger a
-				// group-level resuscitation probe so recovery does not wait
-				// for the next periodic health check. Resuscitate is
-				// rate-limited per group; the kernel additionally rate-limits
-				// event emission per outbound (1/s), so this cannot storm the
-				// probe workers.
-				c.handleBlockedAliveEvent(&ev)
-			}
 		}
-	}()
+		record := ringbuf.Record{}
+		if err := reader.ReadInto(&record); err != nil {
+			_ = reader.Close()
+			reader = nil
+			r.reader.Store(nil)
+			continue
+		}
+		target := r.active.Load()
+		if target == nil {
+			continue
+		}
+		ev := parseDaeEvent(record.RawSample)
+		switch ev.Type {
+		case daeEventUdpConnOverflow, daeEventTcpConnOverflow:
+			r.requestOverflow(target)
+		case daeEventBlockedAlive:
+			// Kernel blocked a packet because the selected outbound is
+			// not alive (wan_outbound_is_alive == false). Userspace never
+			// sees this flow (it is dropped before tproxy), so the normal
+			// dial-error path can't trigger resuscitation here. Trigger a
+			// group-level resuscitation probe so recovery does not wait
+			// for the next periodic health check. Resuscitate is
+			// rate-limited per group; the kernel additionally rate-limits
+			// event emission per outbound (1/s), so this cannot storm the
+			// probe workers.
+			target.handleBlockedAliveEvent(&ev)
+		}
+	}
 }
 
 // handleBlockedAliveEvent reacts to a kernel DAE_EVENT_BLOCKED_ALIVE by

@@ -26,7 +26,7 @@ type NetkitConfig struct {
 	// When true, skb->mark is preserved across netkit boundaries, which is
 	// required for bpf_redirect_peer(). The loader only enables
 	// bpf_redirect_peer() on kernels containing the CVE-2025-37959 fix.
-	// This requires kernel support (Linux 6.6+ with CONFIG_NETKIT).
+	// This requires kernel support (Linux 6.13+ with CONFIG_NETKIT).
 	ScrubNone bool
 }
 
@@ -123,8 +123,8 @@ func requireNetkitL2WithMAC(primary, peer netlink.Link) error {
 	return nil
 }
 
-// checkNetkitScrubSupport checks if the kernel supports the scrub configuration option.
-// Linux 6.6+ has scrub support in the kernel.
+// checkNetkitScrubSupport checks if the kernel supports netkit scrub attributes.
+// The attributes landed in Linux 6.13, after the initial netkit release.
 func checkNetkitScrubSupport(log *logrus.Logger) bool {
 	kernelVersion, err := internal.KernelVersion()
 	if err != nil {
@@ -132,17 +132,20 @@ func checkNetkitScrubSupport(log *logrus.Logger) bool {
 		return false
 	}
 
-	// Linux 6.6+ has scrub support
-	scrubSupportThreshold := internal.Version{6, 6, 0}
+	scrubSupportThreshold := internal.Version{6, 13, 0}
 	supportsScrub := !kernelVersion.Less(scrubSupportThreshold)
 
 	if supportsScrub {
-		log.Debugf("Kernel %s supports netkit scrub (6.6+)", kernelVersion.String())
+		log.Debugf("Kernel %s supports netkit scrub (6.13+)", kernelVersion.String())
 	} else {
-		log.Debugf("Kernel %s may not support netkit scrub (< 6.6)", kernelVersion.String())
+		log.Debugf("Kernel %s may not support netkit scrub (< 6.13)", kernelVersion.String())
 	}
 
 	return supportsScrub
+}
+
+func netkitScrubNone(supports bool, primary, peer netlink.NetkitScrub) bool {
+	return supports && primary == netlink.NETKIT_SCRUB_NONE && peer == netlink.NETKIT_SCRUB_NONE
 }
 
 // checkExistingNetkitScrubConfig checks if an existing netkit device
@@ -158,8 +161,9 @@ func checkExistingNetkitScrubConfig(log *logrus.Logger, ifname string) (bool, er
 		return false, fmt.Errorf("link %s is not a netkit device", ifname)
 	}
 
-	// Check if scrub is set to NONE (0)
-	scrubNone := netkit.Scrub == netlink.NETKIT_SCRUB_NONE
+	// Attribute absence decodes to zero as well, so presence and both ends
+	// must be checked before treating scrub as NONE.
+	scrubNone := netkitScrubNone(netkit.SupportsScrub(), netkit.Scrub, netkit.PeerScrub)
 	log.Debugf("Netkit device %s: scrub=%v, peer_scrub=%v, supportsScrub=%v",
 		ifname, netkit.Scrub, netkit.PeerScrub, netkit.SupportsScrub())
 

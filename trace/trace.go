@@ -18,7 +18,6 @@ import (
 	"os"
 	"slices"
 	"syscall"
-	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/btf"
@@ -32,24 +31,7 @@ import (
 
 //go:generate go run -mod=mod github.com/cilium/ebpf/cmd/bpf2go -cc "$BPF_CLANG" "$BPF_STRIP_FLAG" -cflags "$BPF_CFLAGS" -tags "trace,!dae_stub_ebpf" -target "$BPF_TRACE_TARGET" -type event bpf kern/trace.c -- -I./headers
 
-var nativeEndian binary.ByteOrder
-
-func init() {
-	// Detect native endianness by writing a known uint16 value and examining the bytes.
-	// This uses unsafe.Pointer to access the raw byte representation, which is necessary
-	// for endianness detection. The pattern is well-established and safe.
-	buf := [2]byte{}
-	*(*uint16)(unsafe.Pointer(&buf[0])) = uint16(0xABCD)
-
-	switch buf {
-	case [2]byte{0xCD, 0xAB}:
-		nativeEndian = binary.LittleEndian
-	case [2]byte{0xAB, 0xCD}:
-		nativeEndian = binary.BigEndian
-	default:
-		panic("Could not determine native endianness.")
-	}
-}
+var nativeEndian = internal.NativeEndian
 
 func StartTrace(ctx context.Context, ipVersion int, l4ProtoNo uint16, port int, dropOnly bool, outputFile string) (err error) {
 	kernelVersion, err := internal.KernelVersion()

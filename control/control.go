@@ -26,7 +26,7 @@ func (c *ControlPlane) RollbackPreparedRoutingEpoch() error {
 	if c == nil || c.core == nil {
 		return nil
 	}
-	if err := c.core.RollbackRoutingEpoch(); err != nil {
+	if err := c.rollbackRoutingEpoch(); err != nil {
 		return err
 	}
 	if c.bpfMaintenance != nil {

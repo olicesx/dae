@@ -15,17 +15,21 @@ import (
 )
 
 type dnsControllerRuntimeState struct {
-	routing               *dns.Dns
-	lifecycleCtx          context.Context
-	cacheAccessCallback   func(cache *DnsCache) (err error)
-	cacheDeleteCallback   func(cacheKey string, cache *DnsCache) (err error)
-	newCache              func(fqdn string, answers, ns, extra []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
-	routeProjectionEpoch  uint64
-	routeProjectionHash   [32]byte
-	projectCacheRoute     func(cache *DnsCache) []uint32
-	bestDialerChooser     func(ctx context.Context, snapshot DnsRequestSnapshot, upstream *dns.Upstream) (*dialArgument, error)
-	timeoutExceedCallback func(dialArgument *dialArgument, err error)
-	fixedDomainTtl        map[string]int
+	routing                *dns.Dns
+	lifecycleCtx           context.Context
+	cacheAccessCallback    func(cache *DnsCache) (err error)
+	cacheDeleteCallback    func(cacheKey string, cache *DnsCache) (err error)
+	newCache               func(fqdn string, answers, ns, extra []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
+	routeProjectionEpoch   uint64
+	routeProjectionHash    [32]byte
+	projectCacheRoute      func(cache *DnsCache) []uint32
+	bestDialerChooser      func(ctx context.Context, snapshot DnsRequestSnapshot, upstream *dns.Upstream) (*dialArgument, error)
+	timeoutExceedCallback  func(dialArgument *dialArgument, err error)
+	fixedDomainTtl         map[string]int
+	qtypePrefer            uint16
+	optimisticCacheEnabled bool
+	optimisticCacheTtl     int
+	maxCacheSize           int
 }
 
 func normalizeDnsRuntimeBehavior(option *DnsControllerOption) (qtypePrefer uint16, optimisticCacheEnabled bool, optimisticCacheTtl int, maxCacheSize int, err error) {
@@ -45,17 +49,19 @@ func normalizeDnsRuntimeBehavior(option *DnsControllerOption) (qtypePrefer uint1
 }
 
 func (c *DnsController) currentQtypePrefer() uint16 {
-	if c == nil {
+	rt := c.runtime()
+	if rt == nil {
 		return 0
 	}
-	return uint16(c.qtypePrefer.Load())
+	return rt.qtypePrefer
 }
 
 func (c *DnsController) currentOptimisticCacheConfig() (enabled bool, ttl int, maxCacheSize int) {
-	if c == nil {
+	rt := c.runtime()
+	if rt == nil {
 		return false, 0, 0
 	}
-	return c.optimisticCacheEnabled.Load(), int(c.optimisticCacheTtl.Load()), int(c.maxCacheSize.Load())
+	return rt.optimisticCacheEnabled, rt.optimisticCacheTtl, rt.maxCacheSize
 }
 
 // ReuseForReload updates the current facade to the replacement generation's
@@ -118,10 +124,6 @@ func (c *DnsController) updateRuntime(option *DnsControllerOption, routing *dns.
 	if err != nil {
 		return err
 	}
-	c.qtypePrefer.Store(uint32(qtypePrefer))
-	c.optimisticCacheEnabled.Store(optimisticCacheEnabled)
-	c.optimisticCacheTtl.Store(int64(optimisticCacheTtl))
-	c.maxCacheSize.Store(int64(maxCacheSize))
 	// c.log is deliberately NOT reassigned here: the controller is published
 	// while request handlers and the janitor run, and an unlocked field write
 	// would be a data race. Reloads never introduce a new logger instance
@@ -133,17 +135,21 @@ func (c *DnsController) updateRuntime(option *DnsControllerOption, routing *dns.
 		lifecycleCtx = context.Background()
 	}
 	runtimeState := &dnsControllerRuntimeState{
-		routing:               routing,
-		lifecycleCtx:          lifecycleCtx,
-		cacheAccessCallback:   option.CacheAccessCallback,
-		cacheDeleteCallback:   option.CacheDeleteCallback,
-		newCache:              option.NewCache,
-		routeProjectionEpoch:  option.RouteProjectionEpoch,
-		routeProjectionHash:   option.RouteProjectionHash,
-		projectCacheRoute:     option.ProjectCacheRoute,
-		bestDialerChooser:     option.BestDialerChooser,
-		timeoutExceedCallback: option.TimeoutExceedCallback,
-		fixedDomainTtl:        option.FixedDomainTtl,
+		routing:                routing,
+		lifecycleCtx:           lifecycleCtx,
+		cacheAccessCallback:    option.CacheAccessCallback,
+		cacheDeleteCallback:    option.CacheDeleteCallback,
+		newCache:               option.NewCache,
+		routeProjectionEpoch:   option.RouteProjectionEpoch,
+		routeProjectionHash:    option.RouteProjectionHash,
+		projectCacheRoute:      option.ProjectCacheRoute,
+		bestDialerChooser:      option.BestDialerChooser,
+		timeoutExceedCallback:  option.TimeoutExceedCallback,
+		fixedDomainTtl:         option.FixedDomainTtl,
+		qtypePrefer:            qtypePrefer,
+		optimisticCacheEnabled: optimisticCacheEnabled,
+		optimisticCacheTtl:     optimisticCacheTtl,
+		maxCacheSize:           maxCacheSize,
 	}
 	c.runtimeMu.Lock()
 	c.runtimeState.Store(runtimeState)

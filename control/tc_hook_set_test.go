@@ -397,8 +397,12 @@ func TestTCHookSetDynamicDualRoleCallbacksAreIdempotent(t *testing.T) {
 	}
 	_ = staged.stage(ingress)
 	_ = staged.stage(egress)
-	staged.stageRemoveInterface(tcHookScopeHost, ingress.Ifindex)
-	staged.stageRemoveInterface(tcHookScopeHost, ingress.Ifindex)
+	if err := staged.stageRemoveInterface(tcHookScopeHost, ingress.Ifindex); err != nil {
+		t.Fatal(err)
+	}
+	if err := staged.stageRemoveInterface(tcHookScopeHost, ingress.Ifindex); err != nil {
+		t.Fatal(err)
+	}
 	_ = staged.stage(ingress)
 	_ = staged.stage(egress)
 	_ = staged.stage(ingress)

@@ -121,7 +121,11 @@ func TestBpfMaintenanceCleanupFollowsFreshMapHandleAdoption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("clone conn-state map: %v", err)
 	}
-	t.Cleanup(func() { clonedConnState.Close() })
+	t.Cleanup(func() {
+		if err := clonedConnState.Close(); err != nil {
+			t.Errorf("close cloned conn-state map: %v", err)
+		}
+	})
 
 	previous := &ControlPlane{}
 	successor := &ControlPlane{}
@@ -166,7 +170,11 @@ func TestProcessFlowAdoptionRollsBackOnStaleCleanupOwner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("clone conn-state map: %v", err)
 	}
-	t.Cleanup(func() { clonedConnState.Close() })
+	t.Cleanup(func() {
+		if err := clonedConnState.Close(); err != nil {
+			t.Errorf("close cloned conn-state map: %v", err)
+		}
+	})
 	previousBpf := &bpfObjects{bpfMaps: bpfMaps{ConnStateMap: connState}}
 	successorBpf := &bpfObjects{bpfMaps: bpfMaps{ConnStateMap: clonedConnState}}
 	manager := NewSessionManager(t.Context())

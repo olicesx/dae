@@ -2689,7 +2689,7 @@ int tproxy_wan_ingress_l3(struct __sk_buff *skb)
 	return do_tproxy_wan_ingress(skb, 0);
 }
 
-static __noinline int
+static __always_inline int
 do_tproxy_wan_lan_ingress(struct __sk_buff *skb, __u32 link_h_len)
 {
 	int ret = do_tproxy_wan_ingress(skb, link_h_len);
@@ -3113,7 +3113,7 @@ int tproxy_wan_egress_l3(struct __sk_buff *skb)
 	return do_tproxy_wan_egress(skb, 0);
 }
 
-static __noinline int
+static __always_inline int
 do_tproxy_lan_wan_egress(struct __sk_buff *skb, __u32 link_h_len)
 {
 	int ret = do_tproxy_lan_egress(skb, link_h_len);

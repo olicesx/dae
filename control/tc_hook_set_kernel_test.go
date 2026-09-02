@@ -17,9 +17,17 @@ import (
 
 func TestTCHookSetKernelUpdateAndRollback(t *testing.T) {
 	oldProgram := newKernelTCHookTestProgram(t, "dae_tc_old", 0)
-	defer oldProgram.Close()
+	t.Cleanup(func() {
+		if err := oldProgram.Close(); err != nil {
+			t.Errorf("close old TC program: %v", err)
+		}
+	})
 	newProgram := newKernelTCHookTestProgram(t, "dae_tc_new", 2)
-	defer newProgram.Close()
+	t.Cleanup(func() {
+		if err := newProgram.Close(); err != nil {
+			t.Errorf("close new TC program: %v", err)
+		}
+	})
 
 	name := fmt.Sprintf("daehs%x", os.Getpid()&0xffff)
 	peerName := fmt.Sprintf("daehp%x", os.Getpid()&0xffff)
@@ -32,7 +40,11 @@ func TestTCHookSetKernelUpdateAndRollback(t *testing.T) {
 		}
 		t.Fatal(err)
 	}
-	defer netlink.LinkDel(veth)
+	t.Cleanup(func() {
+		if err := netlink.LinkDel(veth); err != nil && !stderrors.Is(err, unix.ENODEV) {
+			t.Errorf("delete TC test veth: %v", err)
+		}
+	})
 	link, err := netlink.LinkByName(name)
 	if err != nil {
 		t.Fatal(err)
@@ -183,9 +195,17 @@ func TestTCHookSetKernelUpdateAndRollback(t *testing.T) {
 
 func testTCHookContinuationOnPacketPath(t *testing.T) {
 	continueProgram := newKernelTCHookTestProgram(t, "dae_tc_next", -1)
-	defer continueProgram.Close()
+	t.Cleanup(func() {
+		if err := continueProgram.Close(); err != nil {
+			t.Errorf("close continuation TC program: %v", err)
+		}
+	})
 	dropProgram := newKernelTCHookTestProgram(t, "dae_tc_drop", 2)
-	defer dropProgram.Close()
+	t.Cleanup(func() {
+		if err := dropProgram.Close(); err != nil {
+			t.Errorf("close drop TC program: %v", err)
+		}
+	})
 
 	nsName := fmt.Sprintf("dae-tc-%x", os.Getpid()&0xffff)
 	hostName := fmt.Sprintf("daetch%x", os.Getpid()&0xffff)

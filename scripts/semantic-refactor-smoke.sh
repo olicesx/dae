@@ -346,6 +346,37 @@ finish_smoke() {
 # ---------------------------------------------------------------------------
 # lifecycle: datapath lifecycle and stale-state recovery, no traffic.
 # ---------------------------------------------------------------------------
+count_daemon_tcx_ingress_links() {
+	local count=0 info
+
+	for info in /proc/"$daemon_pid"/fdinfo/*; do
+		[ -r "$info" ] || continue
+		if grep -Fqx $'link_type:\ttcx' "$info" &&
+			grep -Eq '^attach_type:[[:space:]]+[0-9]+ \(ingress\)$' "$info"; then
+			count=$((count + 1))
+		fi
+	done
+	printf '%d\n' "$count"
+}
+
+assert_internal_tc_hooks() {
+	local host_count peer_count tcx_count
+
+	host_count=$(tc filter show dev dae0 ingress | grep -F -c dae_dae0_ingress || true)
+	peer_count=$(ip netns exec daens tc filter show dev dae0peer ingress | grep -F -c dae_dae0peer_ingress || true)
+	tcx_count=$(count_daemon_tcx_ingress_links)
+
+	if [ "$host_count" -eq 1 ] && [ "$peer_count" -eq 1 ] && [ "$tcx_count" -eq 0 ]; then
+		return 0
+	fi
+	if [ "$host_count" -eq 0 ] && [ "$peer_count" -eq 0 ] && [ "$tcx_count" -eq 2 ]; then
+		return 0
+	fi
+
+	echo "unexpected internal TC hooks: classic dae0=$host_count dae0peer=$peer_count tcx=$tcx_count" >&2
+	return 1
+}
+
 run_lifecycle() {
 	local source_config rounds
 	binary=${1:-$repo_root/dae}
@@ -385,11 +416,7 @@ run_lifecycle() {
 	while [ "$round" -le "$rounds" ]; do
 		kill -USR1 "$daemon_pid"
 		wait_for_reload_count "$tmp_dir/initial.log" "$round"
-		local host_count peer_count
-		host_count=$(tc filter show dev dae0 ingress | grep -F -c dae_dae0_ingress || true)
-		peer_count=$(ip netns exec daens tc filter show dev dae0peer ingress | grep -F -c dae_dae0peer_ingress || true)
-		if [ "$host_count" -ne 1 ] || [ "$peer_count" -ne 1 ]; then
-			echo "unexpected internal TC filter counts: dae0=$host_count dae0peer=$peer_count" >&2
+		if ! assert_internal_tc_hooks; then
 			cat "$tmp_dir/initial.log" >&2
 			exit 1
 		fi

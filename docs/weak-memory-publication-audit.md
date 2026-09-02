@@ -131,6 +131,47 @@ obtained. This should remain a residual risk unless kernel-version-specific
 execution semantics or a real-kernel stress test falsifies it; it is not evidence
 for adding a packet-path selector, dispatcher, lock, or tail call.
 
+## Change contract
+
+### ROUTING-EPOCH-1: linked publication is single-writer
+
+Current status: an invariant supplied by reload orchestration, not enforced by
+`controlPlaneCore`. Publish and rollback calls for a linked pair must not run
+concurrently. Each core owns a `routingEpochMu`, but a publication transaction
+also swaps the peer's userspace active-slot cache without taking the peer's
+mutex.
+
+Failure condition: if future orchestration permits both linked planes to call
+publish or rollback concurrently, interleaved selector updates and peer-cache
+commit/restore operations can leave the cache naming a slot other than the last
+successful map update.
+
+Required action before parallelizing: serialize the complete linked-pair
+selector/cache transaction outside the packet path, add adversarial concurrent
+publish/rollback/failure tests, and run real-map routing plus supported-kernel
+lifecycle gates. Independent per-core locking is not sufficient.
+
+### ROUTING-EPOCH-2: old-slot cleanup has no proven kernel grace edge
+
+Current status: `finalizePreviousRoutingEpoch` runs only after userspace
+retirement and drain. This is a long practical delay, but it is not a formal
+proof that every TC invocation which sampled the old selector has completed
+before old slot-scoped values are cleared.
+
+Failure condition: an invocation samples the old slot before selector flip,
+is delayed across retirement, and performs a later lookup while userspace
+clears that slot. No supported-kernel reproducer or authoritative grace-period
+proof was established by this audit.
+
+Required action before moving cleanup earlier, shortening its drain dependency,
+or making it concurrent with cutover: obtain kernel-version-specific evidence
+for all supported kernels or a real-kernel test that exercises the delayed
+old-selector lookup. Do not compensate with a packet-path Go lock, extra
+selector, tail call, or dispatcher.
+
+These contract IDs are repeated beside the implementation in
+`control/routing_epoch.go` so code search and future scoped work encounter them.
+
 ## Regression evidence
 
 `control/weak_memory_publication_test.go` contains three publication litmus

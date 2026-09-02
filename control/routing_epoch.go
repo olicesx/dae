@@ -348,6 +348,12 @@ func (c *controlPlaneCore) StageRoutingEpoch() error {
 // PublishRoutingEpoch atomically changes the slot consulted by route(). Call
 // it only after the selected slot's rules, LPM tries, and domain projection
 // have all been prepared.
+//
+// ROUTING-EPOCH-1 contract: reload orchestration is the single writer for a linked
+// pair. Per-core routingEpochMu does not serialize a concurrent publisher on
+// the peer, so any future parallel publication must add lifecycle-level
+// serialization around the complete selector/cache transaction. See the
+// ROUTING-EPOCH-1 section in docs/weak-memory-publication-audit.md.
 func (c *controlPlaneCore) PublishRoutingEpoch(peerCaches ...*controlPlaneCore) error {
 	if c == nil {
 		return nil
@@ -422,6 +428,13 @@ func clearPreviousRoutingEpochMaps(bpf *bpfObjects, previous uint32) error {
 
 // finalizePreviousRoutingEpoch releases the inactive domain projection after
 // the previous generation has drained and rollback is no longer possible.
+//
+// ROUTING-EPOCH-2 contract: userspace retirement is currently the only
+// quiescence barrier before old-slot cleanup. There is no proven kernel grace
+// period covering a TC invocation that sampled the old selector before the
+// flip. Do not move this cleanup earlier or make it concurrent with cutover
+// without supported-kernel evidence that those invocations have quiesced. See
+// the ROUTING-EPOCH-2 section in docs/weak-memory-publication-audit.md.
 func (c *controlPlaneCore) finalizePreviousRoutingEpoch() error {
 	return c.finalizePreviousRoutingEpochWithCleanup(clearPreviousRoutingEpochMaps)
 }

@@ -314,6 +314,8 @@ type bpfDataplanePrograms struct {
 	TproxyLanEgressL3      *ebpf.Program `ebpf:"tproxy_lan_egress_l3"`
 	TproxyLanIngressL2     *ebpf.Program `ebpf:"tproxy_lan_ingress_l2"`
 	TproxyLanIngressL3     *ebpf.Program `ebpf:"tproxy_lan_ingress_l3"`
+	TproxyLanWanEgressL2   *ebpf.Program `ebpf:"tproxy_lan_wan_egress_l2"`
+	TproxyLanWanEgressL3   *ebpf.Program `ebpf:"tproxy_lan_wan_egress_l3"`
 	TproxyWanCgConnect4    *ebpf.Program `ebpf:"tproxy_wan_cg_connect4"`
 	TproxyWanCgConnect6    *ebpf.Program `ebpf:"tproxy_wan_cg_connect6"`
 	TproxyWanCgSendmsg4    *ebpf.Program `ebpf:"tproxy_wan_cg_sendmsg4"`
@@ -324,6 +326,8 @@ type bpfDataplanePrograms struct {
 	TproxyWanEgressL3      *ebpf.Program `ebpf:"tproxy_wan_egress_l3"`
 	TproxyWanIngressL2     *ebpf.Program `ebpf:"tproxy_wan_ingress_l2"`
 	TproxyWanIngressL3     *ebpf.Program `ebpf:"tproxy_wan_ingress_l3"`
+	TproxyWanLanIngressL2  *ebpf.Program `ebpf:"tproxy_wan_lan_ingress_l2"`
+	TproxyWanLanIngressL3  *ebpf.Program `ebpf:"tproxy_wan_lan_ingress_l3"`
 }
 
 // bpfDataplaneMaps mirrors the always-on datapath maps declared in the generated
@@ -652,6 +656,8 @@ func assignDataplaneToBpf(bpf *bpfObjects, dp *bpfDataplane) {
 	bpf.TproxyLanEgressL3 = dp.TproxyLanEgressL3
 	bpf.TproxyLanIngressL2 = dp.TproxyLanIngressL2
 	bpf.TproxyLanIngressL3 = dp.TproxyLanIngressL3
+	bpf.TproxyLanWanEgressL2 = dp.TproxyLanWanEgressL2
+	bpf.TproxyLanWanEgressL3 = dp.TproxyLanWanEgressL3
 	bpf.TproxyWanCgConnect4 = dp.TproxyWanCgConnect4
 	bpf.TproxyWanCgConnect6 = dp.TproxyWanCgConnect6
 	bpf.TproxyWanCgSendmsg4 = dp.TproxyWanCgSendmsg4
@@ -662,6 +668,8 @@ func assignDataplaneToBpf(bpf *bpfObjects, dp *bpfDataplane) {
 	bpf.TproxyWanEgressL3 = dp.TproxyWanEgressL3
 	bpf.TproxyWanIngressL2 = dp.TproxyWanIngressL2
 	bpf.TproxyWanIngressL3 = dp.TproxyWanIngressL3
+	bpf.TproxyWanLanIngressL2 = dp.TproxyWanLanIngressL2
+	bpf.TproxyWanLanIngressL3 = dp.TproxyWanLanIngressL3
 
 	bpf.ActiveRoutingEpochMap = dp.ActiveRoutingEpochMap
 	bpf.AliveBlockRateMap = dp.AliveBlockRateMap

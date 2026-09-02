@@ -193,6 +193,8 @@ type bpfProgramSpecs struct {
 	TproxyLanEgressL3           *ebpf.ProgramSpec `ebpf:"tproxy_lan_egress_l3"`
 	TproxyLanIngressL2          *ebpf.ProgramSpec `ebpf:"tproxy_lan_ingress_l2"`
 	TproxyLanIngressL3          *ebpf.ProgramSpec `ebpf:"tproxy_lan_ingress_l3"`
+	TproxyLanWanEgressL2        *ebpf.ProgramSpec `ebpf:"tproxy_lan_wan_egress_l2"`
+	TproxyLanWanEgressL3        *ebpf.ProgramSpec `ebpf:"tproxy_lan_wan_egress_l3"`
 	TcpOffloadRedirect          *ebpf.ProgramSpec `ebpf:"tcp_offload_redirect"`
 	TcpOffloadSentAccount       *ebpf.ProgramSpec `ebpf:"tcp_offload_sent_account"`
 	TcpOffloadSentAccountKprobe *ebpf.ProgramSpec `ebpf:"tcp_offload_sent_account_kprobe"`
@@ -206,6 +208,8 @@ type bpfProgramSpecs struct {
 	TproxyWanEgressL3           *ebpf.ProgramSpec `ebpf:"tproxy_wan_egress_l3"`
 	TproxyWanIngressL2          *ebpf.ProgramSpec `ebpf:"tproxy_wan_ingress_l2"`
 	TproxyWanIngressL3          *ebpf.ProgramSpec `ebpf:"tproxy_wan_ingress_l3"`
+	TproxyWanLanIngressL2       *ebpf.ProgramSpec `ebpf:"tproxy_wan_lan_ingress_l2"`
+	TproxyWanLanIngressL3       *ebpf.ProgramSpec `ebpf:"tproxy_wan_lan_ingress_l3"`
 }
 
 type bpfMapSpecs struct {
@@ -284,6 +288,7 @@ type bpfMaps struct {
 func (m *bpfMaps) Close() error {
 	return _BpfClose(
 		m.ActiveRoutingEpochMap,
+		m.AliveBlockRateMap,
 		m.BpfStatsMap,
 		m.ConntrackArgsMap,
 		m.CookiePidMap,
@@ -352,6 +357,7 @@ func (p *bpfPrograms) Close() error {
 		p.TproxyLanWanEgressL3,
 		p.TcpOffloadRedirect,
 		p.TcpOffloadSentAccount,
+		p.TcpOffloadSentAccountKprobe,
 		p.TproxyWanCgConnect4,
 		p.TproxyWanCgConnect6,
 		p.TproxyWanCgSendmsg4,

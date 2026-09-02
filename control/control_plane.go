@@ -441,10 +441,11 @@ func NewControlPlaneWithContextOptions(
 			return os.RemoveAll(pinPath)
 		})
 	}
+	var constructedPlane *ControlPlane
 	defer func() {
 		if err != nil {
-			if plane != nil {
-				_ = plane.Close()
+			if constructedPlane != nil {
+				_ = constructedPlane.Close()
 			} else {
 				// Fallback cleanup if plane was not yet fully constructed.
 				for i := len(deferFuncs) - 1; i >= 0; i-- {
@@ -753,6 +754,7 @@ func NewControlPlaneWithContextOptions(
 			udpDirectDispatchSem: make(chan struct{}, udpDirectDispatchConcurrency),
 		},
 	}
+	constructedPlane = plane
 	SetFailedQuicDcidCache(plane.failedQuicDcidCache)
 	SetAnyfromSoMark(global.SoMarkFromDae)
 	plane.deferFuncs = append(plane.deferFuncs, plane.closePublishedListenerFiles)
@@ -812,9 +814,11 @@ func NewControlPlaneWithContextOptions(
 	if err = dnsUpstream.CheckUpstreamsFormat(); err != nil {
 		return nil, err
 	}
+	dnsUpstreamsReady := plane.dnsUpstreamsReady
+	dnsUpstreamsCtx := plane.ctx
 	go func() {
-		defer close(plane.dnsUpstreamsReady)
-		dnsUpstream.InitUpstreams(plane.ctx)
+		defer close(dnsUpstreamsReady)
+		dnsUpstream.InitUpstreams(dnsUpstreamsCtx)
 	}()
 
 	if buildOpts.DelayDatapathCommit {

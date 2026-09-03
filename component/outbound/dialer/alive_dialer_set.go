@@ -208,6 +208,26 @@ func (a *AliveDialerSet) printLatencies() {
 func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	// Unknown dialer: dialerToIndex's zero value is 0, which a naive lookup
+	// would misread as "alive at index 0" and corrupt another dialer's entry.
+	// The set's dialer list is fixed at construction, so an unknown dialer is
+	// a caller bug; ignore it rather than corrupt the invariant.
+	if _, ok := a.dialerToIndex[dialer]; !ok {
+		if a.log.IsLevelEnabled(logrus.DebugLevel) {
+			name := "<nil dialer>"
+			if dialer != nil {
+				name = dialer.property.Name
+			}
+			a.log.WithFields(logrus.Fields{
+				"group":   a.dialerGroupName,
+				"dialer":  name,
+				"network": a.CheckTyp.String(),
+			}).Debugln("NotifyLatencyChange: dialer not in this set; ignored")
+		}
+		return
+	}
+
 	var (
 		rawLatency     time.Duration
 		sortingLatency time.Duration
@@ -374,9 +394,20 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 		if index := a.dialerToIndex[dialer]; index >= 0 {
 			a.aliveEntries[index].sortingLatency = sortingLatency
 		}
-		if a.minLatency.dialer == nil || sortingLatency < a.minLatency.sortingLatency {
+		wasNoAliveDialer := a.minLatency.dialer == nil
+		if wasNoAliveDialer || sortingLatency < a.minLatency.sortingLatency {
 			a.minLatency.dialer = dialer
 			a.minLatency.sortingLatency = sortingLatency
+		}
+		if wasNoAliveDialer && a.minLatency.dialer != nil {
+			// Not alive -> alive: mirror the has-latency branch above so the
+			// group-level callback (which drives the kernel outbound
+			// connectivity map) learns about traffic-driven revival. Without
+			// this, a revived data-UDP domain leaves the map at 0 and the
+			// kernel keeps dropping new flows routed to this group.
+			a.mu.Unlock()
+			a.aliveChangeCallback(true)
+			a.mu.Lock()
 		}
 		if a.log.IsLevelEnabled(logrus.InfoLevel) {
 			a.log.WithFields(logrus.Fields{

@@ -45,6 +45,57 @@ const Timeout = 10 * time.Second
 // dead path.
 var ErrNoApplicableIP = stderrors.New("no applicable IP for this network type")
 
+// errCheckOptionUnavailable is a sentinel error returned by CheckFunc when the
+// check option itself cannot be built (e.g. the TCP check URL cannot be
+// resolved via the system resolver, or the DNS check target failed to parse).
+// Such failures are probe-infrastructure problems shared by every dialer of
+// the generation, not evidence about any single node's health, so check()
+// skips health-state punishment for them instead of flapping all nodes.
+//
+// Deliberate asymmetry with ErrNoApplicableIP: a check target without a record
+// for this IP version is still per-node-path evidence (traffic on that family
+// would hit the same wall), so it keeps punishing; a broken check option says
+// nothing about any path and must not punish.
+var errCheckOptionUnavailable = stderrors.New("check option unavailable")
+
+// wrapCheckOptionError classifies a check-option build failure. The sentinel
+// stays unexported because it is plumbing between CheckFunc closures and
+// check(); callers outside the package have no way to produce it.
+func wrapCheckOptionError(err error) error {
+	return fmt.Errorf("%w: %v", errCheckOptionUnavailable, err)
+}
+
+// isLifecycleTeardownError reports whether err carries no evidence about node
+// health because it was produced by dialer teardown.
+//
+// Cancellation-shaped errors are always teardown: the check ctx's explicit
+// cancel() runs only after CheckFunc has returned, so mid-probe cancellation
+// can only come from the parent dialer context (retirement/reload); a check
+// deadline expiry instead surfaces as context.DeadlineExceeded, which this
+// predicate does not match and which must be punished as a slow node.
+//
+// Closed-connection errors are teardown only when this dialer is actually
+// being retired (d.ctx done). While the dialer is live, net.ErrClosed is NOT
+// teardown: mux protocols in the outbound fork (anytls, juicity, ...) surface
+// net.ErrClosed when the remote side kills the session, and that must still
+// count as node evidence so the node can be punished.
+//
+// Note: an error that merely CONTAINS the text "context canceled" without
+// chaining context.Canceled does not take the unconditional leg and is
+// punished while the dialer is live. That narrowing is deliberate: every
+// in-tree producer chains context.Canceled (or is gated on d.ctx), so a bare
+// string match could only fire for foreign code, where erring toward node
+// evidence is the safe direction.
+func (d *Dialer) isLifecycleTeardownError(err error) bool {
+	if !commonerrors.IsCanceledOrClosed(err) {
+		return false
+	}
+	if stderrors.Is(err, context.Canceled) {
+		return true
+	}
+	return d.ctx.Err() != nil
+}
+
 type UdpHealthDomain uint8
 
 const (
@@ -550,6 +601,13 @@ func getActiveDialerCount() int {
 
 func (d *Dialer) aliveBackground() {
 	cycle := d.CheckInterval
+	if cycle <= 0 {
+		// The daemon config layer enforces a positive interval, but a
+		// programmatic GlobalOption is unvalidated; a non-positive cycle
+		// would panic in fastrand.Int63n below on the first check. Fall back
+		// to the shortest sensible cadence instead of crashing.
+		cycle = time.Second
+	}
 	var tcpSomark uint32
 	var mptcp bool
 	if network, err := netproxy.ParseMagicNetwork(d.TcpCheckOptionRaw.ResolverNetwork); err == nil {
@@ -565,7 +623,7 @@ func (d *Dialer) aliveBackground() {
 		CheckFunc: func(ctx context.Context, typ *NetworkType) (ok bool, err error) {
 			opt, err := d.TcpCheckOptionRaw.Option()
 			if err != nil {
-				return false, err
+				return false, wrapCheckOptionError(err)
 			}
 			if !opt.Ip4.IsValid() {
 				d.Log.WithFields(logrus.Fields{
@@ -587,7 +645,7 @@ func (d *Dialer) aliveBackground() {
 		CheckFunc: func(ctx context.Context, typ *NetworkType) (ok bool, err error) {
 			opt, err := d.TcpCheckOptionRaw.Option()
 			if err != nil {
-				return false, err
+				return false, wrapCheckOptionError(err)
 			}
 			if !opt.Ip6.IsValid() {
 				d.Log.WithFields(logrus.Fields{
@@ -615,7 +673,7 @@ func (d *Dialer) aliveBackground() {
 		return func(ctx context.Context, typ *NetworkType) (ok bool, err error) {
 			opt, err := d.CheckDnsOptionRaw.Option()
 			if err != nil {
-				return false, err
+				return false, wrapCheckOptionError(err)
 			}
 			addr := ip(opt)
 			if !addr.IsValid() {
@@ -834,37 +892,47 @@ func (d *Dialer) submitCheckTasks(workerPool *ants.Pool, wg *sync.WaitGroup, opt
 
 		wg.Add(1)
 		checkOpt := opt
-		err := workerPool.Submit(func() {
+		worker := func() {
 			defer wg.Done()
 			select {
 			case <-d.ctx.Done():
 				return
 			default:
 			}
-			if isResuscitation {
-				// Stagger resuscitation probes to prevent thundering herd.
-				// Random delay between 0 and 2 seconds, but allow reload/cancel
-				// to interrupt the probe before it starts.
-				timer := time.NewTimer(time.Duration(fastrand.Int63n(int64(2 * time.Second))))
-				defer timer.Stop()
+			_, _ = d.check(checkOpt, isResuscitation, cycle)
+		}
+		submitNow := func() {
+			// wg ownership: the worker Dones on completion; callers of
+			// submitNow must Done only when the worker never runs.
+			if err := workerPool.Submit(worker); err != nil {
+				// Nonblocking pools report overload immediately. Health checks are
+				// periodic, so skip this probe instead of spawning an unbounded
+				// goroutine that can outlive the dialer lifecycle.
+				wg.Done()
+			}
+		}
+
+		if isResuscitation {
+			// Stagger resuscitation probes to prevent thundering herd: a
+			// random delay between 0 and 2 seconds. The wait must happen
+			// OUTSIDE the worker pool — sleeping inside pool workers makes
+			// each emergency probe occupy a pool slot for the whole delay and,
+			// during a fleet-wide outage (every node resuscitating at once),
+			// starves the periodic checks of healthy nodes exactly when they
+			// matter most.
+			time.AfterFunc(time.Duration(fastrand.Int63n(int64(2*time.Second))), func() {
 				select {
 				case <-d.ctx.Done():
+					// Retired while waiting for the stagger: drop the task.
+					wg.Done()
 					return
-				case <-timer.C:
+				default:
 				}
-			}
-			_, _ = d.check(checkOpt, isResuscitation, cycle)
-		})
-
-		if err != nil {
-			// Nonblocking pools report overload immediately. Health checks are
-			// periodic, so skip this probe instead of spawning an unbounded
-			// goroutine that can outlive the dialer lifecycle.
-			wg.Done()
-			// Pool closed or overloaded: both mean "skip this cycle";
-			// periodic re-checks are the recovery path either way.
+				submitNow()
+			})
 			continue
 		}
+		submitNow()
 	}
 }
 
@@ -874,6 +942,19 @@ func (d *Dialer) NotifyCheck() {
 	case <-d.ctx.Done():
 		return
 	default:
+	}
+
+	// 2s cooldown, mirroring NotifyCheckDnsUdp/NotifyCheckTcp: NotifyCheck is
+	// reachable from the exported TriggerLatencyChecks API, and a fast GUI
+	// poller could otherwise drive back-to-back full checks (each occupying
+	// worker-pool slots and re-resolving the check URL).
+	now := time.Now().UnixNano()
+	pre := d.lastNotifyCheck.Load()
+	if now-pre < int64(2*time.Second) {
+		return
+	}
+	if !d.lastNotifyCheck.CompareAndSwap(pre, now) {
+		return
 	}
 
 	select {
@@ -1213,14 +1294,17 @@ func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResu
 		if stderrors.Is(err, context.Canceled) {
 			break
 		}
-		if err == nil || err == ErrNoApplicableIP {
-			// No applicable IP or a plain skip; don't retry — the DNS record
-			// will not change between two attempts within the same check cycle.
+		if err == nil || err == ErrNoApplicableIP || stderrors.Is(err, errCheckOptionUnavailable) {
+			// No applicable IP, a plain skip, or a probe-infrastructure
+			// failure (check option cannot be built); don't retry — the DNS
+			// record or the option will not change between two attempts
+			// within the same check cycle.
 			break
 		}
 		// Retry on actual error.
 	}
-	if ok && err == nil {
+	switch {
+	case ok && err == nil:
 		d.collectionFineMu.Lock()
 		collection := d.mustGetCollection(opts.networkType)
 		collection.LastProbe = DialerProbeObservationSnapshot{
@@ -1258,7 +1342,7 @@ func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResu
 			d.Log.WithFields(fields).Debugln("Connectivity Check")
 		}
 		d.informDialerGroupUpdate(update)
-	} else if err != nil && !stderrors.Is(err, context.Canceled) {
+	case err != nil && !d.isLifecycleTeardownError(err) && !stderrors.Is(err, errCheckOptionUnavailable):
 		d.collectionFineMu.Lock()
 		collection := d.mustGetCollection(opts.networkType)
 		collection.LastProbe = DialerProbeObservationSnapshot{
@@ -1268,7 +1352,10 @@ func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResu
 		}
 		d.collectionFineMu.Unlock()
 
-		// Failure: mark unavailable only if there's an actual error.
+		// Failure: mark unavailable only if there's an actual error. Teardown
+		// errors racing dialer retirement and probe-infrastructure failures
+		// carry no evidence about node health and must not poison dialer
+		// state or the process-global proxy failure tracker.
 		d.logUnavailable(opts.networkType, err)
 		d.informDialerGroupUpdate(d.markUnavailable(opts.networkType))
 
@@ -1280,6 +1367,20 @@ func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResu
 				cycle.udpFailure = true
 			}
 			cycle.Unlock()
+		}
+	case stderrors.Is(err, errCheckOptionUnavailable):
+		// Probe-infrastructure failure: health state is preserved. Warn at a
+		// limited rate so a persistent misconfiguration (e.g. an unresolvable
+		// tcp_check_url) stays observable instead of silently keeping every
+		// node at its initial alive state.
+		now := time.Now().UnixNano()
+		if pre := d.lastCheckOptionWarn.Load(); now-pre > int64(time.Minute) {
+			if d.lastCheckOptionWarn.CompareAndSwap(pre, now) {
+				d.Log.WithFields(logrus.Fields{
+					"network": opts.networkType.String(),
+					"node":    d.property.Name,
+				}).Warnf("Connectivity check option unavailable; node health state preserved: %v", err)
+			}
 		}
 	}
 	// Skip update when (ok=false, err=nil): preserve existing alive state.

@@ -339,7 +339,10 @@ func (g *DialerGroup) SelectWithExclusionResult(networkType *dialer.NetworkType,
 		// Fallback to another ipversion. Use local copy to avoid modifying the original networkType if it's passed by reference.
 		nt := *networkType
 		nt.IpVersion = (consts.IpVersion_X - networkType.IpVersion.ToIpVersionType()).ToIpVersionStr()
-		return g._select(&nt, state, policy, excluded)
+		d, latency, selectedNetworkType, err = g._select(&nt, state, policy, excluded)
+		// Do not return early on failure: the single-dialer fallback below is
+		// an availability floor and must not be bypassed by the lenient path
+		// (which should never be worse than the strict one).
 	}
 	if err == nil {
 		return d, latency, selectedNetworkType, nil

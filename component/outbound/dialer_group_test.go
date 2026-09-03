@@ -529,3 +529,161 @@ func TestDialerGroup_Select_DataUdpFixedPolicyDoesNotFallback(t *testing.T) {
 		t.Fatalf("expected fixed policy to keep selecting dialers[1], got another dialer")
 	}
 }
+
+var TestTcp6NetworkType = &dialer.NetworkType{
+	L4Proto:   consts.L4ProtoStr_TCP,
+	IpVersion: consts.IpVersionStr_6,
+	IsDns:     false,
+}
+
+// dataUdpCallbackRecorder records group-level alive callbacks for the
+// data-UDP domain of one address family.
+type dataUdpCallbackRecorder struct {
+	events []string // "init", "true", "false"
+}
+
+func (r *dataUdpCallbackRecorder) callback(alive bool, networkType *dialer.NetworkType, isInit bool) {
+	if networkType.L4Proto != consts.L4ProtoStr_UDP ||
+		networkType.EffectiveUdpHealthDomain() != dialer.UdpHealthDomainData {
+		return
+	}
+	switch {
+	case isInit:
+		r.events = append(r.events, "init")
+	case alive:
+		r.events = append(r.events, "true")
+	default:
+		r.events = append(r.events, "false")
+	}
+}
+
+// events is appended only from the group constructor and test body, both on
+// the test goroutine, so no synchronization is needed.
+
+// newDataUdpCallbackGroup builds a min-latency group of two dialers whose
+// DNS-UDP collections hold no latency sample unless seedDnsLatency is set.
+func newDataUdpCallbackGroup(t *testing.T, rec *dataUdpCallbackRecorder, seedDnsLatency bool) (*DialerGroup, []*dialer.Dialer) {
+	t.Helper()
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    0,
+	}
+	dialers := []*dialer.Dialer{newDirectDialer(option, false), newDirectDialer(option, false)}
+	if seedDnsLatency {
+		// Control case: DNS-UDP probes succeeded at least once, so the
+		// data-UDP set borrows a latency and hasLatency becomes true.
+		for _, d := range dialers {
+			d.MustGetLatencies10(TestDnsUdp4NetworkType).AppendLatency(50 * time.Millisecond)
+		}
+	}
+	g := NewDialerGroup(option, "callback-group", dialers, newEmptyAnnotations(len(dialers)),
+		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinLastLatency},
+		rec.callback)
+	return g, dialers
+}
+
+// TestDialerGroup_DataUdpRevivalCallback_NoDnsLatency pins the callback
+// contract for a data-UDP domain whose DNS-UDP probe never succeeded
+// (hasLatency stays false): killing the whole domain fires callback(false),
+// and a traffic-driven revival must fire callback(true) symmetrically.
+// The callback drives the kernel outbound-connectivity map; a missing
+// callback(true) leaves the map at 0 so the kernel keeps dropping every new
+// data-UDP flow routed to the group.
+//
+// Expected sequence (both data-UDP families, udp4 and udp6):
+//
+//	"true","true" - construction: the first dialer enters each family's
+//	                alive set via the no-latency branch
+//	"init","init" - NewDialerGroup's init loop for udp4 and udp6
+//	"false"       - killing the second dialer empties the udp4 domain
+//	"true"        - traffic-driven revival of dialers[0]
+func TestDialerGroup_DataUdpRevivalCallback_NoDnsLatency(t *testing.T) {
+	rec := &dataUdpCallbackRecorder{}
+	g, dialers := newDataUdpCallbackGroup(t, rec, false)
+
+	set := g.MustGetAliveDialerSet(TestDataUdp4NetworkType)
+	if set.Len() != 2 {
+		t.Fatalf("setup: alive = %d, want 2", set.Len())
+	}
+
+	set.NotifyLatencyChange(dialers[0], false)
+	set.NotifyLatencyChange(dialers[1], false)
+	if set.Len() != 0 {
+		t.Fatalf("after kill: alive = %d, want 0", set.Len())
+	}
+
+	// Revive through the traffic path (markAvailableTraffic -> inform ->
+	// NotifyLatencyChange(d, true)) with no DNS-UDP latency available.
+	set.NotifyLatencyChange(dialers[0], true)
+	if set.Len() != 1 {
+		t.Fatalf("after revive: alive = %d, want 1", set.Len())
+	}
+
+	want := []string{"true", "true", "init", "init", "false", "true"}
+	if !reflect.DeepEqual(rec.events, want) {
+		t.Fatalf("data-UDP alive events = %v, want exact sequence %v "+
+			"(a missing final \"true\" leaves the kernel connectivity map at 0)",
+			rec.events, want)
+	}
+}
+
+// TestDialerGroup_DataUdpRevivalCallback_WithDnsLatency is the control: once
+// a DNS-UDP latency exists, the same kill/revive sequence fires the same
+// event sequence via the pre-existing has-latency path.
+func TestDialerGroup_DataUdpRevivalCallback_WithDnsLatency(t *testing.T) {
+	rec := &dataUdpCallbackRecorder{}
+	g, dialers := newDataUdpCallbackGroup(t, rec, true)
+
+	set := g.MustGetAliveDialerSet(TestDataUdp4NetworkType)
+	set.NotifyLatencyChange(dialers[0], false)
+	set.NotifyLatencyChange(dialers[1], false)
+	set.NotifyLatencyChange(dialers[0], true)
+
+	want := []string{"true", "true", "init", "init", "false", "true"}
+	if !reflect.DeepEqual(rec.events, want) {
+		t.Fatalf("control case: data-UDP alive events = %v, want exact sequence %v",
+			rec.events, want)
+	}
+}
+
+// TestDialerGroup_Select_SingleDialerLenientFallsBackToFixed pins the
+// availability floor: for a single-dialer group, the lenient IP-version
+// fallback must not behave worse than the strict path. When both address
+// families are dead, Select must still return the only dialer (Fixed
+// fallback) instead of ErrNoAliveDialer.
+func TestDialerGroup_Select_SingleDialerLenientFallsBackToFixed(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+		CheckTolerance:    0,
+	}
+	dialers := []*dialer.Dialer{newDirectDialer(option, false)}
+	g := NewDialerGroup(option, "single-node", dialers, newEmptyAnnotations(len(dialers)),
+		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinLastLatency},
+		func(alive bool, networkType *dialer.NetworkType, isInit bool) {})
+
+	// Kill the only dialer in both address families.
+	g.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(dialers[0], false)
+	g.MustGetAliveDialerSet(TestTcp6NetworkType).NotifyLatencyChange(dialers[0], false)
+
+	// Strict path already returns the dialer via the single-dialer fallback.
+	dStrict, _, err := g.Select(TestNetworkType, true)
+	if err != nil || dStrict != dialers[0] {
+		t.Fatalf("strict Select() = (%v, %v), want the only dialer", dStrict, err)
+	}
+
+	// Lenient path must not be worse: after both families fail, it must
+	// reach the same single-dialer fallback instead of erroring out.
+	dLenient, _, err := g.Select(TestNetworkType, false)
+	if err != nil {
+		t.Fatalf("lenient Select() error = %v, want single-dialer fallback", err)
+	}
+	if dLenient != dialers[0] {
+		t.Fatalf("lenient Select() returned %v, want the only dialer", dLenient)
+	}
+}

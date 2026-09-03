@@ -2271,3 +2271,104 @@ int testcheck_not_mismtach(struct __sk_buff *skb)
 				      IPV4(192,168,0,1), IPV4(1,1,1,1),
 				      19233, 79);
 }
+
+struct ab_test_ah_hdr {
+	__u8 nexthdr;
+	__u8 payload_len;
+	__be16 reserved;
+	__be32 spi;
+	__be32 seq_no;
+};
+
+SEC("tc/ab_test/control_plane_custom_mark")
+int test_ab_control_plane_custom_mark(struct __sk_buff *skb)
+{
+	struct pid_pname *p = NULL;
+
+	skb->mark = 0x100;
+	if (pid_is_control_plane(skb, &p))
+		return 1;
+
+	skb->mark = 0x200;
+	if (!pid_is_control_plane(skb, &p))
+		return 2;
+
+	skb->mark = 0x201;
+	if (pid_is_control_plane(skb, &p))
+		return 3;
+
+	return 0;
+}
+
+SEC("tc/ab_test/ipv6_ah_udp_parse")
+int test_ab_ipv6_ah_udp_parse(struct __sk_buff *skb)
+{
+	const __u32 packet_len = FAST_PATH_PACKET_SIZE;
+	const __u32 ah_offset = ETH_HLEN + IP6_HLEN;
+	const __u32 udp_offset = ah_offset + sizeof(struct ab_test_ah_hdr);
+
+	if (bpf_skb_change_tail(skb, packet_len, 0))
+		return 1;
+
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+
+	if (data + packet_len > data_end)
+		return 2;
+
+	struct ethhdr *eth = data;
+	struct ipv6hdr *ip6 = data + ETH_HLEN;
+	struct ab_test_ah_hdr *ah = data + ah_offset;
+	struct udphdr *udp = data + udp_offset;
+
+	eth->h_proto = bpf_htons(ETH_P_IPV6);
+	set_ipv6_header_dscp(ip6, 0);
+	ip6->payload_len = bpf_htons(packet_len - ETH_HLEN - IP6_HLEN);
+	ip6->nexthdr = IPPROTO_AH;
+	ip6->hop_limit = 64;
+	ip6->saddr.in6_u.u6_addr32[3] = bpf_htonl(1);
+	ip6->daddr.in6_u.u6_addr32[3] = bpf_htonl(2);
+
+	ah->nexthdr = IPPROTO_UDP;
+	ah->payload_len = 1;
+	ah->spi = bpf_htonl(1);
+	ah->seq_no = bpf_htonl(1);
+
+	udp->source = bpf_htons(23456);
+	udp->dest = bpf_htons(34567);
+	udp->len = bpf_htons(packet_len - udp_offset);
+
+	struct parse_transport_ctx *ctx =
+		bpf_map_lookup_elem(&parse_ctx_scratch_map, &zero_key);
+	if (!ctx)
+		return 3;
+	__builtin_memset(ctx, 0, sizeof(*ctx));
+
+	if (parse_transport(skb, ETH_HLEN, ctx) != 0)
+		return 4;
+	if (ctx->l4proto != IPPROTO_UDP ||
+	    ctx->listener_l4proto != IPPROTO_UDP)
+		return 5;
+	if (ctx->udph.source != bpf_htons(23456) ||
+	    ctx->udph.dest != bpf_htons(34567))
+		return 6;
+
+	return 0;
+}
+
+#define AB_TEST_HOST_UDP_PORT 54321
+
+SEC("tc/ab_test/lan_ingress_udp_host_listener_pktgen")
+int test_ab_lan_ingress_udp_host_listener_pktgen(struct __sk_buff *skb)
+{
+	return set_ipv4_udp_fastpath_with_dscp(skb,
+					   IPV4(192,168,0,1), IPV4(1,1,1,1),
+					   24567, AB_TEST_HOST_UDP_PORT, 0);
+}
+
+SEC("tc/ab_test/lan_ingress_udp_host_listener")
+int test_ab_lan_ingress_udp_host_listener(struct __sk_buff *skb)
+{
+	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, true);
+	return do_tproxy_lan_ingress(skb, ETH_HLEN);
+}

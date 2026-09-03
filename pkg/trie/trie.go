@@ -150,6 +150,12 @@ func NewTrie(keys []string, chars *ValidChars) (*Trie, error) {
 		}
 	}
 
+	if len(keys) == 0 {
+		// A trie with no keys matches nothing. Build a degenerate trie
+		// instead of panicking on the ranks/selects bookkeeping below.
+		return &Trie{chars: chars}, nil
+	}
+
 	ss := &Trie{
 		chars:  chars,
 		labels: bitlist.NewCompactBitList(bits.Len(uint(chars.Size()))),
@@ -239,6 +245,10 @@ func NewTrie(keys []string, chars *ValidChars) (*Trie, error) {
 
 // HasPrefix query for a word and return whether a prefix of the word is in the Trie.
 func (ss *Trie) HasPrefix(word string) bool {
+	if len(ss.leaves) == 0 {
+		// Degenerate (empty) trie: no key was stored, nothing can match.
+		return false
+	}
 
 	nodeId, bmIdx := 0, 0
 

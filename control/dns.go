@@ -483,11 +483,17 @@ func (d *DoQ) replaceConnection(ctx context.Context, previous quic.EarlyConnecti
 		d.mu.Unlock()
 		return c, nil
 	}
+	var staleConn quic.EarlyConnection
 	if d.connection != nil {
-		_ = d.connection.CloseWithError(0, "")
+		staleConn = d.connection
 		d.connection = nil
 	}
 	d.mu.Unlock()
+	// Close the old connection outside d.mu: CloseWithError sends a
+	// CONNECTION_CLOSE frame and must not stall concurrent ForwardDNS.
+	if staleConn != nil {
+		_ = staleConn.CloseWithError(0, "")
+	}
 
 	qc, err := d.createConnection(ctx)
 	if err != nil {
@@ -499,16 +505,19 @@ func (d *DoQ) replaceConnection(ctx context.Context, previous quic.EarlyConnecti
 
 func (d *DoQ) installConnection(qc quic.EarlyConnection) (quic.EarlyConnection, error) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.closed {
+		d.mu.Unlock()
 		_ = qc.CloseWithError(0, "")
 		return nil, net.ErrClosed
 	}
 	if d.connection != nil {
+		connection := d.connection
+		d.mu.Unlock()
 		_ = qc.CloseWithError(0, "")
-		return d.connection, nil
+		return connection, nil
 	}
 	d.connection = qc
+	d.mu.Unlock()
 	return qc, nil
 }
 
@@ -532,12 +541,14 @@ func (d *DoQ) createConnection(ctx context.Context) (quic.EarlyConnection, error
 
 func (d *DoQ) Close() error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	d.closed = true
-	if d.connection != nil {
-		err := d.connection.CloseWithError(0, "")
-		d.connection = nil
-		return err
+	conn := d.connection
+	d.connection = nil
+	d.mu.Unlock()
+	if conn != nil {
+		// CloseWithError may send a CONNECTION_CLOSE frame; keep d.mu free
+		// so concurrent ForwardDNS callers are not stalled behind it.
+		return conn.CloseWithError(0, "")
 	}
 	return nil
 }

@@ -700,10 +700,24 @@ static __always_inline bool is_extension_header(__u8 nexthdr)
 	case IPPROTO_ROUTING:
 	case IPPROTO_FRAGMENT:
 	case IPPROTO_DSTOPTS:
+	case IPPROTO_AH:
+	case IPPROTO_MH:
 		return true;
 	default:
 		return false;
 	}
+}
+
+/* Total length in bytes of a walkable IPv6 extension header. AH (RFC 4302)
+ * encodes its length in 4-octet units excluding the first 8 octets:
+ * (payload_len + 2) * 4. Every other extension header (incl. MH) uses
+ * 8-octet units, which is what ipv6_optlen computes.
+ */
+static __always_inline __u32 ipv6_exthdr_len(__u8 nexthdr, __u8 len_field)
+{
+	if (nexthdr == IPPROTO_AH)
+		return (__u32)(len_field + 2) * 4;
+	return ipv6_optlen(len_field);
 }
 
 #define PARSE_FRAGMENT 2
@@ -897,8 +911,10 @@ parse_transport_fast(struct __sk_buff *skb, __u32 link_h_len,
 			if ((void *)(ext_hdr + 2) > data_end)
 				return -1;
 
+			__u8 cur_hdr = nexthdr;
+
 			nexthdr = ext_hdr[0];
-			offset += ipv6_optlen(ext_hdr[1]);
+			offset += ipv6_exthdr_len(cur_hdr, ext_hdr[1]);
 			*l4proto = nexthdr;
 		}
 
@@ -1063,6 +1079,8 @@ parse_transport_slow(struct __sk_buff *skb, __u32 link_h_len,
 			if (!is_extension_header(nexthdr))
 				break;
 
+			__u8 cur_hdr = nexthdr;
+
 			ret = bpf_skb_load_bytes(skb, offset, &nexthdr, 1);
 			if (ret)
 				return -EFAULT;
@@ -1074,7 +1092,7 @@ parse_transport_slow(struct __sk_buff *skb, __u32 link_h_len,
 			if (ret)
 				return -EFAULT;
 
-			__u32 ext_len = ipv6_optlen(hdr_ext_len);
+			__u32 ext_len = ipv6_exthdr_len(cur_hdr, hdr_ext_len);
 
 			offset += ext_len;
 		}
@@ -2458,8 +2476,13 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 			tuple_size = sizeof(tuple.ipv6);
 		}
 
+		/* Look up in the netns of the hook (the LAN-side host netns):
+		 * dae_netns_id would search dae's own netns, which can only ever
+		 * match dae sockets and makes the local-service branch below
+		 * unreachable. -1 selects "the netns of ctx".
+		 */
 		sk = bpf_sk_lookup_udp(skb, &tuple, tuple_size,
-				       PARAM.dae_netns_id, 0);
+				       (__u64)(s32)-1, 0);
 		if (sk) {
 			if (!bpf_sock_is_dae_socket(sk)) {
 				bpf_sk_release(sk);
@@ -2621,11 +2644,14 @@ static __always_inline bool pid_is_control_plane(struct __sk_buff *skb,
 	}
 	if (p)
 		*p = NULL;
-	if (PARAM.dae_socket_mark && skb->mark == PARAM.dae_socket_mark)
-		return true;
-	if ((skb->mark & 0x100) == 0x100)
-		return true;
-	return false;
+	/* Fallback for sockets that missed cookie_pid_map (e.g. non-handshake
+	 * packets). Preserve the default reserved-bit behavior, but treat a
+	 * custom so_mark_from_dae as the exact fwmark value configured by the
+	 * user rather than silently turning it into a mask.
+	 */
+	if (PARAM.dae_socket_mark && PARAM.dae_socket_mark != 0x100)
+		return skb->mark == PARAM.dae_socket_mark;
+	return (skb->mark & 0x100) == 0x100;
 }
 
 static __noinline int do_tproxy_wan_ingress(struct __sk_buff *skb, __u32 link_h_len)

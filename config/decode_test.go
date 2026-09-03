@@ -6,6 +6,7 @@
 package config
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/daeuniverse/dae/pkg/config_parser"
@@ -120,4 +121,64 @@ func TestDecodeConfigSectionRejectsUnknownSection(t *testing.T) {
 	err := decodeConfigSection(conf, "unknown", &config_parser.Section{Name: "unknown"})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "unknown section")
+}
+
+func TestGlobalCheckIntervalRejectsNonPositive(t *testing.T) {
+	for _, section := range []string{`
+global {
+  check_interval: 0s
+}
+routing {
+  fallback: direct
+}
+`, `
+global {
+  check_interval: -5s
+}
+routing {
+  fallback: direct
+}
+`} {
+		sections, err := config_parser.Parse(section)
+		require.NoError(t, err)
+
+		_, err = New(sections)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "check_interval")
+	}
+}
+
+func TestGroupCheckIntervalRejectsNegativeButAllowsInherit(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{name: "inherit", value: "0s"},
+		{name: "negative", value: "-5s", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sections, err := config_parser.Parse(fmt.Sprintf(`
+global {}
+group {
+  proxy {
+    policy: random
+    check_interval: %s
+  }
+}
+routing {
+  fallback: proxy
+}
+`, tc.value))
+			require.NoError(t, err)
+
+			_, err = New(sections)
+			if tc.wantErr {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), "check_interval")
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
 }

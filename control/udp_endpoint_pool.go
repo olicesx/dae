@@ -27,10 +27,12 @@ var (
 )
 
 // udpEndpointCreateShardCount is the number of sharded mutexes that guard
-// concurrent endpoint creation. 64 shards provide near-zero contention even
-// under high concurrent-create rates.
+// concurrent endpoint creation. Because a creation lock is held across the
+// dial (up to DefaultDialTimeout), unrelated keys hashing to the same shard
+// queue behind it; a larger shard count keeps
+// that head-of-line blocking negligible under high concurrent-create rates.
 const (
-	udpEndpointCreateShardCount      = 64
+	udpEndpointCreateShardCount      = 1024
 	udpEndpointJanitorInterval       = 250 * time.Millisecond
 	udpEndpointJanitorMaxInterval    = 30 * time.Second
 	udpEndpointPendingReplyPeerLimit = 8
@@ -875,10 +877,19 @@ func (p *UdpEndpointPool) GetOrCreate(key UdpEndpointKey, createOption *UdpEndpo
 	shard.mu.RUnlock()
 
 	// Slow path: serialize creation for the same key using a creation shard lock.
-	shard.createMu.Lock()
-	defer shard.createMu.Unlock()
-
 	var staleToClose *UdpEndpoint
+	shard.createMu.Lock()
+	createMuLocked := true
+	defer func() {
+		// GetOrCreate is called from panic-recovering packet workers. Preserve
+		// unlock and stale cleanup on unwind so one panic cannot strand this shard.
+		if createMuLocked {
+			shard.createMu.Unlock()
+		}
+		if staleToClose != nil {
+			_ = staleToClose.Close()
+		}
+	}()
 	shard.mu.Lock()
 	ue, ok = shard.pool[key]
 	if ok {
@@ -895,12 +906,18 @@ func (p *UdpEndpointPool) GetOrCreate(key UdpEndpointKey, createOption *UdpEndpo
 		}
 	}
 	shard.mu.Unlock()
-	if staleToClose != nil {
-		_ = staleToClose.Close()
-	}
 
 	// Create a new endpoint under the creation lock.
 	newUe, createErr := p.createEndpointLocked(key, createOption)
+	shard.createMu.Unlock()
+	createMuLocked = false
+
+	// Close the stale endpoint outside createMu: Close waits on the
+	// transport receiver and must not extend the shard-wide creation hold.
+	if staleToClose != nil {
+		_ = staleToClose.Close()
+		staleToClose = nil
+	}
 	if createErr != nil {
 		return nil, true, createErr
 	}

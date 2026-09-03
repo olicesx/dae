@@ -71,6 +71,8 @@ type DNSListener struct {
 	log       *logrus.Logger
 	tcpServer *dnsmessage.Server
 	udpServer *dnsmessage.Server
+	udpConn   net.PacketConn
+	tcpLn     net.Listener
 	endpoint  Endpoint
 	mu        sync.Mutex
 
@@ -113,6 +115,35 @@ func (d *DNSListener) SwapController(controller *ControlPlane) {
 	d.controller.Store(controller)
 }
 
+func (d *DNSListener) activateServer(server *dnsmessage.Server, network string) error {
+	started := make(chan struct{})
+	exited := make(chan error, 1)
+	server.NotifyStartedFunc = func() {
+		close(started)
+	}
+
+	go func() {
+		exited <- server.ActivateAndServe()
+	}()
+
+	select {
+	case <-started:
+		// Keep the server pointer local to this goroutine. Start waits for the
+		// readiness callback, so Stop cannot race an unstarted server.
+		go func() {
+			if err := <-exited; err != nil {
+				d.log.Errorf("Failed to serve DNS %s listener: %v", network, err)
+			}
+		}()
+		return nil
+	case err := <-exited:
+		if err == nil {
+			return fmt.Errorf("DNS %s listener stopped before becoming ready", network)
+		}
+		return fmt.Errorf("failed to serve DNS %s listener: %w", network, err)
+	}
+}
+
 // Start starts the DNS listener
 func (d *DNSListener) Start() error {
 	d.mu.Lock()
@@ -130,39 +161,67 @@ func (d *DNSListener) Start() error {
 		listener: d,
 		log:      d.log,
 	}
+	rollbackUDP := func() {
+		if d.udpServer != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), dnsListenerShutdownTimeout)
+			_ = d.udpServer.ShutdownContext(ctx)
+			cancel()
+			d.udpServer = nil
+		}
+		if d.udpConn != nil {
+			_ = d.udpConn.Close()
+			d.udpConn = nil
+		}
+	}
 
 	if d.endpoint.UDP {
-		// create dns servers
-		d.udpServer = &dnsmessage.Server{
-			Addr:    d.Addr(),
-			Net:     "udp",
-			Handler: handler,
-			UDPSize: 65535,
+		// Bind synchronously so that Start reports bind failures to its
+		// caller instead of surfacing them later from a goroutine.
+		udpConn, err := net.ListenPacket("udp", d.Addr())
+		if err != nil {
+			return fmt.Errorf("failed to bind DNS UDP listener on %s: %w", d.Addr(), err)
 		}
-
-		// Start UDP server in goroutine
-		go func() {
-			d.log.Infof("Starting DNS UDP listener on %s", d.udpServer.Addr)
-			if err := d.udpServer.ListenAndServe(); err != nil {
-				d.log.Errorf("Failed to start DNS UDP listener: %v", err)
-			}
-		}()
-
+		udpServer := &dnsmessage.Server{
+			Addr:       d.Addr(),
+			Net:        "udp",
+			Handler:    handler,
+			UDPSize:    65535,
+			PacketConn: udpConn,
+		}
+		d.udpConn = udpConn
+		d.udpServer = udpServer
+		d.log.Infof("Starting DNS UDP listener on %s", d.Addr())
+		if err = d.activateServer(udpServer, "UDP"); err != nil {
+			_ = udpConn.Close()
+			d.udpConn = nil
+			d.udpServer = nil
+			return err
+		}
 	}
-	// also for tcp server
+
 	if d.endpoint.TCP {
-		d.tcpServer = &dnsmessage.Server{
-			Addr:    d.Addr(),
-			Net:     "tcp",
-			Handler: handler,
+		tcpLn, err := net.Listen("tcp", d.Addr())
+		if err != nil {
+			// Roll back the already-active UDP server.
+			rollbackUDP()
+			return fmt.Errorf("failed to bind DNS TCP listener on %s: %w", d.Addr(), err)
 		}
-		// Start TCP server in goroutine
-		go func() {
-			d.log.Infof("Starting DNS TCP listener on %s", d.tcpServer.Addr)
-			if err := d.tcpServer.ListenAndServe(); err != nil {
-				d.log.Errorf("Failed to start DNS TCP listener: %v", err)
-			}
-		}()
+		tcpServer := &dnsmessage.Server{
+			Addr:     d.Addr(),
+			Net:      "tcp",
+			Handler:  handler,
+			Listener: tcpLn,
+		}
+		d.tcpLn = tcpLn
+		d.tcpServer = tcpServer
+		d.log.Infof("Starting DNS TCP listener on %s", d.Addr())
+		if err = d.activateServer(tcpServer, "TCP"); err != nil {
+			_ = tcpLn.Close()
+			d.tcpLn = nil
+			d.tcpServer = nil
+			rollbackUDP()
+			return err
+		}
 	}
 
 	return nil
@@ -182,6 +241,10 @@ func (d *DNSListener) Stop() error {
 			errs = append(errs, err)
 		}
 		cancel()
+		if d.udpConn != nil {
+			_ = d.udpConn.Close()
+			d.udpConn = nil
+		}
 		d.udpServer = nil
 	}
 
@@ -192,6 +255,10 @@ func (d *DNSListener) Stop() error {
 			errs = append(errs, err)
 		}
 		cancel()
+		if d.tcpLn != nil {
+			_ = d.tcpLn.Close()
+			d.tcpLn = nil
+		}
 		d.tcpServer = nil
 	}
 

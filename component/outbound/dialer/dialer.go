@@ -350,6 +350,13 @@ func (d *Dialer) CloneWithGlobalOptionContext(ctx context.Context, option *Globa
 	clone := NewDialerContext(ctx, d.Dialer, option, d.InstanceOption, cloneProperty(d.property))
 	clone.stickyIpDialer = d.stickyIpDialer
 	clone.proxyIpCache = d.proxyIpCache
+	// The fallback clone shares the original's sticky-IP cache, so it must
+	// also hold a registry reference: RetireForEstablishedFlows unregisters
+	// unconditionally, and one unbalanced unregister would strip cache
+	// invalidation from a still-live sibling sharing this cache.
+	if clone.property != nil {
+		registerProxyCache(clone.property.Address, clone.proxyIpCache)
+	}
 	return clone
 }
 

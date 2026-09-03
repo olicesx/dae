@@ -20,12 +20,15 @@ import (
 )
 
 func NewFromLinkContext(ctx context.Context, gOption *GlobalOption, iOption InstanceOption, link string, subscriptionTag string) (*Dialer, error) {
-	return NewFromLinkWithProxyCacheContext(ctx, gOption, iOption, link, subscriptionTag, globalProxyIpCache)
+	// Each dialer owns an independent sticky-IP cache. A shared cache keyed by
+	// proxy address would be thrashed by per-dialer health-check cycles when
+	// the same server appears under two nodes (see sticky_cache.go).
+	return NewFromLinkWithProxyCacheContext(ctx, gOption, iOption, link, subscriptionTag, NewProxyIpCache())
 }
 
 func NewFromLinkWithProxyCacheContext(ctx context.Context, gOption *GlobalOption, iOption InstanceOption, link string, subscriptionTag string, proxyCache *ProxyIpCache) (*Dialer, error) {
 	if proxyCache == nil {
-		proxyCache = globalProxyIpCache
+		proxyCache = NewProxyIpCache()
 	}
 
 	normalizedLink := normalizeShadowTLSPluginOptions(link)

@@ -133,10 +133,14 @@ type Dialer struct {
 	//   0: TCP
 	//   1: DNS UDP
 	//   2: Data UDP
-	recoveryState [3]dialerRecoveryState
-	lastNotifyUdp atomic.Int64
-	lastNotifyTcp atomic.Int64
-	lastPunish    [3]atomic.Int64
+	recoveryState   [3]dialerRecoveryState
+	lastNotifyUdp   atomic.Int64
+	lastNotifyTcp   atomic.Int64
+	lastNotifyCheck atomic.Int64
+	lastPunish      [3]atomic.Int64
+	// lastCheckOptionWarn throttles the warn log for persistent
+	// errCheckOptionUnavailable failures (see check()).
+	lastCheckOptionWarn atomic.Int64
 
 	recoveryManagerMu sync.Mutex
 	recoveryManager   *dialerRecoveryManager

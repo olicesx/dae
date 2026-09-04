@@ -6,6 +6,8 @@
 package control
 
 import (
+	stderrors "errors"
+	"io"
 	"net/netip"
 	"time"
 
@@ -139,6 +141,9 @@ func (ue *UdpEndpoint) enqueueReceivedReply(data []byte, from netip.AddrPort, re
 // invalidate the cached proxy IP on connection-refused. Returns true when the
 // error is fatal and delivery must stop.
 func (ue *UdpEndpoint) applyUpstreamReadErrorPolicy(err error, retire func()) bool {
+	if stderrors.Is(err, io.ErrShortBuffer) {
+		return false
+	}
 	if errors.IsReplayAttackError(err) || errors.IsAuthError(err) {
 		threshold := 3
 		if ue.hasReply.Load() {

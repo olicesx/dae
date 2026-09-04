@@ -71,6 +71,10 @@ type relayCore struct {
 	// lastActiveNano is the last time either direction read or wrote data.
 	// Guarded by atomic; updated by the copy engines via onActive.
 	lastActiveNano atomic.Int64
+	// halfClosed is set after one direction EOFs and CloseWrite's the peer.
+	// Remaining traffic then rolls the half-close read deadline (idle-based,
+	// not a one-shot 10s cut of a still-active download).
+	halfClosed atomic.Bool
 }
 
 type relayDirection struct {
@@ -208,6 +212,9 @@ func (c *relayCore) run(ctx context.Context) error {
 			}
 			lastRefreshNano = now
 			c.lastActiveNano.Store(now)
+			if c.halfClosed.Load() {
+				_ = dir.src.SetReadDeadline(time.Now().Add(c.halfCloseTimeout))
+			}
 		}
 		_, err := c.copyEngine.Copy(ctx, dir.dst, dir.src, dir.record, onActive)
 
@@ -220,11 +227,11 @@ func (c *relayCore) run(ctx context.Context) error {
 			cancel()
 			forceClose()
 		} else {
-			// Graceful half-close: bound the peer's pending read on dir.dst
-			// (which is the source of the opposite direction). Refresh
-			// lastActive so a prior idle period cannot let the watchdog
-			// forceClose before the half-close drain deadline.
+			// Graceful half-close: idle-bound the peer's pending read on
+			// dir.dst (source of the opposite direction). Activity in the
+			// remaining direction rolls the deadline via onActive.
 			c.lastActiveNano.Store(time.Now().UnixNano())
+			c.halfClosed.Store(true)
 			_ = dir.dst.SetReadDeadline(time.Now().Add(c.halfCloseTimeout))
 		}
 

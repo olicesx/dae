@@ -44,6 +44,15 @@ func NewFromLinkWithProxyCacheContext(ctx context.Context, gOption *GlobalOption
 	if err != nil {
 		return nil, err
 	}
+	// Temporary protocol dialers can own background workers before any dial.
+	// Keep ownership until replacement or transfer to the returned Dialer.
+	releaseDialer := func() {
+		if closer, ok := d.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+		d = nil
+	}
+	defer releaseDialer()
 	p := Property{
 		Property:        *_p,
 		SubscriptionTag: subscriptionTag,
@@ -63,6 +72,7 @@ func NewFromLinkWithProxyCacheContext(ctx context.Context, gOption *GlobalOption
 		}
 		metadataRetirer, _ = baseDialer.(establishedFlowMetadataRetirer)
 		scopedBaseDialer = scopeTransportCacheDialer(baseDialer, gOption.TransportCacheNamespace)
+		releaseDialer()
 		d, _p, err = D.NewNetproxyDialerFromLink(scopedBaseDialer, &gOption.ExtraOption, normalizedLink)
 		if err != nil {
 			return nil, err
@@ -94,7 +104,8 @@ func NewFromLinkWithProxyCacheContext(ctx context.Context, gOption *GlobalOption
 		stickyWrapper = stickyip.NewStickyIpDialer(baseDialer, p.Address, proxyCache)
 		scopedStickyWrapper := scopeTransportCacheDialer(stickyWrapper, gOption.TransportCacheNamespace)
 
-		// Re-create the protocol dialer with sticky wrapper as base
+		// Re-create the protocol dialer with sticky wrapper as base.
+		releaseDialer()
 		d, _p, err = D.NewNetproxyDialerFromLink(scopedStickyWrapper, &gOption.ExtraOption, normalizedLink)
 		if err != nil {
 			return nil, err
@@ -111,6 +122,7 @@ func NewFromLinkWithProxyCacheContext(ctx context.Context, gOption *GlobalOption
 	}
 
 	daeDialer := NewDialerContext(ctx, d, gOption, iOption, &p)
+	d = nil
 	daeDialer.metadataRetirer = metadataRetirer
 
 	// Store reference to sticky wrapper for health check cycle management

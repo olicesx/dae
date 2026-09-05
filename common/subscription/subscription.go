@@ -80,12 +80,20 @@ func ResolveSubscriptionAsSIP008(log *logrus.Logger, b []byte) (nodes []string, 
 		return nil, fmt.Errorf("does not seems like a standard sip008 subscription")
 	}
 	for _, server := range sip.Servers {
+		query := make(url.Values)
+		if server.Plugin != "" {
+			plugin := server.Plugin
+			if server.PluginOpts != "" {
+				plugin += ";" + server.PluginOpts
+			}
+			query.Set("plugin", plugin)
+		}
 		userinfo := base64.RawURLEncoding.EncodeToString([]byte(server.Method + ":" + server.Password))
 		u := url.URL{
 			Scheme:   "ss",
 			User:     url.User(userinfo),
 			Host:     net.JoinHostPort(server.Server, strconv.Itoa(server.ServerPort)),
-			RawQuery: url.Values{"plugin": []string{server.PluginOpts}}.Encode(),
+			RawQuery: query.Encode(),
 			Fragment: server.Remarks,
 		}
 		nodes = append(nodes, u.String())

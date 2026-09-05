@@ -6,7 +6,7 @@
 package control
 
 // Real-kernel verification harness for the TCP offload sent-accounting hook.
-// Requires root and kernel BTF; skips otherwise (regular CI containers).
+// Requires root and kernel BTF; only the non-root case is skipped.
 // It loads the pruned offload datapath (verdict + accounting programs),
 // mirrors dae's two-connection relay topology, and asserts that redirected
 // traffic populates tcp_offload_sent and that the fuse backlog stays near
@@ -22,8 +22,10 @@ package control
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"io"
 	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -42,7 +44,15 @@ const (
 // full tproxy object.
 func loadOffloadVerifyCollection(t *testing.T) *ebpf.Collection {
 	t.Helper()
-	spec, err := ebpf.LoadCollectionSpec("bpf_bpfel.o")
+	object := os.Getenv("DAE_TCP_OFFLOAD_TEST_OBJECT")
+	if object == "" {
+		object = "bpf_bpfel.o"
+		if binary.NativeEndian.Uint16([]byte{1, 0}) != 1 {
+			object = "bpf_bpfeb.o"
+		}
+	}
+	t.Logf("offload object: %s", object)
+	spec, err := ebpf.LoadCollectionSpec(object)
 	if err != nil {
 		t.Fatalf("LoadCollectionSpec: %v", err)
 	}
@@ -61,10 +71,12 @@ func loadOffloadVerifyCollection(t *testing.T) *ebpf.Collection {
 			delete(spec.Programs, name)
 		}
 	}
-	for name := range spec.Maps {
+	for name, m := range spec.Maps {
 		if !keepMap[name] && name[0] != '.' {
 			delete(spec.Maps, name)
+			continue
 		}
+		m.Pinning = ebpf.PinNone
 	}
 	coll, err := ebpf.NewCollection(spec)
 	if err != nil {
@@ -73,16 +85,34 @@ func loadOffloadVerifyCollection(t *testing.T) *ebpf.Collection {
 	return coll
 }
 
-func perCPUCounter(m *ebpf.Map, key *bpfTuplesKey) uint64 {
+func perCPUCounter(m *ebpf.Map, key *bpfTuplesKey) (uint64, error) {
 	var vals []uint64
 	if err := m.Lookup(key, &vals); err != nil {
-		return 0
+		return 0, err
 	}
 	var sum uint64
 	for _, v := range vals {
 		sum += v
 	}
-	return sum
+	return sum, nil
+}
+
+func dumpOffloadSent(t *testing.T, m *ebpf.Map, expected *bpfTuplesKey) {
+	t.Helper()
+	t.Logf("sent expected key: %+v", *expected)
+	var key bpfTuplesKey
+	var vals []uint64
+	iter := m.Iterate()
+	for iter.Next(&key, &vals) {
+		var sum uint64
+		for _, v := range vals {
+			sum += v
+		}
+		t.Logf("sent actual key: %+v bytes=%d", key, sum)
+	}
+	if err := iter.Err(); err != nil {
+		t.Logf("sent map iteration: %v", err)
+	}
 }
 
 // dumpConnState prints the TCP state of a relay leg for teardown diagnosis.
@@ -100,15 +130,31 @@ func dumpConnState(t *testing.T, name string, conn *net.TCPConn) {
 }
 
 // TestTCPOffloadSentAccountE2E verifies on this (real) kernel that
-//  1. the fentry attaches to skb_send_sock (L1);
+//  1. the production-selected accounting hook attaches (L1);
 //  2. redirected traffic populates tcp_offload_sent (L2);
-//  3. at 100MiB (> the 64MiB fuse threshold) sent tracks inflow, i.e. the
+//  3. at 70MiB (> the 64MiB fuse threshold) sent tracks inflow, i.e. the
 //     backlog the fuse reads stays near zero (L3).
 func TestTCPOffloadSentAccountE2E(t *testing.T) {
 	if unix.Geteuid() != 0 {
 		t.Skip("needs root for BPF program load/attach")
 	}
+	for _, tc := range []struct {
+		name        string
+		address     string
+		destination bool
+	}{
+		{name: "IPv4", address: "127.0.0.1:0"},
+		{name: "IPv6", address: "[::1]:0"},
+		{name: "IPv6DestinationOptions", address: "[::1]:0", destination: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runTCPOffloadSentAccountE2E(t, tc.address, tc.destination)
+		})
+	}
+}
 
+func runTCPOffloadSentAccountE2E(t *testing.T, address string, destination bool) {
+	t.Helper()
 	coll := loadOffloadVerifyCollection(t)
 	defer coll.Close()
 
@@ -118,27 +164,21 @@ func TestTCPOffloadSentAccountE2E(t *testing.T) {
 		t.Fatal("missing maps in collection")
 	}
 
-	// L1: fentry attach to skb_send_sock.
-	fl, fentryErr := link.AttachTracing(link.TracingOptions{
-		Program:    coll.Programs["tcp_offload_sent_account"],
-		AttachType: ebpf.AttachTraceFEntry,
-	})
-	if fentryErr != nil {
-		t.Logf("L1: fentry attach FAILED on this kernel: %v", fentryErr)
-		t.Logf("L1: trying kprobe fallback (production fallback path)")
-		kl, kerr := link.Kprobe("skb_send_sock", coll.Programs["tcp_offload_sent_account_kprobe"], nil)
-		if kerr != nil {
-			t.Fatalf("L1 FAIL: neither fentry (%v) nor kprobe (%v) could attach to skb_send_sock", fentryErr, kerr)
-		}
-		fl = kl
+	// An explicit override is diagnostic only, never an automatic production fallback.
+	var fl link.Link
+	var hook string
+	var attachErr error
+	if target := os.Getenv("DAE_TCP_OFFLOAD_TEST_KPROBE_TARGET"); target != "" {
+		fl, attachErr = link.Kprobe(target, coll.Programs["tcp_offload_sent_account_kprobe"], nil)
+		hook = "diagnostic kprobe/" + target
+	} else {
+		fl, hook, attachErr = attachTCPOffloadAccount(coll.Programs["tcp_offload_sent_account"], coll.Programs["tcp_offload_sent_account_kprobe"])
+	}
+	if attachErr != nil {
+		t.Fatalf("L1 FAIL: accounting attach: %v", attachErr)
 	}
 	defer func() { _ = fl.Close() }()
-	t.Logf("L1 PASS: accounting hook attached to skb_send_sock (%s)", func() string {
-		if fentryErr != nil {
-			return "kprobe fallback"
-		}
-		return "fentry"
-	}())
+	t.Logf("L1 PASS: accounting hook attached to %s", hook)
 
 	// Verdict program on the SOCKHASH.
 	vl, err := link.AttachRawLink(link.RawLinkOptions{
@@ -153,12 +193,12 @@ func TestTCPOffloadSentAccountE2E(t *testing.T) {
 
 	// Topology mirroring dae's relay pair:
 	//   fakeClient --conn1-- left (accepted)      right (dialed) --conn2-- fakeUpstream
-	l1, err := net.Listen("tcp", "127.0.0.1:0")
+	l1, err := net.Listen("tcp", address)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = l1.Close() }()
-	l2, err := net.Listen("tcp", "127.0.0.1:0")
+	l2, err := net.Listen("tcp", address)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,21 +209,46 @@ func TestTCPOffloadSentAccountE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = client.Close() }()
+	if destination {
+		raw, err := client.(*net.TCPConn).SyscallConn()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var optionErr error
+		if err := raw.Control(func(fd uintptr) {
+			// An eight-byte Destination Options header containing only Pad1.
+			options := []byte{unix.IPPROTO_TCP, 0, 0, 0, 0, 0, 0, 0}
+			optionErr = unix.SetsockoptString(int(fd), unix.IPPROTO_IPV6, unix.IPV6_DSTOPTS, string(options))
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if optionErr != nil {
+			t.Fatalf("set IPv6 Destination Options: %v", optionErr)
+		}
+	}
 	leftRaw, err := l1.Accept()
 	if err != nil {
 		t.Fatal(err)
 	}
 	left := leftRaw.(*net.TCPConn)
+	defer func() { _ = left.Close() }()
 	right, err := net.Dial("tcp", l2.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
 	rightTCP := right.(*net.TCPConn)
+	defer func() { _ = rightTCP.Close() }()
 	upRaw, err := l2.Accept()
 	if err != nil {
 		t.Fatal(err)
 	}
 	up := upRaw.(*net.TCPConn)
+	defer func() { _ = up.Close() }()
+	for _, conn := range []net.Conn{client, left, rightTCP, up} {
+		if err := conn.SetDeadline(time.Now().Add(20 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	leftKey, err := tcpConnTuplesKey(left)
 	if err != nil {
@@ -220,23 +285,31 @@ func TestTCPOffloadSentAccountE2E(t *testing.T) {
 	if _, err := rand.Read(payload); err != nil {
 		t.Fatal(err)
 	}
-	go func() { _, _ = client.Write(payload) }()
+	payloadErr := make(chan error, 1)
+	go func() {
+		_, err := client.Write(payload)
+		payloadErr <- err
+	}()
 	got := make([]byte, verifyPayload)
 	if _, err := io.ReadFull(up, got); err != nil {
 		t.Fatalf("L2 FAIL: upstream read: %v (redirect datapath broken?)", err)
+	}
+	if err := <-payloadErr; err != nil {
+		t.Fatalf("L2 FAIL: client write: %v", err)
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatal("L2 FAIL: payload mismatch through redirect")
 	}
 	time.Sleep(300 * time.Millisecond) // let per-cpu counters settle
 
-	sentL2 := perCPUCounter(sentMap, &leftKey)
-	if sentL2 == 0 {
-		t.Fatalf("L2 FAIL: tcp_offload_sent[leftKey] is EMPTY after %d bytes redirected through the sockmap egress path — the accounting hook never fired", verifyPayload)
+	sentL2, lookupErr := perCPUCounter(sentMap, &leftKey)
+	if lookupErr != nil || sentL2 == 0 {
+		dumpOffloadSent(t, sentMap, &leftKey)
+		t.Fatalf("L2 FAIL: tcp_offload_sent[leftKey]=%d lookup=%v after %d redirected bytes; a missing counter alone does not prove the hook never ran", sentL2, lookupErr, verifyPayload)
 	}
 	t.Logf("L2 PASS: sent[leftKey]=%d after 1MiB (expect ~%d)", sentL2, verifyPayload)
 
-	// L3: 100MiB stream (above the 64MiB fuse engage threshold). The sent
+	// L3: 70MiB stream (above the 64MiB fuse engage threshold). The sent
 	// counter must track inflow so the backlog stays near zero; before the
 	// symbol fix the counter stayed at 0 and the fuse would engage.
 	chunk := make([]byte, 1<<20)
@@ -286,7 +359,11 @@ func TestTCPOffloadSentAccountE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	inflow := int64(rxNow) - int64(rxBase)
-	sentL3 := perCPUCounter(sentMap, &leftKey)
+	sentL3, lookupErr := perCPUCounter(sentMap, &leftKey)
+	if lookupErr != nil {
+		dumpOffloadSent(t, sentMap, &leftKey)
+		t.Fatalf("L3 FAIL: sent lookup: %v", lookupErr)
+	}
 	backlogVal := inflow - int64(sentL3)
 	t.Logf("L3: delivered=%d inflow=%d sent=%d backlog=%d (fuse engage at %d, resume at %d)",
 		n, inflow, sentL3, backlogVal, tcpOffloadMaxPeerBacklog, tcpOffloadFuseResumeBytes)

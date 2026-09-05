@@ -3500,6 +3500,8 @@ int tproxy_wan_cg_sendmsg6(struct bpf_sock_addr *ctx)
 	return 1;
 }
 
+#include "include/tcp_offload.h"
+
 // tcp_offload_redirect is the stream-verdict (RX path) program for the
 // fast_sock SOCKHASH. When a socket registered by the Go control plane
 // receives data, this program redirects it to the peer relay socket's egress
@@ -3524,7 +3526,7 @@ int tcp_offload_redirect(struct __sk_buff *skb)
 	// bits on little-endian targets (convert_skb_access LSH 16);
 	// local_port is host byte order.
 	peer_key.l4proto = IPPROTO_TCP;
-	peer_key.sport = skb->remote_port >> 16;
+	peer_key.sport = tcp_offload_remote_port(skb->remote_port);
 	peer_key.dport = bpf_htons((__u16)skb->local_port);
 	if (skb->family == AF_INET) {
 		peer_key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
@@ -3566,8 +3568,10 @@ SEC("license") const char __license[] = "Dual BSD/GPL";
 /* tcp_offload_sent_account records, per reversed four-tuple, the bytes that
  * skb_send_sock pushes into a peer socket's send path. The key layout
  * must match tcp_offload_redirect's peer_key so the Go session can look up
- * both directions with its registered keys. fentry keeps the per-packet
- * cost below the kprobe trap overhead on the hot redirect path.
+ * both directions with its registered keys. Userspace picks the attach
+ * site per kernel (see tcp_offload_hook.go): fentry on the outer wrapper
+ * when only it is verified, or the kprobe variant on the shared inner
+ * __skb_send_sock when LTO can bypass the wrapper.
  *
  * NOTE: the hook must sit on skb_send_sock, not skb_send_sock_locked.
  * The sockmap verdict egress path is sk_psock_verdict_apply ->
@@ -3578,6 +3582,10 @@ SEC("license") const char __license[] = "Dual BSD/GPL";
  * v6.12 and v6.17 sources). Both functions are identical one-line
  * tail-call wrappers into __skb_send_sock with the same first four
  * arguments, so the BPF_PROG signature below is unchanged.
+ *
+ * A successful attach does not prove this wrapper executes. LTO kernels
+ * can bypass it and call __skb_send_sock directly; the E2E sent/inflow
+ * assertions must still pass before relying on accounting on that kernel.
  *
  * An earlier EBUSY when attaching to skb_send_sock on 6.12/6.17/6.18 was
  * an attachment-conflict signal, not a function-shape artifact: the
@@ -3607,44 +3615,10 @@ static __always_inline void
 tcp_offload_sent_account_body(struct sk_buff *skb, int len)
 {
 	struct tuples_key key = {};
-	struct iphdr ip4;
-	struct tcphdr tcp;
-	__u16 nh;
-	unsigned char *head, *data;
 	__u64 *v;
 
-	nh = BPF_CORE_READ(skb, network_header);
-	head = BPF_CORE_READ(skb, head);
-	data = head + nh;
-	if (bpf_probe_read_kernel(&ip4, sizeof(ip4), data))
+	if (!tcp_offload_skb_key(skb, &key))
 		return;
-
-	key.l4proto = IPPROTO_TCP;
-	if (ip4.version == 4) {
-		__u16 th_off = ip4.ihl * 4;
-
-		if (bpf_probe_read_kernel(&tcp, sizeof(tcp), data + th_off))
-			return;
-		key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
-		key.sip.u6_addr32[3] = ip4.saddr;
-		key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
-		key.dip.u6_addr32[3] = ip4.daddr;
-		key.sport = tcp.source;
-		key.dport = tcp.dest;
-	} else if (ip4.version == 6) {
-		struct ipv6hdr ip6;
-
-		if (bpf_probe_read_kernel(&ip6, sizeof(ip6), data))
-			return;
-		if (bpf_probe_read_kernel(&tcp, sizeof(tcp), data + sizeof(ip6)))
-			return;
-		__builtin_memcpy(&key.sip, &ip6.saddr, IPV6_BYTE_LENGTH);
-		__builtin_memcpy(&key.dip, &ip6.daddr, IPV6_BYTE_LENGTH);
-		key.sport = tcp.source;
-		key.dport = tcp.dest;
-	} else {
-		return;
-	}
 
 	v = bpf_map_lookup_elem(&tcp_offload_sent, &key);
 	if (v) {

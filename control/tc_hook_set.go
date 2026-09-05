@@ -253,6 +253,12 @@ type tcHookTransaction struct {
 	beforeModes map[tcHookGroupKey]tcHookMode
 	desired     map[tcHookKey]tcHookSpec
 	committed   bool
+	// partial records that commit() applied part of the desired state and
+	// its internal restore attempt also failed: kernel TC state no longer
+	// matches `before`, so rollback/abort must re-apply the snapshot
+	// instead of discarding the transaction (and the only record of the
+	// pre-transaction state) without restoring it.
+	partial bool
 }
 
 // tcHookSet owns every TC attachment for one active datapath generation. Its
@@ -344,6 +350,11 @@ func (s *tcHookSet) commit() error {
 			s.restoreModesLocked(s.txn.beforeModes)
 			s.txn = nil
 			s.pruneEmptyGroupsLocked()
+		} else {
+			// Keep the transaction, marked partial: the kernel no longer
+			// matches `before`, and a later rollback()/abort() must still
+			// restore the snapshot rather than discard it.
+			s.txn.partial = true
 		}
 		return stderrors.Join(err, rollbackErr)
 	}
@@ -358,6 +369,17 @@ func (s *tcHookSet) rollback() error {
 		return nil
 	}
 	if !s.txn.committed {
+		if s.txn.partial {
+			// commit() left the kernel partially applied and its internal
+			// restore failed. Discarding `before` now would strand
+			// retired-generation programs on the interfaces until the next
+			// successful reload, so restore the snapshot instead. On
+			// failure keep the transaction for a retry.
+			if err := s.applyDesiredLocked(s.txn.before); err != nil {
+				return err
+			}
+			s.restoreModesLocked(s.txn.beforeModes)
+		}
 		s.txn = nil
 		s.pruneEmptyGroupsLocked()
 		return nil
@@ -388,6 +410,15 @@ func (s *tcHookSet) abort() error {
 	}
 	if s.txn.committed {
 		return fmt.Errorf("cannot abort committed TC HookSet transaction")
+	}
+	if s.txn.partial {
+		// Same rationale as rollback(): commit() already moved kernel
+		// state, so the pre-transaction snapshot must be restored, not
+		// dropped. Keep the transaction on failure for a retry.
+		if err := s.applyDesiredLocked(s.txn.before); err != nil {
+			return err
+		}
+		s.restoreModesLocked(s.txn.beforeModes)
 	}
 	s.txn = nil
 	s.pruneEmptyGroupsLocked()

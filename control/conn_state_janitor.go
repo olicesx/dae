@@ -73,6 +73,15 @@ var (
 	// TCP ACTIVE state has no age timeout because an idle socket can remain valid
 	// indefinitely. FIN/RST transitions state to CLOSING for prompt cleanup.
 	tcpConnStateTimeoutClosing = 10 * time.Second
+
+	// tcpConnStateRoutinglessBackstop bounds routing-less TCP tracking
+	// entries (WAN egress creates them for direct traffic with no routing
+	// metadata, e.g. SYNs to blackholed destinations that never complete).
+	// Every read path treats a routing-less entry exactly like a missing
+	// one (LAN ingress passes it through, WAN egress re-routes the packet),
+	// and a same-tuple SYN recreates it, so retiring idle ones is
+	// behavior-neutral. Aligned with the kernel's 300s UDP backstop.
+	tcpConnStateRoutinglessBackstop = 5 * time.Minute
 )
 
 type mapCleanupStats struct {
@@ -305,6 +314,13 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 
 	closingTimeoutNano := tcpConnStateTimeoutClosing.Nanoseconds()
 	aggressiveClosingTimeout := closingTimeoutNano / 2
+	routinglessBackstopNano := tcpConnStateRoutinglessBackstop.Nanoseconds()
+	if aggressiveCleanup {
+		// Halve like every other protocol TTL here: pressure mode runs when
+		// the map is filling, exactly when dead-SYN tracking entries should
+		// retire fastest.
+		routinglessBackstopNano /= 2
+	}
 
 	scratch := c.connStateJanitorScratch()
 	udpKeysToDelete := takeJanitorDeleteScratch(scratch.udpDelete)
@@ -372,8 +388,20 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 							shouldDelete = true
 						}
 					}
-					// Established TCP has no TTL here (pin-governed), so the stale
-					// threshold is the only retirement path for orphaned entries.
+					// Routing-less tracking entries are neutral to delete on
+					// every read path (LAN ingress passes them through, WAN
+					// egress re-routes the packet, and a same-tuple SYN
+					// recreates them), so idle ones get a backstop instead
+					// of lingering until the next reload's stale threshold.
+					if !shouldDelete && value.Meta.Data.HasRouting == 0 {
+						age := nowNano - int64(value.LastSeenNs)
+						if age > routinglessBackstopNano {
+							shouldDelete = true
+						}
+					}
+					// Established TCP with routing metadata has no TTL here
+					// (pin-governed), so the stale threshold is the only
+					// retirement path for orphaned entries.
 					if !shouldDelete && staleBeforeNs > 0 &&
 						(value.LastSeenNs == 0 || value.LastSeenNs < staleBeforeNs) {
 						shouldDelete = true

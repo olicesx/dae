@@ -48,6 +48,15 @@ var (
 	ErrDNSQueryConcurrencyLimitExceeded = errors.New("dns query concurrency limit exceeded")
 	ErrDNSUDPConnPoolExhausted          = errors.New("dns udp conn pool exhausted")
 	ErrDNSTruncated                     = errors.New("dns response truncated")
+	// ErrDnsForwardersClosed is returned when a forwarder is requested after
+	// the controller's forwarder cache has been swept by Close. In-flight
+	// queries that outlived the close handle-gate must fail instead of
+	// repopulating forwarders that nothing will ever close again.
+	ErrDnsForwardersClosed = errors.New("dns forwarder cache is closed")
+	// errConnPoolClosed is returned when a pooled connection is requested
+	// after the pool has been closed; the fresh dial is discarded instead of
+	// being appended to a dead pool.
+	errConnPoolClosed = errors.New("dns connection pool is closed")
 )
 
 var (
@@ -94,7 +103,12 @@ type dnsControllerStore struct {
 	runtimeMu         sync.RWMutex // Serializes runtime publication with reload cache projection.
 	cacheProjectionMu sync.RWMutex // Serializes cache membership with BPF projection callbacks.
 	dnsForwarderCache sync.Map     // map[dnsForwarderKey]*cachedDnsForwarder
-	sf                singleflight.Group
+	// dnsForwardersClosed is set before closeAllDnsForwarders sweeps the
+	// cache. getOrCreateDnsForwarder re-checks it after a store so an
+	// in-flight query admitted before the close handle-gate expired cannot
+	// repopulate a forwarder that nothing will ever sweep or close again.
+	dnsForwardersClosed atomic.Bool
+	sf                  singleflight.Group
 
 	janitorStop  chan struct{}
 	janitorDone  chan struct{}

@@ -561,6 +561,12 @@ type connPool struct {
 	maxConns int
 	index    atomic.Uint32
 	dialer   func(context.Context) (netproxy.Conn, error)
+	// closed marks the pool as torn down. get()'s slow path dials outside
+	// the lock; without this flag, close() can empty the pool mid-dial and
+	// the fresh connection would then be appended to a dead pool whose
+	// owner has already left, leaking the connection and its readLoop
+	// goroutine (which blocks on a deadline-less ReadFull).
+	closed bool
 }
 
 const connPoolScaleUpPendingThreshold int32 = 64
@@ -602,6 +608,10 @@ func (p *connPool) get(ctx context.Context) (*pipelinedConn, error) {
 slowPath:
 	// Slow path: clean up and decide whether to scale up.
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, errConnPoolClosed
+	}
 	p.pruneClosedLocked()
 
 	var selected *pipelinedConn
@@ -630,6 +640,13 @@ slowPath:
 
 	// Re-enter critical section: another goroutine may have filled pool while dialing.
 	p.mu.Lock()
+	if p.closed {
+		// The pool was torn down while we dialed. Nobody will ever close a
+		// connection appended now, so discard the fresh one here.
+		p.mu.Unlock()
+		conn.Close()
+		return nil, errConnPoolClosed
+	}
 	p.pruneClosedLocked()
 	if len(p.conns) >= p.maxConns {
 		if len(p.conns) > 0 {
@@ -668,7 +685,7 @@ func (p *connPool) pruneClosedLocked() {
 func (p *connPool) close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
+	p.closed = true
 	for _, conn := range p.conns {
 		conn.Close() // pipelinedConn.Close() has no return value
 	}
@@ -693,6 +710,16 @@ func (l *lazyConnPool) getOrInit(init func() *connPool) *connPool {
 		p := init()
 		l.pool.Store(p)
 	})
+	if l.closed.Load() {
+		// closePool raced the lazy initialization: it observed pool==nil
+		// before the Store above and skipped p.close(), so this freshly
+		// created pool would escape closure along with every connection
+		// readLoop inside it. Close it here (idempotent) and report closed.
+		if v := l.pool.Load(); v != nil {
+			_ = v.(*connPool).close()
+		}
+		return nil
+	}
 	if v := l.pool.Load(); v != nil {
 		return v.(*connPool)
 	}

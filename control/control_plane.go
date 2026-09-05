@@ -76,6 +76,13 @@ type ControlPlane struct {
 	ready     chan struct{}
 	readyOnce sync.Once
 
+	// serveLoopErr stores the first terminal ingress loop failure; Serve()
+	// returns it after the context cancellation that fatalIngressLoopError
+	// triggers, so the run loop can fail fast instead of silently
+	// blackholing hijacked traffic.
+	serveLoopErrMu sync.Mutex
+	serveLoopErr   error
+
 	controlPlaneRealDomainRuntime
 	controlPlaneDatapathJanitor
 	bpfMaintenance *bpfMaintenanceBinding
@@ -416,6 +423,14 @@ func NewControlPlaneWithContextOptions(
 	// Ensure critical maps are always present. DNS fast-path optimizations only
 	// skip per-flow map updates, never map object creation.
 	if err = validateRequiredBpfMapsLoaded(bpf); err != nil {
+		// On a fresh load the objects are solely owned here: no core, no
+		// deferFuncs, and LoadAndAssign already moved every object out of
+		// the loader. Close them explicitly or the whole set leaks until
+		// process exit (shared reloads keep ownership elsewhere and must
+		// not close here).
+		if !sharedBpfReload {
+			_ = bpf.Close()
+		}
 		return nil, fmt.Errorf("validate bpf maps: %w", err)
 	}
 	log.Infof("Loaded eBPF programs and maps")
@@ -2228,6 +2243,55 @@ func shouldSkipDNSFastPathForLocalListenerTraffic(listenAddr string, src, dst ne
 	return false
 }
 
+// ingressRetryBackoff is the pause between retries of transient ingress
+// loop errors (fd/memory pressure) so resource exhaustion can clear without
+// tearing the listener loop down.
+const ingressRetryBackoff = 100 * time.Millisecond
+
+// ingressResourceExhausted reports whether an ingress loop error is transient
+// resource exhaustion worth retrying instead of exiting the loop. Exiting the
+// accept/read loop on EMFILE/ENFILE/ENOMEM/ENOBUFS would silently blackhole
+// the listener for that address family until the next reload.
+func ingressResourceExhausted(err error) bool {
+	return stderrors.Is(err, syscall.EMFILE) ||
+		stderrors.Is(err, syscall.ENFILE) ||
+		stderrors.Is(err, syscall.ENOMEM) ||
+		stderrors.Is(err, syscall.ENOBUFS)
+}
+
+// retryIngressAfterBackoff logs (rate-limited) and sleeps briefly so the
+// caller can retry a transient ingress error. It reports whether the caller
+// should keep looping; false means the plane is shutting down.
+func (c *ControlPlane) retryIngressAfterBackoff(op string, err error) bool {
+	if c.allowConnectionErrorLog(time.Now()) {
+		c.log.Errorf("%s: transient error, retrying: %v", op, err)
+	}
+	select {
+	case <-c.ctx.Done():
+		return false
+	case <-time.After(ingressRetryBackoff):
+		return true
+	}
+}
+
+// fatalIngressLoopError records a terminal ingress loop failure and cancels
+// the plane context so Serve() stops blocking on ctx.Done and returns the
+// error to its caller. Without this, a detached accept/read loop that dies
+// on an unclassified error (EPERM, EINVAL, ...) leaves Serve() returning nil
+// and the hijacked traffic silently blackholes until the next reload.
+func (c *ControlPlane) fatalIngressLoopError(op string, err error) {
+	wrapped := fmt.Errorf("%s: %w", op, err)
+	c.serveLoopErrMu.Lock()
+	if c.serveLoopErr == nil {
+		c.serveLoopErr = wrapped
+	}
+	c.serveLoopErrMu.Unlock()
+	if c.cancel != nil {
+		c.cancel()
+	}
+	c.log.Errorf("[Critical] Ingress loop terminated: %v", wrapped)
+}
+
 func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err error) {
 	sentReady := false
 	defer func() {
@@ -2296,9 +2360,21 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				if stderrors.As(err, &netErr) && netErr.Timeout() {
 					return
 				}
-				if !commonerrors.IsClosedConnection(err) && !stderrors.Is(err, context.Canceled) {
-					c.log.Errorf("Error when accept: %v", err)
+				if commonerrors.IsClosedConnection(err) || stderrors.Is(err, context.Canceled) {
+					return
 				}
+				if ingressResourceExhausted(err) {
+					// Transient fd/memory pressure: retry with a short
+					// backoff instead of tearing the accept loop down.
+					// Exiting here would silently blackhole this address
+					// family until the next reload.
+					if !c.retryIngressAfterBackoff("Accept", err) {
+						return
+					}
+					continue
+				}
+				c.log.Errorf("Error when accept: %v", err)
+				c.fatalIngressLoopError("accept", err)
 				return
 			}
 			go func(lconn net.Conn) {
@@ -2416,7 +2492,11 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				n, err := batchReader.ReadBatch()
 				if err != nil {
 					if !commonerrors.IsClosedConnection(err) {
+						if ingressResourceExhausted(err) && c.retryIngressAfterBackoff("ReadBatchUDP", err) {
+							continue
+						}
 						c.log.Errorf("ReadBatchUDP: %v", err)
+						c.fatalIngressLoopError("read-batch-udp", err)
 					}
 					break
 				}
@@ -2444,7 +2524,11 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			pktBuf, src, oobn, err := singleReader.Read(oob[:])
 			if err != nil {
 				if !commonerrors.IsClosedConnection(err) {
+					if ingressResourceExhausted(err) && c.retryIngressAfterBackoff("ReadMsgUDPAddrPort", err) {
+						continue
+					}
 					c.log.Errorf("ReadMsgUDPAddrPort: %v", err)
+					c.fatalIngressLoopError("read-udp", err)
 				}
 				break
 			}
@@ -2469,7 +2553,12 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			"error": ctxErr.Error(),
 		}).Info("[ControlPlane] Serve() exiting; context cancelled")
 	}
-	return nil
+	// A terminal ingress loop failure cancels the context and stashes its
+	// error here; surface it so the caller can fail fast.
+	c.serveLoopErrMu.Lock()
+	serveErr := c.serveLoopErr
+	c.serveLoopErrMu.Unlock()
+	return serveErr
 }
 
 // Listen opens the ingress listeners without starting the serving loops.

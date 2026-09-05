@@ -412,7 +412,12 @@ func (c *controlPlaneCore) resetBpfHookDetachForReattach() {
 	if oldIfmgr != nil {
 		_ = oldIfmgr.Close()
 	}
-	c.addDeferFunc(newIfmgr.Close)
+	// addDeferFunc refuses registration once the core is closed (its
+	// deferFuncs already ran); without this check the fresh ifmgr — a
+	// netlink socket plus its monitor/worker goroutines — would leak.
+	if !c.addDeferFunc(newIfmgr.Close) {
+		_ = newIfmgr.Close()
+	}
 }
 
 // DetachBpfHooks quiesces hook attachment and synchronously detaches every hook

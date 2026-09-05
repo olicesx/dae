@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -312,6 +313,44 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 	return newRunner(log, conf, externGeoDataDirs).Run()
 }
 
+// serveExitTracker records abnormal exits of serve goroutines tagged with
+// the control plane each goroutine served, so the run loop can tell an
+// abnormal exit of the ACTIVE generation apart from the benign exit of a
+// retired or rolled-back one.
+type serveExitTracker struct {
+	mu    sync.Mutex
+	plane *control.ControlPlane
+	err   error
+}
+
+// report records an abnormal exit. Nil planes and nil errors are ignored:
+// a serve goroutine returning nil exited because its generation's context
+// was cancelled (planned retirement or shutdown), which is never fatal. A
+// later report replaces an earlier one, mirroring "the newest death is the
+// one that matters".
+func (t *serveExitTracker) report(plane *control.ControlPlane, err error) {
+	if plane == nil || err == nil {
+		return
+	}
+	t.mu.Lock()
+	t.plane, t.err = plane, err
+	t.mu.Unlock()
+}
+
+// fatalFor returns the recorded error only when it belongs to the given
+// active control plane. The report is consumed either way, so a stale
+// record can never misfire against a later generation.
+func (t *serveExitTracker) fatalFor(plane *control.ControlPlane) error {
+	t.mu.Lock()
+	recordedPlane, recordedErr := t.plane, t.err
+	t.plane, t.err = nil, nil
+	t.mu.Unlock()
+	if plane != nil && recordedPlane == plane && recordedErr != nil {
+		return recordedErr
+	}
+	return nil
+}
+
 func (r *Runner) Run() (err error) {
 	log := r.log
 	conf := r.conf
@@ -389,13 +428,23 @@ func (r *Runner) Run() (err error) {
 	runStateChanges := make(chan struct{}, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGILL, syscall.SIGUSR1, syscall.SIGUSR2)
 
+	// Serve-exit reporting lets the main loop distinguish an abnormal exit
+	// of the CURRENT generation's serve goroutine from the benign exit of a
+	// retired generation's one: if the active generation stops serving while
+	// its hooks are still attached, traffic is hijacked with nobody
+	// accepting — a silent blackhole. Reports are tagged with the served
+	// control plane so only the active generation's death is fatal; a
+	// failed candidate's report goes stale once a reload is rolled back.
+	var serveExits serveExitTracker
+	reportServeExit := serveExits.report
+
 	go func() {
 		readyChan := make(chan bool, 1)
 		go func() {
 			if <-readyChan {
 				_ = sdnotify.Ready()
 				if !disablePidFile {
-					_ = os.WriteFile(PidFilePath, []byte(strconv.Itoa(os.Getpid())), 0644)
+					_ = os.WriteFile(PidFilePath, []byte(strconv.Itoa(os.Getpid())), 0o644)
 				}
 				_ = setRunSignalProgress(consts.ReloadDone, "")
 			} else {
@@ -416,6 +465,7 @@ func (r *Runner) Run() (err error) {
 			return nil
 		}); runErr != nil {
 			w.log.Errorln("GetDaeNetns.With:", runErr)
+			reportServeExit(w.c, runErr)
 		}
 		notifyRunStateChange(runStateChanges)
 	}()
@@ -440,7 +490,7 @@ loop:
 		select {
 		case sig := <-sigs:
 			switch sig {
-			case syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGKILL:
+			case syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT:
 				w.log.Infof("Received termination signal: %v", sig.String())
 				fastExit = true
 				break loop
@@ -480,10 +530,12 @@ loop:
 						listener, listenErr := listenControlPlaneInDaeNetns(w.c, w.conf.Global.TproxyPort)
 						if listenErr != nil {
 							w.log.Errorln("Listen:", listenErr)
+							reportServeExit(w.c, fmt.Errorf("re-listen: %w", listenErr))
 						} else {
 							w.listener = listener
 							if serveErr := serveControlPlaneFunc(w.c, readyChan, listener); serveErr != nil {
 								w.log.Errorln("Serve:", serveErr)
+								reportServeExit(w.c, serveErr)
 							}
 						}
 						notifyRunStateChange(runStateChanges)
@@ -606,6 +658,7 @@ loop:
 					}()
 					if err := serveControlPlaneFunc(serveControlPlane, readyChan, serveListener); err != nil {
 						w.log.Errorln("ListenAndServe:", err)
+						reportServeExit(serveControlPlane, err)
 					}
 					notifyRunStateChange(runStateChanges)
 				}()
@@ -798,6 +851,19 @@ loop:
 				// Listening error.
 				w.log.Errorln("[Critical] Listener failed; exiting")
 				break loop
+			} else {
+				// Not reloading and the listener exists: check whether the
+				// active generation's serve goroutine died. Without this the
+				// process would keep running with hooks attached while
+				// nobody accepts — a silent blackhole until the next reload.
+				// Reports from retired or rolled-back generations never
+				// match w.c; consume them here so a stale report cannot
+				// misfire later.
+				if err := serveExits.fatalFor(w.c); err != nil {
+					w.log.WithError(err).Errorln("[Critical] Serve exited for the active generation; exiting")
+					failRun(fmt.Errorf("serve exited for the active generation: %w", err))
+					break loop
+				}
 			}
 		}
 	}

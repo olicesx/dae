@@ -473,7 +473,7 @@ func waitReloadReadyOrSignal(
 					log.Warnln("[Reload] Signal received while current reload is still becoming ready; ignoring it")
 				}
 				continue
-			case syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGKILL:
+			case syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT:
 				return reloadReadyWaitSignal, sig
 			default:
 				if sig != nil && log != nil {

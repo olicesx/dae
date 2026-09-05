@@ -298,6 +298,9 @@ func newDnsForwarderKey(upstream *dns.Upstream, dialArg *dialArgument) dnsForwar
 }
 
 func (c *DnsController) getOrCreateDnsForwarder(upstream *dns.Upstream, dialArg *dialArgument) (*cachedDnsForwarder, error) {
+	if c.dnsForwardersClosed.Load() {
+		return nil, ErrDnsForwardersClosed
+	}
 	key := newDnsForwarderKey(upstream, dialArg)
 	now := time.Now()
 
@@ -349,6 +352,18 @@ func (c *DnsController) getOrCreateDnsForwarder(upstream *dns.Upstream, dialArg 
 		}
 		return nil, fmt.Errorf("unexpected cached dns forwarder type: %T", actual)
 	}
+	if c.dnsForwardersClosed.Load() {
+		// The controller was closed between the entry check and this store.
+		// Stores that landed before the sweep's Range reaches the key get
+		// swept anyway; stores that land after the sweep passed would never
+		// be closed by anyone, so undo this one and fail the in-flight
+		// query instead. closeNow routes through the cached wrapper's
+		// closeOnce, keeping the double-close with a concurrent sweep
+		// idempotent.
+		c.dnsForwarderCache.CompareAndDelete(key, created)
+		_ = created.closeNow()
+		return nil, ErrDnsForwardersClosed
+	}
 	return created, nil
 }
 
@@ -392,6 +407,11 @@ func (c *DnsController) closeAllDnsForwarders() []error {
 	if c == nil {
 		return nil
 	}
+	// Set the closed flag before sweeping: combined with the post-store
+	// recheck in getOrCreateDnsForwarder, this makes it impossible for an
+	// in-flight query to leave a freshly created forwarder in the cache
+	// after this sweep returns (see the ordering argument there).
+	c.dnsForwardersClosed.Store(true)
 	var errs []error
 	c.dnsForwarderCache.Range(func(key, value any) bool {
 		k := key.(dnsForwarderKey)

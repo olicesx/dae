@@ -29,6 +29,14 @@ var (
 	// ErrFlowAlreadyRegistered is returned when an ingress connection already
 	// belongs to a live flow runtime.
 	ErrFlowAlreadyRegistered = stderrors.New("flow is already registered")
+	// errFlowMigrationAfterFinish is returned when a reload migration reaches
+	// a TCP flow that finished concurrently; the flow is left untouched so the
+	// caller falls back to abort/drain.
+	errFlowMigrationAfterFinish = stderrors.New("flow finished before migration could commit")
+	// errFlowMigrationSuperseded is returned when another migration already
+	// moved the flow off the epoch this migration collected it under; the
+	// caller must release its fresh lease and fall back to abort/drain.
+	errFlowMigrationSuperseded = stderrors.New("flow migrated away before this migration could commit")
 )
 
 type sessionGenerationState struct {
@@ -213,9 +221,19 @@ type FlowRuntime struct {
 	// leak into successor maps.
 	migratedBpf []*bpfObjects
 
-	finishOnce  sync.Once
-	abortOnce   sync.Once
-	migrateOnce sync.Once
+	finishOnce sync.Once
+	abortOnce  sync.Once
+
+	// lifecycleMu serializes finish()/abort() against migrate(): a reload
+	// migration must either fully commit before the flow's natural teardown
+	// starts, or bail out entirely. Without this serialization, migrate()
+	// can bind a fresh egress lease into an already-finished flow (leaking
+	// the new generation's dialer reference forever) and double-decrement
+	// the old generation's accounting that releaseFlow already unwound. It
+	// also guards every read of egressLease from outside the flow's own
+	// goroutine (see currentEgressLease) against the migrate() swap.
+	lifecycleMu sync.Mutex
+	finished    bool
 }
 
 // UDPFlowRuntime keeps an established UDP endpoint and its immutable route
@@ -523,6 +541,12 @@ func (f *FlowRuntime) finish() {
 		return
 	}
 	f.finishOnce.Do(func() {
+		// Publish the finished flag under lifecycleMu so a concurrent
+		// migrate() either observes it and bails out, or completes its
+		// commit first and this teardown unwinds the migrated state.
+		f.lifecycleMu.Lock()
+		f.finished = true
+		f.lifecycleMu.Unlock()
 		if f.manager != nil {
 			f.manager.releaseFlow(f)
 			return
@@ -572,19 +596,30 @@ func (m *SessionManager) releaseFlow(flow *FlowRuntime) {
 			refShard.unpin(flow.redirectKey)
 		}
 		migratedMaps = flow.migratedBpf
+
+		// The physical delete shares this generationsMu critical section with
+		// the unpin above and with adoptTCP's pin: a same-tuple reconnect
+		// must not slip a fresh pin between the refcount dropping to zero
+		// and the delete, or the new flow would lose its live entry. This
+		// mirrors the invariant ReleaseUdpConnStateTuples documents and
+		// enforces for UDP under udpStateMu. Lock order generationsMu ->
+		// udpStateMu matches the janitor's scan-to-delete recheck.
+		if len(deleteKeys) > 0 {
+			m.udpStateMu.RLock()
+			if bpf := m.udpBPF.Load(); bpf != nil && bpf.ConnStateMap != nil {
+				_, _ = BpfMapBatchDelete(bpf.ConnStateMap, deleteKeys)
+			}
+			m.udpStateMu.RUnlock()
+		}
 	}
 	m.generationsMu.Unlock()
 
-	if len(deleteKeys) > 0 {
-		m.udpStateMu.RLock()
-		if bpf := m.udpBPF.Load(); bpf != nil && bpf.ConnStateMap != nil {
-			_, _ = BpfMapBatchDelete(bpf.ConnStateMap, deleteKeys)
-		}
-		m.udpStateMu.RUnlock()
-	}
 	// Also scrub every map this flow was migrated into. The refcounts
 	// for these keys were already unwound above, so we only need to
-	// physically remove the entries from the migrated maps.
+	// physically remove the entries from the migrated maps. This runs
+	// outside generationsMu: only this flow's own migrate() appends to
+	// migratedBpf, and migrate() is serialized against releaseFlow by
+	// lifecycleMu, so no pin can interleave here.
 	for _, bpf := range migratedMaps {
 		if bpf != nil && bpf.ConnStateMap != nil {
 			migrateKeys := make([]bpfTuplesKey, 0, flow.pinKeyCount)
@@ -883,6 +918,19 @@ func (f *FlowRuntime) abort() error {
 	return err
 }
 
+// currentEgressLease returns the flow's bound egress lease under
+// lifecycleMu, so callers outside the flow's own goroutine (e.g.
+// MigrateGeneration's transferLease) read the same field migrate() swaps
+// without a data race.
+func (f *FlowRuntime) currentEgressLease() *egressRuntimeLease {
+	if f == nil {
+		return nil
+	}
+	f.lifecycleMu.Lock()
+	defer f.lifecycleMu.Unlock()
+	return f.egressLease
+}
+
 // migrate transfers a TCP flow from its current generation to a new one
 // without closing the underlying sockets. It re-pins BPF conn_state_map
 // entries, swaps the egress lease, and updates the generation tracking so
@@ -893,49 +941,66 @@ func (f *FlowRuntime) abort() error {
 // original lease and epoch, and the new bpfObjects does not retain stale
 // entries. Once the generation tracking has moved to the new epoch the
 // migration has committed and the old lease is released.
-func (f *FlowRuntime) migrate(m *SessionManager, newBpf *bpfObjects, newLease *egressRuntimeLease, newOutbound *outbound.DialerGroup, newEpoch routing.PolicyEpoch) error {
+func (f *FlowRuntime) migrate(m *SessionManager, oldEpoch routing.PolicyEpoch, newBpf *bpfObjects, newLease *egressRuntimeLease, newOutbound *outbound.DialerGroup, newEpoch routing.PolicyEpoch) error {
 	if f == nil {
 		return nil
 	}
-	var err error
-	f.migrateOnce.Do(func() {
-		oldEpoch := f.binding.Route.PolicyEpoch
-		oldLease := f.egressLease
+	f.lifecycleMu.Lock()
+	defer f.lifecycleMu.Unlock()
+	// The flow finished (natural teardown or abort) between
+	// MigrateGeneration's collection and this commit. Binding the new
+	// lease now would leak the new generation's dialer reference into a
+	// dead flow, and moving the epoch counts would corrupt accounting
+	// that releaseFlow already unwound. Leave the flow untouched so the
+	// caller falls back to abort/drain; it releases the new lease.
+	if f.finished {
+		return errFlowMigrationAfterFinish
+	}
+	// Another migration moved the flow between collection and this commit
+	// (a concurrent MigrateGeneration can be reached from both the reload
+	// retirement drain and the signal shutdown path). Committing now would
+	// decrement a generation that no longer counts this flow and strand
+	// the caller's fresh lease inside a flow that keeps the earlier one.
+	// Bail so the caller releases the new lease and falls back to
+	// abort/drain. Serial re-migration across successive reloads (A->B
+	// then B->C) still passes this guard and migrates for real.
+	if f.binding.Route.PolicyEpoch != oldEpoch {
+		return errFlowMigrationSuperseded
+	}
+	oldLease := f.egressLease
 
-		// Step 1: BPF re-pin. Failures here are non-fatal — the flow can
-		// still relay via userspace — so we proceed even if no entries
-		// were copied. Successful pins are tracked for cleanup on finish.
-		if newBpf != nil {
-			f.repinConnStateMapsForRollback(newBpf)
-		}
+	// Step 1: BPF re-pin. Failures here are non-fatal — the flow can
+	// still relay via userspace — so we proceed even if no entries
+	// were copied. Successful pins are tracked for cleanup on finish.
+	if newBpf != nil {
+		f.repinConnStateMapsForRollback(newBpf)
+	}
 
-		// Step 2: Bind the new lease before releasing the old one. This
-		// keeps the dialer reference count monotonic across the swap.
-		f.egressLease = newLease
-		if newOutbound != nil {
-			f.binding.Egress.Outbound = newOutbound
-		}
+	// Step 2: Bind the new lease before releasing the old one. This
+	// keeps the dialer reference count monotonic across the swap.
+	f.egressLease = newLease
+	if newOutbound != nil {
+		f.binding.Egress.Outbound = newOutbound
+	}
 
-		// Step 3: Move the flow from the old generation to the new one.
-		// This is the commit point: after this the flow belongs to the
-		// new generation for tracking purposes, and the old lease can be
-		// released without risking an underflow in the old runtime.
-		// generationsMu keeps this swap atomic against AbortGeneration /
-		// MigrateGeneration epoch filters and the counter table.
-		m.generationsMu.Lock()
-		m.releaseGenerationLocked(oldEpoch)
-		f.binding.Route.PolicyEpoch = newEpoch
-		m.retainGenerationLocked(newEpoch)
-		m.generationsMu.Unlock()
+	// Step 3: Move the flow from the old generation to the new one.
+	// This is the commit point: after this the flow belongs to the
+	// new generation for tracking purposes, and the old lease can be
+	// released without risking an underflow in the old runtime.
+	// generationsMu keeps this swap atomic against AbortGeneration /
+	// MigrateGeneration epoch filters and the counter table.
+	m.generationsMu.Lock()
+	m.releaseGenerationLocked(oldEpoch)
+	f.binding.Route.PolicyEpoch = newEpoch
+	m.retainGenerationLocked(newEpoch)
+	m.generationsMu.Unlock()
 
-		// Commit complete: drop the old lease now that the new one is
-		// bound and the flow is tracked by the new generation.
-		if oldLease != nil {
-			_ = oldLease.release()
-		}
-		err = nil
-	})
-	return err
+	// Commit complete: drop the old lease now that the new one is
+	// bound and the flow is tracked by the new generation.
+	if oldLease != nil {
+		_ = oldLease.release()
+	}
+	return nil
 }
 
 // repinConnStateMapsForRollback is the rollback-aware variant of
@@ -1056,12 +1121,12 @@ func (m *SessionManager) MigrateGeneration(
 	for _, flow := range flows {
 		// Try to acquire an equivalent lease from the new runtime so the
 		// flow's dialer reference does not keep the old generation alive.
-		newLease, retainedGroup := newRuntime.transferLease(flow.egressLease)
+		newLease, retainedGroup := newRuntime.transferLease(flow.currentEgressLease())
 		if newLease == nil {
 			remaining++
 			continue
 		}
-		if err := flow.migrate(m, newBpf, newLease, retainedGroup, newEpoch); err != nil {
+		if err := flow.migrate(m, oldEpoch, newBpf, newLease, retainedGroup, newEpoch); err != nil {
 			// Migration failed: put back the lease and leave the flow
 			// untouched. The caller may drain/abort it separately.
 			if newLease != nil {

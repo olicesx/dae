@@ -309,8 +309,12 @@ func releaseUdpEndpointReplies(replies []*udpEndpointReply) {
 
 // replySender is the dedicated goroutine that drains the reply channel and
 // calls the handler (which invokes sendPkt). Running this off the read loop
-// avoids blocking the upstream protocol layer's ReceiveCh.
-func (ue *UdpEndpoint) replySender(replyCh <-chan *udpEndpointReply, stop chan<- struct{}, done chan<- struct{}) {
+// avoids blocking the upstream protocol layer's ReceiveCh. The creator binds
+// retire to this sender's lifecycle: a push sender must not synchronously call
+// Close, which waits for its done channel even after the shared queue closes.
+// A ReadFrom sender must close the conn to wake its read loop, including after
+// failed push registration has left behind a closed shared queue.
+func (ue *UdpEndpoint) replySender(replyCh <-chan *udpEndpointReply, stop chan<- struct{}, done chan<- struct{}, retire func()) {
 	defer close(done)
 	batch := make([]*udpEndpointReply, 0, 8)
 	for reply := range replyCh {
@@ -338,7 +342,7 @@ func (ue *UdpEndpoint) replySender(replyCh <-chan *udpEndpointReply, stop chan<-
 			// upstream endpoint's liveness.
 			if err := ue.handler(ue, queued.data, queued.from); err != nil {
 				releaseUdpEndpointReplies(batch[i:])
-				ue.retireFromReplySender()
+				retire()
 				close(stop)
 				ue.logEndpointExit(err, "reply sender")
 				// Drain remaining queued replies to release pool buffers.

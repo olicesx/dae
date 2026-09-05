@@ -2433,6 +2433,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 
 	singleRead:
 		var oob [udpIngressOobSize]byte
+		singleReader := udpIngressSingleReader{pc: udpConn}
 		for {
 			select {
 			case <-c.ctx.Done():
@@ -2440,20 +2441,21 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			default:
 			}
 
-			pktBuf := pool.GetFullCap(consts.EthernetMtu)
-			n, oobn, _, src, err := udpConn.ReadMsgUDPAddrPort(pktBuf, oob[:])
+			pktBuf, src, oobn, err := singleReader.Read(oob[:])
 			if err != nil {
-				pktBuf.Put()
 				if !commonerrors.IsClosedConnection(err) {
 					c.log.Errorf("ReadMsgUDPAddrPort: %v", err)
 				}
 				break
 			}
+			if pktBuf == nil {
+				continue
+			}
 
 			// Dual-stack UDP listener path: prefer correctness and IPv6 coverage
 			// over batch-read optimization. OOB is consumed synchronously in
 			// processPacket, so reusing the stack buffer is safe here.
-			processPacket(pktBuf[:n], src, oob[:oobn])
+			processPacket(pktBuf, src, oob[:oobn])
 		}
 	}()
 	c.ActivateCheck()

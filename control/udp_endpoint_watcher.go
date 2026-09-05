@@ -42,7 +42,7 @@ func (ue *UdpEndpoint) startTransportReceiver() bool {
 	ue.replyQueueStop = make(chan struct{})
 	ch, done, stopSignal := ue.replyQueueCh, ue.replyQueueDone, ue.replyQueueStop
 	ue.replyQueueMu.Unlock()
-	go ue.replySender(ch, stopSignal, done)
+	go ue.replySender(ch, stopSignal, done, ue.markRetiredFromReceiver)
 
 	stop, registered := receiver.RegisterPacketReceiver(ue.handleReceivedPacket)
 	if !registered {
@@ -279,7 +279,7 @@ func (ue *UdpEndpoint) startReadLoop() {
 			replyCh = make(chan *udpEndpointReply, udpEndpointReplyQueueSize)
 			senderStop = make(chan struct{})
 			senderDone = make(chan struct{})
-			go ue.replySender(replyCh, senderStop, senderDone)
+			go ue.replySender(replyCh, senderStop, senderDone, ue.retire)
 		}
 		queued := takeUdpEndpointReply(reply.data, reply.from)
 		select {

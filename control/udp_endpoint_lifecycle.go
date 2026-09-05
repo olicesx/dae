@@ -415,27 +415,6 @@ func (ue *UdpEndpoint) markRetiredFromReceiver() {
 	go func() { _ = ue.Close() }()
 }
 
-// retireFromReplySender evicts the endpoint from the reply sender. Push mode
-// only marks the endpoint dead: Close() there waits on replyQueueDone, which
-// only this sender closes, so markRetiredFromReceiver hands the actual
-// teardown to a fresh goroutine that waits for this sender to drain. ReadFrom
-// mode has no shared queue, so Close() is safe on this stack and required to
-// release the conn — the read loop's defer only waits on its local senderDone.
-func (ue *UdpEndpoint) retireFromReplySender() {
-	ue.replyQueueMu.Lock()
-	// A failed RegisterPacketReceiver tears the shared queue down
-	// (replyQueueClosed) and then falls back to the ReadFrom loop. The
-	// leftover replyQueueDone must not keep us on the push-mode path:
-	// ReadFrom's sender has to Close() the conn itself.
-	pushMode := ue.replyQueueDone != nil && !ue.replyQueueClosed
-	ue.replyQueueMu.Unlock()
-	if pushMode {
-		ue.markRetiredFromReceiver()
-		return
-	}
-	ue.retire()
-}
-
 // udpEndpointWriteTimeout bounds how long one proxy-side write may block. A
 // UDP datagram normally leaves the socket immediately, but many proxies carry
 // UDP over a TCP transport whose peer can stop ACKing; without a deadline one

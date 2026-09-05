@@ -12,7 +12,6 @@ import (
 	"os"
 	"path"
 	"regexp"
-	"runtime"
 
 	"github.com/cilium/ebpf"
 	ciliumLink "github.com/cilium/ebpf/link"
@@ -396,35 +395,19 @@ func (c *controlPlaneCore) setupTCPRelayOffload() error {
 		}
 		var account io.Closer
 		// Backlog-fuse accounting: count bytes entering each relay socket's
-		// send path via skb_send_sock, keyed by reversed four-tuple.
-		// fentry (BPF trampoline) avoids the kprobe trap cost on the hot path.
+		// send path, keyed by reversed four-tuple. The selector prefers an
+		// addressable inner implementation over a potentially bypassed wrapper.
 		// DAE_FUSE_ACCOUNT=0 skips the attach (diagnostics only: the backlog
 		// fuse cannot engage without the accounting).
 		if os.Getenv("DAE_FUSE_ACCOUNT") != "0" {
-			sentLink, err := ciliumLink.AttachTracing(ciliumLink.TracingOptions{
-				Program:    bpf.TcpOffloadSentAccount,
-				AttachType: ebpf.AttachTraceFEntry,
-			})
-			if err != nil && bpf.TcpOffloadSentAccountKprobe != nil && !tcpOffloadKprobeFallbackSupported(runtime.GOARCH) {
-				c.log.WithError(err).Debugf("TCP relay eBPF offload kprobe fallback is unavailable on GOARCH=%s; the embedded fallback uses x86 pt_regs", runtime.GOARCH)
-			}
-			if err != nil && bpf.TcpOffloadSentAccountKprobe != nil && tcpOffloadKprobeFallbackSupported(runtime.GOARCH) {
-				// fentry requires a 5-byte NOP entry (an ftrace mcount point).
-				// Kernels without CONFIG_DYNAMIC_FTRACE (common in trimmed router
-				// builds such as ImmortalWrt) leave tail-call wrapper functions
-				// with a `jmp` entry; bpf_arch_text_poke then returns EBUSY
-				// (entry != NOP). Fall back to a kprobe, which attaches at any
-				// instruction boundary and costs a per-packet trap on the
-				// accounting path only.
-				c.log.WithError(err).Debug("TCP relay eBPF offload fentry accounting unavailable; falling back to kprobe")
-				sentLink, err = ciliumLink.Kprobe(tcpRelayOffloadAccountTarget, bpf.TcpOffloadSentAccountKprobe, nil)
-			}
+			sentLink, hook, err := attachTCPOffloadAccount(bpf.TcpOffloadSentAccount, bpf.TcpOffloadSentAccountKprobe)
 			if err != nil {
 				// Without the accounting the backlog fuse cannot engage, so the
 				// verdict program is useless; drop it so a retry starts clean.
 				_ = rawLink.Close()
-				return tcpOffloadLinks{}, fmt.Errorf("attach tcp_offload_sent_account fentry to %v: %w", tcpRelayOffloadAccountTarget, err)
+				return tcpOffloadLinks{}, fmt.Errorf("attach tcp_offload_sent_account: %w", err)
 			}
+			c.log.Debugf("TCP relay eBPF offload accounting attached to %s", hook)
 			account = sentLink
 		}
 		return tcpOffloadLinks{verdict: rawLink, account: account}, nil
@@ -446,14 +429,10 @@ func (c *controlPlaneCore) setupTCPRelayOffload() error {
 	return nil
 }
 
-// tcpRelayOffloadAccountTarget is the kernel function the accounting fentry
-// attaches to (SEC("fentry/...") in kern/tproxy.c). Kept as a named constant
-// so the error message stays truthful if the hook is ever moved; cilium/ebpf
-// v0.20 exposes no Spec() on runtime programs to derive it. It must be the
-// function the sockmap verdict egress path actually calls
-// (sk_psock_handle_skb -> skb_send_sock in net/core/skmsg.c); hooking
-// skb_send_sock_locked instead never fires because its only kernel caller
-// is espintcp.
+// tcpRelayOffloadAccountTarget matches the embedded fentry program's target.
+// Use this wrapper only when no addressable inner implementation is present;
+// LTO can bypass it on the sk_psock_handle_skb send path. skb_send_sock_locked
+// is not an alternative: it serves espintcp, not sockmap verdict egress.
 const tcpRelayOffloadAccountTarget = "skb_send_sock"
 
 func tcpOffloadKprobeFallbackSupported(goarch string) bool {

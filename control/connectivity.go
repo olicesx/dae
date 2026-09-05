@@ -131,18 +131,29 @@ func (c *ControlPlane) ResumeOutboundConnectivityUpdates() {
 	if c == nil || c.core == nil {
 		return
 	}
+	c.resumeOutboundConnectivityUpdates(c.core.writeOutboundConnectivityLocked)
+}
+
+func (c *ControlPlane) resumeOutboundConnectivityUpdates(publish func(uint8, bool, *dialer.NetworkType)) {
 	c.core.resumeOutboundConnectivityUpdates(func() {
 		for outboundID, group := range c.outbounds {
 			if group == nil {
 				continue
 			}
+			// Match ordinary callback publication. Random policies and non-IP
+			// modes keep kernel admission open for userspace selection/fallback.
+			policy := group.GetSelectionPolicy()
+			publishHealth := c.dialMode == consts.DialMode_Ip &&
+				policy != consts.DialerSelectionPolicy_Random && policy != consts.DialerSelectionPolicy_Fixed
 			for _, healthKey := range dialer.StandardHealthKeys() {
 				networkType := healthKey.NetworkType()
 				alive := true
-				if set := group.MustGetAliveDialerSet(networkType); set != nil {
-					alive = set.Len() > 0
+				if publishHealth {
+					if set := group.MustGetAliveDialerSet(networkType); set != nil {
+						alive = set.Len() > 0
+					}
 				}
-				c.core.writeOutboundConnectivityLocked(uint8(outboundID), alive, networkType)
+				publish(uint8(outboundID), alive, networkType)
 			}
 		}
 	})

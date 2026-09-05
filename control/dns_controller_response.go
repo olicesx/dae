@@ -34,6 +34,21 @@ func dnsUDPResponseSizeLimit(req *dnsmessage.Msg) int {
 	return limit
 }
 
+type dnsUDPResponseWriter struct {
+	dnsmessage.ResponseWriter
+	limit int
+}
+
+func (w *dnsUDPResponseWriter) WriteMsg(msg *dnsmessage.Msg) error {
+	if msg.Len() > w.limit {
+		// Truncate changes sections and compression; cached and singleflight
+		// payloads must stay intact for clients that retry over TCP.
+		msg = msg.Copy()
+		truncateDNSMessage(msg, w.limit)
+	}
+	return w.ResponseWriter.WriteMsg(msg)
+}
+
 // questionEchoMatches reports whether an upstream response echoes the
 // request question. Transaction IDs are only 16 bits, so ID equality alone
 // cannot prove a response belongs to a request: a hijacked upstream, a
@@ -52,6 +67,28 @@ func questionEchoMatches(req dnsmessage.Question, resp *dnsmessage.Msg) bool {
 		dnsmessage.CanonicalName(req.Name) == dnsmessage.CanonicalName(rq.Name)
 }
 
+// truncateDNSMessage requires exclusive ownership of msg and its records.
+func truncateDNSMessage(msg *dnsmessage.Msg, limit int) {
+	msg.Truncate(limit)
+	opt := msg.IsEdns0()
+	if opt == nil || msg.Len() <= limit {
+		return
+	}
+
+	// Truncate retains the entire OPT even when its options exceed the
+	// budget. Keep its header and every complete option that still fits;
+	// omitted options require TCP retry just like omitted resource records.
+	options := opt.Option
+	opt.Option = nil
+	for _, option := range options {
+		opt.Option = append(opt.Option, option)
+		if msg.Len() > limit {
+			opt.Option = opt.Option[:len(opt.Option)-1]
+			msg.Truncated = true
+		}
+	}
+}
+
 // truncateDNSResponse returns packed unchanged if it fits within limit;
 // otherwise it returns a truncated repack with the TC bit set (RFC 1035
 // section 4.2.1) so the client retries over TCP. On unpack/pack failure the
@@ -64,7 +101,7 @@ func truncateDNSResponse(packed []byte, limit int) []byte {
 	if err := msg.Unpack(packed); err != nil {
 		return packed
 	}
-	msg.Truncate(limit)
+	truncateDNSMessage(&msg, limit)
 	if data, err := msg.Pack(); err == nil {
 		return data
 	}
@@ -181,6 +218,7 @@ func (c *DnsController) sendDnsErrorResponse_(
 	if err != nil {
 		return fmt.Errorf("pack DNS packet: %w", err)
 	}
+	data = truncateDNSResponse(data, dnsUDPResponseSizeLimit(dnsMessage))
 	if err = sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.replySoMark(), req.downloadRecorder()); err != nil {
 		return err
 	}

@@ -194,19 +194,13 @@ func (w *reloadWorker) run() {
 			dnsConfigUnchanged,
 			ipVersionPreferenceUnchanged,
 		)
-		var dnsCache map[string]*control.DnsCache
-		if ipVersionPreferenceUnchanged && !streamStagedDnsCache {
-			// Only keep dns cache when ip version preference not change.
-			dnsCache = w.c.CloneDnsCache()
-		}
-		rollbackDNSCache := dnsCache
+		dnsCache, rollbackDNSCache := cloneReloadDNSCaches(w.conf, newConf, stagedHotHandoff, w.c.CloneDnsCache)
 		var stagedListener *control.Listener
 
 		if stagedHotHandoff {
 			w.log.Warnln("[Reload] Prepare staged same-port handoff")
 			ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
 			newC, prepareErr := newPreparedControlPlane(ctx, w.log, reloadBpf, dnsCache, newConf, w.externGeoDataDirs, dnsConfigUnchanged, true)
-			dnsCache = nil
 			prepareErr = attachPreparedSessionManager(newC, w.processSessions, prepareErr)
 			if prepareErr != nil {
 				reloadErr := wrapReloadTimeoutError("prepare staged reload", prepareErr, reloadPrepareTimeout)
@@ -250,7 +244,7 @@ func (w *reloadWorker) run() {
 				continue
 			}
 
-			if ipVersionPreferenceUnchanged {
+			if dnsCachePolicyEqual(oldConf, newConf) {
 				if streamStagedDnsCache {
 					newC.SetReloadDnsCacheStreamSource(oldC.StreamDnsCacheForReload, oldC.PolicyIdentity().Hash())
 				} else {
@@ -297,7 +291,6 @@ func (w *reloadWorker) run() {
 			if prepareErr == nil {
 				newC, prepareErr = newPreparedControlPlane(ctx, w.log, freshState, dnsCache, newConf, w.externGeoDataDirs, false, true)
 			}
-			dnsCache = nil
 			prepareErr = attachPreparedSessionManager(newC, w.processSessions, prepareErr)
 			if prepareErr != nil {
 				reloadErr := wrapReloadTimeoutError("prepare fresh datapath reload", prepareErr, reloadPrepareTimeout)
@@ -367,7 +360,6 @@ func (w *reloadWorker) run() {
 		ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
 		newC, err := newControlPlane(ctx, w.log, reloadBpf, dnsCache, newConf, w.externGeoDataDirs, dnsConfigUnchanged, true)
 		err = attachPreparedSessionManager(newC, w.processSessions, err)
-		dnsCache = nil // Allow previous generation's clone to be GC'd.
 
 		var newCancel context.CancelFunc
 		if err != nil {

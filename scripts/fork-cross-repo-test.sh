@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Run fork repos' own test suites at the commits dae's go.mod replace pins.
+# Run owned fork test suites at the commits in dae's effective module graph.
 #
-# dae's go.mod `replace` directives point at exact fork commits. Fork tests
+# Direct and replaced module requirements pin exact fork commits. Fork tests
 # live outside dae's package graph, so dae's own gate cannot exercise their
 # internal ownership, protocol, and race regressions. This harness prepares
 # isolated worktrees at the pinned commits and runs each fork's own tests.
@@ -57,31 +57,32 @@ export GOPROXY="${GOPROXY:-https://goproxy.cn,direct}"
 # Per-repo timeout in seconds (default 600s = 10min). Override via env.
 per_repo_timeout="${FORK_TEST_TIMEOUT:-600}"
 
-# Parse dae/go.mod `replace <mod> => <target> <pseudo-version>` directives.
-# Only remote replacements with a pseudo-version ending in a 12-hex commit
-# are handled (local file:// replaces need no checkout). Emits one record
-# per line: <localdir>|<repo_module>|<commit>
-parse_replaces() {
-  awk '
-    /^replace[[:space:]]+/ {
-      line = $0
-      sub(/^replace[[:space:]]+/, "", line)
-      sub(/[[:space:]]+\/\/.*$/, "", line)   # strip trailing comment
-      gsub(/[[:space:]]+=>[[:space:]]+/, " ", line)
-      n = split(line, parts, " ")
-      if (n < 3) next
-      target = parts[2]
-      version = parts[3]
-      if (version ~ /-[0-9a-f]{12}$/) {
-        commit = version
-        sub(/.*-/, "", commit)
-        # Local dir = last path segment of target module.
-        nt = split(target, seg, "/")
-        printf "%s|%s|%s\n", seg[nt], target, commit
-      }
-    }
-  ' "$dae_root/go.mod"
+# Let Go resolve replacement blocks and direct/indirect requirements. Tests
+# must use the selected version, not a stale textual requirement or only the
+# subset of forks represented by replace directives.
+parse_forks() {
+  local modules target version commit
+  modules="$(go list -m -f '{{with .Replace}}{{.Path}} {{.Version}}{{else}}{{.Path}} {{.Version}}{{end}}' all)" || return 1
+  while read -r target version; do
+    case "$target" in
+      github.com/olicesx/*) ;;
+      *) continue ;;
+    esac
+    commit="${version##*-}"
+    if [[ "$commit" =~ ^[0-9a-f]{12}$ ]]; then
+      printf '%s|%s|%s\n' "${target##*/}" "$target" "$commit"
+    else
+      echo "fork-cross-repo-test: unsupported owned fork version: $target $version" >&2
+      return 1
+    fi
+  done <<< "$modules"
 }
+
+forks="$(parse_forks)" || exit 2
+if [[ -z "$forks" ]]; then
+  echo "fork-cross-repo-test: no owned pseudo-versioned forks found in the module graph" >&2
+  exit 2
+fi
 
 # Build go test invocation.
 test_args=(go test)
@@ -126,6 +127,9 @@ while IFS='|' read -r localdir target commit; do
   echo "=== $localdir @ $commit ($run_path) ==="
   if (
     cd "$run_path"
+    # QPACK's interoperability corpus is a pinned submodule, not part of
+    # the module zip. Prepare it before testing the exact fork worktree.
+    git submodule update --init --recursive || exit 1
     # Per-repo timeout prevents a hung integration test from hiding the
     # other fork's result.
     timeout "${per_repo_timeout}" "${test_args[@]}"
@@ -135,12 +139,7 @@ while IFS='|' read -r localdir target commit; do
     failures=$((failures + 1))
   fi
   git -C "$source_path" worktree remove --force "$run_path"
-done < <(parse_replaces)
-
-if [[ $repo_count -eq 0 ]]; then
-  echo "fork-cross-repo-test: no remote pseudo-versioned replaces found in dae/go.mod" >&2
-  exit 2
-fi
+done <<< "$forks"
 if [[ $skipped -gt 0 ]]; then
   echo "fork-cross-repo-test: skipped $skipped/$repo_count fork repo(s)." >&2
   if [[ "$strict" -eq 1 ]]; then
@@ -159,5 +158,9 @@ if [[ $failures -gt 0 ]]; then
   exit 0
 fi
 passed=$((repo_count - skipped))
-echo "fork-cross-repo-test: ${passed}/${repo_count} available fork repos pass."
+if [[ "$dry_run" -eq 1 ]]; then
+  echo "fork-cross-repo-test: dry-run planned ${passed}/${repo_count} fork repos; no tests executed."
+else
+  echo "fork-cross-repo-test: ${passed}/${repo_count} available fork repos pass."
+fi
 exit 0

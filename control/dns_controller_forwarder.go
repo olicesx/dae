@@ -537,28 +537,15 @@ func (c *DnsController) dialSend(
 		return err
 	}
 
-	// Truncate oversized UDP responses with the TC bit set (RFC 1035) so the
-	// client retries over TCP. Without this the client receives a
-	// "noerror, 0 answer, tc=0" reply and believes the name has no
-	// addresses. The cache must keep the FULL response (a later TCP client
-	// query needs all answers), so a deep copy is taken before truncating.
+	// Truncate only the outgoing wire message, including oversized OPT options.
+	// Keep respMsg intact for asynchronous caching and later TCP retries.
 	limit := dnsDefaultUDPSize
 	if len(data) > limit {
 		var reqMsg dnsmessage.Msg
 		if err = reqMsg.Unpack(dnsRequestData); err == nil {
 			limit = dnsUDPResponseSizeLimit(&reqMsg)
 		}
-		if len(data) > limit {
-			fullResp := *respMsg
-			fullResp.Answer = append([]dnsmessage.RR(nil), respMsg.Answer...)
-			fullResp.Extra = append([]dnsmessage.RR(nil), respMsg.Extra...)
-			respMsg.Truncate(limit)
-			data, err = respMsg.PackBuffer((*bufPtr)[:cap(*bufPtr)])
-			if err != nil {
-				return err
-			}
-			respMsg = &fullResp
-		}
+		data = truncateDNSResponse(data, limit)
 	}
 
 	if err = sendRuntimeTrackedPkt(c.log, data, req.realDst, req.realSrc, req.replySoMark(), req.downloadRecorder()); err != nil {

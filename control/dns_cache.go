@@ -279,11 +279,18 @@ func ttlScratchSlice(n int, stack *[8]uint32) []uint32 {
 	return make([]uint32, n)
 }
 
+func setRecordTTL(rr dnsmessage.RR, ttl uint32) {
+	hdr := rr.Header()
+	// OPT encodes EDNS version and flags in this field, not a lifetime.
+	if hdr.Rrtype != dnsmessage.TypeOPT {
+		hdr.Ttl = ttl
+	}
+}
+
 func setSectionTTL(rrs []dnsmessage.RR, ttl uint32, scratch []uint32) {
 	for i, rr := range rrs {
-		hdr := rr.Header()
-		scratch[i] = hdr.Ttl
-		hdr.Ttl = ttl
+		scratch[i] = rr.Header().Ttl
+		setRecordTTL(rr, ttl)
 	}
 }
 
@@ -375,7 +382,7 @@ func (c *DnsCache) prepackResponseWithTTL(qname string, qtype uint16, ttl uint32
 		msg.Answer = make([]dnsmessage.RR, len(c.Answer))
 		for i, rr := range c.Answer {
 			copiedRR := dnsmessage.Copy(rr)
-			copiedRR.Header().Ttl = ttl
+			setRecordTTL(copiedRR, ttl)
 			msg.Answer[i] = copiedRR
 		}
 	}
@@ -383,7 +390,7 @@ func (c *DnsCache) prepackResponseWithTTL(qname string, qtype uint16, ttl uint32
 		msg.Ns = make([]dnsmessage.RR, len(c.NS))
 		for i, rr := range c.NS {
 			copiedRR := dnsmessage.Copy(rr)
-			copiedRR.Header().Ttl = ttl
+			setRecordTTL(copiedRR, ttl)
 			msg.Ns[i] = copiedRR
 		}
 	}
@@ -391,7 +398,7 @@ func (c *DnsCache) prepackResponseWithTTL(qname string, qtype uint16, ttl uint32
 		msg.Extra = make([]dnsmessage.RR, len(c.Extra))
 		for i, rr := range c.Extra {
 			copiedRR := dnsmessage.Copy(rr)
-			copiedRR.Header().Ttl = ttl
+			setRecordTTL(copiedRR, ttl)
 			msg.Extra[i] = copiedRR
 		}
 	}
@@ -534,7 +541,7 @@ func (c *DnsCache) fillIntoWithTTLInPlace(req *dnsmessage.Msg, now time.Time) []
 	for i, rr := range c.Answer {
 		copiedRR := dnsmessage.Copy(rr)
 		// Update TTL to remaining time
-		copiedRR.Header().Ttl = remainingTTL
+		setRecordTTL(copiedRR, remainingTTL)
 		req.Answer[i] = copiedRR
 	}
 

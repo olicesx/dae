@@ -11,6 +11,7 @@
 package dnstransport
 
 import (
+	"context"
 	stderrors "errors"
 	"io"
 	"net"
@@ -32,13 +33,17 @@ type OwnedEarlyConn struct {
 	closeErr   error
 }
 
-// OwnEarlyConnection wraps qc so closing the connection also closes the
-// caller-owned socket.
+// OwnEarlyConnection wraps qc so explicit close or natural connection shutdown
+// releases the caller-owned socket exactly once.
 func OwnEarlyConnection(qc quic.EarlyConnection, packetConn io.Closer) quic.EarlyConnection {
 	if qc == nil || packetConn == nil {
 		return qc
 	}
-	return &OwnedEarlyConn{EarlyConnection: qc, packetConn: packetConn}
+	owned := &OwnedEarlyConn{EarlyConnection: qc, packetConn: packetConn}
+	// Watch the session, not an individual request. HTTP/3 can evict a dead
+	// connection without calling CloseWithError on the ownership wrapper.
+	context.AfterFunc(qc.Context(), func() { _ = owned.CloseWithError(0, "") })
+	return owned
 }
 
 func (c *OwnedEarlyConn) CloseWithError(code quic.ApplicationErrorCode, reason string) error {

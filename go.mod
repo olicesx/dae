@@ -115,7 +115,7 @@ require (
 // control, and explicit-transport address behavior. Performance and security
 // claims are enforced in the fork's own unit/race gates; no GC behavior is
 // inferred from pool implementation choice here.
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260831031827-fbf90cb0a47d
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260905085431-d3c999a52a3d
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config

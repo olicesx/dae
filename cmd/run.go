@@ -513,7 +513,8 @@ loop:
 				w.log.Infof("Received signal: %v", sig.String())
 			}
 		case <-runStateChanges:
-			if reloadManager.reloading.Load() {
+			switch {
+			case reloadManager.reloading.Load():
 				if w.listener == nil {
 					w.log.Warnln("[Reload] Re-listening after reload")
 					readyChan := make(chan bool, 1)
@@ -847,11 +848,11 @@ loop:
 				if dnsHandoffActive && w.log.IsLevelEnabled(logrus.DebugLevel) {
 					w.log.Debugln("[Reload] Shared DNS controller handoff remains available while old generation drains")
 				}
-			} else if w.listener == nil {
+			case w.listener == nil:
 				// Listening error.
 				w.log.Errorln("[Critical] Listener failed; exiting")
 				break loop
-			} else {
+			default:
 				// Not reloading and the listener exists: check whether the
 				// active generation's serve goroutine died. Without this the
 				// process would keep running with hooks attached while

@@ -124,5 +124,6 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260905
 // scoped h2 MarkDead, 8KiB direct small-tier, TUIC stream-parse bench,
 // and protocol lifecycle/framing/short-write hardening. Adds AnyTLS
 // remote-FIN data preservation, gRPC zero-deadline clearing, and
-// chain-constructed dialer ownership.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260905225628-ae7b173b82b8
+// chain-constructed dialer ownership. Includes cancellable dial queues,
+// immediate TUIC retirement signals, and explicit write-deadline behavior.
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260906101127-13b850162fd6

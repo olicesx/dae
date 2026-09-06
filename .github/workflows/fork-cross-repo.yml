@@ -5,6 +5,11 @@ on:
     paths:
       - "go.mod"
       - "go.sum"
+      - "component/dnstransport/**"
+      - "component/outbound/**"
+      - "common/errors/**"
+      - "control/udp_endpoint*.go"
+      - "control/udp_write_batch*.go"
       - "scripts/fork-cross-repo-test.sh"
       - ".github/workflows/fork-cross-repo.yml"
   push:
@@ -14,6 +19,11 @@ on:
     paths:
       - "go.mod"
       - "go.sum"
+      - "component/dnstransport/**"
+      - "component/outbound/**"
+      - "common/errors/**"
+      - "control/udp_endpoint*.go"
+      - "control/udp_write_batch*.go"
       - "scripts/fork-cross-repo-test.sh"
       - ".github/workflows/fork-cross-repo.yml"
   workflow_dispatch:
@@ -42,6 +52,20 @@ jobs:
         with:
           go-version: "1.26.x"
           cache: true
+
+      # Dependency package tests are not included by dae's own ./... tests.
+      # Keep this in dae's module graph; standalone fork tests below use each
+      # fork's own graph and also prepare QPACK's submodule-only interop corpus.
+      - name: Test forks in dae dependency graph
+        env:
+          GOWORK: "off"
+        run: |
+          go test -mod=readonly -short -timeout 10m ${{ matrix.test_args }} \
+            ./component/dnstransport \
+            github.com/daeuniverse/outbound/... \
+            github.com/olicesx/quic-go \
+            github.com/olicesx/quic-go/http3 \
+            github.com/olicesx/qpack
 
       - name: Test pinned fork revisions
         env:

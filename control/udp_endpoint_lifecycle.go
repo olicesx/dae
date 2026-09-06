@@ -20,6 +20,7 @@ import (
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/common/errors"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/sirupsen/logrus"
 )
 
@@ -421,10 +422,11 @@ func (ue *UdpEndpoint) markRetiredFromReceiver() {
 // stalled upstream parks its calling goroutine forever, and under a shared
 // dispatcher a handful of stalled flows would park every worker. Hitting the
 // deadline means the transport stopped draining: handleWriteError retires the
-// endpoint immediately (fail fast). QUIC-backed transports never arm this
-// deadline: their fork-level SetWriteDeadline delegates to SetDeadline, which
-// closes the whole session instead of aborting the write, so a merely-full
-// datagram queue must be absorbed as a dropped datagram instead.
+// endpoint immediately (fail fast). Transports whose SetWriteDeadline is
+// destructive (declared via netproxy.WriteDeadlineBehavior, e.g. the
+// QUIC-session-backed TUIC and Hysteria2 UDP relays, where the deadline is a
+// session-close timer rather than a write abort) never arm this deadline: a
+// merely-full datagram queue must be absorbed as a dropped datagram instead.
 const udpEndpointWriteTimeout = 10 * time.Second
 
 // udpEndpointSendStaleTimeout is how long an established game-like endpoint
@@ -501,14 +503,16 @@ func (ue *UdpEndpoint) sendStaleTimeout() time.Duration {
 }
 
 func (ue *UdpEndpoint) armWriteDeadline(now time.Time) {
-	// QUIC-backed transports (hysteria2/tuic) never arm the deadline. Their
-	// fork-level SetWriteDeadline delegates to SetDeadline, which is a
-	// session-close timer (time.AfterFunc -> conn.Close) rather than a write
-	// abort, so a deadline on a merely-full datagram queue would kill the
-	// whole hy2/tuic session. Connection death there is signalled via
-	// TransportDone and retired by the pool watcher; a full send queue is
-	// congestion and is absorbed as a dropped datagram by handleWriteError.
-	if endpointTransportDoneChannel(ue) != nil {
+	// Transports that declare a session-closing write deadline via the
+	// netproxy.WriteDeadlineBehavior contract (TUIC/Hysteria2: their
+	// SetWriteDeadline delegates to SetDeadline, a session-close timer
+	// rather than a write abort) never arm the deadline. Connection death
+	// there is signalled via TransportDone and retired by the pool watcher;
+	// a full send queue is congestion and is absorbed as a dropped datagram
+	// by handleWriteError. This is deliberately decoupled from
+	// TransportLifecycle: a transport may publish a transport-death signal
+	// while still supporting standard (write-abort) write deadlines.
+	if netproxy.WriteDeadlineClosesSession(ue.conn) {
 		return
 	}
 	last := ue.writeDeadlineArmedAtNano.Load()
@@ -660,12 +664,14 @@ func (ue *UdpEndpoint) handleWriteError(err error) error {
 		ue.retire()
 		return err
 	}
-	// Only transports that armed the write deadline (non-QUIC) can hit this:
-	// the deadline is the stall probe, so hitting it is the fail-fast signal.
-	// QUIC-backed transports never arm it — their fork-level SetDeadline
-	// closes the whole session instead of aborting the write — so a merely
-	// full datagram queue (ErrDatagramQueueFullTimeout) falls through to the
-	// tolerated path below instead of tearing down a healthy hy2/tuic session.
+	// Only transports that armed the write deadline (non-destructive
+	// write-deadline semantics) can hit this: the deadline is the stall
+	// probe, so hitting it is the fail-fast signal. Transports that declare
+	// a session-closing deadline via netproxy.WriteDeadlineBehavior (TUIC/
+	// Hysteria2) never arm it — their deadline would close the whole session
+	// instead of aborting the write — so a merely full datagram queue
+	// (ErrDatagramQueueFullTimeout) falls through to the tolerated path
+	// below instead of tearing down a healthy QUIC session.
 	if stderrors.Is(err, os.ErrDeadlineExceeded) {
 		ue.retire()
 		return err

@@ -108,9 +108,13 @@ func newTestGroupForSelection(policy DialerSelectionPolicy) (*DialerGroup, []*di
 	return group, dialers
 }
 
+// markDialersDead kills dialers through the real collection-state API:
+// NotifyLatencyChange is an out-of-order-tolerant informer that revalidates
+// membership against the dialer's collection state, so tests must drive real
+// state transitions.
 func markDialersDead(set *dialer.AliveDialerSet, dialers ...*dialer.Dialer) {
 	for _, d := range dialers {
-		set.NotifyLatencyChange(d, false)
+		d.ReportUnavailableForced(set.CheckTyp, errors.New("offline"))
 	}
 }
 
@@ -205,11 +209,19 @@ func TestDialerGroup_Select_MinLastLatency(t *testing.T) {
 				alive = true
 			}
 			d.MustGetLatencies10(TestNetworkType).AppendLatency(latency)
+			if !alive {
+				// Real failure: flips the collection and removes the dialer
+				// from the set (NotifyLatencyChange is state-revalidated).
+				d.ReportUnavailableForced(TestNetworkType, errors.New("timeout"))
+			} else {
+				// Real revival: restores the collection and re-adds the
+				// dialer.
+				d.MarkAliveForReloadFallback(TestNetworkType)
+			}
 			if alive && (jMinLatency == -1 || latency < minLatency) {
 				jMinLatency = j
 				minLatency = latency
 			}
-			g.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(d, alive)
 		}
 		d, _, err := g.Select(TestNetworkType, true)
 		if jMinLatency == -1 {
@@ -673,9 +685,10 @@ func TestDialerGroup_Select_SingleDialerLenientFallsBackToFixed(t *testing.T) {
 		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinLastLatency},
 		func(alive bool, networkType *dialer.NetworkType, isInit bool) {})
 
-	// Kill the only dialer in both address families.
-	g.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(dialers[0], false)
-	g.MustGetAliveDialerSet(TestTcp6NetworkType).NotifyLatencyChange(dialers[0], false)
+	// Kill the only dialer in both address families through the real
+	// collection-state API.
+	dialers[0].ReportUnavailableForced(TestNetworkType, errors.New("offline"))
+	dialers[0].ReportUnavailableForced(TestTcp6NetworkType, errors.New("offline"))
 
 	// Strict path already returns the dialer via the single-dialer fallback.
 	dStrict, _, err := g.Select(TestNetworkType, true)

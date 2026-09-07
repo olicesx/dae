@@ -339,7 +339,10 @@ func TestDialerGroup_SetAlive(t *testing.T) {
 			Policy: consts.DialerSelectionPolicy_Random,
 		}, func(alive bool, networkType *dialer.NetworkType, isInit bool) {})
 	zeroTarget := 3
-	g.MustGetAliveDialerSet(TestNetworkType).NotifyLatencyChange(dialers[zeroTarget], false)
+	// Kill through the dialer state API: NotifyLatencyChange is now an
+	// out-of-order-tolerant informer that revalidates membership against the
+	// dialer's collection state, so tests must drive real state transitions.
+	dialers[zeroTarget].ReportUnavailableForced(TestNetworkType, errors.New("offline"))
 	count := make([]int, len(dialers))
 	for range 100 {
 		d, _, err := g.Select(TestNetworkType, false)
@@ -609,15 +612,16 @@ func TestDialerGroup_DataUdpRevivalCallback_NoDnsLatency(t *testing.T) {
 		t.Fatalf("setup: alive = %d, want 2", set.Len())
 	}
 
-	set.NotifyLatencyChange(dialers[0], false)
-	set.NotifyLatencyChange(dialers[1], false)
+	// Kill both dialers through the production state API.
+	dialers[0].ReportUnavailableForced(TestDataUdp4NetworkType, errors.New("offline"))
+	dialers[1].ReportUnavailableForced(TestDataUdp4NetworkType, errors.New("offline"))
 	if set.Len() != 0 {
 		t.Fatalf("after kill: alive = %d, want 0", set.Len())
 	}
 
 	// Revive through the traffic path (markAvailableTraffic -> inform ->
 	// NotifyLatencyChange(d, true)) with no DNS-UDP latency available.
-	set.NotifyLatencyChange(dialers[0], true)
+	dialers[0].ReportAvailableTraffic(TestDataUdp4NetworkType)
 	if set.Len() != 1 {
 		t.Fatalf("after revive: alive = %d, want 1", set.Len())
 	}
@@ -637,10 +641,12 @@ func TestDialerGroup_DataUdpRevivalCallback_WithDnsLatency(t *testing.T) {
 	rec := &dataUdpCallbackRecorder{}
 	g, dialers := newDataUdpCallbackGroup(t, rec, true)
 
-	set := g.MustGetAliveDialerSet(TestDataUdp4NetworkType)
-	set.NotifyLatencyChange(dialers[0], false)
-	set.NotifyLatencyChange(dialers[1], false)
-	set.NotifyLatencyChange(dialers[0], true)
+	if set := g.MustGetAliveDialerSet(TestDataUdp4NetworkType); set.Len() != 2 {
+		t.Fatalf("setup: alive = %d, want 2", set.Len())
+	}
+	dialers[0].ReportUnavailableForced(TestDataUdp4NetworkType, errors.New("offline"))
+	dialers[1].ReportUnavailableForced(TestDataUdp4NetworkType, errors.New("offline"))
+	dialers[0].ReportAvailableTraffic(TestDataUdp4NetworkType)
 
 	want := []string{"true", "true", "init", "init", "false", "true"}
 	if !reflect.DeepEqual(rec.events, want) {

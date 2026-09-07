@@ -397,6 +397,113 @@ func udpCacheStaleOptimisticFixture() DnsCorpusFixture {
 	}
 }
 
+// dnsCnameOnlyNodataMsg builds a NOERROR response whose answer section holds
+// only a CNAME aliasing away from the requested A type: RFC 2308 §2.2 NODATA
+// (with no SOA here, so it is also uncacheable per §5).
+func dnsCnameOnlyNodataMsg(name, target string) *dnsmessage.Msg {
+	msg := new(dnsmessage.Msg)
+	msg.SetReply(&dnsmessage.Msg{})
+	msg.SetQuestion(name, dnsmessage.TypeA)
+	msg.Answer = []dnsmessage.RR{
+		&dnsmessage.CNAME{
+			Hdr: dnsmessage.RR_Header{
+				Name:   dnsmessage.CanonicalName(name),
+				Rrtype: dnsmessage.TypeCNAME,
+				Class:  dnsmessage.ClassINET,
+				Ttl:    60,
+			},
+			Target: dnsmessage.CanonicalName(target),
+		},
+	}
+	return msg
+}
+
+// udpCacheStaleCnameNodataRefreshFixture pins RFC 8767 §4 supersession for an
+// uncacheable negative refresh: a background refresh returning a CNAME-only
+// NODATA without SOA cannot be stored (RFC 2308 §5), but it still disproves
+// the expired positive, which must be evicted instead of remaining serveable
+// for the rest of the stale window.
+func udpCacheStaleCnameNodataRefreshFixture() DnsCorpusFixture {
+	var forwardCalls atomic.Int32
+	return DnsCorpusFixture{
+		Name:        "udp_cache_stale_cname_nodata_refresh",
+		Description: "CNAME-only NODATA refresh supersedes an expired positive even though the negative cannot be cached",
+		BuildConfig: func() *config.Dns {
+			return &config.Dns{
+				Routing: config.DnsRouting{
+					Request:  config.DnsRequestRouting{Fallback: "asis"},
+					Response: config.DnsResponseRouting{Fallback: "accept"},
+				},
+			}
+		},
+		ForwarderFactory: func(upstream *componentdns.Upstream, dialArg dialArgument, _ *logrus.Logger) (DnsForwarder, error) {
+			return &stubDnsForwarder{forward: func(ctx context.Context, data []byte) (*dnsmessage.Msg, error) {
+				forwardCalls.Add(1)
+				return dnsCnameOnlyNodataMsg("stale.test.", "gone.test."), nil
+			}}, nil
+		},
+		Cases: []DnsCorpusCase{
+			{
+				Name: "cname_nodata_refresh_evicts_superseded_stale_entry",
+				PreState: func(t *testing.T, ctrl *DnsController) {
+					req := defaultUdpRequest()
+					baseKey := ctrl.cacheKey("stale.test.", dnsmessage.TypeA)
+					cacheKey := ctrl.responseCacheKey(
+						baseKey, req,
+						consts.DnsRequestOutboundIndex_AsIs, nil,
+					)
+					if err := ctrl.UpdateDnsCacheTtlWithKey(
+						cacheKey, "stale.test.", dnsmessage.TypeA,
+						dnsAResponseMsg("stale.test.", "203.0.113.7").Answer,
+						nil, nil, 60,
+					); err != nil {
+						t.Fatalf("UpdateDnsCacheTtlWithKey error = %v", err)
+					}
+					cacheValue, ok := ctrl.dnsCache.Load(cacheKey)
+					if !ok {
+						t.Fatal("stale cache entry was not stored")
+					}
+					cache := cacheValue.(*DnsCache)
+					expiredAt := time.Now().Add(-time.Second)
+					cache.Deadline = expiredAt
+					cache.deadlineNano.Store(expiredAt.UnixNano())
+				},
+				Query: func() *dnsmessage.Msg {
+					return corpusDnsQuery(0x1004, "stale.test.", dnsmessage.TypeA)
+				},
+				Expected: DnsCorpusExpected{
+					HasRcode:       true,
+					Rcode:          dnsmessage.RcodeSuccess,
+					HasAnswerCount: true,
+					AnswerCount:    1,
+					AnswerIPv4:     "203.0.113.7", // cached (possibly stale) IP
+				},
+				PostAssert: func(t *testing.T, ctrl *DnsController, _ *dnsmessage.Msg) {
+					req := defaultUdpRequest()
+					baseKey := ctrl.cacheKey("stale.test.", dnsmessage.TypeA)
+					cacheKey := ctrl.responseCacheKey(
+						baseKey, req,
+						consts.DnsRequestOutboundIndex_AsIs, nil,
+					)
+					deadline := time.Now().Add(2 * time.Second)
+					for time.Now().Before(deadline) {
+						if forwardCalls.Load() >= 1 {
+							if _, ok := ctrl.dnsCache.Load(cacheKey); !ok {
+								return // refresh superseded and evicted the expired positive
+							}
+						}
+						time.Sleep(10 * time.Millisecond)
+					}
+					if forwardCalls.Load() == 0 {
+						t.Fatal("background refresh never forwarded")
+					}
+					t.Fatal("expired positive survived an accepted CNAME-only NODATA refresh")
+				},
+			},
+		},
+	}
+}
+
 // tcpUdpFallbackFixture pins the user-observable tcp+udp fallback path. A
 // request selects the named upstream, its UDP attempt fails, and the same
 // request succeeds over TCP. This covers the complete request routing and

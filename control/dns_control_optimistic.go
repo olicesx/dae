@@ -71,9 +71,14 @@ func (c *DnsController) backgroundRefresh(cacheKey string, dnsMessage *dnsmessag
 }
 
 // isNegativeResponse reports whether msg is a complete negative answer from
-// the configured upstream (NXDOMAIN or an empty NOERROR answer). Such answers
-// supersede an expired positive under RFC 8767 §4, unlike SERVFAIL or
-// timeouts, which must leave the old entry in place.
+// the configured upstream: NXDOMAIN or a NOERROR response without an answer
+// of the requested type (RFC 2308 §2.2 - the answer section may still carry
+// CNAME records aliasing to the empty target). Such answers supersede an
+// expired positive under RFC 8767 §4, unlike SERVFAIL or timeouts, which must
+// leave the old entry in place. Classification must mirror the cache
+// admission rule, so a negative that cannot be stored (no SOA, zero negative
+// lifetime) still triggers supersession instead of leaving the disproven
+// positive in place.
 func isNegativeResponse(msg *dnsmessage.Msg) bool {
 	if msg == nil || !msg.Response || len(msg.Question) == 0 {
 		return false
@@ -81,7 +86,7 @@ func isNegativeResponse(msg *dnsmessage.Msg) bool {
 	if msg.Rcode == dnsmessage.RcodeNameError {
 		return true
 	}
-	return msg.Rcode == dnsmessage.RcodeSuccess && len(msg.Answer) == 0
+	return msg.Rcode == dnsmessage.RcodeSuccess && !hasRelevantAnswer(msg, msg.Question[0])
 }
 
 // evictSupersededExpiredPositive removes an expired cache entry that an

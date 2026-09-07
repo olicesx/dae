@@ -808,6 +808,32 @@ func findAuthoritySoa(msg *dnsmessage.Msg) *dnsmessage.SOA {
 	return nil
 }
 
+// hasRelevantAnswer reports whether msg carries an answer of the question's
+// requested type (RFC 2308 §2.2: NODATA is the absence of a *relevant*
+// answer, so a CNAME-only answer for an A/AAAA question is still a negative).
+func hasRelevantAnswer(msg *dnsmessage.Msg, q dnsmessage.Question) bool {
+	for _, rr := range msg.Answer {
+		if typeMatchesQuestion(rr.Header().Rrtype, q.Qtype) {
+			return true
+		}
+	}
+	return false
+}
+
+// typeMatchesQuestion reports whether an answer record type satisfies the
+// question's QTYPE. QTYPE=ANY matches any record: a well-formed ANY response
+// carries concrete RRsets such as A, MX or HINFO, never type-ANY records
+// (RFC 8482 §3). QTYPE=MAILB (253) requests MB, MG or MR records (RFC 1035
+// §3.2.3). QTYPE=MAILA (254) requested the obsolete MD/MF records, which this
+// stack cannot represent, so no special case is needed.
+func typeMatchesQuestion(rrtype, qtype uint16) bool {
+	if qtype == dnsmessage.TypeANY || rrtype == qtype {
+		return true
+	}
+	return qtype == dnsmessage.TypeMAILB &&
+		(rrtype == dnsmessage.TypeMB || rrtype == dnsmessage.TypeMG || rrtype == dnsmessage.TypeMR)
+}
+
 // NormalizeAndCacheDnsResp_ handle DNS resp in place.
 func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg, responseCacheKey string) (err error) {
 	if !msg.Response || len(msg.Question) == 0 {
@@ -816,13 +842,16 @@ func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg, responseC
 
 	q := msg.Question[0]
 
-	// Negative responses (RFC 2308): an NXDOMAIN or an empty NOERROR answer is
-	// only a terminal negative answer when the authority section carries an
-	// SOA. NS-only responses are referrals, not answers, and no-SOA negatives
-	// SHOULD NOT be cached (§5). NXDOMAIN itself is never stored: the packed
-	// cache can only replay success responses, so a stored NXDOMAIN could not
-	// be reproduced faithfully.
-	if msg.Rcode != dnsmessage.RcodeSuccess || len(msg.Answer) == 0 {
+	// Negative responses (RFC 2308 §2.2): NODATA is NOERROR without an answer
+	// of the requested type - the answer section may still carry CNAME
+	// records aliasing to the empty target. A response is therefore negative
+	// on non-success RCODE or when no answer record matches the question's
+	// QTYPE. It is only a terminal, cacheable negative when the authority
+	// section carries an SOA: NS-only responses are referrals, not answers,
+	// and no-SOA negatives SHOULD NOT be cached (§5). NXDOMAIN itself is
+	// never stored: the packed cache can only replay success responses, so a
+	// stored NXDOMAIN could not be reproduced faithfully.
+	if msg.Rcode != dnsmessage.RcodeSuccess || !hasRelevantAnswer(msg, q) {
 		if msg.Rcode == dnsmessage.RcodeSuccess {
 			soa := findAuthoritySoa(msg)
 			if soa == nil {

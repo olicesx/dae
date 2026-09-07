@@ -78,7 +78,9 @@ func (c *DnsController) backgroundRefresh(cacheKey string, dnsMessage *dnsmessag
 // leave the old entry in place. Classification must mirror the cache
 // admission rule, so a negative that cannot be stored (no SOA, zero negative
 // lifetime) still triggers supersession instead of leaving the disproven
-// positive in place.
+// positive in place. An NS-only authority without SOA is a referral, not an
+// answer (RFC 2308 §2.2): it does not disprove a cached positive and must
+// not supersede it.
 func isNegativeResponse(msg *dnsmessage.Msg) bool {
 	if msg == nil || !msg.Response || len(msg.Question) == 0 {
 		return false
@@ -86,7 +88,16 @@ func isNegativeResponse(msg *dnsmessage.Msg) bool {
 	if msg.Rcode == dnsmessage.RcodeNameError {
 		return true
 	}
-	return msg.Rcode == dnsmessage.RcodeSuccess && !hasRelevantAnswer(msg, msg.Question[0])
+	if msg.Rcode != dnsmessage.RcodeSuccess {
+		return false
+	}
+	if hasRelevantAnswer(msg, msg.Question[0]) {
+		return false
+	}
+	if findAuthoritySoa(msg) == nil && authorityHasNs(msg) {
+		return false
+	}
+	return true
 }
 
 // evictSupersededExpiredPositive removes an expired cache entry that an

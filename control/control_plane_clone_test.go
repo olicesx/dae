@@ -28,19 +28,19 @@ func newTestListener(t *testing.T) (*Listener, listenerAddrs) {
 	}
 	tcp6, err := net.Listen("tcp6", "[::1]:0")
 	if err != nil {
-		tcp4.Close()
+		_ = tcp4.Close()
 		t.Fatalf("listen tcp6: %v", err)
 	}
 	udp, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
-		tcp4.Close()
-		tcp6.Close()
+		_ = tcp4.Close()
+		_ = tcp6.Close()
 		t.Fatalf("listen udp4: %v", err)
 	}
 	t.Cleanup(func() {
-		tcp4.Close()
-		tcp6.Close()
-		udp.Close()
+		_ = tcp4.Close()
+		_ = tcp6.Close()
+		_ = udp.Close()
 	})
 	return &Listener{
 			tcp4Listener: tcp4,
@@ -66,14 +66,14 @@ func tryReclaim(t *testing.T, kind, addr string, afterCloneErr error) {
 			var ln net.Listener
 			ln, err = net.Listen("tcp", addr)
 			if err == nil {
-				ln.Close()
+				_ = ln.Close()
 				return
 			}
 		case "udp":
 			var pc net.PacketConn
 			pc, err = net.ListenPacket("udp", addr)
 			if err == nil {
-				pc.Close()
+				_ = pc.Close()
 				return
 			}
 		}
@@ -131,7 +131,7 @@ func TestListenerCloneSuccessDuplicatesAllSockets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Clone() failed: %v", err)
 	}
-	defer cloned.Close()
+	defer func() { _ = cloned.Close() }()
 
 	// The duplicates must be independently usable and must own distinct fds:
 	// closing the originals must not tear down the clones.
@@ -142,7 +142,7 @@ func TestListenerCloneSuccessDuplicatesAllSockets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial original tcp4 addr: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if err := cloned.tcp4Listener.(*net.TCPListener).SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatalf("set accept deadline: %v", err)
 	}
@@ -150,5 +150,5 @@ func TestListenerCloneSuccessDuplicatesAllSockets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cloned listener did not accept after original close: %v", err)
 	}
-	accepted.Close()
+	_ = accepted.Close()
 }

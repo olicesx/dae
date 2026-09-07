@@ -1092,6 +1092,88 @@ int testcheck_wan_udp_new_outbound_obeys_connectivity_change(
 	return check_status_and_mark(skb, TC_ACT_SHOT, 0);
 }
 
+// Blocked-event rate-limit regression. DAE_EVENT_BLOCKED (type 0) shares
+// alive_block_rate_map with the per-outbound DAE_EVENT_BLOCKED_ALIVE
+// domains. The reserved BLOCKED_EVENT_RATE_KEY slot must resolve inside the
+// ARRAY (previously 0xFFFFFFFF exceeded max_entries, so every lookup
+// failed and type-0 emissions were suppressed forever) and each key must
+// keep an independent 1s budget.
+SEC("tc/pktgen/blocked_event_rate_limit")
+int testpktgen_blocked_event_rate_limit(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb, IPV4(192,168,0,1), IPV4(1,1,1,1), 19233, 443);
+}
+
+SEC("tc/setup/blocked_event_rate_limit")
+int testsetup_blocked_event_rate_limit(struct __sk_buff *skb)
+{
+	return TC_ACT_OK;
+}
+
+SEC("tc/check/blocked_event_rate_limit")
+int testcheck_blocked_event_rate_limit(struct __sk_buff *skb)
+{
+	__u32 alive_key = OUTBOUND_USER_DEFINED_MIN;
+	__u32 blocked_key = BLOCKED_EVENT_RATE_KEY;
+	__u64 now = bpf_ktime_get_ns();
+	__u64 zero = 0;
+	__u64 *last;
+
+	// The type-0 slot must be resolvable; without it the limiter reports
+	// "rate-limited" unconditionally and blocked events never emit.
+	last = bpf_map_lookup_elem(&alive_block_rate_map, &blocked_key);
+	if (!last) {
+		bpf_printk("no alive_block_rate_map slot for blocked events\n");
+		return TC_ACT_SHOT;
+	}
+
+	// Start from a known state: put the alive key inside its 1s window
+	// (fresh timestamp) and the type-0 key outside it (timestamp 0, the
+	// preallocated ARRAY default; the write also fails when the slot is
+	// out of bounds).
+	if (bpf_map_update_elem(&alive_block_rate_map, &alive_key, &now,
+				BPF_ANY)) {
+		bpf_printk("cannot arm alive rate-limit slot\n");
+		return TC_ACT_SHOT;
+	}
+	if (bpf_map_update_elem(&alive_block_rate_map, &blocked_key, &zero,
+				BPF_ANY)) {
+		bpf_printk("cannot clear blocked rate-limit slot\n");
+		return TC_ACT_SHOT;
+	}
+
+	// Per-outbound budget: a second blocked-alive emission for the same
+	// outbound within 1s must be suppressed.
+	if (!blocked_event_rate_limited(alive_key)) {
+		bpf_printk("alive rate-limit slot ignored its 1s window\n");
+		return TC_ACT_SHOT;
+	}
+
+	// Budget independence (alive -> blocked): the fresh alive timestamp
+	// above must not throttle the type-0 key, so its first emission after
+	// the 1s window is allowed. The test host has been up for at least 1s,
+	// so the zeroed timestamp is always outside the window.
+	if (blocked_event_rate_limited(blocked_key)) {
+		bpf_printk("blocked rate-limit slot suppressed a clean emission\n");
+		return TC_ACT_SHOT;
+	}
+
+	// The type-0 key now honours its own 1s budget.
+	if (!blocked_event_rate_limited(blocked_key)) {
+		bpf_printk("blocked rate-limit slot ignored its 1s window\n");
+		return TC_ACT_SHOT;
+	}
+
+	// Budget independence (blocked -> alive): the type-0 emission above
+	// must not have reset the alive key's window.
+	if (!blocked_event_rate_limited(alive_key)) {
+		bpf_printk("blocked emission reset the alive rate-limit slot\n");
+		return TC_ACT_SHOT;
+	}
+
+	return TC_ACT_OK;
+}
+
 SEC("tc/pktgen/lan_ingress_udp_first_fragment_listener")
 int testpktgen_lan_ingress_udp_first_fragment_listener(struct __sk_buff *skb)
 {

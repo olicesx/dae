@@ -513,16 +513,23 @@ enum bpf_stats_key {
 	BPF_STATS_TCP_CONN_OVERFLOW = 1,
 };
 
-// alive_block_rate_map rate-limits DAE_EVENT_BLOCKED_ALIVE emission per
-// outbound: key = outbound id, value = last emission time (CLOCK_MONOTONIC ns).
-// Without this, an outbound that is not alive would emit one event per blocked
-// packet and flood the ringbuf until the periodic health check recovers it.
+// alive_block_rate_map rate-limits blocked-event emission: key = outbound
+// id for DAE_EVENT_BLOCKED_ALIVE, or BLOCKED_EVENT_RATE_KEY for
+// DAE_EVENT_BLOCKED; value = last emission time (CLOCK_MONOTONIC ns).
+// Without this, an outbound that is not alive (or a blocked-flow flood)
+// would emit one event per blocked packet and flood the ringbuf, starving
+// the consumed event types. Key domains cannot collide: outbound ids are
+// small indices while BLOCKED_EVENT_RATE_KEY has the high bit set.
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__type(key, __u32);
 	__type(value, __u64);
 	__uint(max_entries, 256);
 } alive_block_rate_map SEC(".maps");
+
+// BLOCKED_EVENT_RATE_KEY is the rate-map key domain for DAE_EVENT_BLOCKED
+// (type-0) events. It must never collide with a real outbound id.
+#define BLOCKED_EVENT_RATE_KEY 0xFFFFFFFFU
 
 // Events delivered to userspace via ring buffer.
 enum dae_event_type {
@@ -607,6 +614,29 @@ send_dae_event(__u32 type, __u32 pid, const char *pname, __u8 outbound,
 	return bpf_ringbuf_output(&event_ringbuf, &e, sizeof(e), 0);
 }
 
+// blocked_event_rate_limited reports whether an emission for rate key
+// is allowed (at most once per second per key). CAS makes the
+// read-modify-write atomic: concurrent CPUs blocked on the same key all read
+// the same old timestamp and only one wins the update, so the 1s-per-key
+// limit holds under a multi-CPU datapath.
+static __always_inline bool
+blocked_event_rate_limited(__u32 key)
+{
+	__u64 *last = bpf_map_lookup_elem(&alive_block_rate_map, &key);
+
+	if (!last)
+		return true;
+
+	__u64 now = bpf_ktime_get_ns();
+	__u64 old = *last;
+
+	if (now - old < 1000000000ULL)  // 1s
+		return true;
+	if (__sync_val_compare_and_swap(last, old, now) != old)
+		return true;
+	return false;
+}
+
 // send_blocked_alive_event emits DAE_EVENT_BLOCKED_ALIVE at most once per
 // second per outbound. The rate limit keeps a dead outbound from flooding the
 // ringbuf with one event per blocked packet while the periodic health check is
@@ -615,27 +645,27 @@ static __always_inline bool
 send_blocked_alive_event(__u8 outbound, __u8 l4proto, const __u32 *sip,
 			 const __u32 *dip, __u16 sport, __u16 dport)
 {
-	__u32 key = (__u32)outbound;
-	__u64 *last = bpf_map_lookup_elem(&alive_block_rate_map, &key);
-
-	if (!last)
-		return false;
-
-	__u64 now = bpf_ktime_get_ns();
-	__u64 old = *last;
-
-	if (now - old < 1000000000ULL)  // 1s
-		return false;
-	/* CAS makes the read-modify-write atomic: concurrent CPUs blocked on the
-	 * same outbound all read the same old timestamp and only one wins the
-	 * update, so the 1s-per-outbound limit holds under multi-CPU datapath.
-	 */
-	if (__sync_val_compare_and_swap(last, old, now) != old)
+	if (blocked_event_rate_limited((__u32)outbound))
 		return false;
 
 	send_dae_event(DAE_EVENT_BLOCKED_ALIVE, 0, NULL, outbound, l4proto,
 		       sip, dip, sport, dport);
 	return true;
+}
+
+// send_blocked_event emits DAE_EVENT_BLOCKED (type 0) at most once per
+// second. The event has no userspace consumer today, and an unthrottled
+// blocked-flow flood (e.g. an attacker hitting a block rule at line rate)
+// would occupy ringbuf space that the consumed event types (1/2/3) need.
+static __always_inline void
+send_blocked_event(__u8 outbound, __u8 l4proto, const __u32 *sip,
+		   const __u32 *dip, __u16 sport, __u16 dport)
+{
+	if (blocked_event_rate_limited(BLOCKED_EVENT_RATE_KEY))
+		return;
+
+	send_dae_event(DAE_EVENT_BLOCKED, 0, NULL, outbound, l4proto, sip,
+		       dip, sport, dport);
 }
 
 static __always_inline __u8 ipv4_get_dscp(const struct iphdr *iph)
@@ -2576,10 +2606,10 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
 		bpf_printk("SHOT OUTBOUND_BLOCK");
 #endif
-		send_dae_event(DAE_EVENT_BLOCKED, 0, NULL, outbound,
-			       pkt->l4proto, pkt->tuples.five.sip.u6_addr32,
-			       pkt->tuples.five.dip.u6_addr32,
-			       pkt->tuples.five.sport, pkt->tuples.five.dport);
+		send_blocked_event(outbound, pkt->l4proto,
+				   pkt->tuples.five.sip.u6_addr32,
+				   pkt->tuples.five.dip.u6_addr32,
+				   pkt->tuples.five.sport, pkt->tuples.five.dport);
 		goto block;
 	}
 
@@ -3560,7 +3590,15 @@ int tcp_offload_redirect(struct __sk_buff *skb)
 	}
 
 	// flags == 0 selects the egress path: the peer socket sends the data.
-	return bpf_sk_redirect_hash(skb, &fast_sock, &peer_key, 0);
+	// The helper returns SK_DROP when the key vanished between the pre-check
+	// lookup above and this call (userspace teardown deletes keys after
+	// pausing), or on any other redirect failure. Dropping the skb would
+	// lose the packet, so translate every outcome into SK_PASS: a successful
+	// redirect has already marked the skb, and a failed one falls through to
+	// the userspace fallback path. (The helper takes its own socket
+	// reference, so the pre-check's released reference stays balanced.)
+	bpf_sk_redirect_hash(skb, &fast_sock, &peer_key, 0);
+	return SK_PASS;
 }
 
 SEC("license") const char __license[] = "Dual BSD/GPL";

@@ -228,6 +228,32 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 		return
 	}
 
+	// Revalidate membership against the dialer's current collection state.
+	// Notifications are published after the collection lock is released, so a
+	// slow failure report can arrive after a newer success already flipped
+	// the collection back to alive; trusting the stale bool would remove a
+	// healthy node from this set. The data-UDP health domain has no periodic
+	// probe and its traffic-success notifications are suppressed while the
+	// dialer is already alive, so such a stale removal could persist for a
+	// long time. MustGetAlive only performs an atomic load on the collection
+	// (no collection lock is taken), so no lock-order cycle with the
+	// collection fine lock is introduced by revalidating here. Sets are
+	// registered under their own CheckTyp collection, so the revalidated
+	// state is the very state the notification was derived from.
+	if actual := dialer.MustGetAlive(a.CheckTyp); actual != alive {
+		if a.log.IsLevelEnabled(logrus.DebugLevel) {
+			a.log.WithFields(logrus.Fields{
+				"group":        a.dialerGroupName,
+				"dialer":       dialer.property.Name,
+				"network":      a.CheckTyp.String(),
+				"notified":     alive,
+				"actual":       actual,
+				"notifySource": "out-of-order availability notification",
+			}).Debugln("NotifyLatencyChange: ignoring stale availability notification")
+		}
+		alive = actual
+	}
+
 	var (
 		rawLatency     time.Duration
 		sortingLatency time.Duration

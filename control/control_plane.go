@@ -800,6 +800,7 @@ func NewControlPlaneWithContextOptions(
 	plane.dnsFixedDomainTtl = fixedDomainTtl
 	plane.dnsOptimisticCache = dnsConfig.OptimisticCache
 	plane.dnsOptimisticCacheTtl = dnsConfig.OptimisticCacheTtl
+	plane.dnsOptimisticStaleReplyTtl = dnsConfig.OptimisticStaleReplyTtl
 	plane.dnsMaxCacheSize = dnsConfig.MaxCacheSize
 	plane.dnsIpVersionPrefer = dnsConfig.IpVersionPrefer
 	plane.dnsController, err = NewDnsController(dnsUpstream, plane.dnsControllerOption())
@@ -1177,11 +1178,12 @@ func (c *ControlPlane) dnsControllerOption() *DnsControllerOption {
 				UdpHealthDomain: dialer.UdpHealthDomainDns,
 			}, err)
 		},
-		FixedDomainTtl:     c.dnsFixedDomainTtl,
-		OptimisticCache:    c.dnsOptimisticCache,
-		OptimisticCacheTtl: c.dnsOptimisticCacheTtl,
-		MaxCacheSize:       c.dnsMaxCacheSize,
-		IpVersionPrefer:    c.dnsIpVersionPrefer,
+		FixedDomainTtl:          c.dnsFixedDomainTtl,
+		OptimisticCache:         c.dnsOptimisticCache,
+		OptimisticCacheTtl:      c.dnsOptimisticCacheTtl,
+		OptimisticStaleReplyTtl: c.dnsOptimisticStaleReplyTtl,
+		MaxCacheSize:            c.dnsMaxCacheSize,
+		IpVersionPrefer:         c.dnsIpVersionPrefer,
 	}
 }
 

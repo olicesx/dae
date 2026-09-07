@@ -759,27 +759,113 @@ func (c *DnsController) LookupDnsRespCache_(msg *dnsmessage.Msg, cacheKey string
 	return nil, false
 }
 
+// dnsMaxCacheableTtl clamps entry lifetimes to one year (integer-overflow
+// guard for 32-bit platforms and an upper bound consistent with cache sanity).
+const dnsMaxCacheableTtl = 31536000
+
+// dnsNegativeCacheMaxTtl caps the negative-cache lifetime derived from the
+// authority SOA. RFC 2308 §5 suggests one to three hours as a tunable default
+// cap; one hour matches common resolver defaults (e.g. Unbound's
+// cache-max-negative-ttl=3600).
+const dnsNegativeCacheMaxTtl = 3600
+
+// minRealRecordTtl returns the minimum TTL over all non-OPT resource records
+// in the message. With whole-message caching, the entry may only outlive its
+// shortest-lived record (RFC 4035 §4.5: an atomic response entry is discarded
+// when any contained RR expires), so this bounds the entry deadline instead of
+// trusting the first answer record.
+func minRealRecordTtl(msg *dnsmessage.Msg) uint32 {
+	var minTtl uint32
+	first := true
+	consider := func(rrs []dnsmessage.RR) {
+		for _, rr := range rrs {
+			if rr.Header().Rrtype == dnsmessage.TypeOPT {
+				continue
+			}
+			ttl := rr.Header().Ttl
+			if first || ttl < minTtl {
+				minTtl = ttl
+				first = false
+			}
+		}
+	}
+	consider(msg.Answer)
+	consider(msg.Ns)
+	consider(msg.Extra)
+	if first {
+		return 0
+	}
+	return minTtl
+}
+
+// findAuthoritySoa returns the authority SOA of a negative response, if any.
+func findAuthoritySoa(msg *dnsmessage.Msg) *dnsmessage.SOA {
+	for _, rr := range msg.Ns {
+		if soa, ok := rr.(*dnsmessage.SOA); ok {
+			return soa
+		}
+	}
+	return nil
+}
+
 // NormalizeAndCacheDnsResp_ handle DNS resp in place.
 func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg, responseCacheKey string) (err error) {
-	// Check healthy resp.
-	if !msg.Response || len(msg.Question) == 0 || msg.Rcode != dnsmessage.RcodeSuccess {
+	if !msg.Response || len(msg.Question) == 0 {
 		return nil
 	}
 
 	q := msg.Question[0]
 
-	// Get TTL.
-	var ttl uint32
-	if len(msg.Answer) > 0 {
-		ttl = msg.Answer[0].Header().Ttl
-	} else {
-		// NXDomain or empty answer
-		ttl = minFirefoxCacheTtl
+	// Negative responses (RFC 2308): an NXDOMAIN or an empty NOERROR answer is
+	// only a terminal negative answer when the authority section carries an
+	// SOA. NS-only responses are referrals, not answers, and no-SOA negatives
+	// SHOULD NOT be cached (§5). NXDOMAIN itself is never stored: the packed
+	// cache can only replay success responses, so a stored NXDOMAIN could not
+	// be reproduced faithfully.
+	if msg.Rcode != dnsmessage.RcodeSuccess || len(msg.Answer) == 0 {
+		if msg.Rcode == dnsmessage.RcodeSuccess {
+			soa := findAuthoritySoa(msg)
+			if soa == nil {
+				// Referral or SOA-less NODATA: not a cacheable negative.
+				return nil
+			}
+			// RFC 2308 §3: negative lifetime = min(SOA TTL, SOA.MINIMUM),
+			// capped by the configurable maximum (§5).
+			ttl := int(soa.Hdr.Ttl)
+			if int(soa.Minttl) < ttl {
+				ttl = int(soa.Minttl)
+			}
+			if ttl <= 0 {
+				return nil
+			}
+			if ttl > dnsNegativeCacheMaxTtl {
+				ttl = dnsNegativeCacheMaxTtl
+			}
+			// Store the SOA in the authority section so replayed NODATA
+			// responses carry the negative proof with a decreasing TTL.
+			return c.updateDnsCache(msg, responseCacheKey, uint32(ttl), &q)
+		}
+		// NXDOMAIN (and other non-success RCODEs) are not stored; see above.
+		// Background refresh treats an accepted NXDOMAIN as superseding an
+		// expired positive instead (RFC 8767 §4).
+		return nil
 	}
 
-	// Clamp TTL to 1 year max to prevent integer overflow when casting to int on 32-bit platforms
-	if ttl > 31536000 {
-		ttl = 31536000
+	// Positive response. Entry lifetime is the minimum over all retained real
+	// records (answers, authority and additional sections), collected before
+	// the A/AAAA downstream-zero rewrite below. Fixed-domain operator
+	// overrides still apply downstream in the deadline functions.
+	//
+	// A zero minimum is intentionally still cached with a now-deadline: the
+	// A/AAAA downstream-zero rewrite above makes zero the *normal* stored TTL
+	// for dae-managed address answers, whose freshness dae tracks through the
+	// entry deadline and serves through the stale window. Treating every
+	// zero-TTL answer as uncacheable would disable that self-management.
+	ttl := minRealRecordTtl(msg)
+	// Clamp TTL to 1 year max to prevent integer overflow when casting to int
+	// on 32-bit platforms.
+	if ttl > dnsMaxCacheableTtl {
+		ttl = dnsMaxCacheableTtl
 	}
 
 	// For A/AAAA records, we set TTL to 0 to prevent downstream caching while we manage it.

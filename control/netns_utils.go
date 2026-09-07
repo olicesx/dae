@@ -461,16 +461,11 @@ func (ns *DaeNetns) setup() (err error) {
 		runtime.LockOSThread()
 		var setupErr error
 		restored := false
-		// Start deterministically in the host namespace regardless of which
-		// OS thread the scheduler picked for this goroutine.
-		if setupErr = netns.Set(hostNs); setupErr != nil {
-			setupErr = fmt.Errorf("failed to switch setup thread to host netns: %w", setupErr)
-		}
 		defer func() {
 			panicValue := recover()
 			if restored {
 				runtime.UnlockOSThread()
-			} else if restoreErr := netns.Set(hostNs); restoreErr != nil {
+			} else if restoreErr := setNetnsFunc(hostNs); restoreErr != nil {
 				// Last authoritative restore attempt. If it fails (e.g.
 				// setns(2) ENOMEM), keep the thread locked and exit: a
 				// goroutine that exits while still locked makes the runtime
@@ -483,6 +478,17 @@ func (ns *DaeNetns) setup() (err error) {
 			}
 			resultCh <- setupResult{err: setupErr, panicValue: panicValue}
 		}()
+
+		// Start deterministically in the host namespace regardless of which
+		// OS thread the scheduler picked for this goroutine. This is the
+		// setup's namespace prerequisite: without it the destructive link
+		// setup below would run in whatever namespace the worker thread was
+		// in. Fail closed instead of continuing (the deferred restore above
+		// also publishes the error before the caller waits on resultCh).
+		if setupErr = setNetnsFunc(hostNs); setupErr != nil {
+			setupErr = fmt.Errorf("failed to switch setup thread to host netns: %w", setupErr)
+			return
+		}
 
 		if setupErr = ns.setupVethOrNetkit(); setupErr != nil {
 			return
@@ -504,7 +510,7 @@ func (ns *DaeNetns) setup() (err error) {
 		}
 		// Success: re-enter the host namespace on this worker before it is
 		// released back to the scheduler.
-		if setupErr = netns.Set(hostNs); setupErr == nil {
+		if setupErr = setNetnsFunc(hostNs); setupErr == nil {
 			restored = true
 		}
 	}()

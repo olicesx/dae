@@ -513,23 +513,27 @@ enum bpf_stats_key {
 	BPF_STATS_TCP_CONN_OVERFLOW = 1,
 };
 
+// BLOCKED_EVENT_RATE_KEY is the rate-map key for the DAE_EVENT_BLOCKED
+// (type-0) rate domain. Outbound ids are stored in an 8-bit field (see
+// struct dae_event and send_blocked_alive_event), so 256 is reserved: it
+// can never collide with a real outbound id, and the ARRAY below reserves
+// one extra slot for it.
+#define BLOCKED_EVENT_RATE_KEY 256
+
 // alive_block_rate_map rate-limits blocked-event emission: key = outbound
 // id for DAE_EVENT_BLOCKED_ALIVE, or BLOCKED_EVENT_RATE_KEY for
 // DAE_EVENT_BLOCKED; value = last emission time (CLOCK_MONOTONIC ns).
 // Without this, an outbound that is not alive (or a blocked-flow flood)
 // would emit one event per blocked packet and flood the ringbuf, starving
-// the consumed event types. Key domains cannot collide: outbound ids are
-// small indices while BLOCKED_EVENT_RATE_KEY has the high bit set.
+// the consumed event types. Key domains cannot collide: outbound ids live
+// in the 0..255 u8 domain while BLOCKED_EVENT_RATE_KEY is the reserved
+// slot beyond it.
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__type(key, __u32);
 	__type(value, __u64);
-	__uint(max_entries, 256);
+	__uint(max_entries, BLOCKED_EVENT_RATE_KEY + 1);
 } alive_block_rate_map SEC(".maps");
-
-// BLOCKED_EVENT_RATE_KEY is the rate-map key domain for DAE_EVENT_BLOCKED
-// (type-0) events. It must never collide with a real outbound id.
-#define BLOCKED_EVENT_RATE_KEY 0xFFFFFFFFU
 
 // Events delivered to userspace via ring buffer.
 enum dae_event_type {
@@ -3594,7 +3598,7 @@ int tcp_offload_redirect(struct __sk_buff *skb)
 	// lookup above and this call (userspace teardown deletes keys after
 	// pausing), or on any other redirect failure. Dropping the skb would
 	// lose the packet, so translate every outcome into SK_PASS: a successful
-	// redirect has already marked the skb, and a failed one falls through to
+	// redirect has already marked the skb, and a failed one is handed to
 	// the userspace fallback path. (The helper takes its own socket
 	// reference, so the pre-check's released reference stays balanced.)
 	bpf_sk_redirect_hash(skb, &fast_sock, &peer_key, 0);

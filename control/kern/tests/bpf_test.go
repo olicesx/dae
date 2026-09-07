@@ -454,3 +454,7 @@ func TestWanEgressUdpRedirectTrack(t *testing.T) {
 func TestConntrackArgsScratchReset(t *testing.T) {
 	runProgramSetByID(t, "ConntrackArgsScratchReset")
 }
+
+func TestBlockedEventRateLimit(t *testing.T) {
+	runProgramSetByID(t, "BlockedEventRateLimit")
+}

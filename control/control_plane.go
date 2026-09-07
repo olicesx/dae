@@ -2098,38 +2098,44 @@ func (l *Listener) Close() error {
 // Clone duplicates the listener sockets so a new control plane generation can
 // take over serving before the old generation closes its copies. This allows
 // reload to wake the old Accept/Read goroutines without rebinding the port.
-func (l *Listener) Clone() (cloned *Listener, err error) {
+func (l *Listener) Clone() (*Listener, error) {
 	if l == nil {
 		return nil, fmt.Errorf("nil listener")
 	}
 
-	cloned = &Listener{port: l.port}
+	// Keep the partial clone in a plain local: the error returns below must
+	// not overwrite the named result before the deferred cleanup inspects it.
+	var err error
+	partial := &Listener{port: l.port}
 	defer func() {
-		if err != nil && cloned != nil {
-			_ = cloned.Close()
+		if err != nil {
+			// Best-effort close of every socket duplicated before the failure
+			// so a failed staged reload releases ports/fds deterministically
+			// instead of leaving them to the garbage collector.
+			_ = partial.Close()
 		}
 	}()
 
 	if l.tcp4Listener != nil {
-		cloned.tcp4Listener, err = cloneTCPListener(l.tcp4Listener)
+		partial.tcp4Listener, err = cloneTCPListener(l.tcp4Listener)
 		if err != nil {
 			return nil, fmt.Errorf("clone tcp4 listener: %w", err)
 		}
 	}
 	if l.tcp6Listener != nil {
-		cloned.tcp6Listener, err = cloneTCPListener(l.tcp6Listener)
+		partial.tcp6Listener, err = cloneTCPListener(l.tcp6Listener)
 		if err != nil {
 			return nil, fmt.Errorf("clone tcp6 listener: %w", err)
 		}
 	}
 	if l.packetConn != nil {
-		cloned.packetConn, err = cloneUDPPacketConn(l.packetConn)
+		partial.packetConn, err = cloneUDPPacketConn(l.packetConn)
 		if err != nil {
 			return nil, fmt.Errorf("clone udp packet conn: %w", err)
 		}
 	}
 
-	return cloned, nil
+	return partial, nil
 }
 
 func cloneTCPListener(listener net.Listener) (net.Listener, error) {
@@ -2618,6 +2624,11 @@ func (c *ControlPlane) ListenAndServe(readyChan chan<- bool, port uint16) (liste
 	}
 
 	if err = c.Serve(readyChan, listener); err != nil {
+		// This wrapper created the sockets, so it owns them: close on failure
+		// so a retried startup cannot leave the previous attempt's listeners
+		// bound until GC. The caller receives nil on error, matching the
+		// historical contract.
+		_ = listener.Close()
 		return nil, fmt.Errorf("failed to serve: %w", err)
 	}
 

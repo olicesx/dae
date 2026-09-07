@@ -442,33 +442,78 @@ func (ns *DaeNetns) tryCreateNetkit() (err error) {
 func (ns *DaeNetns) setup() (err error) {
 	ns.log.Trace("setting up dae netns")
 
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	if ns.hostNs, err = netns.Get(); err != nil {
+	// Capture the host namespace on the caller's thread before spawning the
+	// worker below: goroutines may start on any OS thread, and the setup
+	// steps switch namespaces, so the worker needs an explicit host reference
+	// to start from and restore into.
+	hostNs, err := netns.Get()
+	if err != nil {
 		return fmt.Errorf("failed to get host netns: %w", err)
 	}
-	defer func() { _ = netns.Set(ns.hostNs) }()
+	ns.hostNs = hostNs // persistent handle; released by Close
 
-	if err = ns.setupVethOrNetkit(); err != nil {
-		return
+	type setupResult struct {
+		err        error
+		panicValue any
 	}
-	if err = ns.setupNetns(); err != nil {
-		return
+	resultCh := make(chan setupResult, 1)
+	go func() {
+		runtime.LockOSThread()
+		var setupErr error
+		restored := false
+		// Start deterministically in the host namespace regardless of which
+		// OS thread the scheduler picked for this goroutine.
+		if setupErr = netns.Set(hostNs); setupErr != nil {
+			setupErr = fmt.Errorf("failed to switch setup thread to host netns: %w", setupErr)
+		}
+		defer func() {
+			panicValue := recover()
+			if restored {
+				runtime.UnlockOSThread()
+			} else if restoreErr := netns.Set(hostNs); restoreErr != nil {
+				// Last authoritative restore attempt. If it fails (e.g.
+				// setns(2) ENOMEM), keep the thread locked and exit: a
+				// goroutine that exits while still locked makes the runtime
+				// discard its OS thread, quarantining a thread that would
+				// otherwise run arbitrary code in the dae namespace.
+				ns.log.WithError(restoreErr).Errorln("Failed to restore host netns after dae netns setup; quarantining setup thread")
+				setupErr = stderrors.Join(setupErr, fmt.Errorf("failed to restore host netns: %w", restoreErr))
+			} else {
+				runtime.UnlockOSThread()
+			}
+			resultCh <- setupResult{err: setupErr, panicValue: panicValue}
+		}()
+
+		if setupErr = ns.setupVethOrNetkit(); setupErr != nil {
+			return
+		}
+		if setupErr = ns.setupNetns(); setupErr != nil {
+			return
+		}
+		if setupErr = ns.setupSysctl(); setupErr != nil {
+			return
+		}
+		if setupErr = ns.setupIPv4Datapath(); setupErr != nil {
+			return
+		}
+		if setupErr = ns.setupIPv6Datapath(); setupErr != nil {
+			return
+		}
+		if setupErr = ns.setupRoutingPolicy(); setupErr != nil {
+			return
+		}
+		// Success: re-enter the host namespace on this worker before it is
+		// released back to the scheduler.
+		if setupErr = netns.Set(hostNs); setupErr == nil {
+			restored = true
+		}
+	}()
+
+	res := <-resultCh
+	if res.panicValue != nil {
+		panic(res.panicValue)
 	}
-	if err = ns.setupSysctl(); err != nil {
-		return
-	}
-	if err = ns.setupIPv4Datapath(); err != nil {
-		return
-	}
-	if err = ns.setupIPv6Datapath(); err != nil {
-		return
-	}
-	if err = ns.setupRoutingPolicy(); err != nil {
-		return
-	}
-	return
+	return res.err
 }
 
 func (ns *DaeNetns) setupRoutingPolicy() (err error) {

@@ -180,6 +180,12 @@ func rollbackFreshDatapathReloadHandoff(log *logrus.Logger, handoff *stagedReloa
 		return nil, fmt.Errorf("missing previous generation for fresh datapath rollback")
 	}
 	var rollbackCleanupErrs []error
+	defer func() {
+		// The candidate generation applied its disable_thp policy process-wide
+		// during preparation; a rollback must restore the previous generation's
+		// policy (prctl(PR_SET_THP_DISABLE) is per-mm and idempotent).
+		configureTransparentHugePages(log, handoff.oldConf.Global.DisableTHP)
+	}()
 	if handoff.provisionalOwner && handoff.newControlPlane != nil {
 		handoff.newControlPlane.UnregisterProvisionalRoutingEpochExecutionOwner()
 		handoff.provisionalOwner = false
@@ -339,6 +345,12 @@ func rollbackStagedReloadHandoff(log *logrus.Logger, handoff *stagedReloadHandof
 	}
 	var errs []error
 	defer func() {
+		// The candidate generation applied its disable_thp policy process-wide
+		// during preparation; a rollback must restore the previous generation's
+		// policy (prctl(PR_SET_THP_DISABLE) is per-mm and idempotent).
+		if handoff.oldConf != nil {
+			configureTransparentHugePages(log, handoff.oldConf.Global.DisableTHP)
+		}
 		if handoff.oldConnectivityPaused && handoff.oldControlPlane != nil {
 			handoff.oldControlPlane.ResumeOutboundConnectivityUpdates()
 			handoff.oldConnectivityPaused = false

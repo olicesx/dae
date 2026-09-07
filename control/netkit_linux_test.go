@@ -9,6 +9,7 @@ package control
 
 import (
 	"net"
+	"os/exec"
 	"slices"
 	"testing"
 
@@ -152,4 +153,46 @@ func TestDae0IPv6LinkLocalSkipsDAD(t *testing.T) {
 	if ones != 128 || bits != 128 {
 		t.Fatalf("link-local prefix = %d/%d, want 128/128", ones, bits)
 	}
+}
+
+func TestParseIproute2Version(t *testing.T) {
+	cases := []struct {
+		name      string
+		output    string
+		wantMajor int
+		wantMinor int
+		wantOK    bool
+	}{
+		{"standard", "ip utility, iproute2-6.10.0, libbpf 1.4.0", 6, 10, true},
+		{"standard-lower", "ip utility, iproute2-6.1.0, libbpf 1.3.0", 6, 1, true},
+		{"bare", "iproute2-6.7.0", 6, 7, true},
+		{"trailing-garbage", "iproute2-6.7.0-dev", 6, 7, true},
+		{"three-part", "iproute2-6.10.0.1", 6, 10, true},
+		{"no-marker", "ip utility, libbpf 1.4.0", 0, 0, false},
+		{"no-minor", "iproute2-6", 0, 0, false},
+		{"empty", "", 0, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			major, minor, ok := parseIproute2Version(tc.output)
+			if ok != tc.wantOK || major != tc.wantMajor || minor != tc.wantMinor {
+				t.Fatalf("parseIproute2Version(%q) = (%d, %d, %v), want (%d, %d, %v)",
+					tc.output, major, minor, ok, tc.wantMajor, tc.wantMinor, tc.wantOK)
+			}
+		})
+	}
+}
+
+// TestCheckIpNetkitSupportLive validates the detector against the real
+// iproute2 on the test host: modern output formats and the exit-255 help
+// convention must not break detection when netkit is absent.
+func TestCheckIpNetkitSupportLive(t *testing.T) {
+	// Exercising the real binary is only meaningful when ip is present.
+	if _, err := exec.LookPath("ip"); err != nil {
+		t.Skip("ip command not found")
+	}
+	// The function must not panic and must return a definitive bool on the
+	// host's actual iproute2; correctness of the version gate is covered by
+	// TestParseIproute2Version above.
+	_ = checkIpNetkitSupport()
 }

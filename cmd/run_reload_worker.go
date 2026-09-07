@@ -156,6 +156,11 @@ func (w *reloadWorker) run() {
 		failSupervisorStep := func(err error, step string, candidate *runtimeGeneration, preCleanup, postCleanup func()) {
 			reloadErr := fmt.Errorf("%s: %w", step, err)
 			w.reloadManager.setReloadError(reloadErr)
+			// The candidate already applied its disable_thp policy process-wide
+			// before the supervisor steps; restore the still-active generation's
+			// policy so a failed reload cannot leak the rejected memory policy
+			// (prctl(PR_SET_THP_DISABLE) is per-mm and idempotent).
+			configureTransparentHugePages(w.log, w.conf.Global.DisableTHP)
 			if preCleanup != nil {
 				preCleanup()
 			}

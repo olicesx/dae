@@ -10,6 +10,7 @@ package control
 import (
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -85,6 +86,46 @@ func createNetkitDeviceViaIpCmd(name, peerName string, txQLen int, scrubNone boo
 	return fmt.Errorf("failed to create Netkit device: %w: %s", err, string(output))
 }
 
+// iproute2MinNetkitVersion is the first iproute2 release that understands the
+// "type netkit" link kind (iproute2 6.7.0).
+var iproute2MinNetkitVersion = [2]int{6, 7}
+
+// parseIproute2Version extracts the (major, minor) version from "ip -V"
+// output. Standard output looks like "ip utility, iproute2-6.10.0, libbpf
+// 1.4.0": the version token may be preceded by arbitrary text, so the marker
+// is located by scanning rather than by trimming a fixed prefix.
+func parseIproute2Version(output string) (major, minor int, ok bool) {
+	marker := "iproute2-"
+	idx := strings.Index(output, marker)
+	if idx < 0 {
+		return 0, 0, false
+	}
+	rest := output[idx+len(marker):]
+	// Skip any non-digit characters between the marker and the version
+	// (defensive against future output-format changes).
+	for len(rest) > 0 && (rest[0] < '0' || rest[0] > '9') {
+		rest = rest[1:]
+	}
+	dot := strings.IndexByte(rest, '.')
+	if dot <= 0 || dot == len(rest)-1 {
+		return 0, 0, false
+	}
+	major, err1 := strconv.Atoi(rest[:dot])
+	minorStr := rest[dot+1:]
+	minorEnd := 0
+	for minorEnd < len(minorStr) && minorStr[minorEnd] >= '0' && minorStr[minorEnd] <= '9' {
+		minorEnd++
+	}
+	if minorEnd == 0 {
+		return 0, 0, false
+	}
+	minor, err2 := strconv.Atoi(minorStr[:minorEnd])
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return major, minor, true
+}
+
 // checkIpNetkitSupport checks if the ip command supports Netkit devices.
 // It also checks the iproute2 version to provide helpful error messages.
 func checkIpNetkitSupport() bool {
@@ -95,33 +136,21 @@ func checkIpNetkitSupport() bool {
 		return false
 	}
 
-	// Parse version to check if it's >= 6.7.0
-	versionStr := string(output)
-	// Simple version check for iproute2-6.7.0 and later
-	if strings.Contains(versionStr, "iproute2-") {
-		// Extract major.minor version
-		parts := strings.Split(versionStr, ".")
-		if len(parts) >= 2 {
-			majorStr := strings.TrimPrefix(parts[0], "iproute2-")
-			major := 0
-			minor := 0
-			_, _ = fmt.Sscanf(majorStr, "%d", &major)
-			_, _ = fmt.Sscanf(parts[1], "%d", &minor)
-
-			// Check if version is < 6.7
-			if major < 6 || (major == 6 && minor < 7) {
-				// iproute2 is too old, don't even try to check help text
-				return false
-			}
+	// Parse version to check if it's >= 6.7.0.
+	if major, minor, ok := parseIproute2Version(string(output)); ok {
+		if major < iproute2MinNetkitVersion[0] ||
+			(major == iproute2MinNetkitVersion[0] && minor < iproute2MinNetkitVersion[1]) {
+			// iproute2 is too old, don't even try to check help text
+			return false
 		}
 	}
 
-	// If version is OK, also check help text for netkit keyword
+	// If the version is OK (or unparseable, in which case the help text is
+	// the only signal), check the help text for the netkit keyword. "ip link
+	// help" exits with status 255 after printing the help on stock iproute2,
+	// so the exit code must not be treated as a failure here.
 	cmd = exec.Command("ip", "link", "help")
-	output, err = cmd.CombinedOutput()
-	if err != nil {
-		return false
-	}
+	output, _ = cmd.CombinedOutput()
 
 	// Check if "netkit" is mentioned in the help text
 	return strings.Contains(string(output), "netkit")

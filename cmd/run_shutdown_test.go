@@ -853,9 +853,10 @@ func TestDNSConfigFingerprintCoversAllDnsFields(t *testing.T) {
 	// would cause unnecessary domain_routing_map clear+replay during
 	// staged handoff (dae#1013).
 	excluded := map[string]struct{}{
-		"OptimisticCache":    {},
-		"OptimisticCacheTtl": {},
-		"MaxCacheSize":       {},
+		"OptimisticCache":          {},
+		"OptimisticCacheTtl":       {},
+		"OptimisticStaleReplyTtl":  {},
+		"MaxCacheSize":             {},
 	}
 
 	dnsType := reflect.TypeOf(config.Dns{})

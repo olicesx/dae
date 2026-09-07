@@ -103,6 +103,7 @@ func DnsCorpusFixtures() []DnsCorpusFixture {
 		udpCacheHitAAAAFixture(),
 		negativeResponseFixture(),
 		udpCacheStaleOptimisticFixture(),
+		udpCacheStaleCnameNodataRefreshFixture(),
 		tcpUdpFallbackFixture(),
 		tcpUdpBlackholeFallbackFixture(),
 		rejectBeforeCacheFixture(),

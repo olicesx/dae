@@ -182,6 +182,137 @@ func TestNodataLifetimeBoundsRetainedRecordTtls(t *testing.T) {
 	}
 }
 
+// TestCnameOnlyNodataUsesSoaNegativeLifetime pins RFC 2308 §2.2: NODATA means
+// no answer of the requested type, so a CNAME-only answer for an A query is a
+// terminal negative. Its lifetime must come from the SOA (TTL/MINIMUM/cap and
+// retained-record bounds), not from the CNAME's own TTL through the positive
+// path: here SOA TTL 86400 and MINIMUM 120 must win over the CNAME TTL of
+// 3600, and the replayed message must keep the CNAME and the negative proof.
+func TestCnameOnlyNodataUsesSoaNegativeLifetime(t *testing.T) {
+	c := newSemanticsController(t)
+	msg := new(dnsmessage.Msg)
+	msg.SetQuestion("alias.example.com.", dnsmessage.TypeA)
+	msg.Response = true
+	msg.Answer = []dnsmessage.RR{&dnsmessage.CNAME{
+		Hdr:    dnsmessage.RR_Header{Name: "alias.example.com.", Rrtype: dnsmessage.TypeCNAME, Class: dnsmessage.ClassINET, Ttl: 3600},
+		Target: "empty.example.com.",
+	}}
+	msg.Ns = []dnsmessage.RR{&dnsmessage.SOA{
+		Hdr:    dnsmessage.RR_Header{Name: "example.com.", Rrtype: dnsmessage.TypeSOA, Class: dnsmessage.ClassINET, Ttl: 86400},
+		Ns:     "ns.example.com.",
+		Mbox:   "hostmaster.example.com.",
+		Minttl: 120,
+	}}
+
+	const cacheKey = "semantics-cname-nodata"
+	before := time.Now()
+	if err := c.NormalizeAndCacheDnsResp_(msg, cacheKey); err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now()
+	entry := storedEntry(t, c, cacheKey)
+	lifetime := 120 * time.Second
+	if entry.Deadline.Before(before.Add(lifetime)) || entry.Deadline.After(after.Add(lifetime)) {
+		t.Fatalf("deadline %v does not match SOA.MINIMUM lifetime %v", entry.Deadline, lifetime)
+	}
+
+	var replay dnsmessage.Msg
+	raw := entry.GetPackedResponseWithApproximateTTL(msg.Question[0].Name, dnsmessage.TypeA, after)
+	if err := replay.Unpack(raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(replay.Answer) != 1 || replay.Answer[0].Header().Rrtype != dnsmessage.TypeCNAME {
+		t.Fatalf("replay lost the CNAME answer: %v", replay.Answer)
+	}
+	if len(replay.Ns) != 1 || replay.Ns[0].Header().Rrtype != dnsmessage.TypeSOA {
+		t.Fatal("replay lost the negative proof SOA")
+	}
+	for _, section := range [][]dnsmessage.RR{replay.Answer, replay.Ns} {
+		for _, rr := range section {
+			if rr.Header().Ttl > 120 {
+				t.Fatalf("cached %s TTL = %d exceeds negative lifetime 120", dnsmessage.TypeToString[rr.Header().Rrtype], rr.Header().Ttl)
+			}
+		}
+	}
+}
+
+// TestCnameOnlyWithoutSoaIsNotCached pins RFC 2308 §5: a CNAME-only NODATA
+// without authority SOA must not be cached as if it were a positive answer.
+func TestCnameOnlyWithoutSoaIsNotCached(t *testing.T) {
+	c := newSemanticsController(t)
+	msg := new(dnsmessage.Msg)
+	msg.SetQuestion("alias.example.com.", dnsmessage.TypeA)
+	msg.Response = true
+	msg.Answer = []dnsmessage.RR{&dnsmessage.CNAME{
+		Hdr:    dnsmessage.RR_Header{Name: "alias.example.com.", Rrtype: dnsmessage.TypeCNAME, Class: dnsmessage.ClassINET, Ttl: 3600},
+		Target: "empty.example.com.",
+	}}
+	const cacheKey = "semantics-cname-nodata-nosoa"
+	if err := c.NormalizeAndCacheDnsResp_(msg, cacheKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.dnsCache.Load(cacheKey); ok {
+		t.Fatal("SOA-less CNAME-only NODATA must not be cached")
+	}
+}
+
+// TestCnameQueryAnswerStaysPositive guards the relevance test: a CNAME answer
+// to a CNAME question is a genuine positive answer and keeps its own TTL.
+func TestCnameQueryAnswerStaysPositive(t *testing.T) {
+	c := newSemanticsController(t)
+	msg := new(dnsmessage.Msg)
+	msg.SetQuestion("alias.example.com.", dnsmessage.TypeCNAME)
+	msg.Response = true
+	msg.Answer = []dnsmessage.RR{&dnsmessage.CNAME{
+		Hdr:    dnsmessage.RR_Header{Name: "alias.example.com.", Rrtype: dnsmessage.TypeCNAME, Class: dnsmessage.ClassINET, Ttl: 3600},
+		Target: "target.example.com.",
+	}}
+
+	const cacheKey = "semantics-cname-positive"
+	before := time.Now()
+	if err := c.NormalizeAndCacheDnsResp_(msg, cacheKey); err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now()
+	entry := storedEntry(t, c, cacheKey)
+	lifetime := 3600 * time.Second
+	if entry.Deadline.Before(before.Add(lifetime)) || entry.Deadline.After(after.Add(lifetime)) {
+		t.Fatalf("deadline %v does not match CNAME TTL lifetime %v", entry.Deadline, lifetime)
+	}
+}
+
+// TestCnameChainWithRequestedTypeStaysPositive guards the relevance test: once
+// the answer chain reaches the requested type, the response is positive even
+// though a CNAME is present.
+func TestCnameChainWithRequestedTypeStaysPositive(t *testing.T) {
+	c := newSemanticsController(t)
+	msg := new(dnsmessage.Msg)
+	msg.SetQuestion("alias.example.com.", dnsmessage.TypeA)
+	msg.Response = true
+	msg.Answer = []dnsmessage.RR{
+		&dnsmessage.CNAME{
+			Hdr:    dnsmessage.RR_Header{Name: "alias.example.com.", Rrtype: dnsmessage.TypeCNAME, Class: dnsmessage.ClassINET, Ttl: 3600},
+			Target: "target.example.com.",
+		},
+		&dnsmessage.A{
+			Hdr: dnsmessage.RR_Header{Name: "target.example.com.", Rrtype: dnsmessage.TypeA, Class: dnsmessage.ClassINET, Ttl: 30},
+			A:   net.ParseIP("198.51.100.10").To4(),
+		},
+	}
+
+	const cacheKey = "semantics-cname-chain"
+	before := time.Now()
+	if err := c.NormalizeAndCacheDnsResp_(msg, cacheKey); err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now()
+	entry := storedEntry(t, c, cacheKey)
+	lifetime := 30 * time.Second
+	if entry.Deadline.Before(before.Add(lifetime)) || entry.Deadline.After(after.Add(lifetime)) {
+		t.Fatalf("deadline %v does not match shortest record TTL %v", entry.Deadline, lifetime)
+	}
+}
+
 // TestUncacheableNegativesAreNotStored pins RFC 2308 §5: no-SOA NODATA,
 // NS-only referrals and NXDOMAIN must not create cache entries.
 func TestUncacheableNegativesAreNotStored(t *testing.T) {
@@ -226,6 +357,166 @@ func TestUncacheableNegativesAreNotStored(t *testing.T) {
 	}
 	if _, ok := c.dnsCache.Load("semantics-referral"); ok {
 		t.Fatal("NS-only referral must not be cached as a negative")
+	}
+}
+
+// TestIsNegativeResponseClassification pins the refresh supersession
+// classifier (RFC 2308 §2.2 relevance): it must mirror the cache admission
+// rule so an uncacheable CNAME-only NODATA still supersedes an expired
+// positive under RFC 8767 §4, while genuine positives and ANY answers never
+// count as negative.
+func TestIsNegativeResponseClassification(t *testing.T) {
+	soa := &dnsmessage.SOA{
+		Hdr:    dnsmessage.RR_Header{Name: "example.com.", Rrtype: dnsmessage.TypeSOA, Class: dnsmessage.ClassINET, Ttl: 300},
+		Ns:     "ns.example.com.",
+		Mbox:   "hostmaster.example.com.",
+		Minttl: 300,
+	}
+	cname := func(name string) *dnsmessage.CNAME {
+		return &dnsmessage.CNAME{
+			Hdr:    dnsmessage.RR_Header{Name: name, Rrtype: dnsmessage.TypeCNAME, Class: dnsmessage.ClassINET, Ttl: 3600},
+			Target: "gone.example.com.",
+		}
+	}
+	a := &dnsmessage.A{
+		Hdr: dnsmessage.RR_Header{Name: "alias.example.com.", Rrtype: dnsmessage.TypeA, Class: dnsmessage.ClassINET, Ttl: 300},
+		A:   net.ParseIP("198.51.100.9").To4(),
+	}
+
+	for _, tt := range []struct {
+		name  string
+		build func() *dnsmessage.Msg
+		want  bool
+	}{
+		{name: "nil", build: func() *dnsmessage.Msg { return nil }, want: false},
+		{name: "not_a_response", build: func() *dnsmessage.Msg {
+			msg := new(dnsmessage.Msg)
+			msg.SetQuestion("alias.example.com.", dnsmessage.TypeA)
+			return msg
+		}, want: false},
+		{name: "nxdomain", build: func() *dnsmessage.Msg {
+			msg := new(dnsmessage.Msg)
+			msg.SetQuestion("gone.example.com.", dnsmessage.TypeA)
+			msg.Response = true
+			msg.Rcode = dnsmessage.RcodeNameError
+			return msg
+		}, want: true},
+		{name: "servfail", build: func() *dnsmessage.Msg {
+			msg := new(dnsmessage.Msg)
+			msg.SetQuestion("alias.example.com.", dnsmessage.TypeA)
+			msg.Response = true
+			msg.Rcode = dnsmessage.RcodeServerFailure
+			return msg
+		}, want: false},
+		{name: "empty_noerror", build: func() *dnsmessage.Msg {
+			msg := new(dnsmessage.Msg)
+			msg.SetQuestion("empty.example.com.", dnsmessage.TypeA)
+			msg.Response = true
+			return msg
+		}, want: true},
+		{name: "cname_only", build: func() *dnsmessage.Msg {
+			msg := new(dnsmessage.Msg)
+			msg.SetQuestion("alias.example.com.", dnsmessage.TypeA)
+			msg.Response = true
+			msg.Answer = []dnsmessage.RR{cname("alias.example.com.")}
+			return msg
+		}, want: true},
+		{name: "cname_only_with_soa", build: func() *dnsmessage.Msg {
+			msg := new(dnsmessage.Msg)
+			msg.SetQuestion("alias.example.com.", dnsmessage.TypeA)
+			msg.Response = true
+			msg.Answer = []dnsmessage.RR{cname("alias.example.com.")}
+			msg.Ns = []dnsmessage.RR{soa}
+			return msg
+		}, want: true},
+		{name: "cname_chain_with_target_type", build: func() *dnsmessage.Msg {
+			msg := new(dnsmessage.Msg)
+			msg.SetQuestion("alias.example.com.", dnsmessage.TypeA)
+			msg.Response = true
+			msg.Answer = []dnsmessage.RR{cname("alias.example.com."), a}
+			return msg
+		}, want: false},
+		{name: "plain_a", build: func() *dnsmessage.Msg {
+			msg := new(dnsmessage.Msg)
+			msg.SetQuestion("alias.example.com.", dnsmessage.TypeA)
+			msg.Response = true
+			msg.Answer = []dnsmessage.RR{a}
+			return msg
+		}, want: false},
+		{name: "ns_only_referral", build: func() *dnsmessage.Msg {
+			msg := new(dnsmessage.Msg)
+			msg.SetQuestion("delegated.example.com.", dnsmessage.TypeA)
+			msg.Response = true
+			msg.Ns = []dnsmessage.RR{&dnsmessage.NS{
+				Hdr: dnsmessage.RR_Header{Name: "example.com.", Rrtype: dnsmessage.TypeNS, Class: dnsmessage.ClassINET, Ttl: 3600},
+				Ns:  "ns1.other.example.",
+			}}
+			return msg
+		}, want: true},
+		{name: "any_query_with_answers", build: func() *dnsmessage.Msg {
+			msg := new(dnsmessage.Msg)
+			msg.SetQuestion("alias.example.com.", dnsmessage.TypeANY)
+			msg.Response = true
+			msg.Answer = []dnsmessage.RR{a}
+			return msg
+		}, want: false},
+		{name: "any_query_empty", build: func() *dnsmessage.Msg {
+			msg := new(dnsmessage.Msg)
+			msg.SetQuestion("empty.example.com.", dnsmessage.TypeANY)
+			msg.Response = true
+			return msg
+		}, want: true},
+		{name: "mailb_query_with_mb_answer", build: func() *dnsmessage.Msg {
+			// RFC 1035 §3.2.3: QTYPE=MAILB requests MB/MG/MR records, never a
+			// type-253 answer. The classifier must treat an MB answer as
+			// relevant so forwarded MAILB responses stay positively cached.
+			msg := new(dnsmessage.Msg)
+			msg.SetQuestion("mailbox.example.com.", dnsmessage.TypeMAILB)
+			msg.Response = true
+			msg.Answer = []dnsmessage.RR{&dnsmessage.A{
+				Hdr: dnsmessage.RR_Header{Name: "mailbox.example.com.", Rrtype: dnsmessage.TypeMB, Class: dnsmessage.ClassINET, Ttl: 300},
+				A:   net.ParseIP("198.51.100.12").To4(),
+			}}
+			return msg
+		}, want: false},
+		{name: "mailb_query_empty", build: func() *dnsmessage.Msg {
+			msg := new(dnsmessage.Msg)
+			msg.SetQuestion("mailbox.example.com.", dnsmessage.TypeMAILB)
+			msg.Response = true
+			return msg
+		}, want: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isNegativeResponse(tt.build()); got != tt.want {
+				t.Fatalf("isNegativeResponse() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestAnyQueryAnswerRemainsPositive pins RFC 8482 §3: a well-formed ANY
+// response carries concrete RRsets (never type-ANY records), so relevance for
+// QTYPE=ANY is a non-empty answer section and admission must stay positive.
+func TestAnyQueryAnswerRemainsPositive(t *testing.T) {
+	c := newSemanticsController(t)
+	msg := new(dnsmessage.Msg)
+	msg.SetQuestion("anything.example.com.", dnsmessage.TypeANY)
+	msg.Response = true
+	msg.Answer = []dnsmessage.RR{&dnsmessage.A{
+		Hdr: dnsmessage.RR_Header{Name: "anything.example.com.", Rrtype: dnsmessage.TypeA, Class: dnsmessage.ClassINET, Ttl: 60},
+		A:   net.ParseIP("198.51.100.11").To4(),
+	}}
+
+	const cacheKey = "semantics-any"
+	before := time.Now()
+	if err := c.NormalizeAndCacheDnsResp_(msg, cacheKey); err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now()
+	entry := storedEntry(t, c, cacheKey)
+	lifetime := 60 * time.Second
+	if entry.Deadline.Before(before.Add(lifetime)) || entry.Deadline.After(after.Add(lifetime)) {
+		t.Fatalf("deadline %v does not match answer TTL lifetime %v", entry.Deadline, lifetime)
 	}
 }
 

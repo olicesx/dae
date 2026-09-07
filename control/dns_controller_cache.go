@@ -829,21 +829,15 @@ func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg, responseC
 				// Referral or SOA-less NODATA: not a cacheable negative.
 				return nil
 			}
-			// RFC 2308 §3: negative lifetime = min(SOA TTL, SOA.MINIMUM),
-			// capped by the configurable maximum (§5).
-			ttl := int(soa.Hdr.Ttl)
-			if int(soa.Minttl) < ttl {
-				ttl = int(soa.Minttl)
-			}
-			if ttl <= 0 {
+			// RFC 2308 negative lifetime is bounded by SOA TTL and MINIMUM.
+			// Whole-message replay must also respect every retained record's TTL.
+			ttl := min(soa.Hdr.Ttl, soa.Minttl, minRealRecordTtl(msg), uint32(dnsNegativeCacheMaxTtl))
+			if ttl == 0 {
 				return nil
-			}
-			if ttl > dnsNegativeCacheMaxTtl {
-				ttl = dnsNegativeCacheMaxTtl
 			}
 			// Store the SOA in the authority section so replayed NODATA
 			// responses carry the negative proof with a decreasing TTL.
-			return c.updateDnsCache(msg, responseCacheKey, uint32(ttl), &q)
+			return c.updateDnsCache(msg, responseCacheKey, ttl, &q)
 		}
 		// NXDOMAIN (and other non-success RCODEs) are not stored; see above.
 		// Background refresh treats an accepted NXDOMAIN as superseding an

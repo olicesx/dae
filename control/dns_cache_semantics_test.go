@@ -48,7 +48,7 @@ func TestPositiveEntryLifetimeUsesMinimumRecordTtl(t *testing.T) {
 	msg.Question[0].Qtype = dnsmessage.TypeCNAME
 	msg.Answer = []dnsmessage.RR{
 		&dnsmessage.CNAME{
-			Hdr: dnsmessage.RR_Header{Name: "mixed.example.com.", Rrtype: dnsmessage.TypeCNAME, Class: dnsmessage.ClassINET, Ttl: 3600},
+			Hdr:    dnsmessage.RR_Header{Name: "mixed.example.com.", Rrtype: dnsmessage.TypeCNAME, Class: dnsmessage.ClassINET, Ttl: 3600},
 			Target: "target.example.com.",
 		},
 		&dnsmessage.A{
@@ -79,7 +79,7 @@ func TestNodataNegativeLifetimeUsesSoa(t *testing.T) {
 	msg.Rcode = dnsmessage.RcodeSuccess
 	msg.Ns = []dnsmessage.RR{
 		&dnsmessage.SOA{
-			Hdr: dnsmessage.RR_Header{Name: "example.com.", Rrtype: dnsmessage.TypeSOA, Class: dnsmessage.ClassINET, Ttl: 300},
+			Hdr:     dnsmessage.RR_Header{Name: "example.com.", Rrtype: dnsmessage.TypeSOA, Class: dnsmessage.ClassINET, Ttl: 300},
 			Ns:      "ns1.example.com.",
 			Mbox:    "hostmaster.example.com.",
 			Serial:  1,
@@ -99,6 +99,86 @@ func TestNodataNegativeLifetimeUsesSoa(t *testing.T) {
 	}
 	if len(entry.NS) == 0 {
 		t.Fatal("NODATA entry must retain the SOA in its authority section")
+	}
+}
+
+// TestNodataLifetimeBoundsRetainedRecordTtls checks both entry deadlines and
+// wire TTLs, including zero-TTL records and the OPT pseudo-record exception.
+func TestNodataLifetimeBoundsRetainedRecordTtls(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		section string
+		ttl     uint32
+		wantTtl uint32
+	}{
+		{name: "short_authority", section: "authority", ttl: 180, wantTtl: 180},
+		{name: "short_additional", section: "additional", ttl: 90, wantTtl: 90},
+		{name: "zero_authority", section: "authority", ttl: 0, wantTtl: 0},
+		{name: "zero_additional", section: "additional", ttl: 0, wantTtl: 0},
+		{name: "opt_is_not_a_ttl", wantTtl: 300},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newSemanticsController(t)
+			msg := new(dnsmessage.Msg)
+			msg.SetQuestion("empty.example.com.", dnsmessage.TypeA)
+			msg.Response = true
+			msg.Ns = []dnsmessage.RR{&dnsmessage.SOA{
+				Hdr:    dnsmessage.RR_Header{Name: "example.com.", Rrtype: dnsmessage.TypeSOA, Class: dnsmessage.ClassINET, Ttl: 300},
+				Ns:     "ns.example.com.",
+				Mbox:   "hostmaster.example.com.",
+				Minttl: 300,
+			}}
+			switch tt.section {
+			case "authority":
+				msg.Ns = append(msg.Ns, &dnsmessage.NSEC{
+					Hdr:        dnsmessage.RR_Header{Name: "empty.example.com.", Rrtype: dnsmessage.TypeNSEC, Class: dnsmessage.ClassINET, Ttl: tt.ttl},
+					NextDomain: "next.example.com.",
+					TypeBitMap: []uint16{dnsmessage.TypeAAAA, dnsmessage.TypeRRSIG, dnsmessage.TypeNSEC},
+				})
+			case "additional":
+				msg.Extra = append(msg.Extra, &dnsmessage.A{
+					Hdr: dnsmessage.RR_Header{Name: "ns.example.com.", Rrtype: dnsmessage.TypeA, Class: dnsmessage.ClassINET, Ttl: tt.ttl},
+					A:   net.ParseIP("198.51.100.53").To4(),
+				})
+			}
+			msg.SetEdns0(1232, false)
+
+			const cacheKey = "semantics-nodata-record-ttl"
+			before := time.Now()
+			if err := c.NormalizeAndCacheDnsResp_(msg, cacheKey); err != nil {
+				t.Fatal(err)
+			}
+			after := time.Now()
+			if tt.wantTtl == 0 {
+				if _, ok := c.dnsCache.Load(cacheKey); ok {
+					t.Fatal("negative response containing a zero-TTL record must not be cached")
+				}
+				return
+			}
+
+			entry := storedEntry(t, c, cacheKey)
+			lifetime := time.Duration(tt.wantTtl) * time.Second
+			if entry.Deadline.Before(before.Add(lifetime)) || entry.Deadline.After(after.Add(lifetime)) {
+				t.Fatalf("deadline %v does not match lifetime %v", entry.Deadline, lifetime)
+			}
+			var replay dnsmessage.Msg
+			if err := replay.Unpack(entry.GetPackedResponseWithApproximateTTL(msg.Question[0].Name, dnsmessage.TypeA, after)); err != nil {
+				t.Fatal(err)
+			}
+			if len(replay.Ns) != len(msg.Ns) || len(replay.Extra) != len(msg.Extra) {
+				t.Fatal("cached response lost retained records")
+			}
+			for _, section := range [][]dnsmessage.RR{replay.Ns, replay.Extra} {
+				for _, rr := range section {
+					if rr.Header().Rrtype != dnsmessage.TypeOPT && rr.Header().Ttl > tt.wantTtl {
+						t.Fatalf("cached %s TTL = %d, exceeds %d", dnsmessage.TypeToString[rr.Header().Rrtype], rr.Header().Ttl, tt.wantTtl)
+					}
+				}
+			}
+			if opt := replay.IsEdns0(); opt == nil || opt.UDPSize() != 1232 || opt.Hdr.Ttl != 0 {
+				t.Fatalf("cached OPT changed: %v", opt)
+			}
+		})
 	}
 }
 
@@ -137,8 +217,8 @@ func TestUncacheableNegativesAreNotStored(t *testing.T) {
 	referral.Response = true
 	referral.Ns = []dnsmessage.RR{
 		&dnsmessage.NS{
-			Hdr:  dnsmessage.RR_Header{Name: "example.com.", Rrtype: dnsmessage.TypeNS, Class: dnsmessage.ClassINET, Ttl: 3600},
-			Ns:   "ns1.other.example.",
+			Hdr: dnsmessage.RR_Header{Name: "example.com.", Rrtype: dnsmessage.TypeNS, Class: dnsmessage.ClassINET, Ttl: 3600},
+			Ns:  "ns1.other.example.",
 		},
 	}
 	if err := c.NormalizeAndCacheDnsResp_(referral, "semantics-referral"); err != nil {

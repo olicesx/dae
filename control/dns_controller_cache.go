@@ -808,6 +808,18 @@ func findAuthoritySoa(msg *dnsmessage.Msg) *dnsmessage.SOA {
 	return nil
 }
 
+// authorityHasNs reports whether the authority section carries an NS record,
+// which (without an SOA) marks the response as a referral rather than an
+// answer (RFC 2308 §2.2).
+func authorityHasNs(msg *dnsmessage.Msg) bool {
+	for _, rr := range msg.Ns {
+		if rr.Header().Rrtype == dnsmessage.TypeNS {
+			return true
+		}
+	}
+	return false
+}
+
 // hasRelevantAnswer reports whether msg carries an answer of the question's
 // requested type (RFC 2308 §2.2: NODATA is the absence of a *relevant*
 // answer, so a CNAME-only answer for an A/AAAA question is still a negative).
@@ -824,14 +836,17 @@ func hasRelevantAnswer(msg *dnsmessage.Msg, q dnsmessage.Question) bool {
 // question's QTYPE. QTYPE=ANY matches any record: a well-formed ANY response
 // carries concrete RRsets such as A, MX or HINFO, never type-ANY records
 // (RFC 8482 §3). QTYPE=MAILB (253) requests MB, MG or MR records (RFC 1035
-// §3.2.3). QTYPE=MAILA (254) requested the obsolete MD/MF records, which this
-// stack cannot represent, so no special case is needed.
+// §3.2.3). QTYPE=MAILA (254) requests the obsolete MD or MF records, which
+// the wire decoder still represents and can return as answer records.
 func typeMatchesQuestion(rrtype, qtype uint16) bool {
 	if qtype == dnsmessage.TypeANY || rrtype == qtype {
 		return true
 	}
-	return qtype == dnsmessage.TypeMAILB &&
-		(rrtype == dnsmessage.TypeMB || rrtype == dnsmessage.TypeMG || rrtype == dnsmessage.TypeMR)
+	if qtype == dnsmessage.TypeMAILB {
+		return rrtype == dnsmessage.TypeMB || rrtype == dnsmessage.TypeMG || rrtype == dnsmessage.TypeMR
+	}
+	return qtype == dnsmessage.TypeMAILA &&
+		(rrtype == dnsmessage.TypeMD || rrtype == dnsmessage.TypeMF)
 }
 
 // NormalizeAndCacheDnsResp_ handle DNS resp in place.

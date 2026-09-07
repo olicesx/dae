@@ -88,7 +88,10 @@ type DnsControllerOption struct {
 	ConcurrencyLimit      int
 	OptimisticCache       bool
 	OptimisticCacheTtl    int // 0 means never expire (rely on LRU eviction)
-	MaxCacheSize          int // maximum number of cache entries (0 = unlimited)
+	// OptimisticStaleReplyTtl bounds the TTL advertised for served-stale
+	// answers (RFC 8767); 0 keeps the previously packed TTL.
+	OptimisticStaleReplyTtl int
+	MaxCacheSize            int // maximum number of cache entries (0 = unlimited)
 }
 
 type dnsControllerStore struct {

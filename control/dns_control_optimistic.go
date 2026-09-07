@@ -53,7 +53,13 @@ func (c *DnsController) backgroundRefresh(cacheKey string, dnsMessage *dnsmessag
 	refresh.Response = false
 	refresh.Answer = nil
 	refresh.Ns = nil
-	refresh.Extra = nil
+	// Keep the initiating query's Additional section: it carries the
+	// request-side OPT (DO bit, EDNS Client Subnet, ...). Re-issuing the
+	// refresh without it changes the query semantics, and caching the answer
+	// under the original key would then replace a tailored answer with a
+	// generic one (RFC 5625 §3/§4.4.2 transparent forwarding; RFC 8767
+	// refresh continues the triggering request). The caller always passes a
+	// query, never a response, so no response-owned records reach this path.
 
 	if err := c.refreshDnsRespCache(ctx, refresh, req, upstream, cacheKey); err != nil &&
 		c.log != nil && c.log.IsLevelEnabled(logrus.DebugLevel) {

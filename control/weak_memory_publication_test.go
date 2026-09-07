@@ -43,7 +43,7 @@ func TestDNSRuntimeBehaviorPublicationLitmus(t *testing.T) {
 		defer wg.Done()
 		<-start
 		for range iterations {
-			enabled, ttl, maxSize := controller.currentOptimisticCacheConfig()
+			enabled, ttl, _, maxSize := controller.currentOptimisticCacheConfig()
 			if (enabled && ttl == 202 && maxSize == 2002) || (!enabled && ttl == 101 && maxSize == 1001) {
 				continue
 			}

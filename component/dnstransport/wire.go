@@ -88,9 +88,11 @@ func SendHTTPDNS(ctx context.Context, client *http.Client, target string, upstre
 	return &msg, nil
 }
 
-// SendStreamDNS writes data with its two-byte big-endian length prefix to
-// stream and reads one framed response back (RFC 1035 TCP/DoQ framing).
-func SendStreamDNS(stream io.ReadWriter, data []byte) (*dnsmessage.Msg, error) {
+// WriteFramedDNSQuery writes data with its two-byte big-endian length prefix
+// (RFC 1035 TCP / RFC 9250 DoQ framing). The caller may close the write side
+// of the stream immediately afterwards; DoQ servers wait for the query FIN
+// before answering.
+func WriteFramedDNSQuery(w io.Writer, data []byte) error {
 	bufPtr := dnsBufPool.Get().(*[]byte)
 	defer dnsBufPool.Put(bufPtr) //nolint:staticcheck
 	buf := *bufPtr
@@ -106,20 +108,29 @@ func SendStreamDNS(stream io.ReadWriter, data []byte) (*dnsmessage.Msg, error) {
 	}
 	binary.BigEndian.PutUint16(req[:2], uint16(len(data)))
 	copy(req[2:], data)
-	if _, err := stream.Write(req); err != nil {
-		return nil, fmt.Errorf("failed to write DNS request: %w", err)
+	if _, err := w.Write(req); err != nil {
+		return fmt.Errorf("failed to write DNS request: %w", err)
 	}
+	return nil
+}
+
+// ReadFramedDNSResponse reads one length-prefixed DNS message (RFC 1035
+// TCP / RFC 9250 DoQ framing) and unpacks it.
+func ReadFramedDNSResponse(r io.Reader) (*dnsmessage.Msg, error) {
+	bufPtr := dnsBufPool.Get().(*[]byte)
+	defer dnsBufPool.Put(bufPtr) //nolint:staticcheck
+	buf := *bufPtr
 
 	// The length prefix is read into a stack array; the response payload
 	// reuses the pooled buffer. respLen is a uint16 so it always fits within
 	// the 64KiB capacity.
 	var lengthBuf [2]byte
-	if _, err := io.ReadFull(stream, lengthBuf[:]); err != nil {
+	if _, err := io.ReadFull(r, lengthBuf[:]); err != nil {
 		return nil, fmt.Errorf("failed to read DNS response length: %w", err)
 	}
 	respLen := int(binary.BigEndian.Uint16(lengthBuf[:]))
 	respBuf := buf[:respLen]
-	if _, err := io.ReadFull(stream, respBuf); err != nil {
+	if _, err := io.ReadFull(r, respBuf); err != nil {
 		return nil, fmt.Errorf("failed to read DNS response payload: %w", err)
 	}
 	var msg dnsmessage.Msg
@@ -127,4 +138,15 @@ func SendStreamDNS(stream io.ReadWriter, data []byte) (*dnsmessage.Msg, error) {
 		return nil, err
 	}
 	return &msg, nil
+}
+
+// SendStreamDNS writes data with its two-byte big-endian length prefix to
+// stream and reads one framed response back (RFC 1035 TCP/DoQ framing).
+// Stream transports that must close the write side before reading (DoQ) use
+// WriteFramedDNSQuery + ReadFramedDNSResponse instead.
+func SendStreamDNS(stream io.ReadWriter, data []byte) (*dnsmessage.Msg, error) {
+	if err := WriteFramedDNSQuery(stream, data); err != nil {
+		return nil, err
+	}
+	return ReadFramedDNSResponse(stream)
 }

@@ -514,14 +514,16 @@ func (d *DoQ) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, err
 		stream.CancelRead(doqRequestCancelledCode)
 		return nil, err
 	}
-	// The framed response has been fully consumed, but quic-go retires a
-	// stream only when both halves complete, and the receive half completes
-	// only when a read observes EOF or the stream is cancelled locally. DoQ
+	// The framed response has been fully consumed, but quic-go completes a
+	// stream only when both halves finish, and the receive half finishes only
+	// when a read observes EOF or the stream is cancelled locally. DoQ
 	// servers close their send side after answering (RFC 9250 §4.2), yet the
 	// FIN can arrive after the payload; without cancellation the read half
-	// stays open, holds the stream slot on the reused connection and is only
-	// reclaimed when the connection is replaced. CancelRead retires it
-	// deterministically (STOP_SENDING, RFC 9250 §4.3.1).
+	// stays open and holds the stream slot on the reused connection until the
+	// connection is replaced. CancelRead releases the receive half and sends
+	// STOP_SENDING (RFC 9250 §4.3.1); the slot itself is reclaimed once the
+	// peer's FIN or RESET arrives and the send half has completed, which a
+	// well-behaved DoQ server provides immediately after answering.
 	stream.CancelRead(doqRequestCancelledCode)
 	return msg, nil
 }

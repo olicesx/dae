@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
 )
@@ -195,5 +196,32 @@ func TestDaeNetnsWithUsesSnapshotsWhileOriginalHandlesClose(t *testing.T) {
 		if _, err := unix.FcntlInt(uintptr(target), unix.F_GETFD, 0); !stderrors.Is(err, unix.EBADF) {
 			t.Fatalf("snapshot handle %d remains open after With(): %v", target, err)
 		}
+	}
+}
+
+func TestDaeNetnsSetupPublishesInitialSwitchFailure(t *testing.T) {
+	previousSetNetns := setNetnsFunc
+	t.Cleanup(func() { setNetnsFunc = previousSetNetns })
+
+	wantErr := stderrors.New("initial host namespace switch failed")
+	calls := 0
+	setNetnsFunc = func(netns.NsHandle) error {
+		calls++
+		if calls == 1 {
+			return wantErr
+		}
+		return nil
+	}
+
+	ns := &DaeNetns{log: logrus.New()}
+	err := ns.setup()
+	if !stderrors.Is(err, wantErr) {
+		t.Fatalf("setup() error = %v, want %v", err, wantErr)
+	}
+	if calls != 2 {
+		t.Fatalf("setup namespace switch calls = %d, want initial failure plus restore", calls)
+	}
+	if ns.hostNs.IsOpen() {
+		_ = ns.hostNs.Close()
 	}
 }

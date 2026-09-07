@@ -480,18 +480,26 @@ func (d *DoQ) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, err
 		if exchangeCtx.Err() != nil {
 			err = exchangeCtx.Err()
 		}
-		// The query never completed; reset the write side so the peer can
-		// discard the partial query and its resources.
+		// The query never completed; abandon the whole stream: reset the
+		// write side so the peer can discard the partial query and its
+		// resources, and cancel the read side (STOP_SENDING, RFC 9250
+		// §4.3.1) so the receive half is released instead of pinning the
+		// stream on the reused connection until it is replaced.
 		writeCanceled = true
 		stream.CancelWrite(doqRequestCancelledCode)
+		stream.CancelRead(doqRequestCancelledCode)
 		return nil, err
 	}
 	if err := stream.Close(); err != nil {
-		// FIN could not be delivered; the stream is gone, so treat the
-		// exchange as failed.
+		// FIN could not be delivered. quic-go reports an error here when the
+		// send half was cancelled (e.g. a peer STOP_SENDING racing the
+		// query), not only when the connection is gone, so the receive half
+		// may still be open on a healthy connection: cancel it too instead of
+		// leaving the stream half-open.
 		if exchangeCtx.Err() != nil {
 			err = exchangeCtx.Err()
 		}
+		stream.CancelRead(doqRequestCancelledCode)
 		return nil, err
 	}
 	finSent = true
@@ -506,6 +514,15 @@ func (d *DoQ) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, err
 		stream.CancelRead(doqRequestCancelledCode)
 		return nil, err
 	}
+	// The framed response has been fully consumed, but quic-go retires a
+	// stream only when both halves complete, and the receive half completes
+	// only when a read observes EOF or the stream is cancelled locally. DoQ
+	// servers close their send side after answering (RFC 9250 §4.2), yet the
+	// FIN can arrive after the payload; without cancellation the read half
+	// stays open, holds the stream slot on the reused connection and is only
+	// reclaimed when the connection is replaced. CancelRead retires it
+	// deterministically (STOP_SENDING, RFC 9250 §4.3.1).
+	stream.CancelRead(doqRequestCancelledCode)
 	return msg, nil
 }
 

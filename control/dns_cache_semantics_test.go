@@ -408,17 +408,38 @@ func TestIsNegativeResponseClassification(t *testing.T) {
 			msg.Rcode = dnsmessage.RcodeServerFailure
 			return msg
 		}, want: false},
-		{name: "empty_noerror", build: func() *dnsmessage.Msg {
+		{name: "empty_noerror_with_soa", build: func() *dnsmessage.Msg {
 			msg := new(dnsmessage.Msg)
 			msg.SetQuestion("empty.example.com.", dnsmessage.TypeA)
 			msg.Response = true
+			msg.Ns = []dnsmessage.RR{soa}
 			return msg
 		}, want: true},
+		{name: "cname_only_with_ns_no_soa", build: func() *dnsmessage.Msg {
+			// A CNAME answer with an NS-only (SOA-less) authority is a
+			// referral-shaped response, not a terminal negative: it must not
+			// supersede a cached positive.
+			msg := new(dnsmessage.Msg)
+			msg.SetQuestion("alias.example.com.", dnsmessage.TypeA)
+			msg.Response = true
+			msg.Answer = []dnsmessage.RR{cname("alias.example.com.")}
+			msg.Ns = []dnsmessage.RR{&dnsmessage.NS{
+				Hdr: dnsmessage.RR_Header{Name: "example.com.", Rrtype: dnsmessage.TypeNS, Class: dnsmessage.ClassINET, Ttl: 3600},
+				Ns:  "ns1.other.example.",
+			}}
+			return msg
+		}, want: false},
 		{name: "cname_only", build: func() *dnsmessage.Msg {
 			msg := new(dnsmessage.Msg)
 			msg.SetQuestion("alias.example.com.", dnsmessage.TypeA)
 			msg.Response = true
 			msg.Answer = []dnsmessage.RR{cname("alias.example.com.")}
+			return msg
+		}, want: true},
+		{name: "empty_noerror", build: func() *dnsmessage.Msg {
+			msg := new(dnsmessage.Msg)
+			msg.SetQuestion("empty.example.com.", dnsmessage.TypeA)
+			msg.Response = true
 			return msg
 		}, want: true},
 		{name: "cname_only_with_soa", build: func() *dnsmessage.Msg {
@@ -444,6 +465,8 @@ func TestIsNegativeResponseClassification(t *testing.T) {
 			return msg
 		}, want: false},
 		{name: "ns_only_referral", build: func() *dnsmessage.Msg {
+			// RFC 2308 §2.2: an NS-only authority without SOA is a referral,
+			// not an answer - it must not supersede a cached positive.
 			msg := new(dnsmessage.Msg)
 			msg.SetQuestion("delegated.example.com.", dnsmessage.TypeA)
 			msg.Response = true
@@ -452,7 +475,7 @@ func TestIsNegativeResponseClassification(t *testing.T) {
 				Ns:  "ns1.other.example.",
 			}}
 			return msg
-		}, want: true},
+		}, want: false},
 		{name: "any_query_with_answers", build: func() *dnsmessage.Msg {
 			msg := new(dnsmessage.Msg)
 			msg.SetQuestion("alias.example.com.", dnsmessage.TypeANY)
@@ -485,6 +508,26 @@ func TestIsNegativeResponseClassification(t *testing.T) {
 			msg.Response = true
 			return msg
 		}, want: true},
+		{name: "maila_query_with_md_answer", build: func() *dnsmessage.Msg {
+			msg := new(dnsmessage.Msg)
+			msg.SetQuestion("mailbox.example.com.", dnsmessage.TypeMAILA)
+			msg.Response = true
+			msg.Answer = []dnsmessage.RR{&dnsmessage.MD{
+				Hdr: dnsmessage.RR_Header{Name: "mailbox.example.com.", Rrtype: dnsmessage.TypeMD, Class: dnsmessage.ClassINET, Ttl: 300},
+				Md:  "mailhost.example.com.",
+			}}
+			return msg
+		}, want: false},
+		{name: "maila_query_with_mf_answer", build: func() *dnsmessage.Msg {
+			msg := new(dnsmessage.Msg)
+			msg.SetQuestion("mailbox.example.com.", dnsmessage.TypeMAILA)
+			msg.Response = true
+			msg.Answer = []dnsmessage.RR{&dnsmessage.MF{
+				Hdr: dnsmessage.RR_Header{Name: "mailbox.example.com.", Rrtype: dnsmessage.TypeMF, Class: dnsmessage.ClassINET, Ttl: 300},
+				Mf:  "mailhost.example.com.",
+			}}
+			return msg
+		}, want: false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isNegativeResponse(tt.build()); got != tt.want {
@@ -517,6 +560,44 @@ func TestAnyQueryAnswerRemainsPositive(t *testing.T) {
 	lifetime := 60 * time.Second
 	if entry.Deadline.Before(before.Add(lifetime)) || entry.Deadline.After(after.Add(lifetime)) {
 		t.Fatalf("deadline %v does not match answer TTL lifetime %v", entry.Deadline, lifetime)
+	}
+}
+
+// TestMailaAnswersRemainPositive pins RFC 1035 §3.2.3: MAILA is the obsolete
+// meta-query for MD/MF records, and those concrete answer types remain positive
+// cache entries rather than being misclassified as NODATA.
+func TestMailaAnswersRemainPositive(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rr   dnsmessage.RR
+	}{
+		{
+			name: "md",
+			rr: &dnsmessage.MD{
+				Hdr: dnsmessage.RR_Header{Name: "mailbox.example.com.", Rrtype: dnsmessage.TypeMD, Class: dnsmessage.ClassINET, Ttl: 60},
+				Md:  "mailhost.example.com.",
+			},
+		},
+		{
+			name: "mf",
+			rr: &dnsmessage.MF{
+				Hdr: dnsmessage.RR_Header{Name: "mailbox.example.com.", Rrtype: dnsmessage.TypeMF, Class: dnsmessage.ClassINET, Ttl: 60},
+				Mf:  "mailhost.example.com.",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newSemanticsController(t)
+			msg := new(dnsmessage.Msg)
+			msg.SetQuestion("mailbox.example.com.", dnsmessage.TypeMAILA)
+			msg.Response = true
+			msg.Answer = []dnsmessage.RR{tc.rr}
+
+			if err := c.NormalizeAndCacheDnsResp_(msg, "semantics-maila-"+tc.name); err != nil {
+				t.Fatal(err)
+			}
+			storedEntry(t, c, "semantics-maila-"+tc.name)
+		})
 	}
 }
 

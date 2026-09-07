@@ -381,7 +381,7 @@ func (c *DnsController) evictDnsCacheLocked(cacheKey string, cache *DnsCache) bo
 // case selects the oldest entry from a fixed sample so admission work does not
 // grow with cache cardinality.
 func (c *DnsController) enforceDnsCacheCapacityLocked(incomingKey string) {
-	_, _, maxCacheSize := c.currentOptimisticCacheConfig()
+	_, _, _, maxCacheSize := c.currentOptimisticCacheConfig()
 	if maxCacheSize <= 0 {
 		return
 	}
@@ -455,7 +455,7 @@ func (c *DnsController) evictDnsRespCacheIfSame(cacheKey string, cache *DnsCache
 }
 
 func (c *DnsController) evictExpiredDnsCache(now time.Time) {
-	optimisticCacheEnabled, optimisticCacheTtl, maxCacheSize := c.currentOptimisticCacheConfig()
+	optimisticCacheEnabled, optimisticCacheTtl, _, maxCacheSize := c.currentOptimisticCacheConfig()
 	// Step 1: Time-based eviction
 	// - When optimistic_cache_ttl > 0: evict entries older than (deadline + stale_window)
 	// - When optimistic_cache_ttl == 0 AND maxCacheSize > 0: skip time-based eviction (rely on LRU)
@@ -728,7 +728,7 @@ func (c *DnsController) LookupDnsRespCache_(msg *dnsmessage.Msg, cacheKey string
 	}
 
 	// Cache expired - check if optimistic cache is enabled
-	optimisticCacheEnabled, optimisticCacheTtl, _ := c.currentOptimisticCacheConfig()
+	optimisticCacheEnabled, optimisticCacheTtl, staleReplyTtl, _ := c.currentOptimisticCacheConfig()
 	if optimisticCacheEnabled {
 		// Try stale response (RFC 8767)
 		// Use optimisticCacheTtl (0 means never expire)
@@ -737,6 +737,17 @@ func (c *DnsController) LookupDnsRespCache_(msg *dnsmessage.Msg, cacheKey string
 			// Use CAS to ensure only one goroutine triggers refresh
 			if cache.refreshing.CompareAndSwap(false, true) {
 				needRefresh = true
+			}
+			// Bound the TTL advertised for the stale answer: replaying the
+			// original long TTL would make downstream clients cache the stale
+			// data long after dae stopped serving it (RFC 8767 §4 recommends a
+			// short reply TTL). Zero-TTL (dae-managed A/AAAA) records and the
+			// OPT pseudo-record are left untouched. On a malformed wire the
+			// original bytes are served unchanged rather than failing the query.
+			if staleReplyTtl > 0 {
+				if bounded := clampWireRecordTtls(resp, uint32(staleReplyTtl)); bounded != nil {
+					resp = bounded
+				}
 			}
 			return resp, needRefresh
 		}

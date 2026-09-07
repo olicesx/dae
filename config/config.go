@@ -142,7 +142,10 @@ type Dns struct {
 	Bind               string          `mapstructure:"bind"`
 	OptimisticCache    bool            `mapstructure:"optimistic_cache" default:"true"`
 	OptimisticCacheTtl int             `mapstructure:"optimistic_cache_ttl" default:"60"`
-	MaxCacheSize       int             `mapstructure:"max_cache_size" default:"65536"`
+	// OptimisticStaleReplyTtl bounds the TTL advertised when a stale (RFC
+	// 8767) response is served. 0 keeps the previously packed TTL.
+	OptimisticStaleReplyTtl int `mapstructure:"optimistic_stale_reply_ttl" default:"30"`
+	MaxCacheSize            int `mapstructure:"max_cache_size" default:"65536"`
 }
 
 type Routing struct {

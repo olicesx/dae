@@ -60,8 +60,16 @@ var responseSlotPool = sync.Pool{
 	},
 }
 
-// sendStreamDNSFunc is an indirection for tests that replace stream DNS I/O.
-var sendStreamDNSFunc = dnstransport.SendStreamDNS
+// doqExchangeTimeout bounds a single DNS-over-QUIC exchange when the caller
+// did not already provide a tighter deadline. Quic-go streams only observe
+// cancellation through deadlines, and a peer that keeps the connection alive
+// while withholding a response must not pin this goroutine, the singleflight
+// slot and the open stream indefinitely.
+const doqExchangeTimeout = 8 * time.Second
+
+// doqRequestCancelledCode is DOQ_REQUEST_CANCELLED (RFC 9250 §4.3.1), sent
+// via STOP_SENDING/RESET_STREAM when a query is abandoned.
+const doqRequestCancelledCode quic.StreamErrorCode = 0x3
 
 func newResponseSlot() *responseSlot {
 	s := responseSlotPool.Get().(*responseSlot)
@@ -414,38 +422,88 @@ type DoQ struct {
 }
 
 func (d *DoQ) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, error) {
-	connection, err := d.getOrCreateConnection(ctx)
+	// Bound the whole exchange (dial/open included) by the caller context and
+	// the exchange cap.
+	exchangeCtx, cancelExchange := context.WithTimeout(ctx, doqExchangeTimeout)
+	defer cancelExchange()
+
+	connection, err := d.getOrCreateConnection(exchangeCtx)
 	if err != nil {
 		return nil, err
 	}
 
-	stream, err := connection.OpenStreamSync(ctx)
+	stream, err := connection.OpenStreamSync(exchangeCtx)
 	if err != nil {
-		if ctx.Err() != nil {
+		if exchangeCtx.Err() != nil {
 			return nil, err
 		}
 		// If failed to open stream, we should try to create a new connection.
-		connection, err = d.replaceConnection(ctx, connection)
+		connection, err = d.replaceConnection(exchangeCtx, connection)
 		if err != nil {
 			return nil, err
 		}
-		stream, err = connection.OpenStreamSync(ctx)
+		stream, err = connection.OpenStreamSync(exchangeCtx)
 		if err != nil {
 			return nil, err
 		}
 	}
+
+	// Apply the exchange deadline to the stream I/O and unblock any parked
+	// Read/Write synchronously when the exchange context is done. Cancellation
+	// never closes the shared QUIC connection: only this stream is abandoned.
+	finSent := false
+	writeCanceled := false
 	defer func() {
-		// Best effort cleanup; stream may already be closed by QUIC implementation.
-		_ = stream.Close()
+		if !finSent && !writeCanceled {
+			// Best effort cleanup; the stream may already be closed by the
+			// QUIC implementation.
+			_ = stream.Close()
+		}
 	}()
+	if deadline, ok := exchangeCtx.Deadline(); ok {
+		_ = stream.SetDeadline(deadline)
+	}
+	stopWatchdog := context.AfterFunc(exchangeCtx, func() {
+		// A past deadline unblocks any Read/Write parked inside quic-go.
+		_ = stream.SetDeadline(time.Unix(1, 0))
+	})
+	defer stopWatchdog()
 
 	// According https://datatracker.ietf.org/doc/html/rfc9250#section-4.2.1
 	// msg id should set to 0 when transport over QUIC.
 	// thanks https://github.com/natesales/q/blob/1cb2639caf69bd0a9b46494a3c689130df8fb24a/transport/quic.go#L97
 	binary.BigEndian.PutUint16(data[0:2], 0)
 
-	msg, err := sendStreamDNSFunc(stream, data)
+	// Write the complete query, then close the write side (FIN) before
+	// reading: DoQ servers answer only after the query FIN (RFC 9250 §4.2).
+	if err := dnstransport.WriteFramedDNSQuery(stream, data); err != nil {
+		if exchangeCtx.Err() != nil {
+			err = exchangeCtx.Err()
+		}
+		// The query never completed; reset the write side so the peer can
+		// discard the partial query and its resources.
+		writeCanceled = true
+		stream.CancelWrite(doqRequestCancelledCode)
+		return nil, err
+	}
+	if err := stream.Close(); err != nil {
+		// FIN could not be delivered; the stream is gone, so treat the
+		// exchange as failed.
+		if exchangeCtx.Err() != nil {
+			err = exchangeCtx.Err()
+		}
+		return nil, err
+	}
+	finSent = true
+
+	msg, err := dnstransport.ReadFramedDNSResponse(stream)
 	if err != nil {
+		if exchangeCtx.Err() != nil {
+			err = exchangeCtx.Err()
+		}
+		// Abandoning the query: ask the peer to stop transmitting (RFC 9250
+		// §4.3.1). No-op once the peer already sent the full response.
+		stream.CancelRead(doqRequestCancelledCode)
 		return nil, err
 	}
 	return msg, nil

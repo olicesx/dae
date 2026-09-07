@@ -25,10 +25,11 @@ type controlPlaneDNSRuntime struct {
 	// staged handoff — assembles the same behaviour. Patching them onto the
 	// option at one call site silently resets them to zero at the others,
 	// which turned the cache size limit off after a reload.
-	dnsOptimisticCache    bool
-	dnsOptimisticCacheTtl int
-	dnsMaxCacheSize       int
-	dnsIpVersionPrefer    int
+	dnsOptimisticCache         bool
+	dnsOptimisticCacheTtl      int
+	dnsOptimisticStaleReplyTtl int
+	dnsMaxCacheSize            int
+	dnsIpVersionPrefer         int
 
 	dnsListener               *DNSListener
 	dnsListenerStopRegistered bool

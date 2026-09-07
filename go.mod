@@ -7,14 +7,14 @@ require (
 	github.com/antlr/antlr4/runtime/Go/antlr/v4 v4.0.0-20230305170008-8188dc5388df
 	github.com/cilium/ebpf v0.22.0
 	github.com/daeuniverse/dae-config-dist/go/dae_config v0.0.0-20230604120805-1c27619b592d
-	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260904160206-324aa7fd9b7d
+	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260907140516-07427f11deb3
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/json-iterator/go v1.1.12
 	github.com/mholt/archives v0.1.5
 	github.com/miekg/dns v1.1.72
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
 	github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac
-	github.com/olicesx/quic-go v0.0.0-20260831031827-fbf90cb0a47d
+	github.com/olicesx/quic-go v0.0.0-20260907084439-1f471a6b94bd
 	github.com/panjf2000/ants/v2 v2.11.5
 	github.com/safchain/ethtool v0.7.0
 	github.com/shirou/gopsutil/v4 v4.26.1
@@ -115,7 +115,7 @@ require (
 // control, and explicit-transport address behavior. Performance and security
 // claims are enforced in the fork's own unit/race gates; no GC behavior is
 // inferred from pool implementation choice here.
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260905085431-d3c999a52a3d
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260907084439-1f471a6b94bd
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
@@ -126,4 +126,4 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260905
 // remote-FIN data preservation, gRPC zero-deadline clearing, and
 // chain-constructed dialer ownership. Includes cancellable dial queues,
 // immediate TUIC retirement signals, and explicit write-deadline behavior.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260906101127-13b850162fd6
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260907140516-07427f11deb3

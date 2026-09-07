@@ -619,10 +619,14 @@ send_dae_event(__u32 type, __u32 pid, const char *pname, __u8 outbound,
 }
 
 // blocked_event_rate_limited reports whether an emission for rate key
-// is allowed (at most once per second per key). CAS makes the
-// read-modify-write atomic: concurrent CPUs blocked on the same key all read
-// the same old timestamp and only one wins the update, so the 1s-per-key
-// limit holds under a multi-CPU datapath.
+// is allowed (at most once per second per key across CPUs). The clock is
+// sampled AFTER the previous-emission read so now >= old always holds for
+// the value compared: sampling first lets a concurrent CPU claim the slot
+// with a newer timestamp between the sample and the read, and the unsigned
+// subtraction then underflows past the 1s window. CAS claims the slot
+// atomically: when several CPUs observe an expired window concurrently,
+// only the CAS winner emits and the others are rate-limited, keeping the
+// per-key budget strict instead of merely best-effort.
 static __always_inline bool
 blocked_event_rate_limited(__u32 key)
 {
@@ -631,8 +635,8 @@ blocked_event_rate_limited(__u32 key)
 	if (!last)
 		return true;
 
-	__u64 now = bpf_ktime_get_ns();
 	__u64 old = *last;
+	__u64 now = bpf_ktime_get_ns();
 
 	if (now - old < 1000000000ULL)  // 1s
 		return true;
@@ -3583,8 +3587,8 @@ int tcp_offload_redirect(struct __sk_buff *skb)
 
 	// Pre-check: bpf_sk_redirect_hash returns SK_DROP when the key is not
 	// found, which would silently discard the packet. Pass instead. The
-	// lookup acquires a socket reference that must be released before the
-	// program exits (the redirect helper takes its own reference).
+	// lookup returns a referenced socket that must be released before the
+	// program exits (the redirect helper itself does not take a reference).
 	{
 		struct bpf_sock *peer =
 			bpf_map_lookup_elem(&fast_sock, &peer_key);
@@ -3599,8 +3603,10 @@ int tcp_offload_redirect(struct __sk_buff *skb)
 	// pausing), or on any other redirect failure. Dropping the skb would
 	// lose the packet, so translate every outcome into SK_PASS: a successful
 	// redirect has already marked the skb, and a failed one is handed to
-	// the userspace fallback path. (The helper takes its own socket
-	// reference, so the pre-check's released reference stays balanced.)
+	// the userspace fallback path. No further reference accounting is
+	// involved here: the helper resolves the redirect target from the map
+	// and records it in the skb (validated later under RCU when the verdict
+	// runs), so the pre-check's released reference stays balanced.
 	bpf_sk_redirect_hash(skb, &fast_sock, &peer_key, 0);
 	return SK_PASS;
 }

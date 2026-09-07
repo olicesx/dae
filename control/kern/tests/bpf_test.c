@@ -1164,8 +1164,23 @@ int testcheck_blocked_event_rate_limit(struct __sk_buff *skb)
 		return TC_ACT_SHOT;
 	}
 
-	// Budget independence (blocked -> alive): the type-0 emission above
-	// must not have reset the alive key's window.
+	// Budget independence (blocked -> alive), value-level: the type-0
+	// emission above must not have refreshed the alive slot. The behaviour
+	// check below cannot see a refresh - the fresh armed timestamp and a
+	// rewritten one both throttle - so compare the stored value directly
+	// with the armed timestamp: any write to the alive slot shows up here.
+	last = bpf_map_lookup_elem(&alive_block_rate_map, &alive_key);
+	if (!last) {
+		bpf_printk("alive rate-limit slot vanished\n");
+		return TC_ACT_SHOT;
+	}
+	if (*last != now) {
+		bpf_printk("blocked emission refreshed the alive rate-limit slot\n");
+		return TC_ACT_SHOT;
+	}
+
+	// Budget independence (blocked -> alive), behaviour-level: the type-0
+	// emission above must not have reset the alive key's window.
 	if (!blocked_event_rate_limited(alive_key)) {
 		bpf_printk("blocked emission reset the alive rate-limit slot\n");
 		return TC_ACT_SHOT;

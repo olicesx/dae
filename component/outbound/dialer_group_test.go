@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -579,6 +580,11 @@ func (r *dataUdpCallbackRecorder) callback(alive bool, networkType *dialer.Netwo
 // DNS-UDP collections hold no latency sample unless seedDnsLatency is set.
 func newDataUdpCallbackGroup(t *testing.T, rec *dataUdpCallbackRecorder, seedDnsLatency bool) (*DialerGroup, []*dialer.Dialer) {
 	t.Helper()
+	return newDataUdpGroup(t, rec.callback, seedDnsLatency)
+}
+
+func newDataUdpGroup(t *testing.T, callback func(bool, *dialer.NetworkType, bool), seedDnsLatency bool) (*DialerGroup, []*dialer.Dialer) {
+	t.Helper()
 	option := &dialer.GlobalOption{
 		Log:               log,
 		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
@@ -596,8 +602,96 @@ func newDataUdpCallbackGroup(t *testing.T, rec *dataUdpCallbackRecorder, seedDns
 	}
 	g := NewDialerGroup(option, "callback-group", dialers, newEmptyAnnotations(len(dialers)),
 		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinLastLatency},
-		rec.callback)
+		callback)
 	return g, dialers
+}
+
+// TestDialerGroup_AliveCallbackSerializesRevalidation ensures an older
+// availability callback cannot publish after a newer revival has completed
+// membership revalidation.
+func TestDialerGroup_AliveCallbackSerializesRevalidation(t *testing.T) {
+	deadStarted := make(chan struct{})
+	releaseDead := make(chan struct{})
+	revivalPublished := make(chan struct{})
+	var deadOnce sync.Once
+	var revivalOnce sync.Once
+	var eventsMu sync.Mutex
+	var events []bool
+	tracking := false
+
+	callback := func(alive bool, networkType *dialer.NetworkType, isInit bool) {
+		if !tracking || isInit || networkType == nil || networkType.L4Proto != consts.L4ProtoStr_UDP ||
+			networkType.IpVersion != consts.IpVersionStr_4 || networkType.IsDns ||
+			networkType.EffectiveUdpHealthDomain() != dialer.UdpHealthDomainData {
+			return
+		}
+		eventsMu.Lock()
+		events = append(events, alive)
+		eventsMu.Unlock()
+		if alive {
+			revivalOnce.Do(func() { close(revivalPublished) })
+			return
+		}
+		deadOnce.Do(func() {
+			close(deadStarted)
+			<-releaseDead
+		})
+	}
+
+	g, dialers := newDataUdpGroup(t, callback, false)
+	tracking = true
+	t.Cleanup(func() { _ = g.Close() })
+	set := g.MustGetAliveDialerSet(TestDataUdp4NetworkType)
+	if set.Len() != 2 {
+		t.Fatalf("setup: alive = %d, want 2", set.Len())
+	}
+
+	dialers[0].ReportUnavailableForced(TestDataUdp4NetworkType, errors.New("offline"))
+	deadDone := make(chan struct{})
+	go func() {
+		dialers[1].ReportUnavailableForced(TestDataUdp4NetworkType, errors.New("offline"))
+		close(deadDone)
+	}()
+	select {
+	case <-deadStarted:
+	case <-time.After(time.Second):
+		t.Fatal("dead availability callback did not start")
+	}
+
+	revivalDone := make(chan struct{})
+	go func() {
+		dialers[0].ReportAvailableTraffic(TestDataUdp4NetworkType)
+		close(revivalDone)
+	}()
+	select {
+	case <-revivalPublished:
+		t.Fatal("revival callback published before the older callback completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseDead)
+	select {
+	case <-deadDone:
+	case <-time.After(time.Second):
+		t.Fatal("dead availability update did not finish")
+	}
+	select {
+	case <-revivalDone:
+	case <-time.After(time.Second):
+		t.Fatal("revival availability update did not finish")
+	}
+	select {
+	case <-revivalPublished:
+	case <-time.After(time.Second):
+		t.Fatal("revival callback did not publish")
+	}
+
+	eventsMu.Lock()
+	got := append([]bool(nil), events...)
+	eventsMu.Unlock()
+	if !reflect.DeepEqual(got, []bool{false, true}) {
+		t.Fatalf("alive callback sequence = %v, want [false true]", got)
+	}
 }
 
 // TestDialerGroup_DataUdpRevivalCallback_NoDnsLatency pins the callback
@@ -664,6 +758,53 @@ func TestDialerGroup_DataUdpRevivalCallback_WithDnsLatency(t *testing.T) {
 	if !reflect.DeepEqual(rec.events, want) {
 		t.Fatalf("control case: data-UDP alive events = %v, want exact sequence %v",
 			rec.events, want)
+	}
+}
+
+// TestDialerGroup_PublishAliveChangeRevalidatesStaleNotifications pins the
+// publication contract: set callbacks fire outside the set lock, so their
+// bool can lag behind a concurrent state flip (a death callback paused while
+// a revival completes). publishAliveChange must re-derive the value from the
+// set's current membership so a stale notification can never regress the
+// kernel connectivity map away from the truth, while init publications pass
+// through untouched.
+func TestDialerGroup_PublishAliveChangeRevalidatesStaleNotifications(t *testing.T) {
+	rec := &dataUdpCallbackRecorder{}
+	g, dialers := newDataUdpCallbackGroup(t, rec, false)
+	set := g.MustGetAliveDialerSet(TestDataUdp4NetworkType)
+	if set.Len() != 2 {
+		t.Fatalf("setup: alive = %d, want 2", set.Len())
+	}
+	n0 := len(rec.events)
+
+	// Both dialers alive: a stale "dead" transition (its callback delayed
+	// behind a revival that already happened) must publish the current
+	// truth, not the historical bool.
+	g.publishAliveChange(false, TestDataUdp4NetworkType, false)
+
+	// Real death empties the domain and fires the real "false" event.
+	dialers[0].ReportUnavailableForced(TestDataUdp4NetworkType, errors.New("offline"))
+	dialers[1].ReportUnavailableForced(TestDataUdp4NetworkType, errors.New("offline"))
+	if set.Len() != 0 {
+		t.Fatalf("after kill: alive = %d, want 0", set.Len())
+	}
+
+	// Domain dead: a stale "alive" transition must be revalidated down to
+	// the current truth as well.
+	g.publishAliveChange(true, TestDataUdp4NetworkType, false)
+
+	// Init publications are exempt from revalidation by design.
+	g.publishAliveChange(true, TestDataUdp4NetworkType, true)
+
+	// Traffic-driven revival still publishes the real "true".
+	dialers[0].ReportAvailableTraffic(TestDataUdp4NetworkType)
+	if set.Len() != 1 {
+		t.Fatalf("after revive: alive = %d, want 1", set.Len())
+	}
+
+	want := []string{"true", "false", "false", "init", "true"}
+	if !reflect.DeepEqual(rec.events[n0:], want) {
+		t.Fatalf("published events after setup = %v, want %v", rec.events[n0:], want)
 	}
 }
 

@@ -36,6 +36,7 @@ type DialerGroup struct {
 	dialersAnnotations  []*dialer.Annotation
 	checkTolerance      time.Duration
 	aliveChangeCallback func(alive bool, networkType *dialer.NetworkType, isInit bool)
+	alivePublishMu      sync.Mutex
 
 	resuscitateLastTime atomic.Int64
 	noAliveLogLastTimes [8]atomic.Int64
@@ -76,7 +77,7 @@ func NewDialerGroup(
 	group.cachedMinCheckInterval = group.MinCheckInterval()
 
 	for _, nt := range standardSelectionNetworkTypes() {
-		aliveChangeCallback(true, nt, true)
+		group.publishAliveChange(true, nt, true)
 	}
 
 	return group
@@ -460,7 +461,7 @@ func (g *DialerGroup) buildSelectionState(policy DialerSelectionPolicy, setAlive
 			g.log, g.Name, &networkType, g.checkTolerance, policy.Policy,
 			g.Dialers, g.dialersAnnotations,
 			func(networkType *dialer.NetworkType) func(alive bool) {
-				return func(alive bool) { g.aliveChangeCallback(alive, networkType, false) }
+				return func(alive bool) { g.publishAliveChange(alive, networkType, false) }
 			}(&networkType),
 			false,
 		)
@@ -479,6 +480,36 @@ func (g *DialerGroup) buildSelectionState(policy DialerSelectionPolicy, setAlive
 		}
 	}
 	return state
+}
+
+// publishAliveChange forwards a group availability transition to the
+// aliveChangeCallback after revalidating it against the set's current
+// membership. AliveDialerSet fires its callback outside the set lock, so the
+// bool only describes the state at transition time: a notification that lags
+// behind a concurrent flip (e.g. a death callback paused while a revival
+// completes) would otherwise publish a historical value and could regress the
+// kernel outbound-connectivity map away from the current truth. Re-deriving
+// the bool from the set's membership at publication time keeps every write
+// consistent with the latest state, so the map converges on the final truth
+// and cannot be left at 0 for a group that is alive again - data-UDP domains
+// have no periodic probe that would repair it. Init publications are exempt:
+// a fresh group publishes optimistic aliveness before its health converges.
+func (g *DialerGroup) publishAliveChange(alive bool, networkType *dialer.NetworkType, isInit bool) {
+	if g == nil || g.aliveChangeCallback == nil {
+		return
+	}
+	// Set callbacks intentionally run outside AliveDialerSet's lock. Serialize
+	// the membership revalidation with the callback so an older notification
+	// cannot publish after a newer revival has already reached the datapath.
+	g.alivePublishMu.Lock()
+	defer g.alivePublishMu.Unlock()
+
+	if !isInit {
+		if set := g.MustGetAliveDialerSet(networkType); set != nil {
+			alive = set.Len() > 0
+		}
+	}
+	g.aliveChangeCallback(alive, networkType, isInit)
 }
 
 func (g *DialerGroup) registerAliveDialerSets(aliveDialerSets [8]*dialer.AliveDialerSet) {

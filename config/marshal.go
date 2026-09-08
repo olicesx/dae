@@ -132,7 +132,31 @@ unsupported:
 	return fmt.Errorf("unsupported section type %v", from.Type())
 }
 
-func (m *Marshaller) marshalLeaf(key string, from reflect.Value, depth int) (err error) {
+func (m *Marshaller) marshalAndFunctionList(key string, from, annotation reflect.Value, depth int) error {
+	for i := 0; i < from.Len(); i++ {
+		andFuncs := from.Index(i)
+		if andFuncs.Len() == 0 {
+			continue
+		}
+		funcs := make([]*config_parser.Function, 0, andFuncs.Len())
+		for j := 0; j < andFuncs.Len(); j++ {
+			funcs = append(funcs, andFuncs.Index(j).Interface().(*config_parser.Function))
+		}
+		p := &config_parser.Param{
+			Key:          key,
+			AndFunctions: funcs,
+		}
+		if annotation.IsValid() && annotation.Kind() == reflect.Slice && i < annotation.Len() {
+			if a, ok := annotation.Index(i).Interface().([]*config_parser.Param); ok {
+				p.Annotation = a
+			}
+		}
+		m.writeLine(depth, p.String(true, true))
+	}
+	return nil
+}
+
+func (m *Marshaller) marshalLeaf(key string, from reflect.Value, depth int, annotation reflect.Value) (err error) {
 	if m.IgnoreZero && from.IsZero() {
 		// Do not marshal zero value.
 		return nil
@@ -143,19 +167,7 @@ func (m *Marshaller) marshalLeaf(key string, from reflect.Value, depth int) (err
 			return nil
 		}
 		if from.Type().Elem().Kind() == reflect.Slice && from.Type().Elem().Elem() == reflect.TypeFor[*config_parser.Function]() {
-			for i := 0; i < from.Len(); i++ {
-				andFuncs := from.Index(i)
-				if andFuncs.Len() == 0 {
-					continue
-				}
-				vals := make([]string, 0, andFuncs.Len())
-				for j := 0; j < andFuncs.Len(); j++ {
-					v := andFuncs.Index(j).Interface().(*config_parser.Function)
-					vals = append(vals, v.String(true, true, false))
-				}
-				m.writeLine(depth, key+":"+strings.Join(vals, "&&"))
-			}
-			return nil
+			return m.marshalAndFunctionList(key, from, annotation, depth)
 		}
 		switch from.Index(0).Interface().(type) {
 		case fmt.Stringer, string,
@@ -174,7 +186,7 @@ func (m *Marshaller) marshalLeaf(key string, from reflect.Value, depth int) (err
 			var vals []string
 			for i := 0; i < from.Len(); i++ {
 				v := from.Index(i).Interface().(*config_parser.Function)
-				vals = append(vals, v.String(true, true, false))
+				vals = append(vals, v.MarshalString(true, true, false))
 			}
 			m.writeLine(depth, key+":"+strings.Join(vals, "&&"))
 		case KeyableString:
@@ -197,7 +209,7 @@ func (m *Marshaller) marshalLeaf(key string, from reflect.Value, depth int) (err
 			bool:
 			m.writeLine(depth, key+":"+strconv.Quote(fmt.Sprintf("%v", val)))
 		case *config_parser.Function:
-			m.writeLine(depth, key+":"+val.String(true, true, false))
+			m.writeLine(depth, key+":"+val.MarshalString(true, true, false))
 		default:
 			return fmt.Errorf("unknown leaf type: %T", val)
 		}
@@ -250,8 +262,9 @@ func (m *Marshaller) marshalParam(from reflect.Value, depth int) (err error) {
 			continue
 		}
 
-		// Normal field.
-		if err = m.marshalLeaf(key, field, depth); err != nil {
+		// Pair Field with sibling FieldAnnotation by index (Group.Filter).
+		annotation := from.FieldByName(structField.Name + "Annotation")
+		if err = m.marshalLeaf(key, field, depth, annotation); err != nil {
 			return err
 		}
 	}

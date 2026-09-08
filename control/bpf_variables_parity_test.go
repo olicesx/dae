@@ -92,6 +92,20 @@ func TestEventRateStructLayoutContract(t *testing.T) {
 	}
 }
 
+func TestEventRateValueMatchesContract(t *testing.T) {
+	// Anchors the injected value (and the contract symbols) in the
+	// dae_stub_ebpf build, where bpf_utils.go — the production consumer —
+	// is excluded: without this reference the mirror would be flagged
+	// unused by the stub-tagged lint pass.
+	v := eventRateValue()
+	if v.WindowNs != blockedEventRateWindowNs {
+		t.Fatalf("EVENT_RATE window %d != contract %d", v.WindowNs, blockedEventRateWindowNs)
+	}
+	if v.BlockedKey != blockedEventRateKey {
+		t.Fatalf("EVENT_RATE blocked key %d != contract %d", v.BlockedKey, blockedEventRateKey)
+	}
+}
+
 func TestEventRateFallbackConstantsMatchGoOwner(t *testing.T) {
 	m := rateKeyFallbackPattern.FindStringSubmatch(tproxySource)
 	if m == nil {

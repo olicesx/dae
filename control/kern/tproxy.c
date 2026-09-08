@@ -513,26 +513,43 @@ enum bpf_stats_key {
 	BPF_STATS_TCP_CONN_OVERFLOW = 1,
 };
 
-// BLOCKED_EVENT_RATE_KEY is the rate-map key for the DAE_EVENT_BLOCKED
-// (type-0) rate domain. Outbound ids are stored in an 8-bit field (see
-// struct dae_event and send_blocked_alive_event), so 256 is reserved: it
-// can never collide with a real outbound id, and the ARRAY below reserves
-// one extra slot for it.
-#define BLOCKED_EVENT_RATE_KEY 256
+// Event rate-limit constants are owned by userspace and injected through the
+// .rodata datasec at load time (same mechanism as struct dae_param). The
+// initializers below are clang-side fallbacks: Go overwrites the variable
+// before LoadAndAssign, and the ARRAY capacity is derived from the same
+// userspace key there, so the key-domain/capacity pairing has a single
+// owner instead of a two-sided convention.
+struct dae_event_rate {
+	__u64 window_ns;   // per-key minimum spacing between emissions
+	__u32 blocked_key; // reserved rate-map key for DAE_EVENT_BLOCKED
+};
+
+// window_ns first keeps the struct free of implicit padding: the Go mirror
+// is written with packed binary encoding, so the C layout must not carry
+// alignment holes either.
+const volatile struct dae_event_rate EVENT_RATE = {
+	.window_ns = 1000000000ULL,
+	.blocked_key = 256,
+};
+
+// Map definitions need an integer constant expression for max_entries, so
+// the fallback stays a macro; the authoritative capacity is re-derived from
+// the injected EVENT_RATE.blocked_key on the Go side (tuneEventRateMap).
+#define BLOCKED_EVENT_RATE_KEY_FALLBACK 256
 
 // alive_block_rate_map rate-limits blocked-event emission: key = outbound
-// id for DAE_EVENT_BLOCKED_ALIVE, or BLOCKED_EVENT_RATE_KEY for
+// id for DAE_EVENT_BLOCKED_ALIVE, or EVENT_RATE.blocked_key for
 // DAE_EVENT_BLOCKED; value = last emission time (CLOCK_MONOTONIC ns).
 // Without this, an outbound that is not alive (or a blocked-flow flood)
 // would emit one event per blocked packet and flood the ringbuf, starving
 // the consumed event types. Key domains cannot collide: outbound ids live
-// in the 0..255 u8 domain while BLOCKED_EVENT_RATE_KEY is the reserved
-// slot beyond it.
+// in the 0..255 u8 domain while the reserved blocked_key is the slot
+// beyond it.
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__type(key, __u32);
 	__type(value, __u64);
-	__uint(max_entries, BLOCKED_EVENT_RATE_KEY + 1);
+	__uint(max_entries, BLOCKED_EVENT_RATE_KEY_FALLBACK + 1);
 } alive_block_rate_map SEC(".maps");
 
 // Events delivered to userspace via ring buffer.
@@ -638,7 +655,7 @@ blocked_event_rate_limited(__u32 key)
 	__u64 old = *last;
 	__u64 now = bpf_ktime_get_ns();
 
-	if (now - old < 1000000000ULL)  // 1s
+	if (now - old < EVENT_RATE.window_ns)
 		return true;
 	if (__sync_val_compare_and_swap(last, old, now) != old)
 		return true;
@@ -669,7 +686,7 @@ static __always_inline void
 send_blocked_event(__u8 outbound, __u8 l4proto, const __u32 *sip,
 		   const __u32 *dip, __u16 sport, __u16 dport)
 {
-	if (blocked_event_rate_limited(BLOCKED_EVENT_RATE_KEY))
+	if (blocked_event_rate_limited(EVENT_RATE.blocked_key))
 		return;
 
 	send_dae_event(DAE_EVENT_BLOCKED, 0, NULL, outbound, l4proto, sip,

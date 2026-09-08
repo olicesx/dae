@@ -33,18 +33,21 @@ var expectedInjectedVariables = []string{
 	"EVENT_RATE",
 }
 
-// eventRateValue returns the value injected into the eBPF .rodata variable
-// EVENT_RATE (struct dae_event_rate in kern/tproxy.c). The field order
-// mirrors the C struct: window_ns (u64) first, blocked_key (u32) second, no
-// implicit padding between them; the trailing [4]byte makes the Go mirror
-// match the C sizeof exactly. Keep in sync with kern/tproxy.c (guarded by
+// eventRateSpec mirrors C struct dae_event_rate. The field order mirrors the
+// C struct: window_ns (u64) first, blocked_key (u32) second, no implicit
+// padding between them; the trailing [4]byte makes the Go mirror match the
+// C sizeof exactly. Keep in sync with kern/tproxy.c (guarded by
 // TestBpfVariablesParityWithKernelSource).
-func eventRateValue() any {
-	return struct {
-		WindowNs   uint64
-		BlockedKey uint32
-		_          [4]byte
-	}{
+type eventRateSpec = struct {
+	WindowNs   uint64
+	BlockedKey uint32
+	_          [4]byte
+}
+
+// eventRateValue returns the value injected into the eBPF .rodata variable
+// EVENT_RATE (struct dae_event_rate in kern/tproxy.c) at load time.
+func eventRateValue() eventRateSpec {
+	return eventRateSpec{
 		WindowNs:   blockedEventRateWindowNs,
 		BlockedKey: blockedEventRateKey,
 	}

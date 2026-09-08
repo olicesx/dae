@@ -301,6 +301,12 @@ const (
 	defaultConnStateMapMaxEntries = 65536 * 4
 )
 
+// The blocked-event rate-limit contract values (blockedEventRateKey,
+// blockedEventRateWindowNs, expectedInjectedVariables, eventRateValue) live
+// in event_rate_contract.go, which compiles under both the real-eBPF build
+// and the dae_stub_ebpf test build so the parity tests can pin them against
+// the kernel source.
+
 // bpfDataplanePrograms mirrors the always-on datapath programs declared in the
 // generated bpfPrograms, but WITHOUT the opt-in tcp_offload_* programs. It is the
 // binding target for the first (mandatory) load pass so that a trimmed kernel
@@ -378,8 +384,22 @@ func loadBpfObjectsWithConstantsAndCustomizer(
 		return err
 	}
 	for name, value := range constants {
-		if err := spec.Variables[name].Set(value); err != nil {
+		v, ok := spec.Variables[name]
+		if !ok || v == nil {
+			return fmt.Errorf("inject eBPF constant %q: variable not found in collection spec; the kernel-side declaration was likely removed or renamed — keep the Go-side constants map in sync with kern/tproxy.c .rodata variables", name)
+		}
+		if err := v.Set(value); err != nil {
 			return err
+		}
+	}
+	// Completeness guard: every expected .rodata variable must actually be
+	// injected above. A variable missing from the constants map would
+	// otherwise silently fall back to its C-side initializer (e.g. the
+	// clang fallback of EVENT_RATE), and a map geometry derived on the Go
+	// side could diverge from the value the kernel actually runs with.
+	for _, name := range expectedInjectedVariables {
+		if _, ok := constants[name]; !ok {
+			return fmt.Errorf("eBPF constant %q is expected to be injected but missing from the constants map", name)
 		}
 	}
 	if customize != nil {
@@ -424,6 +444,28 @@ func customizeBpfMapSpecs(spec *ebpf.CollectionSpec, connStateMapMaxEntries uint
 	if err := tuneConnStateBpfMap(spec, connStateMapMaxEntries); err != nil {
 		return err
 	}
+	return nil
+}
+
+// tuneEventRateMap derives the alive_block_rate_map capacity from the same
+// userspace-owned blocked key that gets injected into the EVENT_RATE rodata
+// variable, so the key domain and the ARRAY geometry share a single owner
+// (the map definition on the C side can only reference a compile-time
+// fallback constant). The derived invariant matches the C fallback exactly:
+// capacity = reserved key + 1.
+func tuneEventRateMap(spec *ebpf.CollectionSpec) error {
+	if spec == nil {
+		return fmt.Errorf("nil collection spec")
+	}
+	m, ok := spec.Maps["alive_block_rate_map"]
+	if !ok || m == nil {
+		return fmt.Errorf("missing map spec %q", "alive_block_rate_map")
+	}
+	want := blockedEventRateKey + 1
+	if m.MaxEntries != want {
+		return fmt.Errorf("alive_block_rate_map capacity %d diverges from the userspace-owned blocked-event rate key %d (+1 slot) in EVENT_RATE; the C fallback and Go constants are out of sync", m.MaxEntries, blockedEventRateKey)
+	}
+	m.MaxEntries = want
 	return nil
 }
 
@@ -566,6 +608,7 @@ retryLoadBpf:
 			datapathGeneration:   opts.DatapathGeneration,
 			daeSocketMark:        soMarkFromDae,
 		},
+		"EVENT_RATE": eventRateValue(),
 	}
 	var dataplane bpfDataplane
 	if err = loadBpfObjectsWithConstantsAndCustomizer(
@@ -573,7 +616,10 @@ retryLoadBpf:
 		opts.CollectionOptions,
 		constants,
 		func(spec *ebpf.CollectionSpec) error {
-			return customizeBpfMapSpecs(spec, opts.ConnStateMapMaxEntries)
+			if err := customizeBpfMapSpecs(spec, opts.ConnStateMapMaxEntries); err != nil {
+				return err
+			}
+			return tuneEventRateMap(spec)
 		},
 	); err != nil {
 		if errors.Is(err, ebpf.ErrMapIncompatible) {

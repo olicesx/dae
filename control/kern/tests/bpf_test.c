@@ -1094,7 +1094,7 @@ int testcheck_wan_udp_new_outbound_obeys_connectivity_change(
 
 // Blocked-event rate-limit regression. DAE_EVENT_BLOCKED (type 0) shares
 // alive_block_rate_map with the per-outbound DAE_EVENT_BLOCKED_ALIVE
-// domains. The reserved BLOCKED_EVENT_RATE_KEY slot must resolve inside the
+// domains. The reserved EVENT_RATE.blocked_key slot must resolve inside the
 // ARRAY (previously 0xFFFFFFFF exceeded max_entries, so every lookup
 // failed and type-0 emissions were suppressed forever) and each key must
 // keep an independent 1s budget.
@@ -1114,7 +1114,7 @@ SEC("tc/check/blocked_event_rate_limit")
 int testcheck_blocked_event_rate_limit(struct __sk_buff *skb)
 {
 	__u32 alive_key = OUTBOUND_USER_DEFINED_MIN;
-	__u32 blocked_key = BLOCKED_EVENT_RATE_KEY;
+	__u32 blocked_key = EVENT_RATE.blocked_key;
 	__u64 now = bpf_ktime_get_ns();
 	__u64 zero = 0;
 	__u64 *last;

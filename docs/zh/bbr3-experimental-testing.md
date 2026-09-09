@@ -35,20 +35,30 @@ GOPROXY=direct GOPRIVATE='github.com/olicesx/*' go mod download github.com/olice
 
 ## 3. 启用
 
-在 dae 配置的 `node` 段里给 TUIC 链接追加 `cc_override=bbr3`：
+在 dae 配置的 `node` 段里给 QUIC 协议链接追加 `cc_override=bbr3`。outbound 里
+**所有已实现的 QUIC 协议**都支持（tuic / juicity / hysteria2；`naive+quic` 仍不支持）：
 
 ```text
 node {
     t1: 'tuic://<uuid>:<password>@<server>:<port>?congestion_control=bbr&cc_override=bbr3&cwnd=2500000'
+    j1: 'juicity://<uuid>:<password>@<server>:<port>?congestion_control=bbr&cc_override=bbr3&cwnd=2500000'
+    h1: 'hysteria2://<password>@<server>:<port>/?sni=<domain>&cc_override=bbr3&upmbps=20&downmbps=100'
 }
 ```
+
+各协议语义差异：
+
+| 协议 | bbr3 的带宽上限来源 | 说明 |
+|---|---|---|
+| tuic / juicity | `cwnd`（字节/秒） | 与 brutal 同一单位；`0`/不设 = 纯探测 |
+| hysteria2 | `upmbps` 换算后的 **MaxTx**（字节/秒） | 不设带宽则 `0` = 纯探测；`cc_override` 优先于服务端的 RxAuto 决策 |
 
 | 参数 | 说明 |
 |---|---|
 | `cc_override` | 只在客户端本地生效，**不发给服务端**，服务端无需支持 |
 | `congestion_control` | 仍按原逻辑发给服务端并回显；服务端写 `bbr`/`cubic`/留空都可以 |
 | `cwnd` | 对 bbr3 是接入带宽上限（字节/秒），只作上限不是目标；`0`/不设 = 纯探测（**不在证据覆盖范围内**） |
-| 白名单 | `bbr`、`cubic`、`new_reno`、`brutal`、`bbr3`；非法值在首次拨号时报错 |
+| 白名单 | `bbr`、`cubic`、`new_reno`、`brutal`、`bbr3`；非法值在首次拨号时报错。注意 `cubic`/`new_reno` 在 tuic/juicity 下会落到 BBR（既有行为），在 hysteria2 下直接报错 |
 
 复现仿真条件用 `cwnd=2500000`（= 20 Mbps）。
 
@@ -62,13 +72,15 @@ global {
 }
 ```
 
-每条 TUIC 连接安装控制器时输出：
+TUIC / juicity 连接安装控制器时输出：
 
 ```text
 level=debug msg="installing experimental bbr3 congestion controller" cc=bbr3 hint_bps=2500000
 ```
 
-看不到这行 = 没生效（链接写错、拼写错误、或走了其他节点）。`cc_override` 拼错时表现为**该节点连接失败**，不会在配置校验阶段报错。
+**hysteria2 目前没有这行日志**（其 CC 在握手后分派），只能靠行为对照判断。看不到日志 =
+没生效（链接写错、拼写错误、或走了其他节点）。`cc_override` 拼错时表现为**该节点连接失败**，
+不会在配置校验阶段报错。
 
 ## 4. 回退（三级，任选）
 
@@ -82,12 +94,19 @@ tuic://...?congestion_control=bbr
 tuic://...?congestion_control=bbr&cc_override=bbr
 ```
 
-**② 代码级**
+**② 代码级**：特性已合入基线分支 `kdae`（以合并提交形式），所以回退就是撤销合并：
 
 ```bash
-git checkout kdae            # 切回基线分支
-# 或保留分支反向提交：git revert <本分支提交>
+# outbound：合并提交 319c8e6（基线 7a32a56 与特性分支 934b37c 的合并）
+cd <outbound 仓库> && git revert -m 1 319c8e6
+
+# dae：合并提交用下面的命令查（本页提交时尚未生成）
+cd <dae 仓库> && git log --merges -1 --format='%h %s' kdae
+git revert -m 1 <上面查到的 sha>   # 恢复 go.mod 旧钉法并移除本指南
 ```
+
+两条都要做：dae 的合并提交只恢复依赖钉法，outbound 的合并提交才移除控制器代码。
+若只想停用而不动代码，用 ① 即可。
 
 **③ 产品级**：把 `go.mod` 的 outbound 钉回旧提交
 

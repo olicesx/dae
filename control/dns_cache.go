@@ -290,25 +290,22 @@ func setRecordTTL(rr dnsmessage.RR, ttl uint32) {
 
 func setSectionTTL(rrs []dnsmessage.RR, ttl uint32, scratch []uint32) {
 	for i, rr := range rrs {
-		hdr := rr.Header()
-		scratch[i] = hdr.Ttl
-		// A stored zero TTL is the downstream "do not cache this" signal dae
-		// sets on its own A/AAAA answers; the TTL rewrite must not resurrect
-		// it (see clampWireRecordTtls for the served-stale counterpart).
-		if hdr.Ttl != 0 {
-			setRecordTTL(rr, ttl)
-		}
+		scratch[i] = rr.Header().Ttl
+		setRecordTTL(rr, ttl)
 	}
 }
 
-// copySectionWithTTL deep-copies a record section and re-stamps the TTL of
-// every record whose stored TTL is non-zero. This is the single place where the
-// "materialize a stored section onto the wire at a given remaining TTL" policy
-// lives, so the pre-packed path and the in-place fallback cannot drift apart.
-// Records that are already zero-TTL (dae-managed A/AAAA answers) stay zero: the
-// zero is the signal that the downstream resolver must not cache the answer
-// because dae manages its lifetime itself. The EDNS OPT pseudo-record is never
-// treated as a TTL (see setRecordTTL).
+// copySectionWithTTL deep-copies a record section and stamps the remaining
+// lifetime onto every record. This is the single place where the "materialize a
+// stored section onto the wire at a given remaining TTL" policy lives, so the
+// pre-packed path and the in-place fallback cannot drift apart.
+//
+// Answers carry a real TTL: the first answer carries the TTL the upstream
+// returned, a cache hit the remaining lifetime of the entry. dae tracks
+// freshness of its own address answers through the entry deadline and the stale
+// window rather than by telling resolvers not to cache, so nothing here may
+// rewrite a lifetime to zero. The EDNS OPT pseudo-record is never treated as a
+// TTL (see setRecordTTL).
 func copySectionWithTTL(rrs []dnsmessage.RR, ttl uint32) []dnsmessage.RR {
 	if rrs == nil {
 		return nil
@@ -316,9 +313,7 @@ func copySectionWithTTL(rrs []dnsmessage.RR, ttl uint32) []dnsmessage.RR {
 	copied := make([]dnsmessage.RR, len(rrs))
 	for i, rr := range rrs {
 		record := dnsmessage.Copy(rr)
-		if record.Header().Ttl != 0 {
-			setRecordTTL(record, ttl)
-		}
+		setRecordTTL(record, ttl)
 		copied[i] = record
 	}
 	return copied

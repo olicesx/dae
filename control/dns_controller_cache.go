@@ -1138,15 +1138,13 @@ func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg, responseC
 	}
 
 	// Positive response. Entry lifetime is the minimum over all retained real
-	// records (answers, authority and additional sections), collected before
-	// the A/AAAA downstream-zero rewrite below. Fixed-domain operator
-	// overrides still apply downstream in the deadline functions.
+	// records (answers, authority and additional sections). Fixed-domain
+	// operator overrides still apply downstream in the deadline functions.
 	//
-	// A zero minimum is intentionally still cached with a now-deadline: the
-	// A/AAAA downstream-zero rewrite above makes zero the *normal* stored TTL
-	// for dae-managed address answers, whose freshness dae tracks through the
-	// entry deadline and serves through the stale window. Treating every
-	// zero-TTL answer as uncacheable would disable that self-management.
+	// A zero minimum is still cached with a now-deadline: an upstream that
+	// answers with TTL 0 asks for exactly that, and dae keeps its own freshness
+	// bookkeeping through the entry deadline and the stale window instead of
+	// treating the record as uncacheable.
 	ttl := minRealRecordTtl(msg)
 	// Clamp TTL to 1 year max to prevent integer overflow when casting to int
 	// on 32-bit platforms.
@@ -1154,12 +1152,13 @@ func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg, responseC
 		ttl = dnsMaxCacheableTtl
 	}
 
-	// For A/AAAA records, we set TTL to 0 to prevent downstream caching while we manage it.
-	if q.Qtype == dnsmessage.TypeA || q.Qtype == dnsmessage.TypeAAAA {
-		for i := range msg.Answer {
-			msg.Answer[i].Header().Ttl = 0
-		}
-	}
+	// Answers are forwarded with their real TTL, both on the first response and
+	// on a cache hit (where it is the remaining lifetime). dae used to rewrite
+	// A/AAAA TTLs to zero to keep resolvers from caching, but that made the
+	// answer a client saw depend on whether the entry happened to be cached:
+	// the first response carried 0 and every later one the remaining lifetime.
+	// Freshness of dae-managed address answers is tracked by the entry deadline
+	// and the stale window, not by suppressing downstream caching.
 
 	// Update DnsCache.
 	return c.updateDnsCache(msg, responseCacheKey, ttl, &q)

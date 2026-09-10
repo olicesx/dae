@@ -19,16 +19,18 @@ import (
 )
 
 // These tests pin the single "wire materialization" policy shared by the
-// pre-packed path and the in-place fallback: section TTLs are re-stamped only
-// for records whose stored TTL is non-zero, and the question section echoes the
+// pre-packed path and the in-place fallback: section TTLs are stamped with the
+// remaining lifetime on every delivery path, and the question section echoes the
 // requester's own spelling.
 
-// TestServedAddressAnswersKeepZeroTtlOnMissAndHit is the P2-5 regression: dae
-// zeroes the TTL of its own A/AAAA answers so downstream resolvers do not cache
-// them, and the packing paths must not resurrect the entry lifetime. Before the
-// fix the served TTL was rewritten from the cache deadline (a positive value) on
-// both the miss and the hit delivery path.
-func TestServedAddressAnswersKeepZeroTtlOnMissAndHit(t *testing.T) {
+// TestServedAddressAnswersCarryTheRealTtl is the regression for the TTL policy:
+// an answer carries a real TTL on both the miss and the hit path - the upstream
+// TTL on the first response and the remaining lifetime on a cache hit. dae used
+// to rewrite A/AAAA TTLs to zero so that downstream resolvers would not cache
+// them, which made the answer a client saw depend on whether the entry happened
+// to be cached (0 first, a positive lifetime afterwards). Freshness is tracked
+// by the entry deadline and the stale window instead.
+func TestServedAddressAnswersCarryTheRealTtl(t *testing.T) {
 	for _, qtype := range []uint16{dnsmessage.TypeA, dnsmessage.TypeAAAA} {
 		t.Run(dnsmessage.TypeToString[qtype], func(t *testing.T) {
 			installCorpusDnsForwarderFactory(t, func(_ *componentdns.Upstream, _ dialArgument, _ *logrus.Logger) (DnsForwarder, error) {
@@ -56,26 +58,31 @@ func TestServedAddressAnswersKeepZeroTtlOnMissAndHit(t *testing.T) {
 				if msg == nil || len(msg.Answer) == 0 {
 					t.Fatalf("%s: no answer captured", phase)
 				}
-				if ttl := msg.Answer[0].Header().Ttl; ttl != 0 {
-					t.Fatalf("%s: answer TTL = %d, want 0 (the zero is the downstream "+
-						"\"do not cache\" signal and the packing path must not restore the entry lifetime)", phase, ttl)
+				// The upstream stub answers with TTL 60, so a real TTL is in
+				// [1, 60]: the first response carries the upstream value and a
+				// cache hit the remaining lifetime. Zero is only correct when
+				// the upstream itself said zero.
+				ttl := msg.Answer[0].Header().Ttl
+				if ttl == 0 || ttl > 60 {
+					t.Fatalf("%s: answer TTL = %d, want a real TTL in [1,60] (zero only when the upstream answered zero)", phase, ttl)
 				}
 				// The same value must be on the wire that was actually sent.
 				var wire dnsmessage.Msg
 				if err := wire.Unpack(writer.Wire()); err != nil {
 					t.Fatalf("%s: unpack delivered wire: %v", phase, err)
 				}
-				if ttl := wire.Answer[0].Header().Ttl; ttl != 0 {
-					t.Fatalf("%s: delivered wire answer TTL = %d, want 0", phase, ttl)
+				if wireTtl := wire.Answer[0].Header().Ttl; wireTtl != ttl {
+					t.Fatalf("%s: delivered wire answer TTL = %d, in-memory %d", phase, wireTtl, ttl)
 				}
 			}
 		})
 	}
 }
 
-// TestCopySectionWithTTLPolicy pins the shared record-level TTL policy: zero
-// stays zero (dae-managed address answers), non-zero is re-stamped, and the
-// EDNS OPT pseudo-record is never treated as a lifetime.
+// TestCopySectionWithTTLPolicy pins the shared record-level TTL policy: every
+// real record is stamped with the requested remaining lifetime (including one
+// whose stored TTL was zero, so the first response and a cache hit agree), and
+// the EDNS OPT pseudo-record is never treated as a lifetime.
 func TestCopySectionWithTTLPolicy(t *testing.T) {
 	section := []dnsmessage.RR{
 		&dnsmessage.A{Hdr: dnsmessage.RR_Header{Name: "zero.test.", Rrtype: dnsmessage.TypeA, Class: dnsmessage.ClassINET, Ttl: 0}, A: net.ParseIP("192.0.2.1").To4()},
@@ -87,11 +94,11 @@ func TestCopySectionWithTTLPolicy(t *testing.T) {
 	if len(copied) != len(section) {
 		t.Fatalf("copied section length = %d, want %d", len(copied), len(section))
 	}
-	if got := copied[0].Header().Ttl; got != 0 {
-		t.Fatalf("zero-TTL record = %d, want 0", got)
+	if got := copied[0].Header().Ttl; got != 60 {
+		t.Fatalf("record stored with TTL 0 = %d, want the requested 60 (the delivered answer carries the real remaining lifetime, not a zero marker)", got)
 	}
 	if got := copied[1].Header().Ttl; got != 60 {
-		t.Fatalf("non-zero record = %d, want the requested 60", got)
+		t.Fatalf("record stored with TTL 300 = %d, want the requested 60", got)
 	}
 	if got := copied[2].Header().Ttl; got != 0x00008000 {
 		t.Fatalf("OPT flags field = %#x, want it untouched (it is not a TTL)", got)
@@ -153,8 +160,8 @@ func TestPrepackAndInPlaceShareRecordTtlPolicy(t *testing.T) {
 			t.Fatalf("answer[%d] TTL differs between the paths: in-place %d, prepacked %d", i, got, want)
 		}
 	}
-	if got := prepacked.Answer[0].Header().Ttl; got != 0 {
-		t.Fatalf("prepacked zero-TTL answer = %d, want 0", got)
+	if got := prepacked.Answer[0].Header().Ttl; got != 30 {
+		t.Fatalf("prepacked answer stored with TTL 0 = %d, want the remaining 30: the delivered answer carries a real TTL, not a zero marker", got)
 	}
 	if got := prepacked.Answer[1].Header().Ttl; got != 30 {
 		t.Fatalf("prepacked CNAME TTL = %d, want the remaining 30", got)

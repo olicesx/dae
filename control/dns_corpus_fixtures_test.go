@@ -61,11 +61,12 @@ func udpCacheMissFixture() DnsCorpusFixture {
 					AnswerCount:    1,
 					AnswerIPv4:     "1.1.1.1", // matches defaultUdpRequest realDst
 					HasAnswerTTL:   true,
-					// dae zeroes the TTL of its own A/AAAA answers and serves
-					// them with that zero (P2-5); the entry lifetime stays in
-					// the cache deadline, not in the wire.
-					AnswerTTLMin: 0,
-					AnswerTTLMax: 0,
+					// The delivered answer carries the real TTL: the upstream
+					// value on the first response, the remaining lifetime on a
+					// cache hit. dae tracks freshness in the entry deadline and
+					// the stale window, not by zeroing the wire.
+					AnswerTTLMin: 1,
+					AnswerTTLMax: 60,
 					WireHex:      "1001818000010001000000000a63616368652d6d697373047465737400000100010a63616368652d6d6973730474657374000001000100000000000401010101",
 				},
 				PostAssert: func(t *testing.T, _ *DnsController, _ *dnsmessage.Msg) {
@@ -575,11 +576,12 @@ func tcpUdpFallbackFixture() DnsCorpusFixture {
 					AnswerCount:    1,
 					AnswerIPv4:     "198.51.100.53",
 					HasAnswerTTL:   true,
-					// dae zeroes the TTL of its own A/AAAA answers and serves
-					// them with that zero (P2-5); the entry lifetime stays in
-					// the cache deadline, not in the wire.
-					AnswerTTLMin: 0,
-					AnswerTTLMax: 0,
+					// The delivered answer carries the real TTL: the upstream
+					// value on the first response, the remaining lifetime on a
+					// cache hit. dae tracks freshness in the entry deadline and
+					// the stale window, not by zeroing the wire.
+					AnswerTTLMin: 1,
+					AnswerTTLMax: 60,
 					WireHex:      "1005818000010001000000000c7463702d66616c6c6261636b047465737400000100010c7463702d66616c6c6261636b04746573740000010001000000000004c6336435",
 				},
 				PostAssert: func(t *testing.T, _ *DnsController, _ *dnsmessage.Msg) {
@@ -668,11 +670,12 @@ func tcpUdpBlackholeFallbackFixture() DnsCorpusFixture {
 					AnswerCount:    1,
 					AnswerIPv4:     "198.51.100.53",
 					HasAnswerTTL:   true,
-					// dae zeroes the TTL of its own A/AAAA answers and serves
-					// them with that zero (P2-5); the entry lifetime stays in
-					// the cache deadline, not in the wire.
-					AnswerTTLMin: 0,
-					AnswerTTLMax: 0,
+					// The delivered answer carries the real TTL: the upstream
+					// value on the first response, the remaining lifetime on a
+					// cache hit. dae tracks freshness in the entry deadline and
+					// the stale window, not by zeroing the wire.
+					AnswerTTLMin: 1,
+					AnswerTTLMax: 60,
 					WireHex:      "1006818000010001000000000c7463702d66616c6c6261636b047465737400000100010c7463702d66616c6c6261636b04746573740000010001000000000004c6336435",
 				},
 			},

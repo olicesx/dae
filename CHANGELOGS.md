@@ -92,6 +92,22 @@ changed. Review them before upgrading:
   on abnormal exits (`Restart=on-abnormal`) with a crash-loop limit. dae also
   no longer derives `GOMEMLIMIT` from `memory.high` — only `memory.max`
   participates, and an explicit `GOMEMLIMIT` environment variable always wins.
+- A named parameter is now rejected on the routing functions that take bare
+  values (`pname`, `port`/`dport`, `sport`, `dscp`, `ip`/`dip`, `sip`,
+  `ipversion`, `l4proto`, `mac`, `qtype`, and the response-routing `upstream`).
+  The grammar accepts `key: value` inside every function call, and these
+  parsers used to ignore the key, so a mistyped parameter name was read as one
+  more operand: `port(bogus_param: 443)` silently built the same match set as
+  `port(443)` and `pname(bogus_param: 1)` matched a process named `1`, on both
+  the `dae run` and the `dae validate` path. Such a rule now fails with
+  `unsupported parameter key "bogus_param"` and names the accepted form. The
+  documented short form (`pname(NetworkManager)`, `port(443)`,
+  `dip(geoip:cn)`, `domain(geosite:cn, suffix:quay.io)`) is unaffected.
+
+  This one does not merely change a default: a config that used a parameter
+  name on these functions stops starting until the name is removed. That is the
+  point — the previous behaviour was a different rule, not the one written —
+  but it has to be reviewed before upgrading.
 
 ### v2.0.0rc1 (Pre-release)
 

@@ -109,6 +109,66 @@ routing {
 	})
 }
 
+// TestValidateRoutingRulesRejectsNamedParametersOnValueOnlyFunctions is the
+// validate-path half of the empty-key contract: `dae validate` dry-runs the
+// same rule lowering as `dae run`, and the functions whose operands are bare
+// values must reject a named parameter there too. Before the fix these configs
+// exited 0 while `port(bogus_param: 443)` built the same match set as
+// `port(443)` - a typo became a different, effective rule.
+func TestValidateRoutingRulesRejectsNamedParametersOnValueOnlyFunctions(t *testing.T) {
+	parse := func(t *testing.T, rules string) *config.Config {
+		t.Helper()
+		sections, err := config_parser.Parse("global {}\nrouting {\n" + rules + "\n  fallback: direct\n}\n")
+		require.NoError(t, err)
+		conf, err := config.New(sections)
+		require.NoError(t, err)
+		return conf
+	}
+
+	bogusRules := map[string]string{
+		"pname":     "pname(bogus_param: 1) -> direct",
+		"port":      "port(bogus_param: 443) -> direct",
+		"sport":     "sport(bogus_param: 443) -> direct",
+		"dport":     "dport(bogus_param: 443) -> direct",
+		"dscp":      "dscp(bogus_param: 1) -> direct",
+		"ip":        "ip(bogus_param: 1.2.3.4) -> direct",
+		"dip":       "dip(bogus_param: 1.2.3.4) -> direct",
+		"sip":       "sip(bogus_param: 1.2.3.4) -> direct",
+		"ipversion": "ipversion(bogus_param: 4) -> direct",
+		"l4proto":   "l4proto(bogus_param: tcp) -> direct",
+		"mac":       "mac(bogus_param: 'aa:bb:cc:dd:ee:ff') -> direct",
+	}
+	for name, rule := range bogusRules {
+		t.Run(name, func(t *testing.T) {
+			err := validateRoutingRules(logrus.New(), parse(t, rule), nil)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "unsupported parameter key")
+			require.Contains(t, err.Error(), `"bogus_param"`)
+			require.Contains(t, err.Error(), "<value>")
+		})
+	}
+
+	// The documented short form keeps working on the same path.
+	bareRules := map[string]string{
+		"pname":     "pname(NetworkManager) -> direct",
+		"port":      "port(443) -> direct",
+		"sport":     "sport(443) -> direct",
+		"dport":     "dport(443) -> direct",
+		"dscp":      "dscp(0x4) -> direct",
+		"ip":        "ip(1.2.3.4) -> direct",
+		"dip":       "dip(224.0.0.0/3, 'ff00::/8') -> direct",
+		"sip":       "sip(1.2.3.4) -> direct",
+		"ipversion": "ipversion(4) -> direct",
+		"l4proto":   "l4proto(tcp) -> direct",
+		"mac":       "mac('aa:bb:cc:dd:ee:ff') -> direct",
+	}
+	for name, rule := range bareRules {
+		t.Run(name+"/bare", func(t *testing.T) {
+			require.NoError(t, validateRoutingRules(logrus.New(), parse(t, rule), nil))
+		})
+	}
+}
+
 // TestValidateRoutingRulesUsesConfigGroups pins that the dry-run resolves rule
 // outbounds against the configured groups (like the matcher builder), not
 // against node names or an empty namespace.

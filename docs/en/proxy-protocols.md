@@ -3,9 +3,11 @@
 > **Note**: dae currently supports the following proxy protocols
 
 - [x] HTTP(S), naiveproxy
+
   ```
   https://[[user:]pass@]hostname:port/
   ```
+
 - [x] Socks
   - [x] Socks4
   - [x] Socks4a
@@ -53,7 +55,7 @@
   - [x] Trojan-gfw
   - [x] Trojan-go
 
-  [trojan/trojan-go URI Schema](https://p4gefau1t.github.io/trojan-go/developer/url/)
+  [trojan/trojan-go URI Schema](https://p4gefau1t.github.io/trojan-go/developer/url)
 
 - [x] Tuic (v5)
 
@@ -111,7 +113,7 @@ is well formed, in particular when `legacy_session_id` is inside the RFC 8446
 section 4.1.2 bound of 0..32 bytes and the message is long enough to contain
 the field.
 
-On a malformed `ServerHello` (session id longer than 32 bytes, truncated or
+On a malformed `ServerHello` (session ID longer than 32 bytes, truncated or
 oversized handshake) the cipher suite is left unset, **XTLS Vision is not
 enabled for that connection and the session falls back to a plain VLESS
 relay**: no Vision padding is applied and no protocol error is raised. The

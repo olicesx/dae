@@ -48,7 +48,7 @@ drift surface. Pinning the commit (below) already bounds what that code can be.
 | Minimal token permissions | The three callers declare workflow-level `permissions: contents: read`; no write scope is given to the automatic token |
 | Explicit secrets where they are possible | The same-repository call to `./.github/workflows/seed-build.yml` passes `GH_APP_ID` / `GH_APP_PRIVATE_KEY` explicitly; `seed-build.yml` declares them under `workflow_call.secrets` |
 | No `TELEGRAM_*` forwarding | The callers never set `notify: true`, so the upstream notification path is never handed those secrets |
-| Renovation | `.github/dependabot.yml` (github-actions ecosystem) proposes pin updates, which are reviewed like any other change |
+| Renovation | `.github/dependabot.yml` (the GitHub Actions ecosystem) proposes pin updates, which are reviewed like any other change |
 
 ## Unblock condition
 

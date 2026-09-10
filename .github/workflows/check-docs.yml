@@ -15,6 +15,12 @@ on:
       - 'package.json'
       - '.autocorrectrc'
       - '.markdownlint-cli2.jsonc'
+      # The markdownlint ratchet and the ledger it compares against: changing
+      # either has to re-run the gate that judges it.
+      - '.markdownlint-baseline.txt'
+      - 'scripts/check-markdownlint-baseline.sh'
+      - 'scripts/test-markdownlint-ratchet.sh'
+      - 'scripts/testdata/markdownlint-ci-sample.txt'
       - '.github/workflows/check-docs.yml'
 
 permissions:
@@ -27,6 +33,13 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+      - name: Self-test the markdownlint ratchet
+        run: |
+          # Pure bash, no npm: proves the ratchet still passes on a baseline
+          # match, still fails on a violation outside the baseline, and still
+          # refuses to read a broken lint run as a clean tree. Runs first so a
+          # broken parser fails fast rather than being trusted below.
+          bash scripts/test-markdownlint-ratchet.sh
       - name: Use Node.js
         uses: actions/setup-node@v3
         with:
@@ -37,7 +50,16 @@ jobs:
           npm ci
       - name: Lint Markdown files (markdownlint)
         run: |
-          npm run markdown-lint
+          # markdownlint exits non-zero on the first violation, and this branch
+          # carries pre-existing documentation debt that this change does not
+          # touch (see .markdownlint-baseline.txt). So the step is not judged on
+          # markdownlint's own exit code: the output is fed to the ratchet,
+          # which fails on any violation that is not already in the ledger.
+          # Linting and judging stay in one step on purpose - a step that goes
+          # green while markdownlint printed violations would be a silent pass.
+          npm run markdown-lint > "${RUNNER_TEMP}/markdownlint.log" 2>&1 || true
+          cat "${RUNNER_TEMP}/markdownlint.log"
+          bash scripts/check-markdownlint-baseline.sh "${RUNNER_TEMP}/markdownlint.log"
       - name: Lint Markdown files (autocorrect)
         uses: huacnlee/autocorrect-action@main
         with:

@@ -1,5 +1,43 @@
 name: Docker
 
+# This job is NOT a gate: branch `kdae` carries no protection rule, so it cannot
+# block a merge or a push either way. In this fork it also publishes nothing -
+# there are no DockerHub credentials, so `Login to DockerHub` is skipped, `push`
+# stays false, and the job reports "build only" through a notice and the step
+# summary. What it is worth is the multi-arch build below, and that is why it is
+# kept rather than deleted.
+#
+# The `paths` filter is narrowed to the surfaces that can break that build: a
+# full multi-arch build costs 9-12 minutes (measured on runs 34459072603 and
+# 34462029090) while the previous filter - `**/*.go`, `**/*.c`, `**/*.h` -
+# matched almost every commit. The build is the only push-time path that compiles
+# the arm/v7 + trace program, and it is what caught the real failure in
+# trace/kern/trace.c on arm (`no member named 'uregs' in 'struct pt_regs'`), so
+# the fix is a narrower trigger, not a removal.
+#   control/kern/**               eBPF C compiled inside the image
+#   trace/kern/**                 the trace C program - the surface that broke
+#   Makefile                      the generation logic and the
+#                                 TRACE_UNSUPPORTED_GOARCH ledger it reads
+#   Dockerfile                    the image recipe
+#   .github/workflows/docker.yml  the workflow itself
+# Dropped, with the reason:
+#   `**/*.go`, `**/*.c`, `**/*.h` - the only non-amd64 Go files in this tree are
+#     big-endian (pkg/ebpf_internal/endian_be.go, control/bpf_bpfeb.go), and no
+#     Docker platform is big-endian (arm/v7, arm64, amd64 and 386 are all
+#     little-endian); amd64 is gated on every push by Build/Go Test/Lint.
+#   `go.mod`, `go.sum` - real image inputs (`ADD go.mod go.sum`), but they already
+#     trigger bpf-test.yml, which runs scripts/check-trace-arch-matrix.sh, so the
+#     arm/trace property stays gated for dependency bumps at a fraction of the
+#     cost. Adding them back would raise this filter from 10 to 17 triggers per
+#     40 pushes (+70%).
+#   `install/friendly-filenames.json`, `scripts/fetch-geo-data.sh` - not inputs to
+#     this build: the Dockerfile only runs `make OUTPUT=dae`, and neither the
+#     Makefile nor the Dockerfile consumes them (the single mention is a comment
+#     about a release-time ARG pin).
+# Measured over the last 40 commits on kdae: the previous filter would match 36
+# of them and this one 10 (-26 runs, ~3.9-5.2 h at 9-12 min each). `kdae` only
+# entered `branches` at f3491dbb, so most of those could not fire at the time; in
+# the 10 pushes since, the previous filter ran 7 times and this one matches 5.
 on:
   workflow_dispatch:
   push:
@@ -8,14 +46,10 @@ on:
       # `kdae` is the development branch of this fork (P3-22).
       - kdae
     paths:
-      - "**/*.go"
-      - "**/*.c"
-      - "**/*.h"
-      - "go.mod"
-      - "go.sum"
+      - "control/kern/**"
+      - "trace/kern/**"
+      - "Makefile"
       - "Dockerfile"
-      - "install/friendly-filenames.json"
-      - "scripts/fetch-geo-data.sh"
       - ".github/workflows/docker.yml"
   release:
     types: [ prereleased ]

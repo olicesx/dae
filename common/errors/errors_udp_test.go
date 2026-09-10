@@ -89,3 +89,34 @@ func TestTypedQUICStreamErrorCodeZeroIsNormalClose(t *testing.T) {
 		t.Fatal("StreamError with a non-zero code must not be a normal UDP close")
 	}
 }
+
+// TestReplayFamilyClassificationCoversExpiredTimestamps pins the consumer side
+// of the outbound classification split. SS2022 reports a message timestamp
+// outside its clock window with its own sentinel ("timestamp expired"); that
+// rejection is still a per-packet anti-replay rejection, so it must keep the
+// soft classification here instead of retiring the UDP endpoint on the first
+// skewed reply.
+func TestReplayFamilyClassificationCoversExpiredTimestamps(t *testing.T) {
+	replay := stderrors.New("replay attack")
+	expired := stderrors.New("timestamp expired")
+	wrapped := fmt.Errorf("udp read: %w", expired)
+
+	for _, err := range []error{replay, expired, wrapped} {
+		if !IsReplayAttackError(err) {
+			t.Fatalf("%v must be classified as a replay-family rejection", err)
+		}
+		if !IsUDPEndpointNormalClose(err) {
+			t.Fatalf("%v must stay a soft (normal-close) UDP endpoint error", err)
+		}
+	}
+
+	// The classification must not widen: an unrelated transport failure keeps
+	// retiring the endpoint.
+	fatal := stderrors.New("unexpected EOF")
+	if IsReplayAttackError(fatal) {
+		t.Fatalf("%v must not be classified as a replay", fatal)
+	}
+	if IsUDPEndpointNormalClose(fatal) {
+		t.Fatalf("%v must not be a normal UDP close", fatal)
+	}
+}

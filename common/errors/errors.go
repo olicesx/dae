@@ -281,19 +281,45 @@ func IsUDPEndpointNormalClose(err error) bool {
 	}
 
 	// Check for replay attack error
-	if Contains(errStr, "replay attack") {
+	if isReplayFamilyErrorString(errStr) {
 		return true
 	}
 
 	return false
 }
 
-// IsReplayAttackError reports whether err is a replay attack error.
+// replayFamilyErrorSubstrings are the message fragments that mark a packet-level
+// anti-replay rejection. SIP022 §3.2.3 treats a message timestamp outside the
+// 30-second clock window as replay, but the outbound library reports that case
+// with its own sentinel ("timestamp expired") so an operator can tell clock skew
+// from a genuine replay. Both rejections are per-packet: the packet is dropped
+// and the transport stays healthy. A consumer reacting to one of them reacts to
+// that property, so both fragments must keep classifying the same way; splitting
+// the outbound sentinel must not silently turn a stale timestamp into a fatal
+// transport error.
+var replayFamilyErrorSubstrings = [...]string{"replay attack", "timestamp expired"}
+
+// isReplayFamilyErrorString reports whether a message names a replay-family
+// rejection. Matching is string-based, like the rest of this file's slow path,
+// because the outbound sentinel sits behind a module pin this module cannot
+// import ahead of.
+func isReplayFamilyErrorString(errStr string) bool {
+	for _, pattern := range replayFamilyErrorSubstrings {
+		if Contains(errStr, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsReplayAttackError reports whether err is a replay attack error. An expired
+// message timestamp counts: the packet is rejected for the same reason class and
+// with the same per-packet consequence.
 func IsReplayAttackError(err error) bool {
 	if err == nil {
 		return false
 	}
-	return Contains(err.Error(), "replay attack")
+	return isReplayFamilyErrorString(err.Error())
 }
 
 // IsAuthError reports whether err is an authentication error (e.g. AEAD check failed).

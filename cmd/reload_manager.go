@@ -432,7 +432,7 @@ func (m *reloadManager) startControlPlaneRetirement(
 	m.lastRetirementMu.Unlock()
 
 	if log != nil {
-		log.Warnln("[Reload] Retiring old control plane")
+		log.Infoln("[Reload] Retiring old control plane")
 	}
 	// lastRetirementMu only serializes cancellation/replacement of the previous
 	// retirement goroutine. The timing metadata below belongs to the reload
@@ -469,7 +469,7 @@ func (m *reloadManager) startControlPlaneRetirement(
 		}
 		supervisor.markRetirementComplete(task.generation)
 		if log != nil {
-			log.Warnln("[Reload] Retired old control plane")
+			log.Infoln("[Reload] Retired old control plane")
 		}
 	}(task)
 }

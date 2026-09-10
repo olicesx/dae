@@ -1168,6 +1168,34 @@ func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg, responseC
 	return c.updateDnsCache(msg, responseCacheKey, ttl, &q)
 }
 
+// dnsCacheStoreFailureLogInterval paces the failed-cache-store warning. A
+// response that cannot be stored is offered again by the client on its next
+// query, so the condition repeats for as long as the response stays
+// unstorable; an unpaced warning would be one line per query for the whole
+// cache lifetime of the affected name.
+const dnsCacheStoreFailureLogInterval = time.Minute
+
+// noteDnsCacheStoreFailure reports a DNS response that could not be stored in
+// the cache. Storing is a latency optimization: the response itself is already
+// on its way to the client, so a failure is not an outage and does not belong
+// on the per-query path at warning level. Every path that stores a response
+// (sync, async, and the controller's own writer) reports through here, so one
+// failed store stays one line at most and one shared count, instead of the
+// same event being reported at two different levels by two callers.
+func (c *DnsController) noteDnsCacheStoreFailure(site string, err error) {
+	if c == nil || c.dnsControllerStore == nil || c.log == nil || err == nil {
+		return
+	}
+	entry := c.log.WithField("cache_site", site)
+	if c.log.IsLevelEnabled(logrus.DebugLevel) {
+		entry.WithError(err).Debug("failed to cache DNS response")
+	}
+	if failures, emit := c.dnsCacheStoreFailureAlert.observe(time.Now(), dnsCacheStoreFailureLogInterval); emit {
+		entry.Warnf("failed to cache DNS response (%s): %v; failures=%d, reporting at most one line per %v",
+			site, err, failures, dnsCacheStoreFailureLogInterval)
+	}
+}
+
 func (c *DnsController) updateDnsCache(msg *dnsmessage.Msg, responseCacheKey string, ttl uint32, q *dnsmessage.Question) error {
 	// Update DnsCache.
 	if c.log.IsLevelEnabled(logrus.TraceLevel) {

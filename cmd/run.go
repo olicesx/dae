@@ -516,7 +516,7 @@ loop:
 			switch {
 			case reloadManager.reloading.Load():
 				if w.listener == nil {
-					w.log.Warnln("[Reload] Re-listening after reload")
+					w.log.Infoln("[Reload] Re-listening after reload")
 					readyChan := make(chan bool, 1)
 					go func() {
 						defer func() {
@@ -569,13 +569,13 @@ loop:
 					} else {
 						_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
 					}
-					w.log.Warnln("[Reload] Finished")
+					w.log.Infoln("[Reload] Finished")
 					reloadManager.finishReloadSuccess()
 					continue
 				}
 				// Serve.
 				reloadManager.reloading.Store(false)
-				w.log.Warnln("[Reload] Serve")
+				w.log.Infoln("[Reload] Serve")
 				handoff := reloadManager.currentPendingStagedHandoff()
 				serveControlPlane := w.c
 				serveListener := w.listener
@@ -843,7 +843,7 @@ loop:
 				} else {
 					_ = setRunSignalProgress(consts.ReloadError, reloadErr.Error())
 				}
-				w.log.Warnln("[Reload] Finished")
+				w.log.Infoln("[Reload] Finished")
 				reloadManager.finishReloadSuccess()
 				if dnsHandoffActive && w.log.IsLevelEnabled(logrus.DebugLevel) {
 					w.log.Debugln("[Reload] Shared DNS controller handoff remains available while old generation drains")

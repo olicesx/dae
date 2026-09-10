@@ -110,8 +110,17 @@ type dnsControllerStore struct {
 	// dnsCacheIndexReconciles counts janitor runs that found the base-key index
 	// out of sync with the live cache and rebuilt it.
 	dnsCacheIndexReconciles atomic.Uint64
-	dnsKnowledge            sync.Map // map[string]int64 (base cache key -> original deadline unix nano)
-	dnsKnowledgeMu          sync.Mutex
+	// dnsCacheStoreFailureAlert paces the report of DNS responses that could
+	// not be stored in the cache. Caching is a latency optimization - the
+	// response has already been sent to the client - so one line per query
+	// reports a working DNS path as if it were an outage; the paced line
+	// carries the number of failed stores so the repeats stay visible. It
+	// lives on the shared store because the per-query entry points run on both
+	// the owning controller and its reload facades, which must share one pace
+	// and one count.
+	dnsCacheStoreFailureAlert pacedAlert
+	dnsKnowledge              sync.Map // map[string]int64 (base cache key -> original deadline unix nano)
+	dnsKnowledgeMu            sync.Mutex
 	// runtimeState owns the complete immutable runtime and behavior snapshot so
 	// one load cannot combine fields from different reload generations.
 	runtimeState      atomic.Pointer[dnsControllerRuntimeState]

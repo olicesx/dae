@@ -313,6 +313,48 @@ func parseDNSListenerAddrPort(raw string, preferV6 bool) (netip.AddrPort, error)
 type dnsHandler struct {
 	listener *DNSListener
 	log      *logrus.Logger
+
+	// badClientAddrAlert paces the unusable-client-address report. The address
+	// is client-controlled, so one broken or hostile peer would otherwise draw
+	// one error line per request; the observation count carried by each
+	// emitted line is the number of requests answered with SERVFAIL for this
+	// reason, and the per-request detail stays available at debug.
+	badClientAddrAlert pacedAlert
+}
+
+// dnsListenerBadClientAddrLogInterval paces the unusable-client-address
+// warning. A peer whose address never parses keeps failing every request it
+// sends, so an unpaced report is one line per request for as long as the peer
+// keeps asking.
+const dnsListenerBadClientAddrLogInterval = 30 * time.Second
+
+// answerUnusableClientAddr answers SERVFAIL for a request whose client address
+// could not be turned into an IP:port, and reports it once per pace instead of
+// once per request. It is the single reporting point for every address-parsing
+// failure in the listener path, so the failures cannot be counted per site and
+// then lose their total.
+func (h *dnsHandler) answerUnusableClientAddr(w dnsmessage.ResponseWriter, r *dnsmessage.Msg, reason string, detail error) {
+	if h == nil {
+		return
+	}
+	if h.log != nil {
+		entry := h.log.WithField("reason", reason)
+		if detail != nil {
+			entry = entry.WithError(detail)
+		}
+		if h.log.IsLevelEnabled(logrus.DebugLevel) {
+			entry.Debug("DNS listener: unusable client address; answering SERVFAIL")
+		}
+		if dropped, emit := h.badClientAddrAlert.observe(time.Now(), dnsListenerBadClientAddrLogInterval); emit {
+			entry.Warnf("DNS listener: answering SERVFAIL for a request with an unusable client address (%s); "+
+				"dropped=%d, reporting at most one line per %v", reason, dropped, dnsListenerBadClientAddrLogInterval)
+		}
+	}
+	if w != nil && r != nil {
+		m := new(dnsmessage.Msg)
+		m.SetRcode(r, dnsmessage.RcodeServerFailure)
+		_ = w.WriteMsg(m)
+	}
 }
 
 func isDNSClientWriteGoneError(err error) bool {
@@ -374,10 +416,7 @@ func (h *dnsHandler) ServeDNS(w dnsmessage.ResponseWriter, r *dnsmessage.Msg) {
 	// Create a fake udpRequest to pass to the DNS controller
 	clientAddr := w.RemoteAddr()
 	if clientAddr == nil {
-		h.log.Errorf("Failed to parse client address: nil RemoteAddr")
-		m := new(dnsmessage.Msg)
-		m.SetRcode(r, dnsmessage.RcodeServerFailure)
-		_ = w.WriteMsg(m)
+		h.answerUnusableClientAddr(w, r, "nil RemoteAddr", nil)
 		return
 	}
 	var clientIPPort netip.AddrPort
@@ -385,19 +424,13 @@ func (h *dnsHandler) ServeDNS(w dnsmessage.ResponseWriter, r *dnsmessage.Msg) {
 	// Parse client address
 	host, portStr, err := net.SplitHostPort(clientAddr.String())
 	if err != nil {
-		h.log.Errorf("Failed to parse client address: %v", err)
-		m := new(dnsmessage.Msg)
-		m.SetRcode(r, dnsmessage.RcodeServerFailure)
-		_ = w.WriteMsg(m)
+		h.answerUnusableClientAddr(w, r, "split host and port", err)
 		return
 	}
 
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		h.log.Errorf("Failed to parse client port: %v", err)
-		m := new(dnsmessage.Msg)
-		m.SetRcode(r, dnsmessage.RcodeServerFailure)
-		_ = w.WriteMsg(m)
+		h.answerUnusableClientAddr(w, r, "parse port", err)
 		return
 	}
 
@@ -407,10 +440,7 @@ func (h *dnsHandler) ServeDNS(w dnsmessage.ResponseWriter, r *dnsmessage.Msg) {
 
 	clientIP, err := netip.ParseAddr(host)
 	if err != nil {
-		h.log.Errorf("Failed to parse client IP: %v", err)
-		m := new(dnsmessage.Msg)
-		m.SetRcode(r, dnsmessage.RcodeServerFailure)
-		_ = w.WriteMsg(m)
+		h.answerUnusableClientAddr(w, r, "parse IP", err)
 		return
 	}
 

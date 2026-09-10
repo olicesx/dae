@@ -108,6 +108,18 @@ type ControlPlane struct {
 	lastDnsFastPathServfailLogTime atomic.Int64
 	lastHandlePktEpochWarnTime     atomic.Int64
 	tcpConnPanicCount              atomic.Uint64
+	// The janitor map-capacity alerts are paced one per condition, not one per
+	// janitor run: see pacedAlert. They are per-map so that one saturated map
+	// cannot pace another map's alert out of the log.
+	redirectTrackCapacityAlert  pacedAlert
+	cookiePidCapacityAlert      pacedAlert
+	routingHandoffCapacityAlert pacedAlert
+	// Per-packet datapath conditions that hold for every packet of every
+	// affected flow until the underlying state changes. Each has its own pace
+	// so one condition cannot suppress the report of another.
+	udpRoutingTupleWarnAlert    pacedAlert
+	udpDNSRoutingTupleWarnAlert pacedAlert
+	udpHandlePktWarnAlert       pacedAlert
 	// udpDirectDispatchPanicCount and udpIngressLoopPanicCount count recovered
 	// panics on the two UDP packet-path goroutines that have no convoy wrapper:
 	// the direct-dispatch task (DNS/SIP/RTP/STUN exceptions) and the ingress
@@ -1660,8 +1672,7 @@ func (c *ControlPlane) cleanupRedirectTrackMapBeforeLocked(staleBeforeNs uint64)
 	if totalEntries > 0 && redirectTrackCapacity > 0 {
 		usagePercent := float64(totalEntries) / float64(redirectTrackCapacity) * 100
 		if usagePercent > 90 {
-			c.log.Warnf("cleanupRedirectTrackMap: map at %.1f%% capacity (%d entries)",
-				usagePercent, totalEntries)
+			c.logMapCapacityAlert(&c.redirectTrackCapacityAlert, "cleanupRedirectTrackMap", usagePercent, totalEntries)
 		}
 	}
 	return len(keysToDelete)
@@ -1739,7 +1750,7 @@ func (c *ControlPlane) cleanupCookiePidMapBeforeLocked(staleBeforeNs uint64) int
 	if totalEntries > 0 && maxEntries > 0 {
 		usagePercent := float64(totalEntries) / float64(maxEntries) * 100
 		if usagePercent > 90 {
-			c.log.Warnf("cleanupCookiePidMap: map at %.1f%% capacity (%d entries)", usagePercent, totalEntries)
+			c.logMapCapacityAlert(&c.cookiePidCapacityAlert, "cleanupCookiePidMap", usagePercent, totalEntries)
 		}
 	}
 	return len(keysToDelete)
@@ -1815,7 +1826,7 @@ func (c *ControlPlane) cleanupRoutingHandoffMapBeforeLocked(staleBeforeNs uint64
 	if totalEntries > 0 && maxEntries > 0 {
 		usagePercent := float64(totalEntries) / float64(maxEntries) * 100
 		if usagePercent > 90 {
-			c.log.Warnf("cleanupRoutingHandoffMap: map at %.1f%% capacity (%d entries)", usagePercent, totalEntries)
+			c.logMapCapacityAlert(&c.routingHandoffCapacityAlert, "cleanupRoutingHandoffMap", usagePercent, totalEntries)
 		}
 	}
 	return len(keysToDelete)

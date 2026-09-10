@@ -208,7 +208,9 @@ func createNetkitDevice(log *logrus.Logger, name, peerName string, txQLen int, e
 
 	// Create Netkit device using ip command
 	if err := createNetkitDeviceViaIpCmd(name, peerName, txQLen, scrubNone); err != nil {
-		log.Infof("Failed to create Netkit device via ip command: %v", err)
+		// The error is returned and reported by the caller; keep the detail on
+		// the debug trace so one failure is not printed twice.
+		log.Debugf("Failed to create Netkit device via ip command: %v", err)
 		return fmt.Errorf("failed to create Netkit device via ip command: %w", err)
 	}
 

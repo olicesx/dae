@@ -206,7 +206,16 @@ func (t *udpIngressTask) Run() {
 			}
 			handler, release, ownerErr := c.acquireRoutingEpochExecutionOwner(dnsRoutingResult)
 			if ownerErr != nil {
-				c.log.WithError(ownerErr).Warn("DNS ingress routing epoch owner is unavailable")
+				// The owner is missing for every DNS packet of every flow while
+				// the owning generation retires, so this is a condition rather
+				// than an event: pace it like the UDP ingress path paces the
+				// same condition instead of writing one line per packet.
+				if c.log.IsLevelEnabled(logrus.WarnLevel) && c.allowHandlePktEpochWarn(time.Now()) {
+					c.log.WithError(ownerErr).WithFields(logrus.Fields{
+						"src": convergeSrc.String(),
+						"dst": realDst.String(),
+					}).Warn("DNS ingress routing epoch owner is unavailable; DNS packets are dropped while the owning generation retires")
+				}
 				return
 			}
 			if release != nil {
@@ -322,12 +331,9 @@ func (t *udpIngressTask) Run() {
 				routingResult = &bpfRoutingResult{
 					Outbound: uint8(consts.OutboundControlPlaneRouting),
 				}
-				c.log.WithFields(logrus.Fields{
-					"src": convergeSrc.String(),
-					"dst": realDst.String(),
-				}).WithError(retrieveErr).Warn("UDP routing tuple lookup failed for DNS; fallback to userspace routing")
+				c.logUdpDNSRoutingTupleFailure(convergeSrc, realDst, retrieveErr)
 			default:
-				c.log.Warnf("No AddrPort presented: %v", retrieveErr)
+				c.logUdpRoutingTupleFailure(retrieveErr)
 				return
 			}
 		} else {
@@ -338,14 +344,17 @@ func (t *udpIngressTask) Run() {
 	}
 
 	if e := c.handlePktWithPrefetch(t.lConn, data, convergeSrc, realDst, routingResult, flowDecision, false, cacheLookup.prefetch, cacheLookup.prefetchKey, cacheLookup.prefetchOK); e != nil {
-		// Rate-limit the expected reload-window routing-epoch
-		// ownership loss; other handlePkt errors still log always.
+		// Both branches report a condition that repeats per packet: the
+		// reload-window routing-epoch ownership loss, and any other failure
+		// that persists for the flow (and therefore for every later packet of
+		// it). Each is paced on its own so neither can hide the other, and the
+		// emitted line carries the number of packets seen so far.
 		if stderrors.Is(e, errRoutingEpochOwnerUnavailable) {
 			if c.log.IsLevelEnabled(logrus.WarnLevel) && c.allowHandlePktEpochWarn(time.Now()) {
 				c.log.Warnln("handlePkt:", e)
 			}
 		} else {
-			c.log.Warnln("handlePkt:", e)
+			c.logUdpHandlePktFailure(e)
 		}
 		return
 	}

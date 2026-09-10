@@ -73,9 +73,9 @@ func (w *reloadWorker) run() {
 		reloadStartedAtMono := req.requestedAtMono
 
 		if req.isSuspend {
-			w.log.Warnln("[Reload] Received suspend signal; prepare to suspend")
+			w.log.Infoln("[Reload] Received suspend signal; prepare to suspend")
 		} else {
-			w.log.Warnln("[Reload] Received reload signal; prepare to reload")
+			w.log.Infoln("[Reload] Received reload signal; prepare to reload")
 		}
 		_ = sdnotify.Reloading()
 		_ = setRunSignalProgress(consts.ReloadProcessing, "")
@@ -84,7 +84,7 @@ func (w *reloadWorker) run() {
 
 		// Load new config.
 		abortConnections := os.Remove(AbortFile) == nil
-		w.log.Warnln("[Reload] Load new config")
+		w.log.Infoln("[Reload] Load new config")
 		var newConf *config.Config
 		if req.isSuspend {
 			newConf, err = emptyConfig()
@@ -203,7 +203,7 @@ func (w *reloadWorker) run() {
 		var stagedListener *control.Listener
 
 		if stagedHotHandoff {
-			w.log.Warnln("[Reload] Prepare staged same-port handoff")
+			w.log.Infoln("[Reload] Prepare staged same-port handoff")
 			ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
 			newC, prepareErr := newPreparedControlPlane(ctx, w.log, reloadBpf, dnsCache, newConf, w.externGeoDataDirs, dnsConfigUnchanged, true)
 			prepareErr = attachPreparedSessionManager(newC, w.processSessions, prepareErr)
@@ -289,7 +289,7 @@ func (w *reloadWorker) run() {
 		}
 
 		if freshDatapathHandoff {
-			w.log.Warnln("[Reload] Prepare fresh datapath handoff")
+			w.log.Infoln("[Reload] Prepare fresh datapath handoff")
 			ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
 			freshState, prepareErr := w.c.SnapshotFreshDatapathState()
 			var newC *control.ControlPlane
@@ -361,7 +361,7 @@ func (w *reloadWorker) run() {
 			w.log.Warnf("[Reload] Failed to stop old DNS listener: %v", err)
 		}
 
-		w.log.Warnln("[Reload] Load new control plane")
+		w.log.Infoln("[Reload] Load new control plane")
 		ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
 		newC, err := newControlPlane(ctx, w.log, reloadBpf, dnsCache, newConf, w.externGeoDataDirs, dnsConfigUnchanged, true)
 		err = attachPreparedSessionManager(newC, w.processSessions, err)
@@ -400,7 +400,7 @@ func (w *reloadWorker) run() {
 			w.log.Errorln("[Reload] Last reload failed; rolled back configuration")
 		} else {
 			newCancel = cancel
-			w.log.Warnln("[Reload] Prepared new control plane")
+			w.log.Infoln("[Reload] Prepared new control plane")
 		}
 
 		if stagedListener == nil {

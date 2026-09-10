@@ -170,7 +170,7 @@ func (c *DnsController) reportDnsTruncatedFallback(upstream *dns.Upstream, upgra
 	} else {
 		c.dnsUdpTruncatedUpgradeFailures.Add(1)
 	}
-	if c.log == nil || !c.allowDnsTruncatedLog(time.Now()) {
+	if c.log == nil {
 		return
 	}
 	fields := logrus.Fields{}
@@ -179,7 +179,19 @@ func (c *DnsController) reportDnsTruncatedFallback(upstream *dns.Upstream, upgra
 		fields["scheme"] = upstream.Scheme
 	}
 	if upgraded {
-		c.log.WithFields(fields).Warn("UDP DNS answer was truncated (TC=1); the TCP retry succeeded")
+		// A truncated UDP answer that the TCP retry upgrades is RFC 7766 §5
+		// normal operation, not an anomaly: the client gets the complete
+		// answer. The upgrade counter and the janitor's interval summary carry
+		// the magnitude, so this per-query detail belongs on the debug level
+		// that answers "why did this query go over TCP?". Only the failed
+		// upgrade below stays a warning, because those clients really did
+		// receive a truncated answer.
+		if c.log.IsLevelEnabled(logrus.DebugLevel) {
+			c.log.WithFields(fields).Debug("UDP DNS answer was truncated (TC=1); the TCP retry succeeded")
+		}
+		return
+	}
+	if !c.allowDnsTruncatedLog(time.Now()) {
 		return
 	}
 	c.log.WithError(fallbackErr).WithFields(fields).Warnf("UDP DNS answer was truncated (TC=1) and the TCP retry failed "+
@@ -430,9 +442,7 @@ func (c *DnsController) resolveForSingleflight(
 	respMsg.Id = dnsMessage.Id
 	respMsg.Compress = true
 	if err := c.NormalizeAndCacheDnsResp_(respMsg, responseCacheKey); err != nil {
-		if c.log != nil {
-			c.log.Warnf("failed to cache DNS response: %v", err)
-		}
+		c.noteDnsCacheStoreFailure("controller response", err)
 	}
 	return respMsg, nil
 }

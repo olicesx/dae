@@ -370,7 +370,10 @@ func (ns *DaeNetns) setupVethOrNetkit() (err error) {
 	}
 
 	// Fall back to veth
-	ns.log.Info("Falling back to veth device creation")
+	// The fallback itself is already reported by the Warn above (or by the
+	// kernel-version Info below when Netkit was never attempted); this line
+	// only adds the step to the debug trace.
+	ns.log.Debug("Falling back to veth device creation")
 	ns.useNetkit = false
 	if err := ns.setupVeth(); err != nil {
 		return fmt.Errorf("failed to create veth device: %w", err)
@@ -400,7 +403,10 @@ func (ns *DaeNetns) tryCreateNetkit() (err error) {
 	// CVE-2025-37959 fix (checked by the loader at BPF load time).
 	ns.log.Debugf("Creating Netkit device pair: %s <-> %s", HostVethName, NsVethName)
 	if err := createNetkitDevice(ns.log, HostVethName, NsVethName, DaeVethTxQLen, true); err != nil {
-		ns.log.Infof("createNetkitDevice failed: %v", err)
+		// The wrapped error is reported (with its cause) by setupVethOrNetkit
+		// and, on a real failure, by the caller of DaeNetns setup. Logging it
+		// here as well would print the same failure twice per level.
+		ns.log.Debugf("createNetkitDevice failed: %v", err)
 		return fmt.Errorf("failed to create Netkit device: %w", err)
 	}
 	ns.log.Debug("Netkit device created successfully")

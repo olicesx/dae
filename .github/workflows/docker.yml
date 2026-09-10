@@ -8,8 +8,10 @@ name: Docker
 # kept rather than deleted.
 #
 # The `paths` filter is narrowed to the surfaces that can break that build: a
-# full multi-arch build costs 9-12 minutes (measured on runs 34459072603 and
-# 34462029090) while the previous filter - `**/*.go`, `**/*.c`, `**/*.h` -
+# full multi-arch build costs 31-39 minutes (36.0 and 38.9 minutes measured here
+# on a2e760aa and 33cd7496, 31.2 minutes median over 15 successful upstream runs;
+# the earlier 9-12 minute figure came from runs that failed early and is
+# corrected here) while the previous filter - `**/*.go`, `**/*.c`, `**/*.h` -
 # matched almost every commit. The build is the only push-time path that compiles
 # the arm/v7 + trace program, and it is what caught the real failure in
 # trace/kern/trace.c on arm (`no member named 'uregs' in 'struct pt_regs'`), so
@@ -35,7 +37,7 @@ name: Docker
 #     Makefile nor the Dockerfile consumes them (the single mention is a comment
 #     about a release-time ARG pin).
 # Measured over the last 40 commits on kdae: the previous filter would match 36
-# of them and this one 10 (-26 runs, ~3.9-5.2 h at 9-12 min each). `kdae` only
+# of them and this one 10 (-26 runs, ~13.5-16.9 h at 31-39 min each). `kdae` only
 # entered `branches` at f3491dbb, so most of those could not fire at the time; in
 # the 10 pushes since, the previous filter ran 7 times and this one matches 5.
 on:

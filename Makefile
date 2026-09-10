@@ -47,8 +47,12 @@ GOARCH ?= $(shell go env GOARCH)
 #   mips64, mips64le, mipsle -> bpf2go: unsupported target
 # `gen.FindTarget()` accepting an architecture is NOT evidence that its trace
 # program compiles: do not move mips out of this list on that basis alone.
-# Reproducible probe (needs clang and the headers submodule):
-#   GOARCH=<arch> BPF_CLANG=clang go generate ./trace/trace.go
+# Reproducible probe (needs clang and the headers submodule). The architecture is
+# the BPF target, NOT the Go build target: setting GOARCH makes `go generate`
+# cross-build the bpf2go tool itself and then fail to exec it on the host
+# ("exec format error"), which reads as "this architecture cannot generate
+# trace". This is the exact mistake scripts/check-trace-arch-matrix.sh made.
+#   BPF_TRACE_TARGET=<arch> BPF_CLANG=clang go generate ./trace/trace.go
 # or, for the whole ledger: ./scripts/check-trace-arch-matrix.sh
 # Architectures that build without the 'trace' tag, measured with the same
 # generator the build uses:

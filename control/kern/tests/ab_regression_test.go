@@ -96,6 +96,18 @@ func TestABRegression(t *testing.T) {
 		runAbCheckProgram(t, obj.TestAbSynRebindLock, "syn rebind lock")
 	})
 
+	t.Run("same-tuple SYN keeps a live flow only inside its routing epoch", func(t *testing.T) {
+		runAbCheckProgram(t, obj.TestAbSynRebindEpochChange, "syn rebind epoch change")
+	})
+
+	t.Run("same-tuple SYN reroutes an entry written by another datapath", func(t *testing.T) {
+		runAbCheckProgram(t, obj.TestAbSynRebindGenerationChange, "syn rebind generation change")
+	})
+
+	t.Run("reply path refreshes a binding only for its own publisher", func(t *testing.T) {
+		runAbCheckProgram(t, obj.TestAbRedirectReplyRefreshPublisher, "redirect reply refresh publisher")
+	})
+
 	t.Run("stateless established TCP is counted", func(t *testing.T) {
 		runAbCheckProgram(t, obj.TestAbStatelessTcpPassthrough, "stateless TCP passthrough")
 	})

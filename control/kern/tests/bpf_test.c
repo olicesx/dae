@@ -849,9 +849,11 @@ int testpktgen_tcp_pure_syn_preserves_live_state(struct __sk_buff *skb)
 /*
  * P3-14: a pure SYN that reuses the tuple of a live ACTIVE flow (an illegal
  * mid-stream SYN the kernel answers with a challenge ACK) must not delete or
- * rewrite that flow's routing decision. Its liveness is still refreshed, and a
- * routingless entry stays replaceable so the historical behavior for genuinely
- * stale state is preserved.
+ * rewrite that flow's routing decision while the flow still belongs to the
+ * current generation. Its liveness is still refreshed, a routingless entry
+ * stays replaceable so the historical behavior for genuinely stale state is
+ * preserved, and a SYN that cannot name the generation it was routed under
+ * re-routes the flow instead of inheriting the cached routing.
  */
 SEC("tc/setup/tcp_pure_syn_preserves_live_state")
 int testsetup_tcp_pure_syn_preserves_live_state(struct __sk_buff *skb)
@@ -860,9 +862,12 @@ int testsetup_tcp_pure_syn_preserves_live_state(struct __sk_buff *skb)
 	struct conn_state live_state = {};
 	struct conn_state *cur_state;
 	struct tcphdr tcph = {};
-	__u64 now, before;
-	(void)skb;
+	__u8 outbound = OUTBOUND_USER_DEFINED_MIN;
+	__u32 mark = 0;
+	__u8 must = 0;
+	__u64 now, before, rerouted_before;
 
+	(void)skb;
 	key.sip.u6_addr32[2] = bpf_htonl(0xffff);
 	key.sip.u6_addr32[3] = bpf_htonl(IPV4(192,168,20,2));
 	key.dip.u6_addr32[2] = bpf_htonl(0xffff);
@@ -875,14 +880,20 @@ int testsetup_tcp_pure_syn_preserves_live_state(struct __sk_buff *skb)
 	live_state.last_seen_ns = now - 10000000000ULL;
 	live_state.meta.data.has_routing = 1;
 	live_state.meta.data.outbound = OUTBOUND_USER_DEFINED_MIN;
+	live_state.routing_epoch_slot = routing_epoch_slot_encode(0);
+	live_state.datapath_generation = PARAM.datapath_generation;
 	if (bpf_map_update_elem(&conn_state_map, &key, &live_state, BPF_ANY))
 		return TC_ACT_SHOT;
 
 	before = ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED);
+	rerouted_before =
+		ab_read_stat(BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE);
 	tcph.syn = 1;
-	cur_state = mark_tcp_seen(&key, &tcph, false,
-				  NULL, NULL, NULL, NULL,
-				  0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
+	/* Same epoch: a competing SYN must not rewrite the live flow, and its
+	 * liveness must still be refreshed. */
+	cur_state = mark_tcp_seen(&key, &tcph, false, &outbound, &mark, &must,
+				  NULL, 0, NULL, 0,
+				  routing_epoch_slot_encode(0));
 	if (!cur_state || !cur_state->meta.data.has_routing ||
 	    cur_state->state != TCP_STATE_ACTIVE)
 		return TC_ACT_SHOT;
@@ -892,8 +903,12 @@ int testsetup_tcp_pure_syn_preserves_live_state(struct __sk_buff *skb)
 		return TC_ACT_SHOT;
 	if (ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED) != before + 1)
 		return TC_ACT_SHOT;
+	if (ab_read_stat(BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE) !=
+	    rerouted_before)
+		return TC_ACT_SHOT;
 
-	/* A routingless entry is still replaceable. */
+	/* A routingless entry is still replaceable, and replacing it is not a
+	 * generation change: there is no cached decision to replace. */
 	if (bpf_map_delete_elem(&conn_state_map, &key))
 		return TC_ACT_SHOT;
 	__builtin_memset(&live_state, 0, sizeof(live_state));
@@ -905,6 +920,36 @@ int testsetup_tcp_pure_syn_preserves_live_state(struct __sk_buff *skb)
 				  NULL, NULL, NULL, NULL,
 				  0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 	if (!cur_state)
+		return TC_ACT_SHOT;
+	if (ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED) != before + 1)
+		return TC_ACT_SHOT;
+	if (ab_read_stat(BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE) !=
+	    rerouted_before)
+		return TC_ACT_SHOT;
+
+	/* A SYN that cannot name the generation it was routed under is not
+	 * evidence of equality: the live flow's routing is not inherited by
+	 * default, and the replacement is counted. This is the same-tuple SYN of
+	 * a flow that outlived a rules change, with the packet's generation
+	 * unreadable instead of merely different. */
+	if (bpf_map_delete_elem(&conn_state_map, &key))
+		return TC_ACT_SHOT;
+	__builtin_memset(&live_state, 0, sizeof(live_state));
+	live_state.state = TCP_STATE_ACTIVE;
+	live_state.last_seen_ns = now - 10000000000ULL;
+	live_state.meta.data.has_routing = 1;
+	live_state.meta.data.outbound = OUTBOUND_USER_DEFINED_MIN;
+	live_state.routing_epoch_slot = routing_epoch_slot_encode(0);
+	live_state.datapath_generation = PARAM.datapath_generation;
+	if (bpf_map_update_elem(&conn_state_map, &key, &live_state, BPF_ANY))
+		return TC_ACT_SHOT;
+	cur_state = mark_tcp_seen(&key, &tcph, false,
+				  NULL, NULL, NULL, NULL,
+				  0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
+	if (cur_state && cur_state->meta.data.has_routing)
+		return TC_ACT_SHOT;
+	if (ab_read_stat(BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE) !=
+	    rerouted_before + 1)
 		return TC_ACT_SHOT;
 	if (ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED) != before + 1)
 		return TC_ACT_SHOT;
@@ -2727,9 +2772,12 @@ int test_ab_redirect_rebind_lock(struct __sk_buff *skb)
 	return 0;
 }
 
+/* Marks a pure SYN on `key`. `syn_epoch_slot` is the epoch the SYN is routed
+ * under (the value route() would pack into its result), so a probe can present
+ * the same flow across an epoch cutover. */
 static __always_inline int
 ab_mark_syn(struct tuples_key *key, bool with_routing, __u8 outbound,
-	    __u32 mark)
+	    __u32 mark, __u8 syn_epoch_slot)
 {
 	struct tcphdr tcp = {};
 	__u8 out = outbound;
@@ -2743,7 +2791,7 @@ ab_mark_syn(struct tuples_key *key, bool with_routing, __u8 outbound,
 				     0, NULL, 0,
 				     ROUTING_EPOCH_SLOT_UNKNOWN) ? 0 : 1;
 	return mark_tcp_seen(key, &tcp, false, &out, &mk, &must, NULL, 0, NULL,
-			     0, ROUTING_EPOCH_SLOT_UNKNOWN) ? 0 : 1;
+			     0, syn_epoch_slot) ? 0 : 1;
 }
 
 /* P3-14: a same-tuple pure SYN must not rewrite a live ACTIVE flow's routing
@@ -2764,7 +2812,8 @@ int test_ab_syn_rebind_lock(struct __sk_buff *skb)
 	key.l4proto = IPPROTO_TCP;
 
 	/* 1) A first routed SYN opens the live flow. */
-	if (ab_mark_syn(&key, true, OUTBOUND_USER_DEFINED_MIN, 0x11))
+	if (ab_mark_syn(&key, true, OUTBOUND_USER_DEFINED_MIN, 0x11,
+			routing_epoch_slot_encode(0)))
 		return 1;
 	state = bpf_map_lookup_elem(&conn_state_map, &key);
 	if (!state || state->state != TCP_STATE_ACTIVE ||
@@ -2775,8 +2824,10 @@ int test_ab_syn_rebind_lock(struct __sk_buff *skb)
 	state->last_seen_ns = bpf_ktime_get_ns() - 10000000000ULL;
 	before = ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED);
 
-	/* 2) A competing SYN must be refused, without freezing liveness. */
-	if (ab_mark_syn(&key, true, OUTBOUND_USER_DEFINED_MIN + 1, 0x22))
+	/* 2) A competing SYN of the same epoch must be refused, without
+	 * freezing liveness. */
+	if (ab_mark_syn(&key, true, OUTBOUND_USER_DEFINED_MIN + 1, 0x22,
+			routing_epoch_slot_encode(0)))
 		return 3;
 	state = bpf_map_lookup_elem(&conn_state_map, &key);
 	if (!state)
@@ -2796,12 +2847,13 @@ int test_ab_syn_rebind_lock(struct __sk_buff *skb)
 	/* 3) A routingless entry is still replaceable (historical behavior). */
 	if (bpf_map_delete_elem(&conn_state_map, &key))
 		return 10;
-	if (ab_mark_syn(&key, false, 0, 0))
+	if (ab_mark_syn(&key, false, 0, 0, ROUTING_EPOCH_SLOT_UNKNOWN))
 		return 11;
 	state = bpf_map_lookup_elem(&conn_state_map, &key);
 	if (!state || state->meta.data.has_routing)
 		return 12;
-	if (ab_mark_syn(&key, true, OUTBOUND_USER_DEFINED_MIN + 1, 0x22))
+	if (ab_mark_syn(&key, true, OUTBOUND_USER_DEFINED_MIN + 1, 0x22,
+			routing_epoch_slot_encode(0)))
 		return 13;
 	state = bpf_map_lookup_elem(&conn_state_map, &key);
 	if (!state || !state->meta.data.has_routing ||
@@ -2809,6 +2861,324 @@ int test_ab_syn_rebind_lock(struct __sk_buff *skb)
 		return 14;
 	if (ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED) != before + 1)
 		return 15;
+	return 0;
+}
+
+/* Builds the flow key used by the rebind probes below. */
+static __always_inline void
+ab_rebind_key(struct tuples_key *key, __u16 sport)
+{
+	key->sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key->sip.u6_addr32[3] = bpf_htonl(IPV4(10, 0, 0, 1));
+	key->dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key->dip.u6_addr32[3] = bpf_htonl(IPV4(10, 0, 0, 2));
+	key->sport = bpf_htons(sport);
+	key->dport = bpf_htons(80);
+	key->l4proto = IPPROTO_TCP;
+}
+
+/* Stages one routing rule in each epoch and publishes `active_slot` as the
+ * current one: the cutover a reload performs after the new generation's rules
+ * and metadata are in place. */
+static __always_inline int
+ab_stage_two_epochs(__u32 active_slot)
+{
+	__u32 zero = 0;
+
+	if (set_routing_epoch_port_rule(0, 443, OUTBOUND_USER_DEFINED_MIN))
+		return 1;
+	if (set_routing_epoch_port_rule(1, 443, OUTBOUND_USER_DEFINED_MIN + 1))
+		return 2;
+	return bpf_map_update_elem(&active_routing_epoch_map, &zero,
+				   &active_slot, BPF_ANY) ? 3 : 0;
+}
+
+/* Routing epoch semantics on a pure SYN that reuses a live flow's tuple.
+ *
+ * `entry_slot` is the epoch the live entry was routed under, `syn_epoch_slot`
+ * is the epoch the current SYN is routed under, and `final_slot` is the epoch
+ * the entry must carry afterwards.
+ *
+ * Same epoch: the lock keeps the flow's routing untouched and counts the
+ * refusal (P3-14). Different epoch: the entry is dropped and re-created from
+ * the current epoch's decision, and counted as re-routed - "after the rules
+ * changed, a new connection uses the new rules" - with no comparison of the
+ * two decisions anywhere in the datapath.
+ */
+static __always_inline int
+ab_syn_epoch_case(__u32 entry_slot, __u32 syn_epoch_slot, __u32 final_slot)
+{
+	struct tuples_key key = {};
+	struct conn_state *state;
+	__u8 expected_outbound;
+	__u64 rejected_before, rerouted_before;
+
+	if (entry_slot >= ROUTING_EPOCH_SLOT_NUM ||
+	    syn_epoch_slot >= ROUTING_EPOCH_SLOT_NUM ||
+	    final_slot >= ROUTING_EPOCH_SLOT_NUM)
+		return 1;
+	expected_outbound = final_slot == 0 ? OUTBOUND_USER_DEFINED_MIN :
+					      OUTBOUND_USER_DEFINED_MIN + 1;
+
+	ab_rebind_key(&key, 40001);
+
+	/* 1) Open a live routed flow in the entry's epoch. */
+	if (ab_mark_syn(&key, true,
+			entry_slot == 0 ? OUTBOUND_USER_DEFINED_MIN :
+					  OUTBOUND_USER_DEFINED_MIN + 1,
+			0x11, routing_epoch_slot_encode(entry_slot)))
+		return 3;
+	state = bpf_map_lookup_elem(&conn_state_map, &key);
+	if (!state || state->state != TCP_STATE_ACTIVE ||
+	    !state->meta.data.has_routing ||
+	    state->routing_epoch_slot != routing_epoch_slot_encode(entry_slot))
+		return 4;
+
+	state->last_seen_ns = bpf_ktime_get_ns() - 10000000000ULL;
+	rejected_before = ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED);
+	rerouted_before =
+		ab_read_stat(BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE);
+
+	if (ab_stage_two_epochs(syn_epoch_slot))
+		return 5;
+
+	/* 2) The same tuple opens again under the SYN's epoch. Its decision is
+	 * what that epoch's staged rule produces, so a re-route is visible as
+	 * the SYN epoch's outbound. */
+	if (ab_mark_syn(&key, true, expected_outbound, 0x22,
+			routing_epoch_slot_encode(syn_epoch_slot)))
+		return 6;
+	state = bpf_map_lookup_elem(&conn_state_map, &key);
+	if (!state || state->state != TCP_STATE_ACTIVE ||
+	    !state->meta.data.has_routing)
+		return 7;
+	if (state->routing_epoch_slot != routing_epoch_slot_encode(final_slot))
+		return 8;
+
+	if (entry_slot == syn_epoch_slot) {
+		/* Same epoch: locked. Routing, mark and liveness stay the flow's
+		 * own, and the re-route counter must not move. */
+		if (state->meta.data.outbound != OUTBOUND_USER_DEFINED_MIN ||
+		    state->meta.data.mark != 0x11)
+			return 9;
+		if (state->last_seen_ns <= bpf_ktime_get_ns() - 10000000000ULL)
+			return 10;
+		if (ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED) !=
+		    rejected_before + 1)
+			return 11;
+		if (ab_read_stat(
+			    BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE) !=
+		    rerouted_before)
+			return 12;
+	} else {
+		/* Changed epoch: re-routed onto the new decision, and the
+		 * refusal counter must not move. */
+		if (state->meta.data.outbound != expected_outbound ||
+		    state->meta.data.mark != 0x22)
+			return 13;
+		if (state->datapath_generation != PARAM.datapath_generation)
+			return 14;
+		if (ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED) !=
+		    rejected_before)
+			return 15;
+		if (ab_read_stat(
+			    BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE) !=
+		    rerouted_before + 1)
+			return 16;
+	}
+	return 0;
+}
+
+/* Task 1: a live flow's cached routing is only inherited inside its own
+ * routing epoch. A reload cutover to the other slot must re-route the next
+ * SYN, in both directions, while a same-epoch SYN stays locked. */
+SEC("tc/ab_test/syn_rebind_epoch_change")
+int test_ab_syn_rebind_epoch_change(struct __sk_buff *skb)
+{
+	int ret;
+
+	(void)skb;
+	/* Same epoch (entry slot 0, SYN on slot 0): still locked (P3-14). */
+	ret = ab_syn_epoch_case(0, 0, 0);
+	if (ret)
+		return ret;
+
+	/* Slot 0 to slot 1: the new epoch's decision must win. */
+	ret = ab_syn_epoch_case(0, 1, 1);
+	if (ret)
+		return 20 + ret;
+
+	/* Slot 1 to slot 0: the same rule holds in the other direction. */
+	ret = ab_syn_epoch_case(1, 0, 0);
+	if (ret)
+		return 40 + ret;
+	return 0;
+}
+
+/* Task 1: the datapath generation is part of the generation identity. An entry
+ * written by another datapath (pinned conn_state_map across a restart or an
+ * upgrade) is not inherited even when the routing epoch number matches. */
+SEC("tc/ab_test/syn_rebind_generation_change")
+int test_ab_syn_rebind_generation_change(struct __sk_buff *skb)
+{
+	struct tuples_key key = {};
+	struct conn_state *state;
+	__u64 rejected_before, rerouted_before;
+	__u16 foreign_generation = PARAM.datapath_generation + 1;
+
+	(void)skb;
+	if (foreign_generation == 0)
+		return 1;
+	if (ab_stage_two_epochs(0))
+		return 2;
+
+	ab_rebind_key(&key, 40002);
+	/* 1) A live flow of the current datapath, same epoch: locked. */
+	if (ab_mark_syn(&key, true, OUTBOUND_USER_DEFINED_MIN, 0x11,
+			routing_epoch_slot_encode(0)))
+		return 3;
+	state = bpf_map_lookup_elem(&conn_state_map, &key);
+	if (!state || state->datapath_generation != PARAM.datapath_generation)
+		return 4;
+	state->last_seen_ns = bpf_ktime_get_ns() - 10000000000ULL;
+	rejected_before = ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED);
+	rerouted_before =
+		ab_read_stat(BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE);
+	if (ab_mark_syn(&key, true, OUTBOUND_USER_DEFINED_MIN + 1, 0x22,
+			routing_epoch_slot_encode(0)))
+		return 5;
+	state = bpf_map_lookup_elem(&conn_state_map, &key);
+	if (!state || state->meta.data.outbound != OUTBOUND_USER_DEFINED_MIN ||
+	    state->meta.data.mark != 0x11)
+		return 6;
+	if (ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED) != rejected_before + 1)
+		return 7;
+
+	/* 2) Same tuple, same epoch number, but the entry belongs to another
+	 * datapath: the cached routing must be replaced. */
+	state->datapath_generation = foreign_generation;
+	if (ab_mark_syn(&key, true, OUTBOUND_USER_DEFINED_MIN + 1, 0x22,
+			routing_epoch_slot_encode(0)))
+		return 8;
+	state = bpf_map_lookup_elem(&conn_state_map, &key);
+	if (!state)
+		return 9;
+	if (state->meta.data.outbound != OUTBOUND_USER_DEFINED_MIN + 1 ||
+	    state->meta.data.mark != 0x22 ||
+	    state->routing_epoch_slot != routing_epoch_slot_encode(0))
+		return 10;
+	if (state->datapath_generation != PARAM.datapath_generation)
+		return 11;
+	if (ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED) != rejected_before + 1)
+		return 12;
+	if (ab_read_stat(BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE) !=
+	    rerouted_before + 1)
+		return 13;
+	return 0;
+}
+
+/* Task 2: the reply path only refreshes a binding's lease for its own
+ * publisher. A different publisher's reply must not extend the window that
+ * keeps it out, otherwise the rejected side re-freezes the entry for as long
+ * as it keeps replying. */
+SEC("tc/ab_test/redirect_reply_refresh_publisher")
+int test_ab_redirect_reply_refresh_publisher(struct __sk_buff *skb)
+{
+	struct tuples tuples = {};
+	struct ethhdr winner = {};
+	struct redirect_tuple key;
+	struct redirect_entry *entry;
+	__u64 mtime;
+
+	if (ab_build_ipv4_tcp(skb, IPV4(192, 168, 0, 1), IPV4(8, 8, 8, 8),
+			      12345, 443, 5, TCPH_SYN, 0))
+		return 1;
+	tuples.five.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	tuples.five.sip.u6_addr32[3] = bpf_htonl(IPV4(192, 168, 0, 1));
+	tuples.five.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	tuples.five.dip.u6_addr32[3] = bpf_htonl(IPV4(8, 8, 8, 8));
+	tuples.five.sport = bpf_htons(12345);
+	tuples.five.dport = bpf_htons(443);
+	tuples.five.l4proto = IPPROTO_TCP;
+	winner.h_source[5] = 0xaa;
+	winner.h_dest[5] = 0xbb;
+	ab_redirect_key_ipv4(&key, &tuples.five);
+
+	/* Start from a clean binding: this probe shares its object (and thus its
+	 * redirect_track map) with the reply-rebind probe above, whose leftover
+	 * entry for this key is deliberately frozen against another publisher. */
+	bpf_map_delete_elem(&redirect_track, &key);
+
+	/* The reply-path binding as the winning publisher created it. */
+	if (publish_redirect_track_for_packet(skb, ETH_HLEN, &tuples, &winner,
+					      0))
+		return 2;
+	entry = bpf_map_lookup_elem(&redirect_track, &key);
+	if (!entry || entry->smac[5] != 0xaa || entry->dmac[5] != 0xbb)
+		return 3;
+
+	/* Set a stale lease so any refresh is unambiguous: the binding is due
+	 * for takeover as soon as the forward path sees it. */
+	entry->last_seen_ns = bpf_ktime_get_ns() - 10000000000ULL;
+	mtime = entry->last_seen_ns;
+
+	/* The owner is recognized from the reply packet, and only the owner is. */
+	if (ab_build_ipv4_tcp(skb, IPV4(8, 8, 8, 8), IPV4(192, 168, 0, 1),
+			      443, 12345, 5, TCPH_ACK, 0))
+		return 4;
+	if (ab_store_l2_addrs(skb, 0xaa, 0xbb))
+		return 5;
+	entry = bpf_map_lookup_elem(&redirect_track, &key);
+	if (!entry)
+		return 6;
+	if (!reply_publisher_matches(skb, entry))
+		return 7;
+
+	/* The reply-path hook needs the L2 header inside its linear region
+	 * (load_redirect_tuple pulls REDIRECT_PULL_SIZE); pad the frame past
+	 * that, as a real reply frame carrying payload would be. */
+	if (bpf_skb_change_tail(skb, REDIRECT_PULL_SIZE, 0))
+		return 8;
+
+	/* A reply from a different publisher: the tuple matches, so it is still
+	 * redirected toward the binding's owner, but the lease is not extended.
+	 * Before the fix this refresh ran unconditionally, so the rejected side
+	 * re-froze the binding with every reply it sent and the window that is
+	 * supposed to hand the flow over never elapsed. */
+	if (ab_store_l2_addrs(skb, 0xcc, 0xdd))
+		return 9;
+	entry = bpf_map_lookup_elem(&redirect_track, &key);
+	if (!entry)
+		return 10;
+	if (reply_publisher_matches(skb, entry))
+		return 11;
+	tproxy_dae0_ingress(skb);
+	entry = bpf_map_lookup_elem(&redirect_track, &key);
+	if (!entry)
+		return 12;
+	if (entry->last_seen_ns != mtime)
+		return 13;
+	if (entry->smac[5] != 0xaa)
+		return 14;
+
+	/* The owner's own reply still refreshes the lease, so an active winner
+	 * keeps its binding while a silent one lets the window lapse and the
+	 * stale entry becomes rebindable on the forward path. */
+	if (ab_store_l2_addrs(skb, 0xaa, 0xbb))
+		return 15;
+	entry = bpf_map_lookup_elem(&redirect_track, &key);
+	if (!entry)
+		return 16;
+	if (!reply_publisher_matches(skb, entry))
+		return 17;
+	tproxy_dae0_ingress(skb);
+	entry = bpf_map_lookup_elem(&redirect_track, &key);
+	if (!entry)
+		return 18;
+	if (entry->last_seen_ns <= mtime)
+		return 19;
+	if (entry->last_seen_ns < bpf_ktime_get_ns() - 1000000000ULL)
+		return 20;
 	return 0;
 }
 

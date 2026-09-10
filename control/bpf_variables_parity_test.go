@@ -246,6 +246,7 @@ func TestBpfStatsKeysParityWithKernelSource(t *testing.T) {
 		{"BPF_STATS_UNSOLICITED_UDP_SEEN", bpfStatsUnsolicitedUDPSeen},
 		{"BPF_STATS_SOCKMARK_FALLBACK", bpfStatsSockmarkFallback},
 		{"BPF_STATS_EVENT_DROP", bpfStatsEventDrop},
+		{"BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE", bpfStatsRebindReroutedAfterEpochChange},
 	}
 	for _, entry := range contract {
 		value, ok := cKeys[entry.cName]

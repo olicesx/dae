@@ -82,6 +82,13 @@ const (
 	// no room. The consumers are advisory, but a dropped event must never be
 	// invisible.
 	bpfStatsEventDrop = uint32(11)
+	// bpfStatsRebindReroutedAfterEpochChange counts pure SYNs that replaced a
+	// live ACTIVE flow's cached routing because the flow's routing epoch or
+	// datapath generation no longer matched the current one. It is the visible
+	// half of "after the rules changed, a new connection uses the new rules";
+	// the lock that protects a flow inside its own generation is counted as
+	// bpfStatsSynRebindRejected.
+	bpfStatsRebindReroutedAfterEpochChange = uint32(12)
 )
 
 // expectedInjectedVariables lists every .rodata variable this package promises
@@ -125,6 +132,10 @@ type bpfStatsSnapshot struct {
 	SockmarkFallback uint64
 	// EventDrop counts events lost because the ringbuf was full.
 	EventDrop uint64
+	// RebindReroutedAfterEpochChange counts live flows whose cached routing was
+	// replaced by the current generation on a pure SYN, because the flow
+	// outlived a routing-epoch or datapath-generation change.
+	RebindReroutedAfterEpochChange uint64
 }
 
 // eventRateSpec mirrors C struct dae_event_rate. The field order mirrors the

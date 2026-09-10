@@ -35,6 +35,12 @@ const (
 	// binding (P2-29). The matching bpf_stats_map counter separates a full
 	// map from any other update error.
 	daeEventRedirectUpdateFailed
+	// daeEventSynRebindRerouted: a pure SYN re-created a live flow's cached
+	// routing because the flow belonged to an older routing epoch or datapath
+	// generation. This is the expected, counted outcome of a staged reload
+	// handoff that let a connection drain: the connection is not cut, and the
+	// next SYN moves it onto the current rules.
+	daeEventSynRebindRerouted
 )
 
 // daeEvent mirrors struct dae_event in control/kern/tproxy.c. The kernel writes
@@ -151,6 +157,8 @@ func (r *bpfMaintenanceRuntime) readEvents() {
 			reportDatapathAnomaly(target, &ev, "reply binding kept against a competing publisher (still fresh)")
 		case daeEventSynRebindRejected:
 			reportDatapathAnomaly(target, &ev, "pure SYN refused rewrite of a live flow's routing metadata")
+		case daeEventSynRebindRerouted:
+			reportDatapathAnomaly(target, &ev, "pure SYN moved a live flow that outlived a rules change onto the current routing epoch")
 		case daeEventStatelessTcpPassthrough:
 			reportDatapathAnomaly(target, &ev, "established TCP forwarded without cached routing (pre-existing flow, e.g. across a restart)")
 		case daeEventFragTailPassed:

@@ -541,7 +541,12 @@ enum bpf_stats_key {
 	// key=11: datapath events dropped because the ringbuf had no room. The
 	// consumers are advisory, but a dropped event must never be invisible.
 	BPF_STATS_EVENT_DROP = 11,
-	BPF_STATS_MAX = 12,
+	// key=12: pure SYN on a live ACTIVE flow whose cached routing belongs to
+	// a different routing epoch or datapath generation. The entry is
+	// re-created from the current generation instead of being locked, so a
+	// connection that outlives a reload ends up on the current rules.
+	BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE = 12,
+	BPF_STATS_MAX = 13,
 };
 
 // Per-packet datapath counters, indexed by enum bpf_stats_key. Userspace reads
@@ -637,6 +642,9 @@ enum dae_event_type {
 	// redirect_track could not store a reply binding (P2-29). The matching
 	// bpf_stats_map key separates "map full" from "update failed".
 	DAE_EVENT_REDIRECT_UPDATE_FAILED = 8,
+	// A pure SYN on a live flow was re-routed because the flow's cached
+	// routing belonged to a different routing epoch or datapath generation.
+	DAE_EVENT_SYN_REBIND_REROUTED = 9,
 };
 
 struct dae_event {
@@ -2378,6 +2386,44 @@ tcp_conn_state_expired(const struct conn_state *state, __u64 now)
 	return now - state->last_seen_ns > TCP_CONN_STATE_CLOSING_TIMEOUT_NS;
 }
 
+/* routing_generation_matches reports whether a live flow's cached routing was
+ * decided under the generation this packet belongs to.
+ *
+ * args->routing_epoch_slot is the epoch the packet was routed with: every SYN
+ * path supplies the value route() packed into its result together with the
+ * decision, and the paths that only refresh an entry pass UNKNOWN. A packet
+ * that cannot name its epoch is not evidence of equality, so it never inherits
+ * a live flow's cached routing.
+ *
+ * The routing epoch identifies the rule set: a slot's rules and its epoch entry
+ * are staged before the selector is published, and the selector only ever moves
+ * to the slot prepared for the new generation, so "same slot" implies "same
+ * rules". Equivalence between two generations is decided by the reload's staged
+ * handoff; nothing here re-derives it, and a flow re-routed onto an equivalent
+ * rule set simply lands on a byte-identical decision.
+ *
+ * A datapath generation marks the datapath that wrote an entry. It is frozen in
+ * PARAM at load time, so an entry can only disagree with it when the pinned
+ * conn_state_map outlived the datapath that created it (a pinned reload or an
+ * in-place upgrade reusing the pin directory), and such an entry must not be
+ * inherited either.
+ */
+static __always_inline bool
+routing_generation_matches(const struct conn_state *state,
+			   const struct conntrack_args *args)
+{
+	__u8 decision_slot = routing_epoch_slot_sanitize(args->routing_epoch_slot);
+	__u8 entry_slot =
+		routing_epoch_slot_sanitize(state->routing_epoch_slot);
+
+	if (decision_slot == ROUTING_EPOCH_SLOT_UNKNOWN ||
+	    entry_slot == ROUTING_EPOCH_SLOT_UNKNOWN)
+		return false;
+	if (decision_slot != entry_slot)
+		return false;
+	return state->datapath_generation == PARAM.datapath_generation;
+}
+
 // __mark_tcp_seen: noinline core. tcp_flags: bit 0 = SYN && !ACK (new
 // connection), bit 1 = FIN || RST.
 static __noinline struct conn_state *
@@ -2407,16 +2453,42 @@ __mark_tcp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 	 * binding — for the rest of the flow's life, because an ACTIVE entry with
 	 * routing metadata has no TTL to heal it. Refuse the rewrite instead:
 	 * keep the entry, lock the rebind, count it and emit a rate-limited event.
+	 *
+	 * That protection is bound to the generation it was decided under. A
+	 * connection that outlives a reload — the staged handoff let it drain
+	 * instead of cutting it — still carries the old routing, while the
+	 * rule the flow must follow is the current one: "after the rules changed,
+	 * every new connection uses the new rules". The lock is therefore only
+	 * granted while the decision's epoch (and the datapath that wrote it)
+	 * still matches; otherwise the entry is dropped and re-created from the
+	 * current generation. Equivalence is not re-derived here: reload decides
+	 * it, and an equivalent re-route lands on a byte-identical decision.
 	 */
 	if (state && new_conn_syn) {
 		if (state->state == TCP_STATE_ACTIVE &&
-		    state->meta.data.has_routing) {
+		    state->meta.data.has_routing &&
+		    routing_generation_matches(state, args)) {
+			/* Same generation: the flow keeps its routing. */
 			args->flags |= CT_ARGS_REBIND_LOCKED;
 			bump_stat(BPF_STATS_SYN_REBIND_REJECTED);
 			send_anomaly_event(EVENT_RATE.syn_rebind_key,
 					   DAE_EVENT_SYN_REBIND_REJECTED,
 					   key->l4proto, key);
 		} else {
+			/* Either the entry carries no routing decision to
+			 * inherit, or it carries one from another generation:
+			 * drop it so the SYN below re-creates it from the
+			 * current rules. Only the second case replaces a
+			 * decision, so only it advances the re-route counter
+			 * (the first is the plain stale-SYN path). */
+			if (state->state == TCP_STATE_ACTIVE &&
+			    state->meta.data.has_routing) {
+				bump_stat(BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE);
+				send_anomaly_event(
+					EVENT_RATE.syn_rebind_key,
+					DAE_EVENT_SYN_REBIND_REROUTED,
+					key->l4proto, key);
+			}
 			bpf_map_delete_elem(&conn_state_map, key);
 			state = NULL;
 		}
@@ -3727,6 +3799,36 @@ load_redirect_tuple(struct __sk_buff *skb,
 	return ret;
 }
 
+/* reply_publisher_matches reports whether the reply packet in flight was sent
+ * by the host/mac pair the stored binary binding belongs to: the reply's L2
+ * source is the mac the binding routes back to, and its L2 destination is the
+ * peer it was published for. This mirrors the publisher test the forward path
+ * applies (publish_redirect_track_for_packet compares ifindex / from_wan /
+ * smac); the reply path has no forward ifindex to compare against, because
+ * every reply arrives on the same dae0 ingress hook.
+ *
+ * An unreadable L2 header is reported as "not the publisher" on purpose: the
+ * conservative failure of this test is to stop refreshing the entry, which
+ * lets the userspace janitor expire it, whereas the optimistic failure would
+ * hand a frozen binding an unlimited lease and make the 2s window
+ * unrecoverable (P1-8).
+ */
+static __always_inline bool
+reply_publisher_matches(struct __sk_buff *skb,
+			const struct redirect_entry *redirect_entry)
+{
+	struct ethhdr eth;
+
+	/* Read the L2 header with bpf_skb_load_bytes rather than through
+	 * skb->data: the header is at L2 offset 0 on this hook, and this way the
+	 * test is independent of both the read being preceded by a pull and of
+	 * how skb->data is interpreted for the packet's protocol. */
+	if (bpf_skb_load_bytes(skb, 0, &eth, sizeof(eth)))
+		return false;
+	return mac6_equal(redirect_entry->smac, eth.h_source) &&
+	       mac6_equal(redirect_entry->dmac, eth.h_dest);
+}
+
 SEC("tc/dae0_ingress")
 int tproxy_dae0_ingress(struct __sk_buff *skb)
 {
@@ -3742,7 +3844,17 @@ int tproxy_dae0_ingress(struct __sk_buff *skb)
 	if (!redirect_entry)
 		return TC_ACT_OK;
 
-	redirect_entry->last_seen_ns = bpf_ktime_get_ns();
+	/* Only the publisher of the binding may extend its lease. Refreshing
+	 * last_seen_ns for every packet that matched the tuple let a rejected
+	 * competitor keep its victim's binding frozen forever: the rejection on
+	 * the forward path deliberately does not refresh, but the competitor's
+	 * own replies did, so the staleness window that is supposed to release
+	 * the binding never elapsed and the flow stayed on the winner's path
+	 * for good. Keeping the refresh tied to the publisher is what makes the
+	 * window mean "the winner has been silent for that long", which is
+	 * exactly when the competitor is allowed to take over. */
+	if (reply_publisher_matches(skb, redirect_entry))
+		redirect_entry->last_seen_ns = bpf_ktime_get_ns();
 
 	bpf_skb_store_bytes(skb, offsetof(struct ethhdr, h_source),
 			    redirect_entry->dmac, sizeof(redirect_entry->dmac),

@@ -1922,9 +1922,10 @@ func (c *ControlPlane) readMapOverflowCounters(m *ebpf.Map) (udpOverflow uint64,
 }
 
 // readDatapathCounters reads the bpf_stats_map counters added for the
-// datapath-visibility work (P2-8/P2-29/P2-30/P2-31/P3-14/P3-16/P3-18). Every
-// key is read or the whole read fails: a partially reported snapshot would
-// look like "no anomaly" for the missing keys.
+// datapath-visibility work (P2-8/P2-29/P2-30/P2-31/P3-14/P3-16/P3-18 and the
+// routing-epoch rebind reroute). Every key is read or the whole read fails: a
+// partially reported snapshot would look like "no anomaly" for the missing
+// keys.
 func (c *ControlPlane) readDatapathCounters(m *ebpf.Map) (bpfStatsSnapshot, error) {
 	var snap bpfStatsSnapshot
 
@@ -1946,6 +1947,7 @@ func (c *ControlPlane) readDatapathCounters(m *ebpf.Map) (bpfStatsSnapshot, erro
 		{"unsolicited udp seen", bpfStatsUnsolicitedUDPSeen, &snap.UnsolicitedUDPSeen},
 		{"sockmark fallback", bpfStatsSockmarkFallback, &snap.SockmarkFallback},
 		{"event drop", bpfStatsEventDrop, &snap.EventDrop},
+		{"rebind rerouted after epoch change", bpfStatsRebindReroutedAfterEpochChange, &snap.RebindReroutedAfterEpochChange},
 	} {
 		v, err := readBpfStatsCounter(m, field.key)
 		if err != nil {

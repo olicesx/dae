@@ -57,6 +57,12 @@ func (c *DnsController) forwardWithFallback(
 	upstream *dns.Upstream,
 	primaryDialArg *dialArgument,
 	data []byte,
+	// isAsIs marks the transparent destination synthesized by
+	// resolveDNSUpstream, which has no configured scheme of its own. It is
+	// passed explicitly instead of being inferred from the "udp" scheme that
+	// synthesis happens to write, so the two cases can never be confused when
+	// the synthesized scheme changes.
+	isAsIs bool,
 ) (respMsg *dnsmessage.Msg, usedDialArg *dialArgument, err error) {
 	// Per-attempt timeout: each attempt gets the full DefaultDialTimeout budget.
 	// Deriving from the controller's lifecycle base (instead of the singleflight
@@ -79,20 +85,27 @@ func (c *DnsController) forwardWithFallback(
 	// `tcp+udp://` upstream already retried on every UDP failure; a `udp://`
 	// upstream only does so for the truncation signal, so an operator that
 	// answers large zones with TC=1 over UDP (which RFC 1035 §4.2.1 permits)
-	// no longer turns into a client-visible failure. Every other scheme keeps
-	// its declared transport contract unchanged.
+	// no longer turns into a client-visible failure. An as-is destination is
+	// carried over UDP too and keeps the same contract. Every other scheme
+	// keeps its declared transport contract unchanged.
 	truncated := errors.Is(primaryErr, ErrDNSTruncated)
 	// An upstream may serve this query when it speaks both transports, or when
-	// the answer was truncated and the upstream speaks UDP (the caller then
+	// the answer was truncated and the upstream is UDP-carried (the caller then
 	// retries over TCP). Expressed as the positive predicate so the condition
 	// stays readable.
+	udpCarried := isAsIs || upstream.Scheme == dns.UpstreamScheme_UDP
 	canServe := upstream != nil &&
 		(upstream.Scheme == dns.UpstreamScheme_TCP_UDP ||
-			(truncated && upstream.Scheme == dns.UpstreamScheme_UDP))
+			(truncated && udpCarried))
 	if !canServe || primaryDialArg.l4proto != consts.L4ProtoStr_UDP {
 		return nil, primaryDialArg, primaryErr
 	}
 
+	// The retry is a different transport for the same destination, so the
+	// forwarder has to be built from the rewritten scheme: building it from the
+	// pre-rewrite upstream makes newDnsForwarder reject the TCP transport with
+	// "unexpected scheme: udp", which discards the selection above and puts
+	// that internal string into the error the caller sees.
 	fallbackUpstream := *upstream
 	fallbackUpstream.Scheme = dns.UpstreamScheme_TCP
 
@@ -115,7 +128,7 @@ func (c *DnsController) forwardWithFallback(
 	fallbackCtx, fallbackCancel := context.WithTimeout(attemptCtx, consts.DefaultDialTimeout)
 	defer fallbackCancel()
 
-	respMsg, err = c.forwardWithDialArg(fallbackCtx, upstream, fallbackDialArg, data)
+	respMsg, err = c.forwardWithDialArg(fallbackCtx, &fallbackUpstream, fallbackDialArg, data)
 	if err != nil {
 		if truncated {
 			c.reportDnsTruncatedFallback(upstream, false, primaryErr, err)
@@ -569,7 +582,13 @@ func (c *DnsController) resolveDNSUpstream(
 	}
 
 	upstreamName := "asis"
-	if upstream == nil {
+	// isAsIs records that this destination was synthesized from the request's
+	// real destination rather than configured by the operator. The synthesized
+	// value is spelled "udp" to mean "carried over UDP", which is not the same
+	// statement as "the operator wrote udp://"; the transport decision below
+	// reads this flag, never the synthesized spelling.
+	isAsIs := upstream == nil
+	if isAsIs {
 		// As-is.
 
 		// As-is should not be valid in response routing, thus using connection realDest is reasonable.
@@ -580,7 +599,7 @@ func (c *DnsController) resolveDNSUpstream(
 			ip46.Ip6 = req.realDst.Addr()
 		}
 		upstream = &dns.Upstream{
-			Scheme:   "udp",
+			Scheme:   dns.UpstreamScheme_UDP,
 			Hostname: req.realDst.Addr().String(),
 			Port:     req.realDst.Port(),
 			Ip46:     &ip46,
@@ -598,7 +617,7 @@ func (c *DnsController) resolveDNSUpstream(
 	// Dial and send.
 	var respMsg *dnsmessage.Msg
 	var usedDialArg *dialArgument
-	respMsg, usedDialArg, err = c.forwardWithFallback(ctx, req, upstream, dialArg, data)
+	respMsg, usedDialArg, err = c.forwardWithFallback(ctx, req, upstream, dialArg, data, isAsIs)
 	if err != nil {
 		return nil, err
 	}

@@ -179,7 +179,7 @@ func TestTruncatedAnswerDoesNotUpgradeOtherSchemes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pack query: %v", err)
 	}
-	if _, _, err := ctrl.forwardWithFallback(context.Background(), defaultUdpRequest(), upstream, primary, queryWire); err == nil {
+	if _, _, err := ctrl.forwardWithFallback(context.Background(), defaultUdpRequest(), upstream, primary, queryWire, false); err == nil {
 		t.Fatal("a non-udp scheme must not silently gain a TCP fallback")
 	}
 	if got := forwardCalls.Load(); got != 1 {
@@ -210,7 +210,7 @@ func TestUDPUpstreamNonTruncatedFailureDoesNotFallBack(t *testing.T) {
 	}
 	primary := &dialArgument{l4proto: consts.L4ProtoStr_UDP, ipversion: consts.IpVersionStr_4, bestTarget: netip.MustParseAddrPort("198.51.100.53:53")}
 
-	if _, _, err := ctrl.forwardWithFallback(context.Background(), defaultUdpRequest(), upstream, primary, []byte{0, 1, 2, 3}); err == nil {
+	if _, _, err := ctrl.forwardWithFallback(context.Background(), defaultUdpRequest(), upstream, primary, []byte{0, 1, 2, 3}, false); err == nil {
 		t.Fatal("a non-truncated UDP failure must still be reported to the caller")
 	}
 	if got := forwardCalls.Load(); got != 1 {

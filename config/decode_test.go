@@ -182,3 +182,44 @@ routing {
 		})
 	}
 }
+
+// TestMissingOptionalSectionsStillApplyDefaults is the P3-1 regression: a
+// config that omits an optional section must decode that section from an empty
+// section so its documented `default:` tags apply, instead of silently keeping
+// the Go zero values (a missing dns section used to leave MaxCacheSize == 0,
+// which means "unlimited" rather than the documented 65536).
+func TestMissingOptionalSectionsStillApplyDefaults(t *testing.T) {
+	sections, err := config_parser.Parse(`
+global {}
+routing {
+  fallback: direct
+}
+`)
+	require.NoError(t, err)
+	conf, err := New(sections)
+	require.NoError(t, err)
+
+	require.Equal(t, 65536, conf.Dns.MaxCacheSize, "missing dns section must take the documented default")
+	require.True(t, conf.Dns.OptimisticCache)
+	require.Equal(t, 60, conf.Dns.OptimisticCacheTtl)
+	require.Equal(t, 30, conf.Dns.OptimisticStaleReplyTtl)
+	require.Nil(t, conf.Group)
+	require.Nil(t, conf.Node)
+	require.Nil(t, conf.Subscription)
+
+	// An explicit 0 must still mean "unlimited" (the documented opt-out); it is
+	// the runtime that must not remap it.
+	sections, err = config_parser.Parse(`
+global {}
+dns {
+  max_cache_size: 0
+}
+routing {
+  fallback: direct
+}
+`)
+	require.NoError(t, err)
+	conf, err = New(sections)
+	require.NoError(t, err)
+	require.Zero(t, conf.Dns.MaxCacheSize)
+}

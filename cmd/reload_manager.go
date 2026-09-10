@@ -616,7 +616,11 @@ func dnsConfigFingerprint(dns config.Dns) string {
 			b.WriteString("<nil>")
 			return
 		}
-		b.WriteString(f.String(true, true, false))
+		// MarshalString (not String): the display form ellipsizes params from
+		// index 5 on, so a DNS rule function with six or more params would
+		// fingerprint identical to a different one and the reload would skip
+		// the domain_routing_map clear+replay, leaving the new rule inactive.
+		b.WriteString(f.MarshalString(true, false, true))
 	}
 	writeFunctionOrString := func(name string, value config.FunctionOrString) {
 		b.WriteString(name)

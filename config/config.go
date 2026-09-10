@@ -199,7 +199,19 @@ func New(sections []*config_parser.Section) (conf *Config, err error) {
 	for _, spec := range configSectionSpecs {
 		section, ok := nameToSection[spec.name]
 		if !ok {
-			continue
+			if spec.required {
+				// Unreachable: the required check above already failed.
+				return nil, fmt.Errorf("section %v is required but not provided", spec.name)
+			}
+			// Optional section that the user did not write. It must still be
+			// decoded from an empty section, otherwise the documented
+			// `default:` tags on its fields never run and the whole section
+			// silently keeps its Go zero values (e.g. a missing dns section
+			// left MaxCacheSize == 0, which means "unlimited" rather than the
+			// documented default). Decoding an empty section only applies
+			// defaults and required-param checks; it never invents a value for
+			// a field the user did provide.
+			section = &Section{Val: &config_parser.Section{Name: spec.name}}
 		}
 		if err := decodeConfigSection(conf, spec.name, section.Val); err != nil {
 			return nil, fmt.Errorf("failed to parse \"%v\": %w", spec.name, err)

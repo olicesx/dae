@@ -9,6 +9,8 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/daeuniverse/dae/pkg/config_parser"
@@ -229,5 +231,94 @@ routing {
 	}
 	if !bytes.Contains(b, []byte("n6")) {
 		t.Fatalf("marshal dropped outbound n6:\n%s", string(b))
+	}
+}
+
+// TestMarshalPolicyFixedListIsSupported is the P3-2 regression: a group whose
+// policy is written as a function call (`policy: fixed(0)`) stores an
+// any-typed []*config_parser.Function, which marshalLeaf's interface switch had
+// no case for and rejected as an "unknown leaf type".
+func TestMarshalPolicyFixedListIsSupported(t *testing.T) {
+	sections, err := config_parser.Parse(`
+global {}
+group {
+    g {
+        policy: fixed(0)
+        filter: name(keyword: hk)
+    }
+}
+routing {
+    fallback: g
+}
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conf, err := New(sections)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(conf.Group) != 1 {
+		t.Fatalf("groups = %d, want 1", len(conf.Group))
+	}
+	b, err := conf.Marshal(2)
+	if err != nil {
+		t.Fatalf("Marshal with policy: fixed(N) failed: %v", err)
+	}
+	if !bytes.Contains(b, []byte("policy:fixed(")) {
+		t.Fatalf("marshalled policy line missing:\n%s", string(b))
+	}
+	// The marshalled config must decode again with the same policy value.
+	sections2, err := config_parser.Parse(string(b))
+	if err != nil {
+		t.Fatalf("parse-after-marshal: %v\n%s", err, string(b))
+	}
+	conf2, err := New(sections2)
+	if err != nil {
+		t.Fatalf("decode-after-marshal: %v\n%s", err, string(b))
+	}
+	if len(conf2.Group) != 1 {
+		t.Fatalf("round-trip groups = %d, want 1", len(conf2.Group))
+	}
+	policy, err := ParseFunctionListOrString(conf2.Group[0].Policy)
+	if err != nil {
+		t.Fatalf("round-trip policy: %v", err)
+	}
+	if len(policy) != 1 || policy[0].Name != "fixed" || len(policy[0].Params) != 1 || policy[0].Params[0].Val != "0" {
+		t.Fatalf("round-trip policy = %#v, want fixed(0)", policy)
+	}
+}
+
+// TestMarshalLeafInterfaceFunctionShapes covers the two shapes marshalLeaf must
+// render for interface-typed fields, and pins that an unknown shape still fails
+// loudly instead of being dropped.
+func TestMarshalLeafInterfaceFunctionShapes(t *testing.T) {
+	var list any = []*config_parser.Function{{
+		Name:   "fixed",
+		Params: []*config_parser.Param{{Val: "0"}},
+	}}
+	m := Marshaller{IndentSpace: 2}
+	if err := m.marshalLeaf("policy", reflect.ValueOf(list), 0, reflect.Value{}); err != nil {
+		t.Fatalf("[]*Function leaf: %v", err)
+	}
+	if got := m.buf.String(); !strings.Contains(got, `policy:fixed("0")`) {
+		t.Fatalf("[]*Function leaf rendered %q", got)
+	}
+
+	var andList any = [][]*config_parser.Function{{
+		{Name: "domain", Params: []*config_parser.Param{{Val: "a.com"}}},
+	}}
+	m2 := Marshaller{IndentSpace: 2}
+	if err := m2.marshalLeaf("filter", reflect.ValueOf(andList), 0, reflect.Value{}); err != nil {
+		t.Fatalf("[][]*Function leaf: %v", err)
+	}
+	if got := m2.buf.String(); !strings.Contains(got, `filter:domain("a.com")`) {
+		t.Fatalf("[][]*Function leaf rendered %q", got)
+	}
+
+	var unsupported any = struct{ A int }{}
+	m3 := Marshaller{IndentSpace: 2}
+	if err := m3.marshalLeaf("x", reflect.ValueOf(unsupported), 0, reflect.Value{}); err == nil {
+		t.Fatal("unsupported leaf shape must fail loudly, not be dropped")
 	}
 }

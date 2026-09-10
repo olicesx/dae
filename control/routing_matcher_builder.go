@@ -77,6 +77,14 @@ func bpfBool(v bool) uint8 {
 	return 0
 }
 
+// canonicalizePrefixes sorts prefixes by (bits, address) and drops exact
+// duplicates. It deliberately performs no address normalization: the 4-in-6
+// normalization (::ffff:a.b.c.d/n written with an IPv4 bit count) is owned by
+// pkg/trie.Prefix2bin128 for the userspace matcher and by cidrToBpfLpmKey for
+// the kernel LPM, which both map the mapped and the plain spelling onto the
+// same key. Adding a second normalization point here would only make the two
+// spellings compare equal for dedup while hiding which component owns the
+// semantic decision.
 func canonicalizePrefixes(prefixes []netip.Prefix) []netip.Prefix {
 	if len(prefixes) == 0 {
 		return nil
@@ -160,20 +168,136 @@ func NewRoutingMatcherBuilderFromProgram(log *logrus.Logger, program *routing.No
 	return b, nil
 }
 
-func (b *RoutingMatcherBuilder) registerProgramParsers(rulesBuilder *routing.RulesBuilder) {
-	b.registerProgramParser(rulesBuilder, consts.Function_Domain, routing.PlainParserFactory(b.addDomain))
-	b.registerProgramParser(rulesBuilder, consts.Function_Ip, routing.IpParserFactory(b.addIp))
-	b.registerProgramParser(rulesBuilder, consts.Function_SourceIp, routing.IpParserFactory(b.addSourceIp))
-	b.registerProgramParser(rulesBuilder, consts.Function_Port, routing.PortRangeParserFactory(b.addPort))
-	b.registerProgramParser(rulesBuilder, consts.Function_SourcePort, routing.PortRangeParserFactory(b.addSourcePort))
-	b.registerProgramParser(rulesBuilder, consts.Function_L4Proto, routing.L4ProtoParserFactory(b.addL4Proto))
-	b.registerProgramParser(rulesBuilder, consts.Function_Mac, routing.MacParserFactory(b.addSourceMac))
-	b.registerProgramParser(rulesBuilder, consts.Function_ProcessName, routing.ProcessNameParserFactory(b.addProcessName))
-	b.registerProgramParser(rulesBuilder, consts.Function_Dscp, routing.UintParserFactory(b.addDscp))
-	b.registerProgramParser(rulesBuilder, consts.Function_IpVersion, routing.IpVersionParserFactory(b.addIpVersion))
+// routingProgramSink receives the parsed operands of one routing rule function.
+// The run path compiles and stores them (RoutingMatcherBuilder); the validate
+// path only resolves the referenced outbound name.
+type routingProgramSink interface {
+	// registerParser installs one parser, adding whatever bookkeeping the sink
+	// needs. The run path records predicate-group spans around every call, so
+	// registration must stay behind this method instead of writing straight to
+	// the RulesBuilder.
+	registerParser(rulesBuilder *routing.RulesBuilder, name string, parser routing.FunctionParser)
+	// The ten addX methods mirror the RoutingMatcherBuilder methods of the same
+	// name; their signatures are fixed by the routing.*ParserFactory factories.
+	addDomain(f *config_parser.Function, key string, values []string, outbound *routing.Outbound) error
+	addIp(f *config_parser.Function, values []netip.Prefix, outbound *routing.Outbound) error
+	addSourceIp(f *config_parser.Function, values []netip.Prefix, outbound *routing.Outbound) error
+	addPort(f *config_parser.Function, values [][2]uint16, outbound *routing.Outbound) error
+	addSourcePort(f *config_parser.Function, values [][2]uint16, outbound *routing.Outbound) error
+	addL4Proto(f *config_parser.Function, values consts.L4ProtoType, outbound *routing.Outbound) error
+	addSourceMac(f *config_parser.Function, macAddrs [][6]byte, outbound *routing.Outbound) error
+	addProcessName(f *config_parser.Function, values [][consts.TaskCommLen]byte, outbound *routing.Outbound) error
+	addDscp(f *config_parser.Function, values []uint8, outbound *routing.Outbound) error
+	addIpVersion(f *config_parser.Function, values consts.IpVersionType, outbound *routing.Outbound) error
 }
 
-func (b *RoutingMatcherBuilder) registerProgramParser(rulesBuilder *routing.RulesBuilder, name string, parser routing.FunctionParser) {
+// registerRoutingProgramParsers is the single source of truth for the routing
+// rule function registry shared by the run and validate paths. Any new routing
+// function MUST be added here so `dae validate` cannot silently accept what
+// `dae run` would reject.
+func registerRoutingProgramParsers(b *routing.RulesBuilder, sink routingProgramSink) {
+	sink.registerParser(b, consts.Function_Domain, routing.PlainParserFactory(
+		func(f *config_parser.Function, key string, values []string, outbound *routing.Outbound) error {
+			// The accepted domain keys are checked here, not in a sink, so both
+			// paths agree on which keys are legal.
+			switch consts.RoutingDomainKey(key) {
+			case consts.RoutingDomainKey_Regex,
+				consts.RoutingDomainKey_Full,
+				consts.RoutingDomainKey_Keyword,
+				consts.RoutingDomainKey_Suffix:
+			default:
+				return fmt.Errorf("addDomain: unsupported key: %v", key)
+			}
+			return sink.addDomain(f, key, values, outbound)
+		}))
+	sink.registerParser(b, consts.Function_Ip, routing.IpParserFactory(sink.addIp))
+	sink.registerParser(b, consts.Function_SourceIp, routing.IpParserFactory(sink.addSourceIp))
+	sink.registerParser(b, consts.Function_Port, routing.PortRangeParserFactory(sink.addPort))
+	sink.registerParser(b, consts.Function_SourcePort, routing.PortRangeParserFactory(sink.addSourcePort))
+	sink.registerParser(b, consts.Function_L4Proto, routing.L4ProtoParserFactory(sink.addL4Proto))
+	sink.registerParser(b, consts.Function_Mac, routing.MacParserFactory(sink.addSourceMac))
+	sink.registerParser(b, consts.Function_ProcessName, routing.ProcessNameParserFactory(sink.addProcessName))
+	sink.registerParser(b, consts.Function_Dscp, routing.UintParserFactory(sink.addDscp))
+	sink.registerParser(b, consts.Function_IpVersion, routing.IpVersionParserFactory(sink.addIpVersion))
+}
+
+// routingProgramValidationSink validates rule operands without compiling them.
+// It is what makes `dae validate` run the very same parsers as `dae run`.
+type routingProgramValidationSink struct {
+	resolveOutbound func(name string) error
+}
+
+func (s *routingProgramValidationSink) registerParser(rulesBuilder *routing.RulesBuilder, name string, parser routing.FunctionParser) {
+	rulesBuilder.RegisterFunctionParser(name, parser)
+}
+
+func (s *routingProgramValidationSink) resolve(outbound *routing.Outbound) error {
+	if s == nil || s.resolveOutbound == nil || outbound == nil {
+		return nil
+	}
+	return s.resolveOutbound(outbound.Name)
+}
+
+func (s *routingProgramValidationSink) addDomain(_ *config_parser.Function, _ string, _ []string, outbound *routing.Outbound) error {
+	return s.resolve(outbound)
+}
+
+func (s *routingProgramValidationSink) addIp(_ *config_parser.Function, _ []netip.Prefix, outbound *routing.Outbound) error {
+	return s.resolve(outbound)
+}
+
+func (s *routingProgramValidationSink) addSourceIp(_ *config_parser.Function, _ []netip.Prefix, outbound *routing.Outbound) error {
+	return s.resolve(outbound)
+}
+
+func (s *routingProgramValidationSink) addPort(_ *config_parser.Function, _ [][2]uint16, outbound *routing.Outbound) error {
+	return s.resolve(outbound)
+}
+
+func (s *routingProgramValidationSink) addSourcePort(_ *config_parser.Function, _ [][2]uint16, outbound *routing.Outbound) error {
+	return s.resolve(outbound)
+}
+
+func (s *routingProgramValidationSink) addL4Proto(_ *config_parser.Function, _ consts.L4ProtoType, outbound *routing.Outbound) error {
+	return s.resolve(outbound)
+}
+
+func (s *routingProgramValidationSink) addSourceMac(_ *config_parser.Function, _ [][6]byte, outbound *routing.Outbound) error {
+	return s.resolve(outbound)
+}
+
+func (s *routingProgramValidationSink) addProcessName(_ *config_parser.Function, _ [][consts.TaskCommLen]byte, outbound *routing.Outbound) error {
+	return s.resolve(outbound)
+}
+
+func (s *routingProgramValidationSink) addDscp(_ *config_parser.Function, _ []uint8, outbound *routing.Outbound) error {
+	return s.resolve(outbound)
+}
+
+func (s *routingProgramValidationSink) addIpVersion(_ *config_parser.Function, _ consts.IpVersionType, outbound *routing.Outbound) error {
+	return s.resolve(outbound)
+}
+
+// RegisterRoutingProgramParsers installs the routing program function parsers
+// shared by the run and validate paths. Any new routing function MUST be added
+// here so `dae validate` cannot silently accept what `run` would reject.
+// resolveOutbound mirrors RoutingMatcherBuilder.outboundToId's root-namespace
+// check (the implicit direct/block/logical outbounds plus the configured
+// groups); it is only consulted, never stored.
+func RegisterRoutingProgramParsers(b *routing.RulesBuilder, resolveOutbound func(string) error) {
+	if b == nil {
+		return
+	}
+	registerRoutingProgramParsers(b, &routingProgramValidationSink{resolveOutbound: resolveOutbound})
+}
+
+// registerProgramParsers is the run path's entry point: the matcher builder
+// both validates and compiles every operand.
+func (b *RoutingMatcherBuilder) registerProgramParsers(rulesBuilder *routing.RulesBuilder) {
+	registerRoutingProgramParsers(rulesBuilder, b)
+}
+
+func (b *RoutingMatcherBuilder) registerParser(rulesBuilder *routing.RulesBuilder, name string, parser routing.FunctionParser) {
 	rulesBuilder.RegisterFunctionParser(name, func(
 		log *logrus.Logger,
 		function *config_parser.Function,

@@ -167,3 +167,45 @@ func BenchmarkSniffer_SniffTcp_NotApplicable(b *testing.B) {
 		_ = sniffer.Close()
 	}
 }
+
+// Allocation budgets, measured before and after the P3-4 review.
+//
+// Measured baseline on the review machine (go1.26, amd64, -benchtime 2000x):
+//
+//	BenchmarkSniffer_SniffUdp_QUIC   5909 ns/op  5427 B/op  60 allocs/op
+//	BenchmarkIsLikelyQuicInitialPacket 0.28 ns/op   0 B/op   0 allocs/op
+//
+// P3-4 proposed moving the HKDF/AES construction off the per-packet path by
+// reusing a cipher suite per destination connection ID. That change was NOT
+// made: QUIC Initial keys are per (version, DCID) and the sniffer only ever
+// sees a flow's first packets, so the win is bounded to a handful of packets
+// per flow, while the change itself carries a silent-misclassification failure
+// mode (a stale or wrong cached suite decrypts to a wrong domain, which then
+// picks a different outbound) and would require the pooled key buffers to stay
+// owned by the cache instead of being returned by Keys.Close. The numbers below
+// are therefore a regression gate on the current shape: any future
+// optimization must lower them, and any unrelated change that raises them fails
+// here instead of silently costing allocations on a per-flow path.
+func TestSniffAllocationBudget(t *testing.T) {
+	quicAllocs := testing.AllocsPerRun(20, func() {
+		sniffer := NewPacketSniffer(QuicStream3, 300*time.Millisecond)
+		if _, err := sniffer.SniffQuic(); err != nil {
+			t.Fatalf("SniffQuic: %v", err)
+		}
+		_ = sniffer.Close()
+	})
+	if quicAllocs > 60 {
+		t.Fatalf("SniffQuic allocations = %v/op, budget 60 (P3-4 baseline)", quicAllocs)
+	}
+
+	tlsAllocs := testing.AllocsPerRun(20, func() {
+		sniffer := NewStreamSniffer(newDeadlineConn(tlsStreamGoogle), 300*time.Millisecond)
+		if _, err := sniffer.SniffTcp(); err != nil {
+			t.Fatalf("SniffTcp: %v", err)
+		}
+		_ = sniffer.Close()
+	})
+	if tlsAllocs > 8 {
+		t.Fatalf("SniffTcp(TLS) allocations = %v/op, budget 8", tlsAllocs)
+	}
+}

@@ -414,14 +414,17 @@ func (ns *DaeNetns) tryCreateNetkit() (err error) {
 	// Get link references
 	ns.log.Debugf("Getting link reference for %s", HostVethName)
 	if ns.dae0, err = netlink.LinkByName(HostVethName); err != nil {
-		ns.log.Errorf("Failed to get link %s: %v", HostVethName, err)
+		// The returned error carries this cause (%w) and is reported once by
+		// the caller of DaeNetns setup (With/WithRequired -> the serve loop),
+		// so the inner line only adds the same failure a second time.
+		ns.log.Debugf("Failed to get link %s: %v", HostVethName, err)
 		return fmt.Errorf("failed to get link dae0: %w", err)
 	}
 	ns.log.Debug("Got link reference for dae0")
 
 	ns.log.Debugf("Getting link reference for %s", NsVethName)
 	if ns.dae0peer, err = netlink.LinkByName(NsVethName); err != nil {
-		ns.log.Errorf("Failed to get link %s: %v", NsVethName, err)
+		ns.log.Debugf("Failed to get link %s: %v", NsVethName, err)
 		return fmt.Errorf("failed to get link dae0peer: %w", err)
 	}
 	ns.log.Debug("Got link reference for dae0peer")
@@ -437,7 +440,7 @@ func (ns *DaeNetns) tryCreateNetkit() (err error) {
 	// Set link up
 	ns.log.Debug("Setting link dae0 up")
 	if err = netlink.LinkSetUp(ns.dae0); err != nil {
-		ns.log.Errorf("Failed to set link dae0 up: %v", err)
+		ns.log.Debugf("Failed to set link dae0 up: %v", err)
 		return fmt.Errorf("failed to set link dae0 up: %w", err)
 	}
 	ns.log.Debug("Netkit device setup completed successfully")

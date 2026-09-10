@@ -188,16 +188,19 @@ func (c *controlPlaneCore) bindLan(ifname string, autoConfigKernelParameter bool
 		if link.Attrs().Name == HostVethName {
 			return
 		}
-		c.log.Warnf("New link creation of '%v' is detected. Bind LAN program to it.", link.Attrs().Name)
-		if err := attach(link); err != nil {
-			c.log.Errorf("bindLan: %v", err)
-		}
+		// A link that appears late (veth created after dae started) is the
+		// lazy-bind milestone this callback exists for, so it is info, not a
+		// warning: it is expected operation, and the bind outcome below carries
+		// the anomaly when there is one.
+		c.log.Infof("New link creation of '%v' is detected. Bind LAN program to it.", link.Attrs().Name)
+		c.logBindOutcome(link.Attrs().Name, true, attach(link))
 	}
 	dellinkCallback := func(link netlink.Link) {
 		if link.Attrs().Name == HostVethName {
 			return
 		}
-		c.log.Warnf("Link deletion of '%v' is detected. Bind LAN program to it once it is re-created.", link.Attrs().Name)
+		c.log.Infof("Link deletion of '%v' is detected. Bind LAN program to it once it is re-created.", link.Attrs().Name)
+		c.forgetBindState(link.Attrs().Name)
 		if err := c.removeTCHooksForInterface(tcHookScopeHost, link.Attrs().Index); err != nil {
 			c.log.Errorf("remove TC hooks: %v", err)
 		}
@@ -456,16 +459,17 @@ func (c *controlPlaneCore) bindWan(ifname string) error {
 		if link.Attrs().Name == HostVethName {
 			return
 		}
-		c.log.Warnf("New link creation of '%v' is detected. Bind WAN program to it.", link.Attrs().Name)
-		if err := attach(link); err != nil {
-			c.log.Errorf("bindWan: %v", err)
-		}
+		// See bindLan: a late link is the lazy-bind milestone, the bind
+		// outcome below carries the anomaly.
+		c.log.Infof("New link creation of '%v' is detected. Bind WAN program to it.", link.Attrs().Name)
+		c.logBindOutcome(link.Attrs().Name, false, attach(link))
 	}
 	dellinkCallback := func(link netlink.Link) {
 		if link.Attrs().Name == HostVethName {
 			return
 		}
-		c.log.Warnf("Link deletion of '%v' is detected. Bind WAN program to it once it is re-created.", link.Attrs().Name)
+		c.log.Infof("Link deletion of '%v' is detected. Bind WAN program to it once it is re-created.", link.Attrs().Name)
+		c.forgetBindState(link.Attrs().Name)
 		if err := c.removeTCHooksForInterface(tcHookScopeHost, link.Attrs().Index); err != nil {
 			c.log.Errorf("remove TC hooks: %v", err)
 		}

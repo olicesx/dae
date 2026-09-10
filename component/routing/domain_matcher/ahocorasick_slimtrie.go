@@ -35,6 +35,14 @@ type AhocorasickSlimtrie struct {
 	toBuildTrie [][]string
 	err         error
 
+	// skippedDomains counts routing patterns that were rejected as invalid and
+	// therefore never entered the trie. A rejected pattern silently changes
+	// routing for every name it would have matched, so the count is
+	// correctness information, not a log-volume detail: the first rejection is
+	// reported with its offending character and the per-call total is reported
+	// in one aggregate line.
+	skippedDomains uint64
+
 	// matchCache memoizes the most recent qname resolutions. A single DNS
 	// query otherwise recomputes the same domain bitmap up to six times
 	// (request select, response select, and once per ip-version x protocol
@@ -83,6 +91,7 @@ func (n *AhocorasickSlimtrie) AddSet(bitIndex int, patterns []string, typ consts
 	if maxAcEntries > 0 {
 		n.toBuildAc[bitIndex] = slices.Grow(n.toBuildAc[bitIndex], maxAcEntries)
 	}
+	skippedInThisSet := uint64(0)
 nextPattern:
 	for _, d := range patterns {
 		switch typ {
@@ -97,7 +106,8 @@ nextPattern:
 		case consts.RoutingDomainKey_Full:
 			for _, r := range []byte(d) {
 				if !ValidDomainChars.IsValidChar(r) {
-					n.log.Warnf("DomainMatcher: skip bad full domain: %v: unexpected char: %v", d, string(r))
+					skippedInThisSet++
+					n.noteSkippedDomain("full", bitIndex, d, r)
 					continue nextPattern
 				}
 			}
@@ -105,7 +115,8 @@ nextPattern:
 		case consts.RoutingDomainKey_Suffix:
 			for _, r := range []byte(d) {
 				if !ValidDomainChars.IsValidChar(r) {
-					n.log.Warnf("DomainMatcher: skip bad suffix domain: %v: unexpected char: %v", d, string(r))
+					skippedInThisSet++
+					n.noteSkippedDomain("suffix", bitIndex, d, r)
 					continue nextPattern
 				}
 			}
@@ -135,6 +146,64 @@ nextPattern:
 			return
 		}
 	}
+	n.logSkippedDomainSummary(bitIndex, typ, skippedInThisSet)
+}
+
+// noteSkippedDomain records one routing pattern rejected as invalid. The first
+// rejection is a warning with its offending character (so the user can fix the
+// rule); every later one keeps its detail at debug. Either way the pattern
+// never enters the trie, so routing silently changes for the names it would
+// have matched — the count below is what keeps that visible.
+func (n *AhocorasickSlimtrie) noteSkippedDomain(kind string, bitIndex int, domain string, offending byte) {
+	n.skippedDomains++
+	skipped := n.skippedDomains
+	if n.log == nil {
+		return
+	}
+	if skipped == 1 {
+		n.log.WithFields(logrus.Fields{
+			"rule_index": bitIndex,
+			"domain":     domain,
+			"char":       string(offending),
+			"key_type":   kind,
+			"total":      skipped,
+		}).Warnf("DomainMatcher: bad %v domain rejected and NOT applied to routing (unexpected char %q); later rejections are reported at debug and counted in the per-rule summary",
+			kind, string(offending))
+		return
+	}
+	n.log.WithFields(logrus.Fields{
+		"rule_index": bitIndex,
+		"domain":     domain,
+		"char":       string(offending),
+		"key_type":   kind,
+		"total":      skipped,
+	}).Debugf("DomainMatcher: bad %v domain rejected and NOT applied to routing", kind)
+}
+
+// logSkippedDomainSummary emits the one line that closes an AddSet call when
+// patterns were dropped, so a rule that loses many patterns is one warning
+// plus this count instead of one warning per pattern. total_skipped keeps the
+// lifetime magnitude visible across rules and reloads.
+func (n *AhocorasickSlimtrie) logSkippedDomainSummary(bitIndex int, typ consts.RoutingDomainKey, skipped uint64) {
+	if skipped == 0 || n.log == nil {
+		return
+	}
+	n.log.WithFields(logrus.Fields{
+		"rule_index":    bitIndex,
+		"key_type":      string(typ),
+		"skipped":       skipped,
+		"total_skipped": n.skippedDomains,
+	}).Warnf("DomainMatcher: %d pattern(s) of this rule were rejected and are NOT used for routing; routing decisions for the names they would match are unaffected by this rule",
+		skipped)
+}
+
+// SkippedDomainCount reports how many routing patterns were rejected as
+// invalid across this matcher's lifetime.
+func (n *AhocorasickSlimtrie) SkippedDomainCount() uint64 {
+	if n == nil {
+		return 0
+	}
+	return n.skippedDomains
 }
 
 // matchCacheCap bounds the per-matcher qname->bitmap memo (small: sequential

@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -141,6 +142,12 @@ type Dialer struct {
 	// lastCheckOptionWarn throttles the warn log for persistent
 	// errCheckOptionUnavailable failures (see check()).
 	lastCheckOptionWarn atomic.Int64
+
+	// proxyFailurePromotions counts how many times the persistent-proxy-IP
+	// failure path promoted this dialer to unavailable. The promotion is only
+	// announced when it actually changes a collection's alive state, so this
+	// counter is what keeps the magnitude of repeated promotions visible.
+	proxyFailurePromotions atomic.Uint64
 
 	recoveryManagerMu sync.Mutex
 	recoveryManager   *dialerRecoveryManager
@@ -878,21 +885,60 @@ func (d *Dialer) notifyPeriodicCheckResultByIndex(protoIdx int, proto consts.L4P
 
 // markUnavailableFromProxyFailure immediately marks the dialer as unavailable.
 // This is called when all proxy IPs have failed after retries, bypassing the health check cycle.
+//
+// Caller trace (why this is guarded rather than unconditional): the only
+// caller is NotifyHealthCheckResult, which promotes when
+// recordProxyFailure reports the consecutive-failure threshold
+// (maxConsecutiveFailures, sticky_cache.go). That threshold is per proxy
+// address and the counter is reset when it fires, so a dead proxy keeps
+// reaching this function on every later failure cycle while it stays dead.
+// Marking six collections unavailable on each of those cycles is what used to
+// print one "Marking dialer as unavailable..." line per cycle with no state
+// change behind it.
 func (d *Dialer) markUnavailableFromProxyFailure() {
-	d.Log.WithFields(logrus.Fields{
-		"dialer": d.Property().Name,
-	}).Warnln("Marking dialer as unavailable due to persistent proxy IP failures")
-
 	// Use existing markUnavailable logic from connectivity_check.go.
 	// Shared proxy transport failures must fan out into all transport domains.
-	for _, networkType := range []*NetworkType{
+	networkTypes := []*NetworkType{
 		{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4},
 		{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_6},
 		{L4Proto: consts.L4ProtoStr_UDP, IpVersion: consts.IpVersionStr_4, UdpHealthDomain: UdpHealthDomainDns, IsDns: true},
 		{L4Proto: consts.L4ProtoStr_UDP, IpVersion: consts.IpVersionStr_6, UdpHealthDomain: UdpHealthDomainDns, IsDns: true},
 		{L4Proto: consts.L4ProtoStr_UDP, IpVersion: consts.IpVersionStr_4, UdpHealthDomain: UdpHealthDomainData},
 		{L4Proto: consts.L4ProtoStr_UDP, IpVersion: consts.IpVersionStr_6, UdpHealthDomain: UdpHealthDomainData},
-	} {
+	}
+	// ReportUnavailableForced marks a collection unavailable unconditionally,
+	// so a repeated promotion is a no-op on the dialer state. Capture which
+	// collections were alive first; the line is emitted only when the
+	// promotion really changed at least one of them.
+	changed := make([]*NetworkType, 0, len(networkTypes))
+	for _, networkType := range networkTypes {
+		if d.MustGetAlive(networkType) {
+			changed = append(changed, networkType)
+		}
+	}
+	promotions := d.proxyFailurePromotions.Add(1)
+	switch {
+	case d.Log == nil:
+		// The state change below still has to happen; only the report is
+		// impossible without a logger.
+	case len(changed) > 0:
+		fields := logrus.Fields{
+			"dialer":     d.Property().Name,
+			"network":    describeNetworkTypes(changed),
+			"promotions": promotions,
+		}
+		d.Log.WithFields(fields).Warnln("Marking dialer as unavailable due to persistent proxy IP failures")
+	case d.Log.IsLevelEnabled(logrus.DebugLevel):
+		// No state change: an already-unavailable dialer was promoted again.
+		// Keep it visible at debug with the running count so a repeated
+		// promotion is never indistinguishable from a single one.
+		d.Log.WithFields(logrus.Fields{
+			"dialer":     d.Property().Name,
+			"promotions": promotions,
+		}).Debugln("Dialer was already unavailable; persistent proxy IP failures repeated")
+	}
+
+	for _, networkType := range networkTypes {
 		d.ReportUnavailableForced(networkType, nil)
 	}
 
@@ -909,6 +955,25 @@ func (d *Dialer) markUnavailableFromProxyFailure() {
 		d.resetStabilityCountByIndex(recovery.idx)
 		d.cancelPendingRecoveryConfirmationByIndex(recovery.idx, recovery.proto)
 	}
+}
+
+// describeNetworkTypes renders the network types a promotion actually changed.
+func describeNetworkTypes(networkTypes []*NetworkType) string {
+	names := make([]string, 0, len(networkTypes))
+	for _, networkType := range networkTypes {
+		names = append(names, networkType.String())
+	}
+	return strings.Join(names, ",")
+}
+
+// ProxyFailurePromotionCount reports how many times the persistent-proxy-IP
+// failure path promoted this dialer to unavailable, including the promotions
+// that changed no state and are only visible at debug.
+func (d *Dialer) ProxyFailurePromotionCount() uint64 {
+	if d == nil {
+		return 0
+	}
+	return d.proxyFailurePromotions.Load()
 }
 
 // isRecoveryTypeAlive returns true if any IP version of the specified health

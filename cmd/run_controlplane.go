@@ -195,6 +195,13 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 		var autoSelected bool
 		conf.Global.SoMarkFromDae, autoSelected = common.ResolveSoMarkFromDae(conf.Global.SoMarkFromDae, conf.Global.SoMarkFromDaeSet)
 		if autoSelected {
+			// This is the reachable, user-visible report of the auto-selected
+			// mark: every control-plane build goes through this function
+			// (startup and both reload paths), and it resolves the mark before
+			// control.NewControlPlane sees the config. The same warning exists
+			// in control.NewControlPlane as a defensive guard for callers that
+			// bypass cmd; with this resolution upstream its autoSelected branch
+			// is unreachable from the daemon, so it double-reports nothing.
 			log.Warnf("so_mark_from_dae is unset; using internal socket mark %#x to prevent dae UDP self-capture", conf.Global.SoMarkFromDae)
 		}
 	}
@@ -400,6 +407,21 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	}
 
 	if len(conf.Global.LanInterface) == 0 && len(conf.Global.WanInterface) == 0 {
+		// Deliberately warn, not error, and this is a decision with a stated
+		// invalidation condition: dae binds interfaces lazily. bindLan/bindWan
+		// register a pattern with the InterfaceManager and attach whenever a
+		// matching link appears (see controlPlaneCore.logBindOutcome), so
+		// "no interface at this instant" is recoverable - a container whose
+		// veth is created after dae starts, or a WAN link that appears when
+		// the modem comes up, would be reported as a fatal startup error while
+		// the daemon would in fact have bound it moments later.
+		//
+		// This must become an error if that lazy path ever stops delivering
+		// link events for a configured pattern (for example if the interface
+		// subscription is removed, or if a caller can reach this point with an
+		// empty LanInterface while no lan_interface default exists), because
+		// then "no interface" really is permanent and dae would run with an
+		// empty datapath instead of failing closed.
 		log.Warnln("No interface to bind.")
 	}
 

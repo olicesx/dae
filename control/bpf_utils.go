@@ -573,6 +573,21 @@ func cleanupEphemeralBpfPinDirs(log *logrus.Logger, pinPath string) int {
 	return removed
 }
 
+// logRemovedIncompatiblePinnedMap reports the removal of a pinned map whose
+// layout the new datapath object rejects. Removal is destructive -- the map
+// holds live connection/session or redirect state and the reloaded program
+// starts with an empty one -- so this is a warning that names the map, the pin
+// path, and the consequence for established flows, not a step notice.
+func logRemovedIncompatiblePinnedMap(log *logrus.Logger, mapName, pinPath string) {
+	if log == nil {
+		return
+	}
+	log.WithFields(logrus.Fields{
+		"map":      mapName,
+		"pin_path": filepath.Join(pinPath, mapName),
+	}).Warn("Removed incompatible pinned map: the new datapath object requires a different map layout, so the map's contents (connection tracking / redirect state) are lost and established flows fall back to a fresh decision")
+}
+
 func fullLoadBpfObjects(
 	log *logrus.Logger,
 	bpf *bpfObjects,
@@ -689,7 +704,7 @@ retryLoadBpf:
 				return fmt.Errorf("remove incompatible pinned map %q: %w", mapName, rmErr)
 			}
 			retries++
-			log.Infof("Incompatible new map format with existing map %v detected; removed the old one.", mapName)
+			logRemovedIncompatiblePinnedMap(log, mapName, opts.PinPath)
 			goto retryLoadBpf
 		}
 		// Get detailed log from ebpf.internal.(*VerifierError)

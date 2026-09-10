@@ -8,6 +8,7 @@ package outbound
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -36,6 +37,18 @@ type DialerSet struct {
 	log          *logrus.Logger
 	dialers      []*dialer.Dialer
 	nodeToTagMap map[*dialer.Dialer]string
+
+	// parseFailures counts nodes that were dropped because their link could
+	// not be parsed into a dialer. They are not routable, so the count is a
+	// correctness signal for the operator, not just noise control; it is also
+	// what the aggregate line reports after a subscription refresh that
+	// produced many bad nodes at once. The counter is cumulative for the set's
+	// lifetime; parseFailuresReported remembers how much of it the last
+	// summary already covered.
+	parseFailuresMu       sync.Mutex
+	parseFailures         uint64
+	parseFailuresReported uint64
+	parseFailuresBy       map[string]uint64
 }
 
 // AllDialers returns a snapshot of every dialer owned by the set.
@@ -44,6 +57,89 @@ func (s *DialerSet) AllDialers() []*dialer.Dialer {
 		return nil
 	}
 	return append([]*dialer.Dialer(nil), s.dialers...)
+}
+
+// ParseFailureCount reports how many nodes were skipped because their link
+// could not be parsed. An unparsed node never becomes a dialer, so it cannot
+// be selected by any routing rule built from this set.
+func (s *DialerSet) ParseFailureCount() uint64 {
+	if s == nil {
+		return 0
+	}
+	s.parseFailuresMu.Lock()
+	defer s.parseFailuresMu.Unlock()
+	return s.parseFailures
+}
+
+// noteParseFailure records one dropped node. The first dropped node of the
+// build warns with the concrete parse error; the rest are folded into a single
+// aggregate line, because a subscription refresh can invalidate hundreds of
+// nodes at once and one warning per node would both flood the log and hide the
+// total, which is the number that matters.
+func (s *DialerSet) noteParseFailure(subscriptionTag string, err error) {
+	if s == nil {
+		return
+	}
+	s.parseFailuresMu.Lock()
+	s.parseFailures++
+	total := s.parseFailures
+	first := total == 1
+	if s.parseFailuresBy == nil {
+		s.parseFailuresBy = make(map[string]uint64)
+	}
+	s.parseFailuresBy[subscriptionTag]++
+	s.parseFailuresMu.Unlock()
+
+	if s.log == nil {
+		return
+	}
+	if first {
+		s.log.WithFields(logrus.Fields{
+			"subscription": subscriptionTag,
+			"total":        total,
+		}).Warnf("failed to parse node: %v; the node is dropped and will not participate in routing", err)
+		return
+	}
+	// Every later failure keeps its own cause and subscription tag at debug so
+	// a mixed batch stays diagnosable without one line per node.
+	s.log.WithFields(logrus.Fields{
+		"subscription": subscriptionTag,
+		"total":        total,
+	}).Debugf("failed to parse node: %v", err)
+}
+
+// logParseFailureSummary emits the one line that closes a batch of dropped
+// nodes. It reports the number of nodes dropped since the last summary, so a
+// later refresh reports its own total, and the running count stays available
+// through ParseFailureCount.
+func (s *DialerSet) logParseFailureSummary() {
+	if s == nil || s.log == nil {
+		return
+	}
+	s.parseFailuresMu.Lock()
+	total := s.parseFailures
+	batch := total - s.parseFailuresReported
+	s.parseFailuresReported = total
+	byTag := make(map[string]uint64, len(s.parseFailuresBy))
+	for tag, count := range s.parseFailuresBy {
+		byTag[tag] = count
+	}
+	s.parseFailuresBy = nil
+	s.parseFailuresMu.Unlock()
+	if batch == 0 {
+		return
+	}
+	tags := make([]string, 0, len(byTag))
+	for tag := range byTag {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+	parts := make([]string, 0, len(tags))
+	for _, tag := range tags {
+		parts = append(parts, fmt.Sprintf("%s=%d", tag, byTag[tag]))
+	}
+	s.log.Warnf("%d node(s) were skipped because their link could not be parsed and do not participate in routing (by subscription: %s; total skipped since start: %d)",
+		batch, strings.Join(parts, ", "), total)
 }
 
 func NewDialerSetFromLinksContext(ctx context.Context, option *dialer.GlobalOption, tagToNodeList map[string][]string) *DialerSet {
@@ -56,13 +152,14 @@ func NewDialerSetFromLinksContext(ctx context.Context, option *dialer.GlobalOpti
 		for _, node := range nodes {
 			d, err := dialer.NewFromLinkContext(ctx, option, dialer.InstanceOption{DisableCheck: false}, node, subscriptionTag)
 			if err != nil {
-				s.log.Infof("failed to parse node: %v", err)
+				s.noteParseFailure(subscriptionTag, err)
 				continue
 			}
 			s.dialers = append(s.dialers, d)
 			s.nodeToTagMap[d] = subscriptionTag
 		}
 	}
+	s.logParseFailureSummary()
 	return s
 }
 

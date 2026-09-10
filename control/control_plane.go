@@ -126,6 +126,11 @@ type ControlPlane struct {
 	udpRoutingTupleWarnAlert    pacedAlert
 	udpDNSRoutingTupleWarnAlert pacedAlert
 	udpHandlePktWarnAlert       pacedAlert
+	// checkBpfMapHealthWarnAlert paces the datapath-counter read failure. The
+	// health check runs on every janitor tick (5s), and a read that fails once
+	// usually fails for as long as the underlying condition lasts, so an
+	// unpaced warn would write one line per 5s with no transition behind it.
+	checkBpfMapHealthWarnAlert pacedAlert
 	// udpDirectDispatchPanicCount and udpIngressLoopPanicCount count recovered
 	// panics on the two UDP packet-path goroutines that have no convoy wrapper:
 	// the direct-dispatch task (DNS/SIP/RTP/STUN exceptions) and the ingress
@@ -1838,6 +1843,31 @@ func (c *ControlPlane) cleanupRoutingHandoffMapBeforeLocked(staleBeforeNs uint64
 	return len(keysToDelete)
 }
 
+// datapathCounterReadFailureCooldown paces the datapath-counter read failure.
+// The health check runs on every janitor tick (5s), so an unpaced report of a
+// read that keeps failing writes ~720 lines/hour at the default log level. The
+// condition is worth reporting (a failed read hides every datapath counter),
+// so it is paced rather than demoted, and each emitted line carries the number
+// of failed reads it folded in.
+const datapathCounterReadFailureCooldown = 30 * time.Second
+
+// logDatapathCounterReadFailure reports a failed datapath-counter snapshot
+// read at most once per cooldown. The count in the line is the number of failed
+// reads since the process started, so a condition that never clears stays
+// visible as a magnitude instead of one line per tick, and the first failure is
+// always reported (a single failure is never suppressed).
+func (c *ControlPlane) logDatapathCounterReadFailure(now time.Time, err error) {
+	if c == nil || c.log == nil || err == nil {
+		return
+	}
+	failures, emit := c.checkBpfMapHealthWarnAlert.observe(now, datapathCounterReadFailureCooldown)
+	if !emit {
+		return
+	}
+	c.log.Warnf("checkBpfMapHealth: %v (failures=%d, reporting at most one line per %v)",
+		err, failures, datapathCounterReadFailureCooldown)
+}
+
 // checkBpfMapHealth monitors map usage and overflow counters for robustness.
 // Alerts when maps are approaching capacity or experiencing high overflow rates.
 // Accepts pre-read overflow counters to avoid redundant BPF map lookups.
@@ -1863,7 +1893,7 @@ func (c *ControlPlane) checkBpfMapHealth(udpOverflow, tcpOverflow uint64) {
 	now := time.Now()
 
 	if snapshotErr != nil {
-		c.log.Warnf("checkBpfMapHealth: %v", snapshotErr)
+		c.logDatapathCounterReadFailure(now, snapshotErr)
 	}
 
 	// The by-design passthrough counters are published from this same snapshot

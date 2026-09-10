@@ -18,7 +18,9 @@ import (
 // lockProbeWriter fails the test when the latency listing is rendered while
 // the set's write lock is held. It only inspects writes that belong to the
 // listing, because the same logger also emits a "Group selects dialer" line
-// while holding the lock (a scalar logrus.Fields write, not the list render).
+// (a scalar logrus.Fields write, not the list render). The render itself is
+// debug-level (see printLatenciesOutOfLock): it is per-dialer detail, while
+// the milestone line above it is the info-level event.
 type lockProbeWriter struct {
 	set     *AliveDialerSet
 	mu      sync.Mutex
@@ -87,7 +89,10 @@ func TestNotifyLatencyDoesNotHoldWriteLockDuringFormatting(t *testing.T) {
 
 	probe := &lockProbeWriter{set: set}
 	d1.Log.SetOutput(probe)
-	d1.Log.SetLevel(logrus.InfoLevel)
+	// Debug is where the listing is emitted; the invariant (no render while
+	// the set lock is held) is the same at either level, so the test drives
+	// the level that actually reaches the renderer.
+	d1.Log.SetLevel(logrus.DebugLevel)
 
 	// The constructor already registered both dialers as alive with an
 	// optimistic 0-latency sort key. Giving d1 a real probe latency makes the

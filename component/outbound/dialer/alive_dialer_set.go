@@ -192,9 +192,9 @@ type latencySnapshot struct {
 // held. It must be called with a.mu held (read or write); it performs no I/O
 // and no logging.
 func (a *AliveDialerSet) snapshotLatenciesLocked() (latencySnapshot, bool) {
-	if !a.log.IsLevelEnabled(logrus.InfoLevel) {
-		// The caller logs at Info; skip building the snapshot (which walks
-		// every entry) when it would be discarded anyway.
+	if !a.log.IsLevelEnabled(logrus.DebugLevel) {
+		// The caller logs the rendered list at Debug; skip building the
+		// snapshot (which walks every entry) when it would be discarded anyway.
 		return latencySnapshot{}, false
 	}
 	snap := latencySnapshot{
@@ -225,6 +225,13 @@ func (a *AliveDialerSet) snapshotLatenciesLocked() (latencySnapshot, bool) {
 // snapshotLatenciesLocked. It must run with a.mu RELEASED: the whole point is
 // to keep list formatting and log I/O out of the latency-update critical
 // section (the 30s health cycle calls this for the whole group).
+//
+// The list is per-dialer detail, and the caller already emits the milestone
+// (which dialer was selected and why) at info, so this render is debug: at N
+// dialers it is N lines per best-dialer change, which is exactly the kind of
+// detail log_level=debug exists for. It is not removed, because the ordering
+// behind a selection decision is what an operator needs when they disagree
+// with the choice.
 func (a *AliveDialerSet) printLatenciesOutOfLock(snap latencySnapshot) {
 	alive := snap.entries
 	sort.SliceStable(alive, func(i, j int) bool {
@@ -235,7 +242,7 @@ func (a *AliveDialerSet) printLatenciesOutOfLock(snap latencySnapshot) {
 	for i, dl := range alive {
 		fmt.Fprintf(&builder, "%4d. [%v] %v: %v\n", i+1, dl.tag, dl.name, latencyString(dl.latency, dl.offset))
 	}
-	a.log.Infoln(strings.TrimSuffix(builder.String(), "\n"))
+	a.log.Debugln(strings.TrimSuffix(builder.String(), "\n"))
 }
 
 // NotifyLatencyChange should be invoked when dialer every time latency and alive state changes.
@@ -423,13 +430,29 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 					oldDialerName = bakOldBestDialer.property.Name
 				}
 				if a.log.IsLevelEnabled(logrus.InfoLevel) {
-					a.log.WithFields(logrus.Fields{
+					// One line carries the decision: which dialer won, what
+					// it displaced, the selection key, and why the change
+					// happened. The full latency table moves to debug (see
+					// printLatenciesOutOfLock): it is detail, this line is
+					// the event.
+					reason := "best latency"
+					if bakOldBestDialer == nil {
+						reason = "no dialer was alive"
+					}
+					fields := logrus.Fields{
 						string(a.selectionPolicy): latencyString(newBestLatency, newBestOffset),
 						"_new_dialer":             newBestDialer.property.Name,
 						"_old_dialer":             oldDialerName,
+						"reason":                  reason,
+						"alive_dialers":           len(a.aliveEntries),
 						"group":                   a.dialerGroupName,
 						"network":                 a.CheckTyp.String(),
-					}).Infof("Group %vselects dialer", re)
+					}
+					if bakOldBestDialer != nil {
+						delta := newBestLatency + newBestOffset - bakOldMinSortingLatency
+						fields["latency_delta_ms"] = delta.Milliseconds()
+					}
+					a.log.WithFields(fields).Infof("Group %vselects dialer", re)
 				}
 
 				// Lock order / critical-section discipline: the snapshot is

@@ -425,6 +425,12 @@ func fullLoadBpfObjects(
 	return errBpfObjectsUnavailable
 }
 
+// logRemovedIncompatiblePinnedMap has no counterpart in this build: the stub
+// loader never loads objects and never removes a pinned map, so the warning it
+// emits (bpf_utils.go) is unreachable here. The stub exists so the shared
+// source-contract tests that reference the symbol still compile.
+func logRemovedIncompatiblePinnedMap(_ *logrus.Logger, _, _ string) {}
+
 func BpfMapDeleteAll[K any, V any](m *ebpf.Map) error {
 	return errBpfObjectsUnavailable
 }

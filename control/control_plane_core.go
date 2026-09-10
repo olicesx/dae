@@ -160,6 +160,13 @@ type controlPlaneCore struct {
 	registeredWanPatterns map[string]struct{}
 	tcHookLanPatterns     []string
 	tcHookWanPatterns     []string
+	// bindStateMu guards bindStates (per-link bind outcomes, lazily created).
+	// bindAttempts/bindFailures are the magnitude counters for datapath binds;
+	// see logBindOutcome in control_plane_core_bind_event.go.
+	bindStateMu  sync.Mutex
+	bindStates   map[bindEventKey]*bindEventState
+	bindAttempts atomic.Uint64
+	bindFailures atomic.Uint64
 
 	udpConnStateTracker       atomic.Pointer[udpConnStateTracker]
 	domainRouting             *domainRoutingTracker

@@ -87,10 +87,12 @@ type ControlPlane struct {
 	controlPlaneDatapathJanitor
 	bpfMaintenance *bpfMaintenanceBinding
 
-	// Track last alert time to avoid spamming logs
-	lastBpfOverflowAlertTime atomic.Int64
-	lastUdpPressureAlertTime atomic.Int64
-	lastTcpPressureAlertTime atomic.Int64
+	// Datapath counter report state. Unlike a per-alert timestamp, the baselines
+	// it holds are what let a resource alert describe the interval since the
+	// previous line instead of the lifetime total, which never returns to zero
+	// for a map shared across generations. See
+	// control/datapath_overflow_report.go.
+	datapathOverflowReport controlPlaneDatapathOverflowReport
 
 	wanInterface []string
 	lanInterface []string
@@ -1841,68 +1843,26 @@ func (c *ControlPlane) checkBpfMapHealth(udpOverflow, tcpOverflow uint64) {
 		snap, snapshotErr = c.readDatapathCounters(bpf.BpfStatsMap)
 	}
 
-	// Define alert thresholds
-	const (
-		warnThreshold = 70               // Alert at 70% capacity
-		critThreshold = 85               // Critical alert at 85% capacity
-		alertCooldown = 30 * time.Second // Minimum time between alerts
-	)
-
 	now := time.Now()
 
 	if snapshotErr != nil {
 		c.log.Warnf("checkBpfMapHealth: %v", snapshotErr)
 	}
 
-	// Alert on significant overflow counts
-	if udpOverflow > 0 || tcpOverflow > 0 || snap.RedirectOverflow > 0 || snap.EventDrop > 0 {
-		// Use atomic Int64 to store the last alert time in Unix nanoseconds.
-		// Cooldown prevents alert spam.
-		nowNano := now.UnixNano()
-		last := c.lastBpfOverflowAlertTime.Load()
-		if last == 0 || last+int64(alertCooldown) < nowNano {
-			if c.lastBpfOverflowAlertTime.CompareAndSwap(last, nowNano) {
-				c.log.Warnf("BPF map overflow detected: UDP conn state=%d, TCP conn state=%d, redirect track=%d, dropped events=%d. "+
-					"Some packets are falling back to slower paths, cannot store their reply binding, or lost their notification. "+
-					"Check if map capacity and the event ringbuf size are adequate.",
-					udpOverflow, tcpOverflow, snap.RedirectOverflow, snap.EventDrop)
-			}
-		}
+	// The conn-state capacity is the operator's lever on an overflowing
+	// conn-state map, so it is carried into the report rather than read by it.
+	connStateCapacity := uint64(0)
+	if bpf.ConnStateMap != nil {
+		connStateCapacity = uint64(bpf.ConnStateMap.MaxEntries())
 	}
 
-	// Estimate map usage by sampling (full iteration is expensive)
-	if bpf.ConnStateMap == nil {
-		return
-	}
-
-	maxEntries := bpf.ConnStateMap.MaxEntries()
-	if maxEntries == 0 {
-		return
-	}
-
-	// If overflow is happening, map is under pressure.
-	if udpOverflow > 100 {
-		nowNano := now.UnixNano()
-		last := c.lastUdpPressureAlertTime.Load()
-		if last == 0 || last+int64(alertCooldown) < nowNano {
-			if c.lastUdpPressureAlertTime.CompareAndSwap(last, nowNano) {
-				c.log.Errorf("CRITICAL: UDP conn state map is under heavy pressure (overflow=%d). "+
-					"Configured capacity=%d. Consider increasing conn_state_map capacity or reducing UDP connection timeout.",
-					udpOverflow, maxEntries)
-			}
-		}
-	}
-	if tcpOverflow > 100 {
-		nowNano := now.UnixNano()
-		last := c.lastTcpPressureAlertTime.Load()
-		if last == 0 || last+int64(alertCooldown) < nowNano {
-			if c.lastTcpPressureAlertTime.CompareAndSwap(last, nowNano) {
-				c.log.Errorf("CRITICAL: TCP conn state map is under heavy pressure (overflow=%d). "+
-					"Configured capacity=%d. Consider increasing conn_state_map capacity or reducing TCP connection timeout.",
-					tcpOverflow, maxEntries)
-			}
-		}
-	}
+	// Publish the counters for the interval since the previous line. Comparing
+	// them against their lifetime totals instead (the previous behaviour) meant
+	// that a single overflow ever observed re-alerted on every cooldown expiry
+	// for the life of the process, because these counters never return to zero,
+	// and that "CRITICAL ... overflow=%d" presented a lifetime total as if it
+	// were pressure happening now.
+	c.reportDatapathOverflowInterval(now, snap, udpOverflow, tcpOverflow, connStateCapacity)
 }
 
 // readMapOverflowCounters reads the two conn-state overflow counters that

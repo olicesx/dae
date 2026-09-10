@@ -7,6 +7,8 @@ package control
 
 import (
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -92,9 +94,21 @@ func TestPerPacketUdpWarningsGoThroughThePace(t *testing.T) {
 }
 
 // readPackageSource reads one file of this package for a source contract.
+//
+// The path is resolved against this helper's own directory (via runtime.Caller)
+// rather than the process working directory. `go test ./control` runs with the
+// package as the working directory, but the datapath whitelist harness in
+// .github/workflows/bpf-test.yml compiles this package's tests and runs the
+// binary from the repository root, where a bare file name does not resolve.
+// Source-contract tests inherit whichever harness runs them, so the helper must
+// not depend on the working directory.
 func readPackageSource(t *testing.T, name string) string {
 	t.Helper()
-	src, err := os.ReadFile(name)
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatalf("cannot locate the test source directory to read %s", name)
+	}
+	src, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), name))
 	if err != nil {
 		t.Fatalf("read %s: %v", name, err)
 	}

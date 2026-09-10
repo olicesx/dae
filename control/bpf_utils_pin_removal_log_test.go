@@ -8,12 +8,23 @@
 package control
 
 import (
+	_ "embed"
 	"strings"
 	"testing"
 
 	"github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
 )
+
+// bpfUtilsSource is embedded rather than read at run time. The datapath
+// whitelist harness in .github/workflows/bpf-test.yml runs this package's test
+// binary from the repository root, so a relative os.ReadFile("bpf_utils.go")
+// would not resolve there; go:embed resolves at compile time against this
+// file's own directory and therefore works from any working directory (the
+// same reason bpf_variables_parity_test.go embeds kern/tproxy.c).
+//
+//go:embed bpf_utils.go
+var bpfUtilsSource string
 
 // TestRemovedIncompatiblePinnedMapWarnsWithConsequence is the Q7 contract.
 // Deleting a pinned map because the new object rejects its layout destroys live
@@ -53,7 +64,7 @@ func TestRemovedIncompatiblePinnedMapWarnsWithConsequence(t *testing.T) {
 // TestIncompatiblePinRemovalIsNotAnInfoStep pins the level at the call site: a
 // later edit must not put the step notice back.
 func TestIncompatiblePinRemovalIsNotAnInfoStep(t *testing.T) {
-	src := readPackageSource(t, "bpf_utils.go")
+	src := bpfUtilsSource
 	if strings.Contains(src, "Incompatible new map format with existing map") {
 		t.Fatal("the pinned-map removal is back to being reported as an info step notice")
 	}

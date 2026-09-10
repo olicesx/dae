@@ -50,7 +50,16 @@ GOARCH ?= $(shell go env GOARCH)
 # Reproducible probe (needs clang and the headers submodule):
 #   GOARCH=<arch> BPF_CLANG=clang go generate ./trace/trace.go
 # or, for the whole ledger: ./scripts/check-trace-arch-matrix.sh
-TRACE_UNSUPPORTED_GOARCH ?= mips mips64 mips64le mipsle
+# Architectures that build without the 'trace' tag, measured with the same
+# generator the build uses:
+#   mips/mipsle/mips64/mips64le  unsupported target (and mips: no 'regs' in struct pt_regs)
+#   arm                          no member named 'uregs' in 'struct pt_regs'
+#   s390x                        unknown type name 'user_pt_regs'
+# Every other GOARCH must generate the trace program; the build fails instead of
+# silently dropping the tag. A GOARCH that appears in the release matrix or in the
+# Docker platforms but cannot generate trace belongs in this list, and
+# scripts/check-trace-arch-matrix.sh verifies exactly that in both directions.
+TRACE_UNSUPPORTED_GOARCH ?= arm mips mips64 mips64le mipsle s390x
 TRACE_UNSUPPORTED_THIS_ARCH := $(filter $(GOARCH),$(TRACE_UNSUPPORTED_GOARCH))
 
 # Do NOT remove the line below. This line is for CI.

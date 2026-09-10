@@ -79,8 +79,42 @@ else
   fail=1
 fi
 
+# Coverage direction: every GOARCH that the release matrix and the Docker
+# platforms can build must have an explicit decision. One that is absent from
+# TRACE_UNSUPPORTED_GOARCH has to generate trace; if it does not, the fail-closed
+# build would break that release leg, which is how mips, arm and s390x were each
+# found only after the tag was already being dropped silently.
+matrix_archs=$(
+  {
+    # goarch: [ a, b, c ]  and  goarch: x  (include entries)
+    sed -n 's/.*goarch: *\[\(.*\)\].*/\1/p; s/.*goarch: *\([a-z0-9][a-z0-9]*\).*/\1/p' \
+      .github/workflows/release.yml .github/workflows/prerelease.yml .github/workflows/seed-build.yml 2>/dev/null
+    # platforms: linux/arm/v7,linux/arm64,linux/amd64,linux/386
+    sed -n 's/.*platforms: *//p' .github/workflows/docker.yml 2>/dev/null \
+      | tr ',' '\n' | sed 's#^linux/##; s#/v[0-9]*$##'
+  } | tr ' ,' '\n\n' | sed 's/[^a-z0-9]//g' | sed '/^$/d' | sort -u
+)
+if [ -z "$matrix_archs" ]; then
+  echo "::error::could not derive the architecture matrix from the workflows; the coverage check cannot run" >&2
+  fail=1
+else
+  for arch in $matrix_archs; do
+    case " $unsupported " in
+      *" $arch "*) continue ;;
+    esac
+    log="/tmp/trace-arch-matrix-${arch}.log"
+    if generate "$arch" "$log"; then
+      echo "trace lint: matrix GOARCH=$arch generates trace (no declaration needed)"
+    else
+      echo "::error::GOARCH=$arch is built by the release matrix or the Docker platforms but cannot generate the trace program, and it is not declared in TRACE_UNSUPPORTED_GOARCH; the fail-closed build would fail that leg ($(grep -m1 -E 'error:' "$log" | cut -c1-100))" >&2
+      tail -5 "$log" >&2
+      fail=1
+    fi
+  done
+fi
+
 if [ "$fail" -ne 0 ]; then
   exit 1
 fi
 
-echo "trace architecture ledger: OK (declared trace-less: $(echo $unsupported | tr ' ' ','), control: $control)"
+echo "trace architecture ledger: OK (declared trace-less: $(echo $unsupported | tr ' ' ','), control: $control, matrix: $(echo $matrix_archs | tr '\n' ','))"

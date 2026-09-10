@@ -100,7 +100,7 @@ WSL2 hv 使单次 syscall ~2-3μs，放大效应明显，但真实内核上同�
 |---|---|---|
 | alloc_space 总量 | 893MB | **338MB（-62%）** |
 | alloc_objects 总量 | 7.37M | **2.94M（-60%）** |
-| Serve.func4.1（闭包+读循环） | 1.59M 次 / 230MB cum | **消失** |
+| Serve.func4.1（闭包 + 读循环） | 1.59M 次 / 230MB cum | **消失** |
 
 验证：control 全量测试 + `-race`（UDP/DNS 路径）+ vet 全绿。
 

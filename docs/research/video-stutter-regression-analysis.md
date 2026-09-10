@@ -21,7 +21,7 @@
 
 ### 顺序 e2e（A/B 交替 ×3 轮，双方 replace 均经 `go version -m` 验证）
 
-拓扑：netns 客户端(4 流) → dae tproxy(dport 5201→hy2-grp) → 官方 hysteria 服务端 → 爆发源（每请求回 32 包突发，下载方向，共 7680 datagrams/轮）。BASE=dae@e261ead2+forks(9d6cbf7c/942b5a4)，FIX=同 dae+forks(2ae9729e/57b60d4)。
+拓扑：netns 客户端 (4 流) → dae tproxy(dport 5201→hy2-grp) → 官方 hysteria 服务端 → 爆发源（每请求回 32 包突发，下载方向，共 7680 datagrams/轮）。BASE=dae@e261ead2+forks(9d6cbf7c/942b5a4)，FIX=同 dae+forks(2ae9729e/57b60d4)。
 
 | 轮 | BASE 乱序 | FIX 乱序 |
 |----|----------|---------|
@@ -61,7 +61,7 @@
 | B | hy2 并行 demux 每会话乱序 | 08-13（outbound 68c91ae） | hy2 UDP（H3/QUIC 视频、游戏） | 多 goroutine demux 并发调度（常态） | ★★★ 内层 QUIC 假丢包→cwnd 减半→周期性吞吐塌陷 |
 | C | datagram 发送队列满 30s 超时 → 立即退役 endpoint | 08-10（dae e2f1e545） | hy2/tuic | 需服务端应用层停摆级劣化（WSL2 实测：5% 丢包与 75% 带宽过载均不触发） | ★（降级）病态服务端场景专属；30s 停顿 + 会话重建 |
 | D | >5s 双向静默 → endpoint 重建 | 08-10/08-11（7bcca2ef+003da4ea） | 全部代理 UDP | 缓冲满后的 >5s 真实暂停/分段间隙（播放中不触发；每次暂停一次，非周期） | ★★ 暂停后恢复打嗝/断流 |
-| E | bpf_redirect_peer CVE 门控收紧 | 08-13（dae 4bcd8a16） | 全部流量（内核 6.8~6.14.6） | 未打 DAE_ALLOW_REDIRECT_PEER=1 的发行版内核 | ★ 全局路径变重（MAC 重写+完整 ingress 站），压低余量，与 C/D 叠加 |
+| E | bpf_redirect_peer CVE 门控收紧 | 08-13（dae 4bcd8a16） | 全部流量（内核 6.8~6.14.6） | 未打 DAE_ALLOW_REDIRECT_PEER=1 的发行版内核 | ★ 全局路径变重（MAC 重写 + 完整 ingress 站），压低余量，与 C/D 叠加 |
 
 条件性机制（用户开启才生效）：
 - TCP sockmap offload fuse 循环（默认关，需 DAE_ALLOW_TCP_SOCKMAP=1）：64MB 积压差 engage→冻结排空→用户态接力→lift，周期循环形态与卡顿吻合。
@@ -107,7 +107,7 @@
 
 - `7bcca2ef`（08-10）为游戏局间静默引入重建；`003da4ea`（08-11）修正为**双向**都静默 >5s 才重建（取 lastSend/lastReply 较新者）。
 - **形态精确化**（审计复核）：连续播放中数据+ACK 双向刷新时间戳 → **播放中永不触发**；只在真实 >5s 暂停（播放器缓冲满后的突发分段拉取间隙、用户暂停）触发，**每次暂停一次**，非周期性。
-- 局限仍在：缓冲已满的稳态 DASH/HLS 客户端分段间隙 6~15s 双向静默是常态，每间隙重建 endpoint（新会话+新源端口）。QUIC CID 使内层连接多以"路径迁移"存活（打嗝一下），非 QUIC UDP 或严格服务端会直接断。H3 无 keepalive 时更易命中。
+- 局限仍在：缓冲已满的稳态 DASH/HLS 客户端分段间隙 6~15s 双向静默是常态，每间隙重建 endpoint（新会话 + 新源端口）。QUIC CID 使内层连接多以"路径迁移"存活（打嗝一下），非 QUIC UDP 或严格服务端会直接断。H3 无 keepalive 时更易命中。
 - 可证伪：卡顿前日志出现 `both directions silent for 5s, rebuilding session`（对齐每次卡顿）。
 
 ### E. bpf_redirect_peer CVE 门控（正确但系统性过保守）

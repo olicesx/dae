@@ -81,9 +81,9 @@ dns {
 
     upstream {
         # 支持协议：tcp, udp, tcp+udp, https, tls, http3, h3, quic, 详情见上面的 Schema。
-        # 若主机为域名且具有 A 和 AAAA 记录，dae 自动选择 IPv4 或 IPv6 进行连接,
+        # 若主机为域名且具有 A 和 AAAA 记录，dae 自动选择 IPv4 或 IPv6 进行连接，
         # 是否走代理取决于全局的 routing（不是下面 dns 配置部分的 routing），节点选择取决于 group 的策略。
-        # 请确保DNS流量经过dae且由dae转发，按域名分流需要如此！
+        # 请确保 DNS 流量经过 dae 且由 dae 转发，按域名分流需要如此！
         # 若 dial_mode 设为 'ip'，请确保上游 DNS 无污染，不推荐使用国内公共 DNS。
 
         alidns: 'udp://dns.alidns.com:53'
@@ -113,12 +113,12 @@ dns {
             # asis 即向收到的 DNS 请求中的目标服务器查询，请勿将其他局域网设备 DNS 服务器设为 dae:53（小心回环）。
             # 你可以使用在 upstream 中配置的 DNS 上游。
 
-            # 普通 DNS 请求可使用: qname, qtype。
-            # 同一个块里还支持 dae 自身使用的内部选择器: sub, node, subnode。
+            # 普通 DNS 请求可使用：qname, qtype。
+            # 同一个块里还支持 dae 自身使用的内部选择器：sub, node, subnode。
             # - sub(): 订阅拉取时的解析请求
             # - node(): 节点地址解析请求
             # - subnode(): 订阅节点的地址解析请求，并且优先级高于 node()
-            # 这些内部选择器:
+            # 这些内部选择器：
             # - 只影响 dae 自身发起的解析
             # - 目标只能是 dns.upstream 中定义的名称
             # - 不使用 fallback
@@ -126,7 +126,7 @@ dns {
 
             # DNS 查询域名（省略后缀点 '.'）。
             qname(geosite:category-ads-all) -> reject
-            qname(geosite:google@cn) -> alidns # 参考: https://github.com/v2fly/domain-list-community#attributes
+            qname(geosite:google@cn) -> alidns # 参考：https://github.com/v2fly/domain-list-community#attributes
             qname(suffix: abc.com, keyword: google) -> googledns
             qname(full: ok.com, regex: '^yes') -> googledns
             # DNS 查询类型
@@ -146,16 +146,16 @@ dns {
             # 如果上面的都不匹配，使用这个 upstream。
             fallback: asis
         }
-        # 根据 DNS 查询的回复， 决定接受或使用其他 upstream 重新查询。
+        # 根据 DNS 查询的回复，决定接受或使用其他 upstream 重新查询。
         # 按由上到下的顺序匹配。
         response {
             # 具有预置出站：accept, reject。
             # 你可以使用在 upstream 中配置的 DNS 上游。
 
-            # 可以使用: qname, qtype, upstream, ip。
-            # 接受upstream 'googledns' 回复的 DNS 响应。 有助于避免回环。
+            # 可以使用：qname, qtype, upstream, ip。
+            # 接受 upstream 'googledns' 回复的 DNS 响应。有助于避免回环。
             upstream(googledns) -> accept
-            # 若 DNS 请求的域名不属于 CN 且回复包含私有 IP， 大抵是被污染了，向 'googledns' 重查。
+            # 若 DNS 请求的域名不属于 CN 且回复包含私有 IP，大抵是被污染了，向 'googledns' 重查。
             ip(geoip:private) && !qname(geosite:cn) -> googledns
             fallback: accept
         }
@@ -200,7 +200,7 @@ dns {
       # fallback 意为 default。
       fallback: alidns
     }
-    # 根据 DNS 查询的回复， 决定接受或使用其他 upstream 重新查询。
+    # 根据 DNS 查询的回复，决定接受或使用其他 upstream 重新查询。
     # 按由上到下的顺序匹配。
     response {
       # 可信的 upstream。总是接受它的回复。

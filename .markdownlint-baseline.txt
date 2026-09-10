@@ -1,5 +1,5 @@
 # markdownlint violations that already existed on `kdae` when this gate
-# started running here, as of ce11a67d.
+# started running here, as of 254c4ae9.
 #
 # Regenerate with:
 #   npm run markdown-lint > /tmp/markdownlint.log 2>&1 || true
@@ -112,7 +112,7 @@ docs/research/real-kernel-revalidation.md:68 MD022/blanks-around-headings/blanks
 docs/research/real-kernel-revalidation.md:79 MD022/blanks-around-headings/blanks-around-headers Headings should be surrounded by blank lines [Expected: 1; Actual: 0; Below] [Context: "### socks 路径 e2e（netns sender 8 流饱和 → dae → socks5 count-only proxy）"]
 docs/research/real-kernel-revalidation.md:8 MD028/no-blanks-blockquote Blank line inside blockquote
 docs/research/real-kernel-revalidation.md:93 MD022/blanks-around-headings/blanks-around-headers Headings should be surrounded by blank lines [Expected: 1; Actual: 0; Below] [Context: "### 关键结论"]
-docs/research/real-kernel-revalidation.md:94 MD032/blanks-around-lists Lists should be surrounded by blank lines [Context: "1. **每包 UDP 处理成本（内核读+写+协议栈）是硬瓶..."]
+docs/research/real-kernel-revalidation.md:94 MD032/blanks-around-lists Lists should be surrounded by blank lines [Context: "1. **每包 UDP 处理成本（内核读 + 写 + 协议栈..."]
 docs/research/tcp-sockmap-offload.md:100 MD031/blanks-around-fences Fenced code blocks should be surrounded by blank lines [Context: "```"]
 docs/research/tcp-sockmap-offload.md:101 MD032/blanks-around-lists Lists should be surrounded by blank lines [Context: "- **默认关闭、显式开启**：CVE 修复矩阵之上的内核也..."]
 docs/research/tcp-sockmap-offload.md:133:20 enhanced-proper-names Proper names should have the correct capitalization [Expected: FUSE; Actual: fuse]

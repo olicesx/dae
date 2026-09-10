@@ -74,10 +74,10 @@ go test ./control/ -run 'TestUdp' -race -count 1
 
 → **线性**：sendmmsg 内核路径 = N×单包路径（每包内核处理 ~3.4μs 主导，syscall 边界 ~0.5μs
 可忽略）——批写在此环境**无收益**（此机为真实物理 CPU 3.88GHz，非 CPU 限制所致；
-loopback 发送+接收双向成本）。
+loopback 发送 + 接收双向成本）。
 
 ### socks 路径 e2e（netns sender 8 流饱和 → dae → socks5 count-only proxy）
-| 指标 | BASE（e628af76） | HEAD（批写+优化） |
+| 指标 | BASE（e628af76） | HEAD（批写 + 优化） |
 |---|---|---|
 | sender | 292K pps | 304K pps |
 | proxy 收到 | ~180-200K（15-17K pps） | ~200K（17K pps） |
@@ -91,7 +91,7 @@ dae CPU ~1.4 核处理全部输入（每包 ~4.6μs = 写 3.6μs + 处理 1μs�
 ≈ 200-300K pps（此环境）**。
 
 ### 关键结论
-1. **每包 UDP 处理成本（内核读+写+协议栈）是硬瓶颈**（真实内核 3.6-4.6μs，WSL2 11μs——
+1. **每包 UDP 处理成本（内核读 + 写 + 协议栈）是硬瓶颈**（真实内核 3.6-4.6μs，WSL2 11μs——
    方向一致，WSL2 是放大版）
 2. **sendmmsg 批写无法降低每包内核成本**（内核路径不合并）——两个环境均无收益；
    在 syscall 边界占比高的环境（高性能主机、非 loopback）理论上仍可能有益，因此保留显式

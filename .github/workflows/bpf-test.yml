@@ -120,7 +120,14 @@ jobs:
         env: ${{ matrix.env }}
         run: |
           git submodule update --init
-          CLANG=clang-$VERSION STRIP=llvm-strip-$VERSION ./scripts/check-trace-arch-matrix.sh
+          # The step above runs the kernel tests through sudo, so the generated
+          # trace objects under trace/ are owned by root and a plain user cannot
+          # regenerate them ("unable to open output file ... Operation not
+          # permitted"). Run the ledger with the same privileges and keep the Go
+          # environment, which is the form scripts/ebpf-audit.sh already uses.
+          sudo --preserve-env=PATH,HOME,GOCACHE,GOMODCACHE,GOPATH,GOFLAGS,GOEXPERIMENT \
+            CLANG=clang-$VERSION STRIP=llvm-strip-$VERSION \
+            ./scripts/check-trace-arch-matrix.sh
 
   bpf_abi_big_endian:
     name: BPF ABI (s390x)

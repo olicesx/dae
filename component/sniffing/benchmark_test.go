@@ -187,6 +187,9 @@ func BenchmarkSniffer_SniffTcp_NotApplicable(b *testing.B) {
 // optimization must lower them, and any unrelated change that raises them fails
 // here instead of silently costing allocations on a per-flow path.
 func TestSniffAllocationBudget(t *testing.T) {
+	if raceEnabled {
+		t.Skip("allocation budgets describe production builds; the race detector instruments allocations (see race_off_test.go)")
+	}
 	quicAllocs := testing.AllocsPerRun(20, func() {
 		sniffer := NewPacketSniffer(QuicStream3, 300*time.Millisecond)
 		if _, err := sniffer.SniffQuic(); err != nil {

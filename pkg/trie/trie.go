@@ -101,10 +101,24 @@ func Prefix2bin128(prefix netip.Prefix) (bin128 string) {
 	if n == -1 {
 		panic("! BadPrefix: " + prefix.String())
 	}
-	if prefix.Addr().Is4() {
+	addr := prefix.Addr()
+	if addr.Is4In6() && n <= 32 {
+		// IPv4-mapped IPv6 prefix written with an IPv4 bit count
+		// (::ffff:1.2.3.0/24, and the 16-byte encoding used by geoip .dat
+		// data). Lookups always encode IPv4 as the 128-bit mapped form
+		// (::ffff:a.b.c.d/128), so storing only the first n mapped bits
+		// - which are all zero - made the entry match EVERY IPv4 address.
+		// Unmap first: the Is4 branch below then re-adds the 96-bit mapping
+		// offset, yielding mapping(96 bits) + the n IPv4 bits.
+		//
+		// n > 32 keeps the plain 128-bit reading (::ffff:1.2.3.0/120 is
+		// already the mapped spelling of 1.2.3.0/24 and needs no rewrite).
+		addr = addr.Unmap()
+	}
+	if addr.Is4() {
 		n += 96
 	}
-	ip := prefix.Addr().As16()
+	ip := addr.As16()
 	buf := pool.GetBuffer()
 	defer pool.PutBuffer(buf)
 loop:

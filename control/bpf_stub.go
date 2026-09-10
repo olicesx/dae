@@ -401,15 +401,19 @@ type bpfIfParams struct {
 }
 
 type loadBpfOptions struct {
-	PinPath                string
-	BigEndianTproxyPort    uint32
-	CollectionOptions      *ebpf.CollectionOptions
-	ConnStateMapMaxEntries uint32
-	DatapathGeneration     uint16
+	PinPath                    string
+	BigEndianTproxyPort        uint32
+	CollectionOptions          *ebpf.CollectionOptions
+	ConnStateMapMaxEntries     uint32
+	RedirectTrackMapMaxEntries uint32
+	DatapathGeneration         uint16
 }
 
 const (
 	defaultConnStateMapMaxEntries = 65536 * 4
+	// Mirrors MAX_REDIRECT_TRACK_NUM in kern/tproxy.c; see bpf_utils.go for
+	// the single-owner contract with tuneRedirectTrackMap.
+	defaultRedirectTrackMapMaxEntries = 65536
 )
 
 func fullLoadBpfObjects(
@@ -480,14 +484,33 @@ func tuneConnStateBpfMap(spec *ebpf.CollectionSpec, maxEntries uint32) error {
 	return nil
 }
 
-func customizeBpfMapSpecs(spec *ebpf.CollectionSpec, connStateMapMaxEntries uint32) error {
+func tuneRedirectTrackMap(spec *ebpf.CollectionSpec, maxEntries uint32) error {
+	if spec == nil {
+		return fmt.Errorf("nil collection spec")
+	}
+	if maxEntries == 0 {
+		maxEntries = defaultRedirectTrackMapMaxEntries
+	}
+	m, ok := spec.Maps["redirect_track"]
+	if !ok || m == nil {
+		return fmt.Errorf("missing map spec %q", "redirect_track")
+	}
+	if m.MaxEntries != maxEntries {
+		return fmt.Errorf("redirect_track capacity %d diverges from the expected %d (MAX_REDIRECT_TRACK_NUM in kern/tproxy.c and defaultRedirectTrackMapMaxEntries in bpf_utils.go must agree)",
+			m.MaxEntries, maxEntries)
+	}
+	m.MaxEntries = maxEntries
+	return nil
+}
+
+func customizeBpfMapSpecs(spec *ebpf.CollectionSpec, connStateMapMaxEntries, redirectTrackMapMaxEntries uint32) error {
 	if err := disablePinnedConnStateMaps(spec); err != nil {
 		return err
 	}
 	if err := tuneConnStateBpfMap(spec, connStateMapMaxEntries); err != nil {
 		return err
 	}
-	return nil
+	return tuneRedirectTrackMap(spec, redirectTrackMapMaxEntries)
 }
 
 func cleanupPinnedConnStateMapFiles(log *logrus.Logger, pinPath string) int {

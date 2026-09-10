@@ -41,7 +41,14 @@ tcp_offload_skb_key(struct sk_buff *skb, struct tuples_key *key)
 	if (bpf_probe_read_kernel(&version, sizeof(version), head + nh))
 		return false;
 
-	if (version >> 4 == 4) {
+	/* version is the raw first IP byte, so the version nibble is tested by
+	 * mask rather than by shift: a shift right by four here is
+	 * indistinguishable from a UAPI bitfield extraction in the object code,
+	 * and the datapath keeps the big-endian object free of those (P1-1).
+	 * The two forms are equivalent for a byte: >> 4 == 4 iff the high
+	 * nibble is 4.
+	 */
+	if ((version & 0xf0) == 0x40) {
 		struct iphdr ip4;
 		__u16 ihl = (version & 0xf) * 4;
 
@@ -55,7 +62,7 @@ tcp_offload_skb_key(struct sk_buff *skb, struct tuples_key *key)
 		key->sip.u6_addr32[3] = ip4.saddr;
 		key->dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
 		key->dip.u6_addr32[3] = ip4.daddr;
-	} else if (version >> 4 == 6) {
+	} else if ((version & 0xf0) == 0x60) {
 		struct ipv6hdr ip6;
 
 		if (th - nh < sizeof(ip6))

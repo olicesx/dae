@@ -16,6 +16,16 @@
 static const __u32 three_key = 3;
 static const __u32 four_key = 4;
 
+/* Reads a bpf_stats_map counter. Callers compare deltas because all test
+ * programs of an object share one map. ~0ULL marks a missing key so a failed
+ * read can never look like a zero counter. */
+static __always_inline __u64 ab_read_stat(__u32 key)
+{
+	__u64 *value = bpf_map_lookup_elem(&bpf_stats_map, &key);
+
+	return value ? *value : ~0ULL;
+}
+
 static __always_inline int
 set_ipv4_tcp_with_flags(struct __sk_buff *skb,
 			__u32 saddr, __u32 daddr,

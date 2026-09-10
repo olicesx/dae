@@ -838,21 +838,29 @@ int testcheck_tcp_active_idle_state_retained(struct __sk_buff *skb)
 	return check_status_and_mark(skb, TC_ACT_OK, 0);
 }
 
-SEC("tc/pktgen/tcp_pure_syn_replaces_stale_state")
-int testpktgen_tcp_pure_syn_replaces_stale_state(struct __sk_buff *skb)
+SEC("tc/pktgen/tcp_pure_syn_preserves_live_state")
+int testpktgen_tcp_pure_syn_preserves_live_state(struct __sk_buff *skb)
 {
 	return set_ipv4_tcp(skb,
 			    IPV4(192,168,20,2), IPV4(10,20,0,2),
 			    41001, 443);
 }
 
-SEC("tc/setup/tcp_pure_syn_replaces_stale_state")
-int testsetup_tcp_pure_syn_replaces_stale_state(struct __sk_buff *skb)
+/*
+ * P3-14: a pure SYN that reuses the tuple of a live ACTIVE flow (an illegal
+ * mid-stream SYN the kernel answers with a challenge ACK) must not delete or
+ * rewrite that flow's routing decision. Its liveness is still refreshed, and a
+ * routingless entry stays replaceable so the historical behavior for genuinely
+ * stale state is preserved.
+ */
+SEC("tc/setup/tcp_pure_syn_preserves_live_state")
+int testsetup_tcp_pure_syn_preserves_live_state(struct __sk_buff *skb)
 {
 	struct tuples_key key = {};
-	struct conn_state stale_state = {};
+	struct conn_state live_state = {};
+	struct conn_state *cur_state;
 	struct tcphdr tcph = {};
-	struct conn_state *new_state;
+	__u64 now, before;
 	(void)skb;
 
 	key.sip.u6_addr32[2] = bpf_htonl(0xffff);
@@ -862,26 +870,50 @@ int testsetup_tcp_pure_syn_replaces_stale_state(struct __sk_buff *skb)
 	key.sport = bpf_htons(41001);
 	key.dport = bpf_htons(443);
 	key.l4proto = IPPROTO_TCP;
-	stale_state.state = TCP_STATE_ACTIVE;
-	stale_state.last_seen_ns = 1;
-	stale_state.meta.data.has_routing = 1;
-	stale_state.meta.data.outbound = OUTBOUND_USER_DEFINED_MIN;
-	if (bpf_map_update_elem(&conn_state_map, &key, &stale_state, BPF_ANY))
+	now = bpf_ktime_get_ns();
+	live_state.state = TCP_STATE_ACTIVE;
+	live_state.last_seen_ns = now - 10000000000ULL;
+	live_state.meta.data.has_routing = 1;
+	live_state.meta.data.outbound = OUTBOUND_USER_DEFINED_MIN;
+	if (bpf_map_update_elem(&conn_state_map, &key, &live_state, BPF_ANY))
 		return TC_ACT_SHOT;
 
+	before = ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED);
 	tcph.syn = 1;
-	new_state = mark_tcp_seen(&key, &tcph, false,
+	cur_state = mark_tcp_seen(&key, &tcph, false,
 				  NULL, NULL, NULL, NULL,
 				  0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
-	if (!new_state || new_state->meta.data.has_routing ||
-	    new_state->state != TCP_STATE_ACTIVE)
+	if (!cur_state || !cur_state->meta.data.has_routing ||
+	    cur_state->state != TCP_STATE_ACTIVE)
+		return TC_ACT_SHOT;
+	if (cur_state->meta.data.outbound != OUTBOUND_USER_DEFINED_MIN)
+		return TC_ACT_SHOT;
+	if (cur_state->last_seen_ns <= bpf_ktime_get_ns() - 10000000000ULL)
+		return TC_ACT_SHOT;
+	if (ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED) != before + 1)
+		return TC_ACT_SHOT;
+
+	/* A routingless entry is still replaceable. */
+	if (bpf_map_delete_elem(&conn_state_map, &key))
+		return TC_ACT_SHOT;
+	__builtin_memset(&live_state, 0, sizeof(live_state));
+	live_state.state = TCP_STATE_ACTIVE;
+	live_state.last_seen_ns = now - 10000000000ULL;
+	if (bpf_map_update_elem(&conn_state_map, &key, &live_state, BPF_ANY))
+		return TC_ACT_SHOT;
+	cur_state = mark_tcp_seen(&key, &tcph, false,
+				  NULL, NULL, NULL, NULL,
+				  0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
+	if (!cur_state)
+		return TC_ACT_SHOT;
+	if (ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED) != before + 1)
 		return TC_ACT_SHOT;
 
 	return TC_ACT_OK;
 }
 
-SEC("tc/check/tcp_pure_syn_replaces_stale_state")
-int testcheck_tcp_pure_syn_replaces_stale_state(struct __sk_buff *skb)
+SEC("tc/check/tcp_pure_syn_preserves_live_state")
+int testcheck_tcp_pure_syn_preserves_live_state(struct __sk_buff *skb)
 {
 	return check_status_and_mark(skb, TC_ACT_OK, 0);
 }
@@ -2468,4 +2500,472 @@ int test_ab_lan_ingress_udp_host_listener(struct __sk_buff *skb)
 {
 	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, true);
 	return do_tproxy_lan_ingress(skb, ETH_HLEN);
+}
+
+/* ---------------------------------------------------------------------------
+ * D4 datapath visibility / robustness regression tests.
+ *
+ * Each program returns 0 on success and a distinct non-zero code on failure
+ * (asserted by ab_regression_test.go). Counter assertions use deltas: all
+ * ab_test programs share one loaded object, and therefore one bpf_stats_map.
+ * Header bytes are written raw so the tests do not depend on the host's UAPI
+ * bitfield layout.
+ * ------------------------------------------------------------------------- */
+
+static __always_inline int
+ab_build_ipv4(struct __sk_buff *skb, __u8 proto, __u32 saddr, __u32 daddr,
+	      __u16 frag_field, __u32 l4_len, struct iphdr **ip_out,
+	      void **l4_out)
+{
+	__u32 packet_len = ETH_HLEN + IP4_HLEN + l4_len;
+	struct ethhdr *eth;
+	struct iphdr *ip;
+	void *data, *data_end;
+
+	if (bpf_skb_change_tail(skb, packet_len, 0))
+		return 1;
+	data = (void *)(long)skb->data;
+	data_end = (void *)(long)skb->data_end;
+	if (data + packet_len > data_end)
+		return 2;
+	eth = data;
+	__builtin_memset(eth, 0, ETH_HLEN);
+	eth->h_source[5] = 0xaa;
+	eth->h_dest[5] = 0xbb;
+	eth->h_proto = bpf_htons(ETH_P_IP);
+	ip = data + ETH_HLEN;
+	__builtin_memset(ip, 0, IP4_HLEN);
+	/* version 4, ihl 5, written raw. */
+	((__u8 *)ip)[0] = 0x45;
+	ip->protocol = proto;
+	ip->saddr = bpf_htonl(saddr);
+	ip->daddr = bpf_htonl(daddr);
+	ip->tot_len = bpf_htons(IP4_HLEN + l4_len);
+	ip->frag_off = bpf_htons(frag_field);
+	*ip_out = ip;
+	*l4_out = data + ETH_HLEN + IP4_HLEN;
+	return 0;
+}
+
+static __always_inline int
+ab_build_ipv4_tcp(struct __sk_buff *skb, __u32 saddr, __u32 daddr,
+		  __u16 sport, __u16 dport, __u8 doff, __u8 flags,
+		  __u16 frag_field)
+{
+	struct iphdr *ip;
+	struct tcphdr *tcp;
+	void *l4;
+	int ret;
+
+	ret = ab_build_ipv4(skb, IPPROTO_TCP, saddr, daddr, frag_field, TCP_HLEN,
+			    &ip, &l4);
+	if (ret)
+		return ret;
+	tcp = l4;
+	tcp->source = bpf_htons(sport);
+	tcp->dest = bpf_htons(dport);
+	/* data offset nibble and flags byte, written raw. */
+	((__u8 *)tcp)[12] = doff << 4;
+	((__u8 *)tcp)[13] = flags;
+	return 0;
+}
+
+static __always_inline int
+ab_build_ipv4_udp(struct __sk_buff *skb, __u32 saddr, __u32 daddr,
+		  __u16 sport, __u16 dport, __u16 frag_field)
+{
+	struct iphdr *ip;
+	struct udphdr *udp;
+	void *l4;
+	int ret;
+
+	ret = ab_build_ipv4(skb, IPPROTO_UDP, saddr, daddr, frag_field,
+			    sizeof(struct udphdr), &ip, &l4);
+	if (ret)
+		return ret;
+	udp = l4;
+	udp->source = bpf_htons(sport);
+	udp->dest = bpf_htons(dport);
+	udp->len = bpf_htons(sizeof(struct udphdr));
+	return 0;
+}
+
+/* P1-1: the IP version/ihl and TCP doff/flags bytes must be read raw. */
+SEC("tc/ab_test/raw_header_parse")
+int test_ab_raw_header_parse(struct __sk_buff *skb)
+{
+	struct parse_transport_ctx *ctx;
+	__u32 zero = 0;
+
+	ctx = bpf_map_lookup_elem(&parse_ctx_scratch_map, &zero);
+	if (!ctx)
+		return 1;
+
+	if (ab_build_ipv4_tcp(skb, IPV4(192, 168, 0, 1), IPV4(1, 1, 1, 1),
+			      12345, 80, 5, TCPH_SYN, 0))
+		return 2;
+	__builtin_memset(ctx, 0, sizeof(*ctx));
+	if (parse_transport(skb, ETH_HLEN, ctx) != 0)
+		return 3;
+	if (ctx->ihl != 5)
+		return 4;
+	if (ctx->l4proto != IPPROTO_TCP)
+		return 5;
+	if (ctx->listener_l4proto != IPPROTO_TCP)
+		return 6;
+	if (tcph_doff(&ctx->tcph) != 5)
+		return 7;
+	if (tcph_flags(&ctx->tcph) != TCPH_SYN)
+		return 8;
+
+	/* FIN|ACK is not a new connection. */
+	if (ab_build_ipv4_tcp(skb, IPV4(192, 168, 0, 1), IPV4(1, 1, 1, 1),
+			      12345, 80, 5, TCPH_FIN | TCPH_ACK, 0))
+		return 9;
+	__builtin_memset(ctx, 0, sizeof(*ctx));
+	if (parse_transport(skb, ETH_HLEN, ctx) != 0)
+		return 10;
+	if (ctx->listener_l4proto != 0)
+		return 11;
+	if (tcph_flags(&ctx->tcph) != (TCPH_FIN | TCPH_ACK))
+		return 12;
+	return 0;
+}
+
+static __always_inline void
+ab_redirect_key_ipv4(struct redirect_tuple *key, const struct tuples_key *five)
+{
+	__builtin_memset(key, 0, sizeof(*key));
+	key->sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key->sip.u6_addr32[3] = five->sip.u6_addr32[3];
+	key->dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key->dip.u6_addr32[3] = five->dip.u6_addr32[3];
+}
+
+/* P1-8 + P3-18(a): the reply binding is single-writer while fresh, refreshed
+ * in place by its own publisher, and rebindable once stale. */
+SEC("tc/ab_test/redirect_rebind_lock")
+int test_ab_redirect_rebind_lock(struct __sk_buff *skb)
+{
+	struct iphdr *ip;
+	void *l4;
+	struct tuples tuples = {};
+	struct ethhdr publisher_a = {};
+	struct ethhdr publisher_b = {};
+	struct redirect_tuple key;
+	struct redirect_entry *entry;
+	__u64 before, after;
+
+	if (ab_build_ipv4(skb, IPPROTO_TCP, IPV4(192, 168, 0, 1),
+			  IPV4(8, 8, 8, 8), 0, TCP_HLEN, &ip, &l4))
+		return 1;
+	tuples.five.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	tuples.five.sip.u6_addr32[3] = ip->saddr;
+	tuples.five.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	tuples.five.dip.u6_addr32[3] = ip->daddr;
+	tuples.five.sport = bpf_htons(23456);
+	tuples.five.dport = bpf_htons(443);
+	tuples.five.l4proto = IPPROTO_TCP;
+	publisher_a.h_source[5] = 0x11;
+	publisher_b.h_source[5] = 0x22;
+	ab_redirect_key_ipv4(&key, &tuples.five);
+
+	/* 1) First publish of publisher A creates the binding. */
+	if (publish_redirect_track_for_packet(skb, ETH_HLEN, &tuples,
+					      &publisher_a, 0))
+		return 2;
+	entry = bpf_map_lookup_elem(&redirect_track, &key);
+	if (!entry)
+		return 3;
+	if (entry->from_wan != 0 || entry->smac[5] != 0x11)
+		return 4;
+
+	/* 2) The same publisher only refreshes liveness, and must do so even
+	 * for an entry that has gone stale (black-hole guard). */
+	entry->last_seen_ns = bpf_ktime_get_ns() - 10000000000ULL;
+	before = ab_read_stat(BPF_STATS_REDIRECT_REBIND_REJECTED);
+	if (publish_redirect_track_for_packet(skb, ETH_HLEN, &tuples,
+					      &publisher_a, 0))
+		return 5;
+	entry = bpf_map_lookup_elem(&redirect_track, &key);
+	if (!entry)
+		return 6;
+	if (entry->from_wan != 0 || entry->smac[5] != 0x11)
+		return 7;
+	if (entry->last_seen_ns <= bpf_ktime_get_ns() - 10000000000ULL)
+		return 8;
+	if (ab_read_stat(BPF_STATS_REDIRECT_REBIND_REJECTED) != before)
+		return 9;
+
+	/* 3) A different publisher on a fresh binding is refused. */
+	if (publish_redirect_track_for_packet(skb, ETH_HLEN, &tuples,
+					      &publisher_b, 1))
+		return 10;
+	entry = bpf_map_lookup_elem(&redirect_track, &key);
+	if (!entry)
+		return 11;
+	if (entry->from_wan != 0 || entry->smac[5] != 0x11)
+		return 12;
+	after = ab_read_stat(BPF_STATS_REDIRECT_REBIND_REJECTED);
+	if (after != before + 1)
+		return 13;
+
+	/* 4) Once stale, the rebind is allowed (roaming client recovery). */
+	entry->last_seen_ns = bpf_ktime_get_ns() -
+			      (EVENT_RATE.redirect_rebind_stale_ns +
+			       1000000000ULL);
+	if (publish_redirect_track_for_packet(skb, ETH_HLEN, &tuples,
+					      &publisher_b, 1))
+		return 14;
+	entry = bpf_map_lookup_elem(&redirect_track, &key);
+	if (!entry)
+		return 15;
+	if (entry->from_wan != 1 || entry->smac[5] != 0x22)
+		return 16;
+	if (ab_read_stat(BPF_STATS_REDIRECT_REBIND_REJECTED) != after)
+		return 17;
+	return 0;
+}
+
+static __always_inline int
+ab_mark_syn(struct tuples_key *key, bool with_routing, __u8 outbound,
+	    __u32 mark)
+{
+	struct tcphdr tcp = {};
+	__u8 out = outbound;
+	__u32 mk = mark;
+	__u8 must = 0;
+
+	((__u8 *)&tcp)[12] = 5 << 4;
+	((__u8 *)&tcp)[13] = TCPH_SYN;
+	if (!with_routing)
+		return mark_tcp_seen(key, &tcp, false, NULL, NULL, NULL, NULL,
+				     0, NULL, 0,
+				     ROUTING_EPOCH_SLOT_UNKNOWN) ? 0 : 1;
+	return mark_tcp_seen(key, &tcp, false, &out, &mk, &must, NULL, 0, NULL,
+			     0, ROUTING_EPOCH_SLOT_UNKNOWN) ? 0 : 1;
+}
+
+/* P3-14: a same-tuple pure SYN must not rewrite a live ACTIVE flow's routing
+ * metadata, but must still refresh its liveness. */
+SEC("tc/ab_test/syn_rebind_lock")
+int test_ab_syn_rebind_lock(struct __sk_buff *skb)
+{
+	struct tuples_key key = {};
+	struct conn_state *state;
+	__u64 before;
+
+	key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.sip.u6_addr32[3] = bpf_htonl(IPV4(10, 0, 0, 1));
+	key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.dip.u6_addr32[3] = bpf_htonl(IPV4(10, 0, 0, 2));
+	key.sport = bpf_htons(40000);
+	key.dport = bpf_htons(80);
+	key.l4proto = IPPROTO_TCP;
+
+	/* 1) A first routed SYN opens the live flow. */
+	if (ab_mark_syn(&key, true, OUTBOUND_USER_DEFINED_MIN, 0x11))
+		return 1;
+	state = bpf_map_lookup_elem(&conn_state_map, &key);
+	if (!state || state->state != TCP_STATE_ACTIVE ||
+	    !state->meta.data.has_routing ||
+	    state->meta.data.outbound != OUTBOUND_USER_DEFINED_MIN)
+		return 2;
+
+	state->last_seen_ns = bpf_ktime_get_ns() - 10000000000ULL;
+	before = ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED);
+
+	/* 2) A competing SYN must be refused, without freezing liveness. */
+	if (ab_mark_syn(&key, true, OUTBOUND_USER_DEFINED_MIN + 1, 0x22))
+		return 3;
+	state = bpf_map_lookup_elem(&conn_state_map, &key);
+	if (!state)
+		return 4;
+	if (!state->meta.data.has_routing)
+		return 5;
+	if (state->meta.data.outbound != OUTBOUND_USER_DEFINED_MIN ||
+	    state->meta.data.mark != 0x11)
+		return 6;
+	if (state->state != TCP_STATE_ACTIVE)
+		return 7;
+	if (state->last_seen_ns <= bpf_ktime_get_ns() - 10000000000ULL)
+		return 8;
+	if (ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED) != before + 1)
+		return 9;
+
+	/* 3) A routingless entry is still replaceable (historical behavior). */
+	if (bpf_map_delete_elem(&conn_state_map, &key))
+		return 10;
+	if (ab_mark_syn(&key, false, 0, 0))
+		return 11;
+	state = bpf_map_lookup_elem(&conn_state_map, &key);
+	if (!state || state->meta.data.has_routing)
+		return 12;
+	if (ab_mark_syn(&key, true, OUTBOUND_USER_DEFINED_MIN + 1, 0x22))
+		return 13;
+	state = bpf_map_lookup_elem(&conn_state_map, &key);
+	if (!state || !state->meta.data.has_routing ||
+	    state->meta.data.outbound != OUTBOUND_USER_DEFINED_MIN + 1)
+		return 14;
+	if (ab_read_stat(BPF_STATS_SYN_REBIND_REJECTED) != before + 1)
+		return 15;
+	return 0;
+}
+
+/* P2-30: an established TCP packet with no cached routing is forwarded (policy
+ * unchanged) and now counted. */
+SEC("tc/ab_test/stateless_tcp_passthrough")
+int test_ab_stateless_tcp_passthrough(struct __sk_buff *skb)
+{
+	__u64 before;
+
+	if (ab_build_ipv4_tcp(skb, IPV4(192, 168, 1, 1), IPV4(5, 5, 5, 5),
+			      33333, 443, 5, TCPH_ACK, 0))
+		return 1;
+	before = ab_read_stat(BPF_STATS_STATELESS_TCP_PASSTHROUGH);
+	if (do_tproxy_lan_ingress(skb, ETH_HLEN) != TC_ACT_OK)
+		return 2;
+	if (ab_read_stat(BPF_STATS_STATELESS_TCP_PASSTHROUGH) != before + 1)
+		return 3;
+	return 0;
+}
+
+/* P3-16 (decision A20): an unsolicited WAN-ingress UDP flow is COUNTED but
+ * still tracked. Creating the entry is what carries the
+ * is_wan_ingress_direction marker that host-terminated UDP replies rely on, so
+ * the counter is observability, not enforcement. A flow that already has state
+ * is not counted. */
+SEC("tc/ab_test/unsolicited_udp_wan_ingress")
+int test_ab_unsolicited_udp_wan_ingress(struct __sk_buff *skb)
+{
+	struct tuples_key reversed = {};
+	struct conn_state *state;
+	__u64 before, after;
+
+	if (ab_build_ipv4_udp(skb, IPV4(203, 0, 113, 9), IPV4(192, 168, 1, 50),
+			      40000, 50000, 0))
+		return 1;
+	/* The key the WAN-ingress refresh would have written. */
+	reversed.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	reversed.sip.u6_addr32[3] = bpf_htonl(IPV4(192, 168, 1, 50));
+	reversed.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	reversed.dip.u6_addr32[3] = bpf_htonl(IPV4(203, 0, 113, 9));
+	reversed.sport = bpf_htons(50000);
+	reversed.dport = bpf_htons(40000);
+	reversed.l4proto = IPPROTO_UDP;
+
+	/* Cleanup only: the key is expected to be absent. */
+	if (bpf_map_lookup_elem(&conn_state_map, &reversed))
+		bpf_map_delete_elem(&conn_state_map, &reversed);
+
+	before = ab_read_stat(BPF_STATS_UNSOLICITED_UDP_SEEN);
+	if (do_tproxy_wan_ingress(skb, ETH_HLEN) != DAE_TC_CONTINUE)
+		return 3;
+	after = ab_read_stat(BPF_STATS_UNSOLICITED_UDP_SEEN);
+	if (after != before + 1)
+		return 4;
+	/* The flow is still tracked, marker included: no state was refused. */
+	state = bpf_map_lookup_elem(&conn_state_map, &reversed);
+	if (!state || !state->is_wan_ingress_direction)
+		return 5;
+
+	/* A packet of a flow that already has state is not counted. */
+	if (do_tproxy_wan_ingress(skb, ETH_HLEN) != DAE_TC_CONTINUE)
+		return 6;
+	if (ab_read_stat(BPF_STATS_UNSOLICITED_UDP_SEEN) != after)
+		return 7;
+	state = bpf_map_lookup_elem(&conn_state_map, &reversed);
+	if (!state || !state->is_wan_ingress_direction)
+		return 8;
+	return 0;
+}
+
+/* P2-8: a non-initial fragment is still forwarded, and now counted. */
+SEC("tc/ab_test/frag_tail_passthrough")
+int test_ab_frag_tail_passthrough(struct __sk_buff *skb)
+{
+	__u64 before;
+
+	/* Fragment offset 1 (8 bytes): non-initial. */
+	if (ab_build_ipv4_udp(skb, IPV4(192, 168, 2, 1), IPV4(9, 9, 9, 9),
+			      34567, 4500, 1))
+		return 1;
+	before = ab_read_stat(BPF_STATS_FRAG_TAIL_PASSED);
+	if (do_tproxy_lan_ingress(skb, ETH_HLEN) != TC_ACT_OK)
+		return 2;
+	if (ab_read_stat(BPF_STATS_FRAG_TAIL_PASSED) != before + 1)
+		return 3;
+	return 0;
+}
+
+/* P2-31: "the IP header parsed but the L4 protocol is not routed" and "this is
+ * not an IP frame" are distinct return codes, and the first one is counted at
+ * the consumer without changing its decision. */
+SEC("tc/ab_test/parse_return_code_split")
+int test_ab_parse_return_code_split(struct __sk_buff *skb)
+{
+	struct parse_transport_ctx *ctx;
+	struct ethhdr *eth;
+	void *data, *data_end;
+	struct iphdr *ip;
+	void *l4;
+	__u32 zero = 0;
+	__u64 before;
+
+	ctx = bpf_map_lookup_elem(&parse_ctx_scratch_map, &zero);
+	if (!ctx)
+		return 1;
+
+	/* IP header, L4 protocol 47 (GRE). */
+	if (ab_build_ipv4(skb, IPPROTO_GRE, IPV4(192, 168, 3, 1),
+			  IPV4(7, 7, 7, 7), 0, 8, &ip, &l4))
+		return 2;
+	__builtin_memset(ctx, 0, sizeof(*ctx));
+	if (parse_transport(skb, ETH_HLEN, ctx) != PARSE_UNSUPPORTED_L4)
+		return 3;
+
+	/* ARP: no IP header at all. */
+	if (bpf_skb_change_tail(skb, ETH_HLEN, 0))
+		return 4;
+	data = (void *)(long)skb->data;
+	data_end = (void *)(long)skb->data_end;
+	if (data + ETH_HLEN > data_end)
+		return 5;
+	eth = data;
+	__builtin_memset(eth, 0, ETH_HLEN);
+	eth->h_proto = bpf_htons(ETH_P_ARP);
+	__builtin_memset(ctx, 0, sizeof(*ctx));
+	if (parse_transport(skb, ETH_HLEN, ctx) != PARSE_UNSUPPORTED_ETH)
+		return 6;
+
+	/* The consumer counts the L4 case and still forwards. */
+	if (ab_build_ipv4(skb, IPPROTO_GRE, IPV4(192, 168, 3, 1),
+			  IPV4(7, 7, 7, 7), 0, 8, &ip, &l4))
+		return 7;
+	before = ab_read_stat(BPF_STATS_PARSE_UNSUPPORTED_L4);
+	if (do_tproxy_lan_ingress(skb, ETH_HLEN) != TC_ACT_OK)
+		return 8;
+	if (ab_read_stat(BPF_STATS_PARSE_UNSUPPORTED_L4) != before + 1)
+		return 9;
+	return 0;
+}
+
+/* P3-18(c): with no so_mark injected the reserved-bit test is the last-resort
+ * fallback, and it is counted. */
+SEC("tc/ab_test/control_plane_sockmark_fallback")
+int test_ab_control_plane_sockmark_fallback(struct __sk_buff *skb)
+{
+	struct pid_pname *p = NULL;
+	__u64 before;
+
+	before = ab_read_stat(BPF_STATS_SOCKMARK_FALLBACK);
+	skb->mark = 0x101;
+	if (!pid_is_control_plane(skb, &p))
+		return 1;
+	if (ab_read_stat(BPF_STATS_SOCKMARK_FALLBACK) != before + 1)
+		return 2;
+	skb->mark = 0x200;
+	if (pid_is_control_plane(skb, &p))
+		return 3;
+	return 0;
 }

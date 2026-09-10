@@ -95,10 +95,23 @@ func (o *bpfObjects) newLpmMap(keys []_bpfLpmKey, values []uint32) (m *ebpf.Map,
 
 func cidrToBpfLpmKey(prefix netip.Prefix) _bpfLpmKey {
 	bits := prefix.Bits()
-	if prefix.Addr().Is4() {
+	addr := prefix.Addr()
+	if addr.Is4In6() && bits <= 32 {
+		// An IPv4-mapped prefix written with an IPv4 bit count
+		// (::ffff:1.2.3.0/24, plus the 16-byte encoding used by geoip .dat
+		// data). The datapath always encodes IPv4 in the mapped form
+		// (::ffff:a.b.c.d with a 96+bits prefix length), so storing the
+		// first `bits` bits of the mapped address - which are all zero -
+		// would match every IPv4 address. Unmap first and let the Is4
+		// branch below re-add the 96-bit mapping offset. A bit count above
+		// 32 already is the mapped spelling of an IPv4 prefix and needs no
+		// rewrite. Keep this rule identical to pkg/trie.Prefix2bin128.
+		addr = addr.Unmap()
+	}
+	if addr.Is4() {
 		bits += 96
 	}
-	ip := prefix.Addr().As16()
+	ip := addr.As16()
 	return _bpfLpmKey{
 		PrefixLen: uint32(bits),
 		Data:      common.Ipv6ByteSliceToUint32Array(ip[:]),
@@ -290,15 +303,24 @@ func (p bpfIfParams) CheckVersionRequirement(version *internal.Version) (err err
 }
 
 type loadBpfOptions struct {
-	PinPath                string
-	BigEndianTproxyPort    uint32
-	CollectionOptions      *ebpf.CollectionOptions
-	ConnStateMapMaxEntries uint32
-	DatapathGeneration     uint16
+	PinPath                    string
+	BigEndianTproxyPort        uint32
+	CollectionOptions          *ebpf.CollectionOptions
+	ConnStateMapMaxEntries     uint32
+	RedirectTrackMapMaxEntries uint32
+	DatapathGeneration         uint16
 }
 
 const (
 	defaultConnStateMapMaxEntries = 65536 * 4
+	// defaultRedirectTrackMapMaxEntries mirrors MAX_REDIRECT_TRACK_NUM in
+	// kern/tproxy.c and is cross-checked against the compiled map capacity by
+	// tuneRedirectTrackMap. The C default is deliberately kept: raising it to
+	// 262144 must be justified by measuring resident memory first (HASH
+	// without preallocation only preallocates the bucket array, so the cost
+	// is dominated by live entries: roughly 24 B value + 48 B key + element
+	// overhead per entry), see the D4 report.
+	defaultRedirectTrackMapMaxEntries = 65536
 )
 
 // The blocked-event rate-limit contract values (blockedEventRateKey,
@@ -437,22 +459,50 @@ func tuneConnStateBpfMap(spec *ebpf.CollectionSpec, maxEntries uint32) error {
 	return nil
 }
 
-func customizeBpfMapSpecs(spec *ebpf.CollectionSpec, connStateMapMaxEntries uint32) error {
+// tuneRedirectTrackMap is the single owner of the redirect_track capacity.
+// The map is declared in kern/tproxy.c with MAX_REDIRECT_TRACK_NUM, and
+// userspace used to carry a second hard-coded copy of the same number for its
+// usage warnings; the two could drift silently. Here the compiled capacity is
+// cross-checked against the Go constant (defaultRedirectTrackMapMaxEntries,
+// which mirrors the C macro) and any divergence fails the load instead of
+// quietly resizing or mis-reporting. Growth past the C default is an explicit
+// decision: HASH without preallocation only preallocates the bucket array, so
+// raising it costs memory only as entries are actually used.
+func tuneRedirectTrackMap(spec *ebpf.CollectionSpec, maxEntries uint32) error {
+	if spec == nil {
+		return fmt.Errorf("nil collection spec")
+	}
+	if maxEntries == 0 {
+		maxEntries = defaultRedirectTrackMapMaxEntries
+	}
+	m, ok := spec.Maps["redirect_track"]
+	if !ok || m == nil {
+		return fmt.Errorf("missing map spec %q", "redirect_track")
+	}
+	if m.MaxEntries != maxEntries {
+		return fmt.Errorf("redirect_track capacity %d diverges from the expected %d (MAX_REDIRECT_TRACK_NUM in kern/tproxy.c and defaultRedirectTrackMapMaxEntries in bpf_utils.go must agree)",
+			m.MaxEntries, maxEntries)
+	}
+	m.MaxEntries = maxEntries
+	return nil
+}
+
+func customizeBpfMapSpecs(spec *ebpf.CollectionSpec, connStateMapMaxEntries, redirectTrackMapMaxEntries uint32) error {
 	if err := disablePinnedConnStateMaps(spec); err != nil {
 		return err
 	}
 	if err := tuneConnStateBpfMap(spec, connStateMapMaxEntries); err != nil {
 		return err
 	}
-	return nil
+	return tuneRedirectTrackMap(spec, redirectTrackMapMaxEntries)
 }
 
 // tuneEventRateMap derives the alive_block_rate_map capacity from the same
-// userspace-owned blocked key that gets injected into the EVENT_RATE rodata
+// userspace-owned reserved keys that get injected into the EVENT_RATE rodata
 // variable, so the key domain and the ARRAY geometry share a single owner
 // (the map definition on the C side can only reference a compile-time
 // fallback constant). The derived invariant matches the C fallback exactly:
-// capacity = reserved key + 1.
+// capacity = highest reserved key + 1.
 func tuneEventRateMap(spec *ebpf.CollectionSpec) error {
 	if spec == nil {
 		return fmt.Errorf("nil collection spec")
@@ -461,9 +511,9 @@ func tuneEventRateMap(spec *ebpf.CollectionSpec) error {
 	if !ok || m == nil {
 		return fmt.Errorf("missing map spec %q", "alive_block_rate_map")
 	}
-	want := blockedEventRateKey + 1
+	want := eventRateMapKeyMax + 1
 	if m.MaxEntries != want {
-		return fmt.Errorf("alive_block_rate_map capacity %d diverges from the userspace-owned blocked-event rate key %d (+1 slot) in EVENT_RATE; the C fallback and Go constants are out of sync", m.MaxEntries, blockedEventRateKey)
+		return fmt.Errorf("alive_block_rate_map capacity %d diverges from the userspace-owned reserved event rate key %d (+1 slot) in EVENT_RATE; the C fallback and Go constants are out of sync", m.MaxEntries, eventRateMapKeyMax)
 	}
 	m.MaxEntries = want
 	return nil
@@ -616,7 +666,7 @@ retryLoadBpf:
 		opts.CollectionOptions,
 		constants,
 		func(spec *ebpf.CollectionSpec) error {
-			if err := customizeBpfMapSpecs(spec, opts.ConnStateMapMaxEntries); err != nil {
+			if err := customizeBpfMapSpecs(spec, opts.ConnStateMapMaxEntries, opts.RedirectTrackMapMaxEntries); err != nil {
 				return err
 			}
 			return tuneEventRateMap(spec)

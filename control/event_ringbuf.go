@@ -1,6 +1,8 @@
 package control
 
 import (
+	"encoding/binary"
+	"net"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -8,6 +10,7 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
+	"github.com/sirupsen/logrus"
 )
 
 // Dae event types mirror enum dae_event_type in control/kern/tproxy.c.
@@ -16,6 +19,22 @@ const (
 	daeEventUdpConnOverflow
 	daeEventTcpConnOverflow
 	daeEventBlockedAlive
+	// daeEventRedirectRebindRejected: a competing publisher tried to steal a
+	// reply binding that is still fresh (P1-8).
+	daeEventRedirectRebindRejected
+	// daeEventSynRebindRejected: a pure SYN was refused rewrite of a live
+	// flow's routing metadata (P3-14).
+	daeEventSynRebindRejected
+	// daeEventStatelessTcpPassthrough: established TCP forwarded without a
+	// cached routing decision (P2-30).
+	daeEventStatelessTcpPassthrough
+	// daeEventFragTailPassed: non-initial fragment forwarded without routing
+	// (P2-8).
+	daeEventFragTailPassed
+	// daeEventRedirectUpdateFailed: redirect_track could not store a reply
+	// binding (P2-29). The matching bpf_stats_map counter separates a full
+	// map from any other update error.
+	daeEventRedirectUpdateFailed
 )
 
 // daeEvent mirrors struct dae_event in control/kern/tproxy.c. The kernel writes
@@ -121,6 +140,21 @@ func (r *bpfMaintenanceRuntime) readEvents() {
 		switch ev.Type {
 		case daeEventUdpConnOverflow, daeEventTcpConnOverflow:
 			r.requestOverflow(target)
+		case daeEventRedirectUpdateFailed:
+			// redirect_track could not store a reply binding. Reply traffic
+			// for that flow is lost until the map drains, so run a janitor
+			// round (which also cleans redirect_track sooner under
+			// pressure) in addition to the warning below.
+			r.requestOverflow(target)
+			reportDatapathAnomaly(target, &ev, "redirect_track update failed: reply binding not stored")
+		case daeEventRedirectRebindRejected:
+			reportDatapathAnomaly(target, &ev, "reply binding kept against a competing publisher (still fresh)")
+		case daeEventSynRebindRejected:
+			reportDatapathAnomaly(target, &ev, "pure SYN refused rewrite of a live flow's routing metadata")
+		case daeEventStatelessTcpPassthrough:
+			reportDatapathAnomaly(target, &ev, "established TCP forwarded without cached routing (pre-existing flow, e.g. across a restart)")
+		case daeEventFragTailPassed:
+			reportDatapathAnomaly(target, &ev, "non-initial fragment forwarded without routing")
 		case daeEventBlockedAlive:
 			// Kernel blocked a packet because the selected outbound is
 			// not alive (wan_outbound_is_alive == false). Userspace never
@@ -132,8 +166,48 @@ func (r *bpfMaintenanceRuntime) readEvents() {
 			// event emission per outbound (1/s), so this cannot storm the
 			// probe workers.
 			target.handleBlockedAliveEvent(&ev)
+		default:
+			// Unknown types cannot be acted on, but they must not be dropped
+			// in silence: kernel events and this binary ship together, so an
+			// unknown type means the ABI drifted.
+			logrus.Debugf("ignoring unknown datapath event type %d", ev.Type)
 		}
 	}
+}
+
+// reportDatapathAnomaly logs a kernel-reported datapath anomaly. The kernel
+// rate-limits each anomaly event type to one per second per key, so this
+// cannot flood the log, and the per-packet counters in bpf_stats_map remain
+// the authoritative count.
+func reportDatapathAnomaly(c *ControlPlane, ev *daeEvent, msg string) {
+	if c == nil || c.log == nil {
+		return
+	}
+	c.log.Warnf("datapath anomaly: %s (type=%d pid=%d outbound=%d l4proto=%d %s:%d > %s:%d)",
+		msg, ev.Type, ev.Pid, ev.Outbound, ev.L4proto,
+		netIPString(ev.Sip), netPortString(ev.Sport),
+		netIPString(ev.Dip), netPortString(ev.Dport))
+}
+
+// netPortString renders a port from a ringbuf record. The kernel copies the
+// network-order port field verbatim, so it is re-encoded with the same ABI
+// before being decoded as big-endian.
+func netPortString(port uint16) uint16 {
+	var b [2]byte
+	nativeBpfABI.putUint16(b[:], port)
+	return binary.BigEndian.Uint16(b[:])
+}
+
+// netIPString renders the kernel event address pair. The kernel stores the
+// address words in host byte order inside the ringbuf record, so they are
+// re-encoded with the same ABI before formatting. IPv4-mapped addresses (the
+// kernel's canonical IPv4 form) are printed as plain IPv4.
+func netIPString(addr [4]uint32) string {
+	var b [16]byte
+	for i, word := range addr {
+		nativeBpfABI.putUint32(b[4*i:4*i+4], word)
+	}
+	return net.IP(b[:]).String()
 }
 
 // handleBlockedAliveEvent reacts to a kernel DAE_EVENT_BLOCKED_ALIVE by

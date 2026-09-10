@@ -106,6 +106,12 @@ type ControlPlane struct {
 	lastDnsFastPathServfailLogTime atomic.Int64
 	lastHandlePktEpochWarnTime     atomic.Int64
 	tcpConnPanicCount              atomic.Uint64
+	// udpDirectDispatchPanicCount and udpIngressLoopPanicCount count recovered
+	// panics on the two UDP packet-path goroutines that have no convoy wrapper:
+	// the direct-dispatch task (DNS/SIP/RTP/STUN exceptions) and the ingress
+	// read loop itself.
+	udpDirectDispatchPanicCount atomic.Uint64
+	udpIngressLoopPanicCount    atomic.Uint64
 	controlPlaneListenerRuntime
 	preparedDatapathCommit         bool
 	autoConfigKernelParameter      bool
@@ -1544,14 +1550,21 @@ func (c *ControlPlane) runReloadRetirementCleanup(staleBeforeNs uint64) {
 
 // redirectTrackTimeout is the TTL for redirect entries.
 // Redirect entries track which interface and MAC addresses to use for reply traffic.
-// A longer timeout is acceptable because these entries are small and the consequence
-// of stale entries is minimal (wrong MAC address causes one packet to be misdirected).
+// The TTL only governs entries with no live owner: cleanupRedirectTrackMap
+// consults the pin snapshot BEFORE the age test, so a process-owned
+// connection's entry is never retired by age while its flow lives - the pin,
+// not the TTL, is what keeps an active connection's MAC mapping in place. For
+// the unpinned remainder a longer TTL is acceptable because these entries are
+// small and the consequence of a stale one is bounded: it is refreshed by the
+// next reply packet, and until then it can only misdirect that one reply.
 const redirectTrackTimeout = 5 * time.Minute
 
 // cleanupRedirectTrackMap iterates through the redirect track map and removes
-// entries that haven't been accessed within redirectTrackTimeout.
-// This is necessary because redirect_track uses HASH (not LRU) to avoid
-// the problem where long-lived connections prevent cleanup of other entries.
+// entries that haven't been accessed within redirectTrackTimeout. Pinned
+// entries are skipped before the age test, so a pinned long-lived connection
+// keeps its own entry for as long as its flow lives without ever blocking the
+// cleanup of any other entry: redirect_track is a HASH map, so there is no LRU
+// eviction order for it to occupy.
 func (c *ControlPlane) cleanupRedirectTrackMap() int {
 	cleanupMu, _ := c.maintenanceState()
 	cleanupMu.Lock()
@@ -1637,9 +1650,12 @@ func (c *ControlPlane) cleanupRedirectTrackMapBeforeLocked(staleBeforeNs uint64)
 		c.log.Debugf("cleanupRedirectTrackMap: removed %d entries", len(keysToDelete))
 	}
 
-	// Alert if map usage is high
-	const redirectTrackCapacity = 65536
-	if totalEntries > 0 {
+	// Alert if map usage is high. The capacity is read from the loaded map
+	// instead of a second hard-coded copy of MAX_REDIRECT_TRACK_NUM: the map
+	// capacity is owned by tuneRedirectTrackMap, which cross-checks the
+	// compiled value against the Go constant at load time.
+	redirectTrackCapacity := bpf.RedirectTrack.MaxEntries()
+	if totalEntries > 0 && redirectTrackCapacity > 0 {
 		usagePercent := float64(totalEntries) / float64(redirectTrackCapacity) * 100
 		if usagePercent > 90 {
 			c.log.Warnf("cleanupRedirectTrackMap: map at %.1f%% capacity (%d entries)",
@@ -1812,6 +1828,19 @@ func (c *ControlPlane) checkBpfMapHealth(udpOverflow, tcpOverflow uint64) {
 		return
 	}
 
+	// Read the counters added for the datapath visibility work (redirect
+	// track, rebind rejections, stateless passthrough, ...). The two
+	// conn-state overflow counters are passed in by the janitor because they
+	// also drive its pressure mode. A read failure would silently hide every
+	// counter, so it is reported instead of ignored.
+	var (
+		snap        bpfStatsSnapshot
+		snapshotErr error
+	)
+	if bpf.BpfStatsMap != nil {
+		snap, snapshotErr = c.readDatapathCounters(bpf.BpfStatsMap)
+	}
+
 	// Define alert thresholds
 	const (
 		warnThreshold = 70               // Alert at 70% capacity
@@ -1821,17 +1850,22 @@ func (c *ControlPlane) checkBpfMapHealth(udpOverflow, tcpOverflow uint64) {
 
 	now := time.Now()
 
+	if snapshotErr != nil {
+		c.log.Warnf("checkBpfMapHealth: %v", snapshotErr)
+	}
+
 	// Alert on significant overflow counts
-	if udpOverflow > 0 || tcpOverflow > 0 {
+	if udpOverflow > 0 || tcpOverflow > 0 || snap.RedirectOverflow > 0 || snap.EventDrop > 0 {
 		// Use atomic Int64 to store the last alert time in Unix nanoseconds.
 		// Cooldown prevents alert spam.
 		nowNano := now.UnixNano()
 		last := c.lastBpfOverflowAlertTime.Load()
 		if last == 0 || last+int64(alertCooldown) < nowNano {
 			if c.lastBpfOverflowAlertTime.CompareAndSwap(last, nowNano) {
-				c.log.Warnf("BPF map overflow detected: UDP conn state=%d, TCP conn state=%d. "+
-					"Some packets are falling back to slower paths. Check if map capacity is adequate.",
-					udpOverflow, tcpOverflow)
+				c.log.Warnf("BPF map overflow detected: UDP conn state=%d, TCP conn state=%d, redirect track=%d, dropped events=%d. "+
+					"Some packets are falling back to slower paths, cannot store their reply binding, or lost their notification. "+
+					"Check if map capacity and the event ringbuf size are adequate.",
+					udpOverflow, tcpOverflow, snap.RedirectOverflow, snap.EventDrop)
 			}
 		}
 	}
@@ -1871,17 +1905,55 @@ func (c *ControlPlane) checkBpfMapHealth(udpOverflow, tcpOverflow uint64) {
 	}
 }
 
+// readMapOverflowCounters reads the two conn-state overflow counters that
+// drive the janitor's pressure mode. The remaining bpf_stats_map keys are read
+// by readDatapathCounters on the health-check cadence.
 func (c *ControlPlane) readMapOverflowCounters(m *ebpf.Map) (udpOverflow uint64, tcpOverflow uint64) {
 	if m == nil {
 		return 0, 0
 	}
-	if v, err := readBpfStatsCounter(m, 0); err == nil {
+	if v, err := readBpfStatsCounter(m, bpfStatsUDPConnOverflow); err == nil {
 		udpOverflow = v
 	}
-	if v, err := readBpfStatsCounter(m, 1); err == nil {
+	if v, err := readBpfStatsCounter(m, bpfStatsTCPConnOverflow); err == nil {
 		tcpOverflow = v
 	}
 	return udpOverflow, tcpOverflow
+}
+
+// readDatapathCounters reads the bpf_stats_map counters added for the
+// datapath-visibility work (P2-8/P2-29/P2-30/P2-31/P3-14/P3-16/P3-18). Every
+// key is read or the whole read fails: a partially reported snapshot would
+// look like "no anomaly" for the missing keys.
+func (c *ControlPlane) readDatapathCounters(m *ebpf.Map) (bpfStatsSnapshot, error) {
+	var snap bpfStatsSnapshot
+
+	if m == nil {
+		return snap, fmt.Errorf("read datapath counters: bpf_stats_map is not loaded")
+	}
+	for _, field := range []struct {
+		name string
+		key  uint32
+		dst  *uint64
+	}{
+		{"redirect overflow", bpfStatsRedirectOverflow, &snap.RedirectOverflow},
+		{"redirect update failed", bpfStatsRedirectUpdateFailed, &snap.RedirectUpdateFailed},
+		{"redirect rebind rejected", bpfStatsRedirectRebindRejected, &snap.RedirectRebindRejected},
+		{"syn rebind rejected", bpfStatsSynRebindRejected, &snap.SynRebindRejected},
+		{"stateless tcp passthrough", bpfStatsStatelessTCPPassthrough, &snap.StatelessTCPPassthrough},
+		{"frag tail passed", bpfStatsFragTailPassed, &snap.FragTailPassed},
+		{"parse unsupported l4", bpfStatsParseUnsupportedL4, &snap.ParseUnsupportedL4},
+		{"unsolicited udp seen", bpfStatsUnsolicitedUDPSeen, &snap.UnsolicitedUDPSeen},
+		{"sockmark fallback", bpfStatsSockmarkFallback, &snap.SockmarkFallback},
+		{"event drop", bpfStatsEventDrop, &snap.EventDrop},
+	} {
+		v, err := readBpfStatsCounter(m, field.key)
+		if err != nil {
+			return snap, fmt.Errorf("read bpf_stats_map counter %q (key %d): %w", field.name, field.key, err)
+		}
+		*field.dst = v
+	}
+	return snap, nil
 }
 
 func (c *ControlPlane) allowDnsFastPathErrorLog(now time.Time) bool {
@@ -2412,6 +2484,19 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 	go serveTCP(listener.tcp4Listener)
 	go serveTCP(listener.tcp6Listener)
 	go func() {
+		// Panic isolation for the ingress read loop: this goroutine runs
+		// processPacket synchronously (ClassifyUdpFlow, admission, pooled task
+		// checkout, batch read), so an unrecovered panic here would take down
+		// the whole process. Recovery is not a silent drop: the plane context
+		// is cancelled so Serve() returns the first error and the run loop can
+		// fail fast. This defer is registered first, so it runs after the
+		// batch reader's own Close defer during the unwind.
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				reportPacketPathPanic("udp_ingress", "read_loop", &c.udpIngressLoopPanicCount, recovered)
+				c.fatalIngressLoopError("udp-ingress-read-loop-panic", fmt.Errorf("recovered panic: %v", recovered))
+			}
+		}()
 		processPacket := func(pktBuf pool.PB, src netip.AddrPort, oob []byte) {
 			pktDst := RetrieveOriginalDest(oob)
 			realDst := common.ConvergeAddrPort(pktDst)
@@ -2463,7 +2548,12 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				select {
 				case c.udpDirectDispatchSem <- struct{}{}:
 					task.dispatchSem = c.udpDirectDispatchSem
-					go task.Run()
+					// Panic isolation: task.Run() releases the dispatch
+					// slot, the admission ticket, the packet buffer, and
+					// the pooled task through its own defers, which all
+					// complete during the unwind. The wrapper must only
+					// report the panic (see runDirectDispatchTask).
+					go runDirectDispatchTask(task, &c.udpDirectDispatchPanicCount)
 				default:
 					task.Discard()
 				}

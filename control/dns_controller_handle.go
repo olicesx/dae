@@ -85,18 +85,27 @@ func (c *DnsController) forwardWithFallback(
 	// `tcp+udp://` upstream already retried on every UDP failure; a `udp://`
 	// upstream only does so for the truncation signal, so an operator that
 	// answers large zones with TC=1 over UDP (which RFC 1035 §4.2.1 permits)
-	// no longer turns into a client-visible failure. An as-is destination is
-	// carried over UDP too and keeps the same contract. Every other scheme
-	// keeps its declared transport contract unchanged.
+	// no longer turns into a client-visible failure. Every other scheme keeps
+	// its declared transport contract unchanged.
 	truncated := errors.Is(primaryErr, ErrDNSTruncated)
 	// An upstream may serve this query when it speaks both transports, or when
-	// the answer was truncated and the upstream is UDP-carried (the caller then
-	// retries over TCP). Expressed as the positive predicate so the condition
-	// stays readable.
-	udpCarried := isAsIs || upstream.Scheme == dns.UpstreamScheme_UDP
+	// the answer was truncated and the operator declared `udp://` (the caller
+	// then retries over TCP). Expressed as the positive predicate so the
+	// condition stays readable.
+	//
+	// An as-is destination is deliberately not in that second case even though
+	// the scheme resolveDNSUpstream synthesizes for it reads "udp". As-is means
+	// "ask the server the request was addressed to, as the request arrived"
+	// (docs/zh/configuration/dns.md, docs/en/configuration/dns.md), so dae
+	// forwards it verbatim and does not change the transport on the client's
+	// behalf: a client that receives TC=1 from that server decides for itself
+	// whether to retry over TCP, exactly as it would without dae in the path.
+	// The explicit isAsIs flag, not the synthesized spelling, is what keeps the
+	// two cases apart.
+	udpUpgradeable := upstream != nil && !isAsIs && upstream.Scheme == dns.UpstreamScheme_UDP
 	canServe := upstream != nil &&
 		(upstream.Scheme == dns.UpstreamScheme_TCP_UDP ||
-			(truncated && udpCarried))
+			(truncated && udpUpgradeable))
 	if !canServe || primaryDialArg.l4proto != consts.L4ProtoStr_UDP {
 		return nil, primaryDialArg, primaryErr
 	}

@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,15 +20,70 @@ import (
 	"github.com/daeuniverse/dae/common/consts"
 	componentdns "github.com/daeuniverse/dae/component/dns"
 	"github.com/daeuniverse/dae/config"
+	"github.com/daeuniverse/dae/pkg/config_parser"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
 )
 
 // These tests pin the RFC 7766 §5 truncation contract on both sides of the
-// controller: a truncated (TC=1) upstream answer must be retried over TCP no
-// matter which transport carried the first attempt, and when that retry cannot
-// deliver the answer the client must receive TC=1 rather than a fabricated
-// SERVFAIL.
+// controller for the transports the operator configures: a `udp://` or
+// `tcp+udp://` upstream that answers TC=1 is retried over TCP, and when that
+// retry cannot deliver the answer the client receives TC=1 rather than a
+// fabricated SERVFAIL. A transparent as-is destination is deliberately NOT in
+// this contract - it is forwarded verbatim - and its tests live in
+// dns_truncated_fallback_scheme_test.go.
+
+const truncatedUpstreamProbeQName = "truncated-upstream.test."
+
+// newTruncatedUpstreamRouting routes one probe qname to a single configured
+// upstream, so the ingress under test follows a declared scheme instead of the
+// as-is fallback. spec is the `name:scheme://host:port` form the config uses.
+// The `full:` operand carries no trailing dot, matching how the config files
+// spell a name (the query itself is sent with one).
+func newTruncatedUpstreamRouting(t *testing.T, logger *logrus.Logger, spec string) *componentdns.Dns {
+	t.Helper()
+	routing, err := componentdns.New(&config.Dns{
+		Upstream: []config.KeyableString{config.KeyableString(spec)},
+		Routing: config.DnsRouting{
+			Request: config.DnsRequestRouting{
+				Rules: []*config_parser.RoutingRule{{
+					AndFunctions: []*config_parser.Function{{
+						Name: consts.Function_QName,
+						Params: []*config_parser.Param{{
+							Key: string(consts.RoutingDomainKey_Full),
+							Val: strings.TrimSuffix(truncatedUpstreamProbeQName, "."),
+						}},
+					}},
+					Outbound: config_parser.Function{Name: "u"},
+				}},
+				Fallback: "asis",
+			},
+			Response: config.DnsResponseRouting{Fallback: "accept"},
+		},
+	}, &componentdns.NewOption{
+		Logger: logger,
+		UpstreamReadyCallback: func(*componentdns.Upstream) error {
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("componentdns.New: %v", err)
+	}
+	return routing
+}
+
+// newTruncatedUpstreamController builds a controller whose probe qname is
+// served by the configured upstream in spec.
+func newTruncatedUpstreamController(t *testing.T, spec string) *DnsController {
+	t.Helper()
+	logger := newDNSListenerTestLogger()
+	ctrl, err := NewDnsController(newTruncatedUpstreamRouting(t, logger, spec), phase0NamedUpstreamControllerOption(logger))
+	if err != nil {
+		t.Fatalf("NewDnsController: %v", err)
+	}
+	t.Cleanup(func() { _ = ctrl.Close() })
+	return ctrl
+}
 
 func truncatedTestConfig() *config.Dns {
 	return &config.Dns{
@@ -39,12 +95,13 @@ func truncatedTestConfig() *config.Dns {
 }
 
 // tcpAwareChooser mirrors the production scheme choice: UDP for udp-ish
-// upstreams, TCP for the scheme the fallback rewrites to.
+// upstreams (including `tcp+udp://`, whose network list puts UDP first), and TCP
+// for the scheme the truncation fallback rewrites to.
 func tcpAwareChooser(t *testing.T, udpTarget, tcpTarget netip.AddrPort) func(context.Context, DnsRequestSnapshot, *componentdns.Upstream) (*dialArgument, error) {
 	t.Helper()
 	return func(_ context.Context, _ DnsRequestSnapshot, upstream *componentdns.Upstream) (*dialArgument, error) {
 		switch upstream.Scheme {
-		case componentdns.UpstreamScheme_UDP:
+		case componentdns.UpstreamScheme_UDP, componentdns.UpstreamScheme_TCP_UDP:
 			return &dialArgument{l4proto: consts.L4ProtoStr_UDP, ipversion: consts.IpVersionStr_4, bestTarget: udpTarget}, nil
 		case componentdns.UpstreamScheme_TCP:
 			return &dialArgument{l4proto: consts.L4ProtoStr_TCP, ipversion: consts.IpVersionStr_4, bestTarget: tcpTarget}, nil
@@ -54,11 +111,12 @@ func tcpAwareChooser(t *testing.T, udpTarget, tcpTarget netip.AddrPort) func(con
 	}
 }
 
-// TestUDPUpstreamTruncatedAnswerUpgradesToTCP drives the full TCP client
-// ingress: the upstream answers TC=1 over UDP, and the controller must retry the
-// same query over TCP and deliver the complete answer.
-func TestUDPUpstreamTruncatedAnswerUpgradesToTCP(t *testing.T) {
-	const queryName = "truncated-upgrade.test."
+// TestConfiguredUDPUpstreamTruncatedAnswerUpgradesToTCP drives the full TCP
+// client ingress for a declared `udp://` upstream: the upstream answers TC=1
+// over UDP, and the controller retries the same query over TCP and delivers the
+// complete answer.
+func TestConfiguredUDPUpstreamTruncatedAnswerUpgradesToTCP(t *testing.T) {
+	const queryName = truncatedUpstreamProbeQName
 	var udpCalls, tcpCalls atomic.Int32
 
 	installCorpusDnsForwarderFactory(t, func(_ *componentdns.Upstream, dialArg dialArgument, _ *logrus.Logger) (DnsForwarder, error) {
@@ -78,9 +136,9 @@ func TestUDPUpstreamTruncatedAnswerUpgradesToTCP(t *testing.T) {
 		}
 	})
 
-	ctrl := newCorpusDnsController(t, truncatedTestConfig())
+	ctrl := newTruncatedUpstreamController(t, "u:udp://192.0.2.11:53")
 	setScopedBestDialerChooser(ctrl, tcpAwareChooser(t,
-		netip.MustParseAddrPort("198.51.100.53:53"), netip.MustParseAddrPort("198.51.100.53:53")))
+		netip.MustParseAddrPort("192.0.2.11:53"), netip.MustParseAddrPort("192.0.2.11:53")))
 
 	response := runTCPDNSIngressQuery(t, ctrl, queryName, 0x5a01)
 	if response.Rcode != dnsmessage.RcodeSuccess || response.Truncated {
@@ -103,11 +161,51 @@ func TestUDPUpstreamTruncatedAnswerUpgradesToTCP(t *testing.T) {
 	}
 }
 
-// TestUDPUpstreamTruncatedAnswerWithFailedRetryReturnsTC covers the visible
-// failure path: the TCP retry fails, so the client must receive TC=1 (RFC 7766
-// §5) instead of SERVFAIL, and the failure must be counted.
-func TestUDPUpstreamTruncatedAnswerWithFailedRetryReturnsTC(t *testing.T) {
-	const queryName = "truncated-fallback-fail.test."
+// TestConfiguredTCPAndUDPUpstreamTruncatedAnswerUpgradesToTCP is the same row
+// for `tcp+udp://`, which already retried on every UDP failure before this
+// contract existed.
+func TestConfiguredTCPAndUDPUpstreamTruncatedAnswerUpgradesToTCP(t *testing.T) {
+	const queryName = truncatedUpstreamProbeQName
+	var tcpCalls atomic.Int32
+
+	installCorpusDnsForwarderFactory(t, func(_ *componentdns.Upstream, dialArg dialArgument, _ *logrus.Logger) (DnsForwarder, error) {
+		switch dialArg.l4proto {
+		case consts.L4ProtoStr_UDP:
+			return &stubDnsForwarder{forward: func(context.Context, []byte) (*dnsmessage.Msg, error) {
+				return nil, ErrDNSTruncated
+			}}, nil
+		case consts.L4ProtoStr_TCP:
+			return &stubDnsForwarder{forward: func(context.Context, []byte) (*dnsmessage.Msg, error) {
+				tcpCalls.Add(1)
+				return dnsAResponseMsg(queryName, "198.51.100.79"), nil
+			}}, nil
+		default:
+			return nil, fmt.Errorf("unexpected transport %q", dialArg.l4proto)
+		}
+	})
+
+	ctrl := newTruncatedUpstreamController(t, "u:tcp+udp://192.0.2.11:53")
+	setScopedBestDialerChooser(ctrl, tcpAwareChooser(t,
+		netip.MustParseAddrPort("192.0.2.11:53"), netip.MustParseAddrPort("192.0.2.11:53")))
+
+	response := runTCPDNSIngressQuery(t, ctrl, queryName, 0x5a04)
+	if response.Rcode != dnsmessage.RcodeSuccess || response.Truncated {
+		t.Fatalf("response header = %+v, want a complete NOERROR answer", response.MsgHdr)
+	}
+	if got := dnsAnswerIPv4(t, response); got != "198.51.100.79" {
+		t.Fatalf("answer = %s, want the TCP-retried answer", got)
+	}
+	if got := tcpCalls.Load(); got != 1 {
+		t.Fatalf("TCP forward calls = %d, want 1", got)
+	}
+}
+
+// TestConfiguredUDPUpstreamTruncatedAnswerWithFailedRetryReturnsTC covers the
+// visible failure path for a declared `udp://` upstream: the TCP retry fails, so
+// the client must receive TC=1 (RFC 7766 §5) instead of SERVFAIL, and the
+// failure must be counted.
+func TestConfiguredUDPUpstreamTruncatedAnswerWithFailedRetryReturnsTC(t *testing.T) {
+	const queryName = truncatedUpstreamProbeQName
 	var tcpCalls atomic.Int32
 
 	installCorpusDnsForwarderFactory(t, func(_ *componentdns.Upstream, dialArg dialArgument, _ *logrus.Logger) (DnsForwarder, error) {
@@ -126,9 +224,9 @@ func TestUDPUpstreamTruncatedAnswerWithFailedRetryReturnsTC(t *testing.T) {
 		}
 	})
 
-	ctrl := newCorpusDnsController(t, truncatedTestConfig())
+	ctrl := newTruncatedUpstreamController(t, "u:udp://192.0.2.11:53")
 	setScopedBestDialerChooser(ctrl, tcpAwareChooser(t,
-		netip.MustParseAddrPort("198.51.100.53:53"), netip.MustParseAddrPort("198.51.100.53:53")))
+		netip.MustParseAddrPort("192.0.2.11:53"), netip.MustParseAddrPort("192.0.2.11:53")))
 
 	response := runTCPDNSIngressQuery(t, ctrl, queryName, 0x5a02)
 	if response.Rcode != dnsmessage.RcodeSuccess {

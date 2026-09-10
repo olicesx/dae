@@ -108,6 +108,27 @@ changed. Review them before upgrading:
   name on these functions stops starting until the name is removed. That is the
   point — the previous behaviour was a different rule, not the one written —
   but it has to be reviewed before upgrading.
+- A truncated (TC=1) answer is now retried over TCP for the DNS upstreams that
+  can carry it, and only for those. RFC 7766 §5 requires a forwarder to retry a
+  truncated answer over TCP, and RFC 1035 §4.2.1 permits a server to answer
+  TC=1 when the answer does not fit one datagram; dae used to lose that signal:
+
+  - `udp://`: the retry is now performed, and the TCP forwarder is built from
+    the rewritten transport (it used to be rejected with `unexpected scheme:
+    udp`, so the retry never left the process and the client got TC=1);
+  - `tcp+udp://`: unchanged, it already retried on every UDP failure;
+  - as-is (the built-in transparent destination, or any other scheme): not
+    retried. As-is means "ask the server the request was addressed to, as the
+    request arrived" (see `docs/*/configuration/dns.md`), so the TC=1 answer the
+    destination sent is passed to the client verbatim, with no TCP connection
+    opened on the client's behalf and no second upstream selection. The client
+    decides for itself whether to retry over TCP, exactly as it would without
+    dae in the path. When the client's own UDP size limit is what truncated the
+    answer, the existing client-facing TC=1 path is unchanged.
+
+  A successful upgrade delivers the complete answer where the client used to
+  receive TC=1, so no configuration change is needed; the observable difference
+  is that these answers now resolve on the first query.
 
 ### v2.0.0rc1 (Pre-release)
 

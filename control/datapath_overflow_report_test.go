@@ -214,6 +214,34 @@ func TestDatapathOverflowReportRebaselinesAfterTheCounterRestarts(t *testing.T) 
 	}
 }
 
+func TestCheckBpfMapHealthReachesTheDatapathReportWithoutCounters(t *testing.T) {
+	// The wiring as seen from the real entry point, not the arithmetic: the
+	// health check must reach the report even when no map is loaded (the code
+	// it replaced returned early in that case), must not panic on nil map
+	// handles, and must stay silent because no counter moved.
+	plane := &ControlPlane{core: &controlPlaneCore{}}
+	var buf bytes.Buffer
+	plane.log = overflowReportLogger(&buf)
+	plane.core.bpf.Store(&bpfObjects{})
+
+	plane.checkBpfMapHealth(0, 0)
+	if buf.Len() != 0 {
+		t.Fatalf("a datapath without counters must not log, got %q", buf.String())
+	}
+	if !plane.datapathOverflowReport.primed.Load() {
+		t.Fatal("checkBpfMapHealth did not reach reportDatapathOverflowInterval: the baselines were never established")
+	}
+	if plane.datapathOverflowReport.lastReportTime.Load() == 0 {
+		t.Fatal("checkBpfMapHealth did not reach the priming branch of the report")
+	}
+
+	// Repeated empty ticks stay silent and keep the baselines established.
+	plane.checkBpfMapHealth(0, 0)
+	if buf.Len() != 0 {
+		t.Fatalf("repeated empty ticks must not log, got %q", buf.String())
+	}
+}
+
 func TestClassifyDatapathOverflowIntervalGradesTheInterval(t *testing.T) {
 	// The classifier is the whole grading contract, so it is tested on its own:
 	// logrus orders levels most severe first, and a heavy interval must not be

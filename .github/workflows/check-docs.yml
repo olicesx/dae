@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Self-test the markdownlint ratchet
         run: |
           # Pure bash, no npm: proves the ratchet still passes on a baseline
@@ -41,7 +41,7 @@ jobs:
           # broken parser fails fast rather than being trusted below.
           bash scripts/test-markdownlint-ratchet.sh
       - name: Use Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@3235b876344d2a9aa001b8d1453c930bba69e610 # v3
         with:
           node-version: '16.x'
           cache: 'npm'
@@ -61,7 +61,7 @@ jobs:
           cat "${RUNNER_TEMP}/markdownlint.log"
           bash scripts/check-markdownlint-baseline.sh "${RUNNER_TEMP}/markdownlint.log"
       - name: Lint Markdown files (autocorrect)
-        uses: huacnlee/autocorrect-action@main
+        uses: huacnlee/autocorrect-action@bf91ab3904c2908dd8e71312a8a83ed1eb632997 # main
         with:
           args: --lint ./docs/
       - name: Check broken link (including broken anchor)

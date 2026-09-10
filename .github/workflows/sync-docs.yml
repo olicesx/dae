@@ -48,7 +48,7 @@ jobs:
       git_commit_msg: ${{ steps.export.outputs.git_commit_msg }}
       git_run_number: ${{ steps.export.outputs.git_run_number }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Get metadata from HEAD sha
         id: export
         run: |
@@ -62,26 +62,60 @@ jobs:
           python3 hack/ci/config-doc-generator.py
 
       - name: Export artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: pre_flight_artifacts
+          # NOTE (pre-existing mismatch, reported not fixed - changing it alters
+          # this job's behaviour and needs an owner call):
+          # hack/ci/config-doc-generator.py writes hack/sync/example-config.md,
+          # because it opens the destination path relative to the step's CWD,
+          # which is the repository root. The glob below points at ./docs/sync/,
+          # a directory that does not exist in this repository (docs/sync is
+          # absent; hack/sync/.gitkeep is the tracked marker of the real output
+          # directory). So this upload currently matches no file, and with the
+          # default `if-no-files-found: warn` it produces no artifact at all -
+          # which in turn would make the `download-artifact` step of
+          # sync-to-dae-docs fail once that job is actually reached.
           path: |
             ./docs/sync/*.md
 
+  # Visible-skip companion to `sync-to-dae-docs` below. A job whose `if:` is
+  # false executes no steps, so the gated job cannot announce its own skip; the
+  # fork case is reported here instead of vanishing from the run. This job
+  # deliberately has no `needs:`, so the notice appears on every non-upstream
+  # run, including when the documentation gate above is red - the notice claims
+  # only that this repository does not publish upstream, nothing about the gate.
+  sync-to-dae-docs-skipped:
+    if: github.repository != 'daeuniverse/dae'
+    name: 'Synchronize changes to dae-docs (skipped: not upstream)'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Announce that no documentation is published from this repository
+        run: |
+          echo "::notice::Skipping sync-to-dae-docs: this run is in ${{ github.repository }}, not daeuniverse/dae. Forks do not publish documentation to upstream daeuniverse/dae-docs - that repository is not accessible here (GitHub API returns Not Found), secrets.GH_TOKEN is not set, and a fork must not open pull requests against upstream. The documentation gate (check-docs) still runs and still judges this commit."
+
   sync-to-dae-docs:
     needs: [replicate-config]
+    # Upstream-only job: it checks out daeuniverse/dae-docs with the default
+    # GITHUB_TOKEN, pushes a branch and opens a pull request as @daebot with
+    # secrets.GH_TOKEN plus `assignees: daebot` / `team-reviewers: docs`.
+    # A fork has none of that, so the job can only fail there - it reached its
+    # first step and died with `remote: Repository not found.` / exit 128 the
+    # first time the documentation gate stopped skipping it (P3-44). Gate it to
+    # the upstream repository; the skip is announced by the sibling job above.
+    if: github.repository == 'daeuniverse/dae'
     name: Synchronize changes to dae-docs
     runs-on: ubuntu-latest
     steps:
       - name: Checkout to daeuniverse/dae-docs
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: daeuniverse/dae-docs
           fetch-depth: 0
           ref: master
 
       - name: Copy artifacts from build job to local path
-        uses: actions/download-artifact@v4.1.4
+        uses: actions/download-artifact@c850b930e6ba138125429b7e5c93fc707a7f8427 # v4.1.4
         with:
           name: pre_flight_artifacts
           path: docs/
@@ -96,7 +130,7 @@ jobs:
 
       - name: Create Pull Request
         id: create_pr
-        uses: peter-evans/create-pull-request@v5
+        uses: peter-evans/create-pull-request@4e1beaa7521e8b457b572c090b25bd3db56bf1c5 # v5
         with:
           author: daebot <dae@v2raya.org>
           committer: daebot <dae@v2raya.org>

@@ -28,18 +28,18 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Generate GitHub Auth Token
         # https://github.com/tibdex/github-app-token
         id: generate_token
-        uses: tibdex/github-app-token@v2
+        uses: tibdex/github-app-token@3beb63f4bd073e61482598c45c71c1019b59b73a # v2
         with:
           app_id: ${{ secrets.GH_APP_ID }}
           private_key: ${{ secrets.GH_APP_PRIVATE_KEY }}
 
       - name: Generate release changelogs
-        uses: daeuniverse/changelogs-generator-action@main
+        uses: daeuniverse/changelogs-generator-action@0db5f70682f230ffb732bf17807dd9ad0ce24cf4 # main
         id: changelog
         with:
           # https://github.com/daeuniverse/changelogs-generator-action
@@ -54,7 +54,7 @@ jobs:
 
       - name: Create an issue with proposed changelogs
         if: ${{ inputs.dry_run == 'false' }}
-        uses: dacbd/create-issue-action@main
+        uses: dacbd/create-issue-action@fec641442c0897e734fad173cfe83ae21a2284a3 # main
         with:
           token: ${{ steps.generate_token.outputs.token }}
           title: '[Release Changelogs] ${{ inputs.future_release_tag }}'

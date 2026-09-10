@@ -18,6 +18,16 @@ on:
       - "package.json"
       - ".autocorrectrc"
       - ".markdownlint-cli2.jsonc"
+      # The markdownlint ratchet and everything it is built from. This job is
+      # the only caller of check-docs.yml on push, so without these a commit
+      # that *only* tightens the ledger (the normal way to pay this debt down)
+      # would never re-run the gate that judges it - and the ledger could be
+      # edited into any shape, unverified.
+      - ".markdownlint-baseline.txt"
+      - "scripts/check-markdownlint-baseline.sh"
+      - "scripts/test-markdownlint-ratchet.sh"
+      - "scripts/testdata/**"
+      - '.github/workflows/check-docs.yml'
       - '.github/workflows/sync-docs.yml'
 
 permissions:

@@ -35,7 +35,7 @@ func TestTCPOffloadFuseEngageIsAllOrNothing(t *testing.T) {
 	if fusedIdx < 0 {
 		t.Fatal("engage branch must set fused explicitly")
 	}
-	if !(leftIdx < rightIdx && rightIdx < fusedIdx) {
+	if leftIdx >= rightIdx || rightIdx >= fusedIdx {
 		t.Fatalf("fused must be set only after both pause updates succeeded (left=%d right=%d fused=%d)", leftIdx, rightIdx, fusedIdx)
 	}
 

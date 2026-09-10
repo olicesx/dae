@@ -51,11 +51,10 @@ type stubQuicStream struct {
 	readAfter  bool // a Read happened while the send half was still open
 	closeCalls int
 
-	response    []byte
-	closeErr    error
-	readErr     error
-	writeErr    error
-	writeBefore bool
+	response []byte
+	closeErr error
+	readErr  error
+	writeErr error
 }
 
 func (s *stubQuicStream) StreamID() quic.StreamID { return 0 }

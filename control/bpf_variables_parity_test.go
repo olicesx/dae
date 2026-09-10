@@ -246,7 +246,6 @@ func TestBpfStatsKeysParityWithKernelSource(t *testing.T) {
 		{"BPF_STATS_UNSOLICITED_UDP_SEEN", bpfStatsUnsolicitedUDPSeen},
 		{"BPF_STATS_SOCKMARK_FALLBACK", bpfStatsSockmarkFallback},
 		{"BPF_STATS_EVENT_DROP", bpfStatsEventDrop},
-		{"BPF_STATS_MAX", bpfStatsMapEntries},
 	}
 	for _, entry := range contract {
 		value, ok := cKeys[entry.cName]
@@ -259,9 +258,20 @@ func TestBpfStatsKeysParityWithKernelSource(t *testing.T) {
 				entry.cName, value, entry.goKey)
 		}
 	}
-	if len(cKeys) != len(contract) {
-		t.Errorf("enum bpf_stats_key declares %d entries but Go mirrors %d; every key needs a Go-side reader (or the enum has a stale entry)",
-			len(cKeys), len(contract))
+
+	// BPF_STATS_MAX is the ARRAY capacity, i.e. one past the last valid key. It
+	// is derived from the table above instead of being mirrored as a Go
+	// constant: adding a key in C without covering it here then fails, and the
+	// Go side never owns a second copy of the C macro.
+	if got := cKeys["BPF_STATS_MAX"]; got != uint32(len(contract)) {
+		t.Errorf("BPF_STATS_MAX = %d in C but %d keys are covered here", got, len(contract))
+	}
+	// The C enum carries one entry that is not a key: BPF_STATS_MAX, the array
+	// capacity. Counting it separately keeps both invariants without a Go-side
+	// copy of the C macro (a Go mirror would be a second owner of that value).
+	if len(cKeys) != len(contract)+1 {
+		t.Errorf("enum bpf_stats_key declares %d entries (%d keys plus BPF_STATS_MAX) but Go mirrors %d keys; every key needs a Go-side reader (or the enum has a stale entry)",
+			len(cKeys), len(contract), len(contract))
 	}
 	if !regexp.MustCompile(`__uint\(max_entries,\s*BPF_STATS_MAX\)`).MatchString(tproxySource) {
 		t.Error("bpf_stats_map must size itself from BPF_STATS_MAX so the ARRAY capacity cannot drift from the enum")

@@ -694,9 +694,9 @@ struct {
  * pre-zeroed), and a failed reservation drops the event exactly like the
  * previous bpf_ringbuf_output() on a full ring. */
 static __always_inline int
-send_dae_event(__u32 type, __u32 pid, const char *pname, __u8 outbound,
-	       __u8 l4proto, const __u32 *sip, const __u32 *dip,
-	       __u16 sport, __u16 dport)
+send_dae_event(__u32 type, __u32 pid, const char *pname, bool pname_valid,
+	       __u8 outbound, __u8 l4proto, const __u32 *sip,
+	       const __u32 *dip, __u16 sport, __u16 dport)
 {
 	struct dae_event *e = bpf_ringbuf_reserve(&event_ringbuf, sizeof(*e), 0);
 
@@ -719,7 +719,13 @@ send_dae_event(__u32 type, __u32 pid, const char *pname, __u8 outbound,
 	__builtin_memset(e->sip, 0, sizeof(e->sip));
 	__builtin_memset(e->dip, 0, sizeof(e->dip));
 
-	if (pname)
+	/* The copy is guarded by a scalar flag, not by `pname != NULL`: clang
+	 * 15/16/17 lower a select of a pointer and NULL (`c ? p : NULL`) into a
+	 * bitwise AND on a pointer register, which the verifier rejects with
+	 * "bitwise operator &= on pointer prohibited". Passing a pointer that is
+	 * always valid (the conntrack args slot) plus this flag keeps the select
+	 * on a scalar. */
+	if (pname_valid)
 		__builtin_memcpy(e->pname, pname, 16);
 
 	if (sip)
@@ -770,7 +776,7 @@ send_blocked_alive_event(__u8 outbound, __u8 l4proto, const __u32 *sip,
 	if (blocked_event_rate_limited((__u32)outbound))
 		return false;
 
-	send_dae_event(DAE_EVENT_BLOCKED_ALIVE, 0, NULL, outbound, l4proto,
+	send_dae_event(DAE_EVENT_BLOCKED_ALIVE, 0, NULL, false, outbound, l4proto,
 		       sip, dip, sport, dport);
 	return true;
 }
@@ -786,7 +792,7 @@ send_blocked_event(__u8 outbound, __u8 l4proto, const __u32 *sip,
 	if (blocked_event_rate_limited(EVENT_RATE.blocked_key))
 		return;
 
-	send_dae_event(DAE_EVENT_BLOCKED, 0, NULL, outbound, l4proto, sip,
+	send_dae_event(DAE_EVENT_BLOCKED, 0, NULL, false, outbound, l4proto, sip,
 		       dip, sport, dport);
 }
 
@@ -802,10 +808,10 @@ send_anomaly_event(__u32 rate_key, __u32 type, __u8 l4proto,
 		return;
 
 	if (key)
-		send_dae_event(type, 0, NULL, 0, l4proto, key->sip.u6_addr32,
+		send_dae_event(type, 0, NULL, false, 0, l4proto, key->sip.u6_addr32,
 			       key->dip.u6_addr32, key->sport, key->dport);
 	else
-		send_dae_event(type, 0, NULL, 0, l4proto, NULL, NULL, 0, 0);
+		send_dae_event(type, 0, NULL, false, 0, l4proto, NULL, NULL, 0, 0);
 }
 
 static __always_inline __u8 ipv4_get_dscp(const struct iphdr *iph)
@@ -1546,12 +1552,6 @@ conntrack_args_set(struct conntrack_args *a,
 	}
 	a->pid = pid;
 	a->flags = flags;
-}
-
-static __always_inline const char *
-conntrack_args_pname_or_null(const struct conntrack_args *a)
-{
-	return a->flags & CT_ARGS_HAS_PNAME ? (const char *)a->pname : NULL;
 }
 
 static __always_inline int
@@ -2332,7 +2332,8 @@ __mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 			__sync_fetch_and_add(overflow_count, 1);
 		if (!blocked_event_rate_limited(EVENT_RATE.overflow_key))
 			send_dae_event(DAE_EVENT_UDP_CONN_OVERFLOW, args->pid,
-				       conntrack_args_pname_or_null(args), 0,
+				       (const char *)args->pname,
+				       (args->flags & CT_ARGS_HAS_PNAME) != 0, 0,
 				       key->l4proto, key->sip.u6_addr32,
 				       key->dip.u6_addr32, key->sport,
 				       key->dport);
@@ -2500,7 +2501,9 @@ __mark_tcp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 			if (!blocked_event_rate_limited(EVENT_RATE.overflow_key))
 				send_dae_event(DAE_EVENT_TCP_CONN_OVERFLOW,
 					       args->pid,
-					       conntrack_args_pname_or_null(args),
+					       (const char *)args->pname,
+					       (args->flags &
+						CT_ARGS_HAS_PNAME) != 0,
 					       0, key->l4proto,
 					       key->sip.u6_addr32,
 					       key->dip.u6_addr32, key->sport,

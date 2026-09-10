@@ -82,8 +82,6 @@ const (
 	// no room. The consumers are advisory, but a dropped event must never be
 	// invisible.
 	bpfStatsEventDrop = uint32(11)
-	// bpfStatsMapEntries is the ARRAY capacity (BPF_STATS_MAX in C).
-	bpfStatsMapEntries = uint32(12)
 )
 
 // expectedInjectedVariables lists every .rodata variable this package promises

@@ -82,10 +82,14 @@ func (c *DnsController) forwardWithFallback(
 	// no longer turns into a client-visible failure. Every other scheme keeps
 	// its declared transport contract unchanged.
 	truncated := errors.Is(primaryErr, ErrDNSTruncated)
-	if upstream == nil ||
-		(upstream.Scheme != dns.UpstreamScheme_TCP_UDP &&
-			!(truncated && upstream.Scheme == dns.UpstreamScheme_UDP)) ||
-		primaryDialArg.l4proto != consts.L4ProtoStr_UDP {
+	// An upstream may serve this query when it speaks both transports, or when
+	// the answer was truncated and the upstream speaks UDP (the caller then
+	// retries over TCP). Expressed as the positive predicate so the condition
+	// stays readable.
+	canServe := upstream != nil &&
+		(upstream.Scheme == dns.UpstreamScheme_TCP_UDP ||
+			(truncated && upstream.Scheme == dns.UpstreamScheme_UDP))
+	if !canServe || primaryDialArg.l4proto != consts.L4ProtoStr_UDP {
 		return nil, primaryDialArg, primaryErr
 	}
 

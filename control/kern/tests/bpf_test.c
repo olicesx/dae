@@ -1653,8 +1653,8 @@ int testsetup_conntrack_args_scratch_reset(struct __sk_buff *skb)
 		bpf_printk("args->dscp(%u) != 0\n", args->dscp);
 		return TC_ACT_SHOT;
 	}
-	if (conntrack_args_pname_or_null(args)) {
-		bpf_printk("conntrack_args_pname_or_null(args) != NULL\n");
+	if (args->flags & CT_ARGS_HAS_PNAME) {
+		bpf_printk("args->flags reports a pname\n");
 		return TC_ACT_SHOT;
 	}
 	for (int i = 0; i < TASK_COMM_LEN; i++) {

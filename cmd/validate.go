@@ -13,6 +13,7 @@ import (
 
 	"github.com/daeuniverse/dae/common/assets"
 	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/component/dns"
 	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
@@ -39,6 +40,15 @@ var (
 			// rule set fails here (non-zero) instead of at daemon startup.
 			log := logrus.New()
 			if err := validateRoutingRules(log, conf, []string{filepath.Dir(cfgFile)}); err != nil {
+				fmt.Println(err)
+				os.Exit(1)
+			}
+			// The main routing block above is only half of what the run path
+			// validates: the DNS request/response routing has its own parser
+			// chain (component/dns), and a typo there used to exit 0 here while
+			// `dae run` refused to start. Same chain, no second copy of the
+			// checks - see dns.ValidateRouting.
+			if err := dns.ValidateRouting(log, &conf.Dns, []string{filepath.Dir(cfgFile)}); err != nil {
 				fmt.Println(err)
 				os.Exit(1)
 			}

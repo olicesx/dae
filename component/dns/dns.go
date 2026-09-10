@@ -45,8 +45,11 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 		log: opt.Logger,
 	}
 	s.upstream2Index.Store((*Upstream)(nil), int(consts.DnsRequestOutboundIndex_AsIs))
-	// Parse upstream.
-	upstreamName2Id := map[string]uint8{}
+	// Parse upstream. upstreamName2Id is the shared namespace builder so the
+	// validate path resolves upstream names against the same mapping (see
+	// ValidateRouting); the per-upstream format checks stay here, on the path
+	// that actually dials.
+	upstreamName2Id := upstreamName2Id(dns)
 	for i, upstreamRaw := range dns.Upstream {
 		if i >= int(consts.DnsRequestOutboundIndex_UserDefinedMax) ||
 			i >= int(consts.DnsResponseOutboundIndex_UserDefinedMax) {

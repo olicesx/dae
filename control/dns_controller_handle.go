@@ -164,6 +164,51 @@ func (c *DnsController) reportDnsTruncatedFallback(upstream *dns.Upstream, upgra
 		"(primary error: %v)", primaryErr)
 }
 
+// reportDnsTruncationSummary publishes the RFC 7766 §5 upgrade counters to the
+// operator. The per-event warning above is rate-limited to one line per minute
+// and therefore cannot answer the two questions an operator actually has: are
+// truncation upgrades happening at all, and what fraction of them fail. This
+// summary is emitted by the DNS cache janitor on every tick that saw activity,
+// as an interval delta plus the lifetime totals, and stays silent on an idle
+// interval so a resolver that never truncates costs nothing. It follows the
+// visibility pattern already used for the datapath counters
+// (ControlPlane.checkBpfMapHealth): periodic read, one line per interval, warn
+// only when the numbers say something is wrong.
+func (c *DnsController) reportDnsTruncationSummary() {
+	if c == nil || c.dnsControllerStore == nil || c.log == nil {
+		return
+	}
+	upgrades := c.dnsUdpTruncatedUpgrades.Load()
+	failures := c.dnsUdpTruncatedUpgradeFailures.Load()
+	replies := c.dnsTruncatedRepliesToClient.Load()
+
+	intervalUpgrades := upgrades - c.lastReportedTruncatedUpgrades.Swap(upgrades)
+	intervalFailures := failures - c.lastReportedTruncatedFailures.Swap(failures)
+	intervalReplies := replies - c.lastReportedTruncatedReplies.Swap(replies)
+	if intervalUpgrades == 0 && intervalFailures == 0 && intervalReplies == 0 {
+		return
+	}
+
+	fields := logrus.Fields{
+		"upgrades_total":         upgrades,
+		"upgrade_failures_total": failures,
+		"truncated_to_client":    replies,
+		"upgrades":               intervalUpgrades,
+		"upgrade_failures":       intervalFailures,
+		"truncated_replies":      intervalReplies,
+	}
+	if attempts := intervalUpgrades + intervalFailures; attempts > 0 {
+		// Rendered instead of a float so the ratio is exact at any volume.
+		fields["upgrade_failure_ratio"] = fmt.Sprintf("%d/%d", intervalFailures, attempts)
+	}
+	if intervalFailures > 0 {
+		c.log.WithFields(fields).Warn("DNS truncation (TC=1) TCP upgrades failed; those clients got a truncated answer. " +
+			"Check the upstream's TCP availability and whether its answers fit the client's UDP size limit")
+		return
+	}
+	c.log.WithFields(fields).Info("DNS truncation (TC=1) answers were upgraded to TCP")
+}
+
 func (c *DnsController) allowDnsTruncatedLog(now time.Time) bool {
 	nowNano := now.UnixNano()
 	for {

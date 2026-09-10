@@ -860,7 +860,10 @@ func (c *DnsController) rebuildDnsCacheIndex() {
 }
 
 // startDnsCacheJanitor runs a periodic goroutine that evicts expired DNS cache
-// entries and retires idle DNS forwarders.
+// entries and retires idle DNS forwarders. It also carries the periodic DNS
+// visibility reports (truncation upgrades) on the same cadence, because it is
+// the only DNS-owned ticker and the counters it reports live on the same shared
+// store.
 //
 // IMPORTANT: This goroutine intentionally does NOT watch baseContext().Done().
 // See bpfUpdateWorker comment for the rationale — the same stale-context problem
@@ -880,6 +883,7 @@ func (c *DnsController) startDnsCacheJanitor() {
 				c.reconcileDnsCacheIndex()
 				c.evictExpiredDnsCache(now)
 				c.evictIdleDnsForwarders(now)
+				c.reportDnsTruncationSummary()
 			}
 		}
 	}()

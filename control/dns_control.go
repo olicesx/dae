@@ -159,11 +159,18 @@ type dnsControllerStore struct {
 	// Truncated-answer bookkeeping (RFC 7766 §5). Upgrades count UDP answers
 	// whose TC=1 bit triggered a TCP retry and whether that retry produced an
 	// answer; ClientReplies counts TC=1 answers handed back to a client because
-	// no TCP upgrade delivered the full answer.
+	// no TCP upgrade delivered the full answer. The lastReported* copies hold
+	// the values the janitor published last, so the periodic summary can report
+	// an interval rate instead of a lifetime total only; they are written by
+	// the single DNS cache janitor goroutine (startDnsCacheJanitor) and are
+	// atomic only so a future reader cannot introduce a data race.
 	dnsUdpTruncatedUpgrades        atomic.Uint64
 	dnsUdpTruncatedUpgradeFailures atomic.Uint64
 	dnsTruncatedRepliesToClient    atomic.Uint64
 	lastDnsTruncatedLogTime        atomic.Int64
+	lastReportedTruncatedUpgrades  atomic.Uint64
+	lastReportedTruncatedFailures  atomic.Uint64
+	lastReportedTruncatedReplies   atomic.Uint64
 
 	// handleGate accounts for request handlers that entered through the
 	// active-plane dispatch. The publication RWMutex used to be held across

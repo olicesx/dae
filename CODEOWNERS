@@ -1,4 +1,14 @@
-* @daeuniverse/governance
-docs/** @daeuniverse/docs
-CHANGELOGS.md @daeuniverse/docs @daeuniverse/release
-/.github/** @daeuniverse/infra
+# This repository's `origin` is github.com/olicesx/dae, so the upstream teams
+# below cannot be resolved here: GitHub silently ignores CODEOWNERS entries
+# whose owner is unknown, which made the whole file dead (P3-22). A single
+# resolvable owner is used instead.
+#
+# TODO: restore the upstream ownership split when this repository is merged
+# back into / forked from daeuniverse/dae and those teams are resolvable again:
+#   * @daeuniverse/governance
+#   docs/** @daeuniverse/docs
+#   CHANGELOGS.md @daeuniverse/docs @daeuniverse/release
+#   /.github/** @daeuniverse/infra
+#
+# Validate with: gh api repos/olicesx/dae/codeowners/errors
+* @olicesx

@@ -21,6 +21,9 @@ env:
   DOWNSTREAM_REPO: flake.nix
   WORKFLOW_FILE: sync-upstream.yml
 
+permissions:
+  contents: read
+
 jobs:
   dispatch-downstream-workflow:
     runs-on: ubuntu-latest

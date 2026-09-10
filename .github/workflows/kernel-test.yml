@@ -27,6 +27,9 @@ on:
       - "install/empty.dae"
       - ".github/workflows/kernel-test.yml"
 
+permissions:
+  contents: read
+
 jobs:
 
   build:
@@ -57,8 +60,9 @@ jobs:
     - name: Generate and build
       run: |
         git submodule update --init
-        # Go 1.26 optimization: newinliner, simd, heapminimum512kib, and randomizedheapbase64.
-        export GOEXPERIMENT="newinliner,simd,heapminimum512kib,randomizedheapbase64"
+        # The Go experiment set is owned by the Makefile (DEFAULT_GOEXPERIMENT,
+        # read with `make -s print-goexperiment`); `make` below exports it, so
+        # this workflow must not carry a second copy (scripts/check-build-env.sh).
         make GOFLAGS="-buildvcs=false" CC=clang
 
     - name: Verify built binary is real eBPF (not stub)

@@ -16,26 +16,40 @@ on:
     # At (UTC+8 0:00 | UTC+0 16:00) every day
     - cron: "0 16 * * *"
 
+permissions:
+  contents: read
+
 jobs:
   pre-actions:
-    uses: daeuniverse/ci-seed-jobs/.github/workflows/pre-actions.yml@master
+    # Pinned to a 40-hex commit (P2-25): `@master` moved on every run.
+    # daeuniverse/ci-seed-jobs@5d0b8710ae2b7fcc2051e5e9379671c6662b278e
+    uses: daeuniverse/ci-seed-jobs/.github/workflows/pre-actions.yml@5d0b8710ae2b7fcc2051e5e9379671c6662b278e
     with:
       repository: ${{ github.repository }}
       ref: ${{ github.sha }}
       fetch-depth: 0
       check-runs: '["build", "daily-build-passed"]'
+    # TODO(P2-25): cannot be replaced by an explicit secret mapping until the
+    # referenced workflow declares `on.workflow_call.secrets`; see
+    # docs/fork-ci-secrets.md.
     secrets: inherit
 
   build:
-    uses: daeuniverse/dae/.github/workflows/seed-build.yml@main
+    # Same-repo reusable workflow: the recipe can no longer fork from the one
+    # this repository ships (it previously called upstream's @main).
+    uses: ./.github/workflows/seed-build.yml
     with:
       ref: ${{ github.sha }}
       build-type: daily-build
+    secrets:
+      GH_APP_ID: ${{ secrets.GH_APP_ID }}
+      GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
 
   post-actions:
     if: always()
     needs: [build]
-    uses: daeuniverse/ci-seed-jobs/.github/workflows/dae-post-actions.yml@master
+    # Pinned to a 40-hex commit (P2-25); see the TODO on pre-actions above.
+    uses: daeuniverse/ci-seed-jobs/.github/workflows/dae-post-actions.yml@5d0b8710ae2b7fcc2051e5e9379671c6662b278e
     with:
       check-run-id: "dae-bot[bot]/daily-build-passed"
       check-run-conclusion: ${{ needs.build.result }}

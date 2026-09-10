@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - main
+      # `kdae` is the development branch of this fork (P3-22).
+      - kdae
       - 'ci/**'
       - 'release/**'
     tags:
@@ -17,6 +19,9 @@ on:
       - ".autocorrectrc"
       - ".markdownlint-cli2.jsonc"
       - '.github/workflows/sync-docs.yml'
+
+permissions:
+  contents: read
 
 jobs:
   check-docs:

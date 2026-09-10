@@ -98,3 +98,13 @@
    这里的 pname 的含义是进程名。你可通过启动时的命令，或运行时通过 `ps -ef` 命令或者观察 dae 的日志来确定 naiveproxy 的进程名。must_direct 的含义是所有流量，包括 dns 查询都放行直连，不重定向至 dae。
 
    只绑定 LAN 接口的用户不需要做这一步。
+
+## 兼容性说明
+
+### VLESS XTLS Vision 与畸形 ServerHello
+
+XTLS Vision 只有在客户端从服务端 `ServerHello` 中读出密码套件后才能启用：Vision 的填充策略由该套件决定，猜测套件会破坏数据流。因此 outbound fork 中的 VLESS 实现仅在握手消息格式正确时解析密码套件，即 `legacy_session_id` 长度在 RFC 8446 第 4.1.2 节允许的 0..32 字节范围内、且消息长度足以包含该字段时。
+
+当 `ServerHello` 畸形（session id 超过 32 字节、握手被截断或超长）时，密码套件保持未设置，**该连接不会启用 XTLS Vision，而是退回普通 VLESS 中继**：不施加 Vision 填充，也不产生协议错误。这个失败方向是刻意选择的：从畸形消息推断密码套件会给出错误的填充，直接破坏连接。
+
+该契约随带边界修复的 outbound 版本落地（P1-7）；dae 自身不解析该握手。

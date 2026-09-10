@@ -4,7 +4,10 @@ on:
   workflow_dispatch:
   workflow_call:
   pull_request:
-    branches: [main]
+    # `kdae` is the development branch of this fork; with only `main` listed
+    # this gate never ran on the branch that receives the documentation
+    # changes (P3-22).
+    branches: [main, kdae]
     types: [ opened, synchronize, reopened ]
     paths:
       - 'README.md'
@@ -13,6 +16,9 @@ on:
       - '.autocorrectrc'
       - '.markdownlint-cli2.jsonc'
       - '.github/workflows/check-docs.yml'
+
+permissions:
+  contents: read
 
 jobs:
   check-doc:

@@ -98,3 +98,25 @@ Although dae and other proxy programs support the HTTPS protocol, using them doe
    Here, `pname` refers to the process name. You can determine the process name of naiveproxy by examining the command used to start it, running the `ps -ef` command at runtime, or observing the dae logs. The meaning of `must_direct` is to allow all traffic, including DNS queries, to pass through directly without redirecting to dae.
 
    Users who only bind the LAN interface do not need to perform this step.
+
+## Compatibility notes
+
+### VLESS with XTLS Vision and malformed ServerHello
+
+XTLS Vision can only be enabled once the client has read the cipher suite out
+of the server's `ServerHello`: the Vision padding strategy is derived from it,
+so guessing the suite would corrupt the stream. The VLESS implementation in the
+outbound fork therefore parses the cipher suite only when the handshake message
+is well formed, in particular when `legacy_session_id` is inside the RFC 8446
+section 4.1.2 bound of 0..32 bytes and the message is long enough to contain
+the field.
+
+On a malformed `ServerHello` (session id longer than 32 bytes, truncated or
+oversized handshake) the cipher suite is left unset, **XTLS Vision is not
+enabled for that connection and the session falls back to a plain VLESS
+relay**: no Vision padding is applied and no protocol error is raised. The
+fail-safe direction is deliberate, because inferring a cipher suite from a
+malformed message would produce wrong padding and break the stream.
+
+This contract lands with the outbound revision that carries the bounds fix
+(P1-7). dae itself never parses the handshake.

@@ -13,7 +13,10 @@ TARGET ?= bpfel,bpfeb
 OUTPUT ?= dae
 MAX_MATCH_SET_LEN ?= 1024
 CFLAGS := -DMAX_MATCH_SET_LEN=$(MAX_MATCH_SET_LEN) $(CFLAGS)
-DEFAULT_GOEXPERIMENT := heapminimum512kib,randomizedheapbase64
+# Single owner of the GOEXPERIMENT set used to build released artifacts.
+# CI must not restate this value: read it with `make -s print-goexperiment`
+# (scripts/check-build-env.sh rejects any copy under .github/ or Dockerfile).
+DEFAULT_GOEXPERIMENT := newinliner,simd,heapminimum512kib,randomizedheapbase64
 GOEXPERIMENT_MERGED := $(shell printf '%s\n' "$(DEFAULT_GOEXPERIMENT),$(GOEXPERIMENT)" | tr ',' '\n' | sed '/^$$/d' | awk '!seen[$$0]++' | paste -sd, -)
 export GOEXPERIMENT := $(GOEXPERIMENT_MERGED)
 NOSTRIP ?= n
@@ -29,7 +32,30 @@ endif
 
 GOARCH ?= $(shell go env GOARCH)
 
+# Single owner of the "dae trace is not built for this GOARCH" declaration.
+# An arch not listed here must build trace or fail loudly: a silent trace-less
+# build ships a binary whose `dae trace` diagnostics are missing with no signal.
+# CI asserts the built artifact against this list
+# (scripts/check-artifact-build-env.sh), re-verifies that every listed arch
+# really cannot generate trace (scripts/check-trace-arch-matrix.sh) and reads
+# the list with `make -s print-trace-unsupported`.
+# Measured on 2026-09-10, so nothing is listed on faith:
+#   mips    -> bpf2go fails with `Error: no compiler specified`; with -cc set,
+#              clang fails with `no member named 'regs' in 'struct pt_regs'`
+#              (bpf_tracing.h selects the mips pt_regs layout while the vendored
+#              vmlinux.h from the dae_bpf_headers submodule falls back to x86)
+#   mips64, mips64le, mipsle -> bpf2go: unsupported target
+# `gen.FindTarget()` accepting an architecture is NOT evidence that its trace
+# program compiles: do not move mips out of this list on that basis alone.
+# Reproducible probe (needs clang and the headers submodule):
+#   GOARCH=<arch> BPF_CLANG=clang go generate ./trace/trace.go
+# or, for the whole ledger: ./scripts/check-trace-arch-matrix.sh
+TRACE_UNSUPPORTED_GOARCH ?= mips mips64 mips64le mipsle
+TRACE_UNSUPPORTED_THIS_ARCH := $(filter $(GOARCH),$(TRACE_UNSUPPORTED_GOARCH))
+
 # Do NOT remove the line below. This line is for CI.
+# CI passes GOMODCACHE in the build step environment; it must not rewrite this
+# file in place (a rewritten Makefile no longer matches the release tag).
 #export GOMODCACHE=$(PWD)/go-mod
 
 # Get version from .git.
@@ -44,7 +70,7 @@ endif
 
 BUILD_ARGS := -trimpath -ldflags "-s -w -X github.com/daeuniverse/dae/cmd.Version=$(VERSION) -X github.com/daeuniverse/dae/common/consts.MaxMatchSetLen_=$(MAX_MATCH_SET_LEN)" $(BUILD_ARGS)
 
-.PHONY: clean-ebpf ebpf ebpf-sync ebpf-sync-check ebpf-test-tagged ebpf-test-debug ebpf-test-debug-tagged ebpf-audit dae submodule submodules
+.PHONY: clean-ebpf ebpf ebpf-sync ebpf-sync-check ebpf-test-tagged ebpf-test-debug ebpf-test-debug-tagged ebpf-audit dae submodule submodules print-goexperiment print-goexperiment-env print-trace-unsupported
 
 ## Begin Dae Build
 dae: export GOOS=linux
@@ -113,9 +139,28 @@ ebpf: ebpf-sync submodule clean-ebpf
     go generate ./control/control.go && \
     if go generate ./trace/trace.go; then \
 		echo trace > $(BUILD_TAGS_FILE); \
-	else \
+	elif [ -n "$(TRACE_UNSUPPORTED_THIS_ARCH)" ]; then \
+		echo "WARNING: GOARCH=$(GOARCH) is declared in TRACE_UNSUPPORTED_GOARCH ($(TRACE_UNSUPPORTED_GOARCH)); building without the 'trace' tag, so 'dae trace' is unavailable in this binary." >&2; \
 		echo > $(BUILD_TAGS_FILE); \
+	else \
+		echo "ERROR: trace eBPF generation failed for GOARCH=$(GOARCH), which is not declared in TRACE_UNSUPPORTED_GOARCH ($(TRACE_UNSUPPORTED_GOARCH)). Refusing to silently drop the 'trace' build tag; add $(GOARCH) to TRACE_UNSUPPORTED_GOARCH only after confirming the trace program cannot be generated for it." >&2; \
+		exit 1; \
 	fi
+
+# Read-only accessors. These are the single source of truth that CI and the
+# artifact assertions read instead of parsing/copying Makefile values.
+print-goexperiment:
+	@echo $(GOEXPERIMENT_MERGED)
+
+# Same value in the `NAME=value` form consumed by $GITHUB_ENV, so a job that
+# does not run `make` (a plain `go test`) can still build with the canonical
+# experiment set without restating it. scripts/check-build-env.sh rejects a
+# literal assignment under .github/, which is what keeps this the only owner.
+print-goexperiment-env:
+	@printf '%s=%s\n' GOEXPERIMENT "$(GOEXPERIMENT_MERGED)"
+
+print-trace-unsupported:
+	@echo $(TRACE_UNSUPPORTED_GOARCH)
 
 EBPF_LINT_SOURCES := control/kern/tproxy.c control/kern/tests/bpf_test.c trace/kern/trace.c
 EBPF_LINT_IGNORE := COMMIT_COMMENT_SYMBOL,NOT_UNIFIED_DIFF,COMMIT_LOG_LONG_LINE,LONG_LINE_COMMENT,VOLATILE,ASSIGN_IN_IF,PREFER_DEFINED_ATTRIBUTE_MACRO,CAMELCASE,LEADING_SPACE,OPEN_ENDED_LINE,SPACING,BLOCK_COMMENT_STYLE

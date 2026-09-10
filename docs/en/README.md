@@ -29,7 +29,7 @@ Note that if you bind dae to WAN only, dae only provide network service for loca
 
 `Use trace command`
 
-If you want to use `dae trace` command to triage network connectivity issue, the kernel version is required to be >= 5.15.
+If you want to use `dae trace` command to triage network connectivity issue, the kernel version is required to be >= 5.15. The `trace` build tag is not available for `mips`, `mips64`, `mips64le` and `mipsle` builds (see [Build Guide](user-guide/build-by-yourself.md#trace-support-per-architecture)), so `dae trace` is missing there.
 
 ## Kernel Configurations
 

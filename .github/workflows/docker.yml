@@ -5,15 +5,23 @@ on:
   push:
     branches:
       - main
+      # `kdae` is the development branch of this fork (P3-22).
+      - kdae
     paths:
       - "**/*.go"
       - "**/*.c"
       - "**/*.h"
       - "go.mod"
       - "go.sum"
+      - "Dockerfile"
+      - "install/friendly-filenames.json"
+      - "scripts/fetch-geo-data.sh"
       - ".github/workflows/docker.yml"
   release:
     types: [ prereleased ]
+
+permissions:
+  contents: read
 
 jobs:
   docker:
@@ -34,6 +42,9 @@ jobs:
           else
             tag=$(git log -1 --format="%cd" --date=short | sed s/-//g)
           fi
+          # TODO(P3-22 decision-②): this fork still pushes images into the
+          # upstream namespace. Changing it is a maintainer decision (who owns
+          # the published image identity), so the value is left as-is here.
           echo "IMAGE=daeuniverse/dae" >> $GITHUB_OUTPUT
           echo "TAG=$tag" >> $GITHUB_OUTPUT
       - name: Set up QEMU

@@ -24,9 +24,33 @@ on:
       build-type:
         type: string
         description: "[pr-build,main-build,daily-build,release-build]"
+    secrets:
+      # Needed only by the report-check-run step, which is itself skipped for
+      # pull requests from forks (those runs receive no secrets).
+      GH_APP_ID:
+        required: false
+      GH_APP_PRIVATE_KEY:
+        required: false
+
+permissions:
+  contents: read
 
 jobs:
+  preflight:
+    name: Asset name preflight
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+      # Every matrix leg resolves its own name below with `jq -er`; this checks
+      # the other half of the invariant, that no two keys share a friendlyName.
+      - name: Assert release asset names are unique
+        run: ./scripts/check-asset-names.sh install/friendly-filenames.json
+
   build:
+    needs: [preflight]
     strategy:
       matrix:
         goos: [ linux ]
@@ -54,6 +78,15 @@ jobs:
             goarch: amd64
             goamd64: v3
           # END Linux AMD64 v1 v2 v3
+          # NOTE (P3-20): GitHub currently runs a single `linux, riscv64` job
+          # for these three entries (upstream Build (Main) run 32984376230 and
+          # fork run 34340446868: 17 matrix jobs, 17 artifacts, one
+          # dae-linux-riscv64.zip), so the rva22u64/rva23u64 builds these
+          # entries declare are never produced at all. All four possible
+          # GORISCV64 keys are nevertheless present in
+          # install/friendly-filenames.json, because the per-leg `jq -er`
+          # lookup now fails the build instead of publishing `dae-null.zip`
+          # when a leg carries a value the JSON does not know.
           # BEGIN Linux RISCV64 rva20u64 rva22u64 rva23u64
           - goos: linux
             goarch: riscv64
@@ -103,8 +136,18 @@ jobs:
       - name: Show workflow information
         id: get_filename
         run: |
-          export _NAME=$(jq ".[\"$GOOS-$GOARCH$GOARM$GOAMD64\"].friendlyName" -r < install/friendly-filenames.json)
-          echo "GOOS: $GOOS, GOARCH: $GOARCH, RELEASE_NAME: $_NAME"
+          set -euo pipefail
+          key="$GOOS-$GOARCH$GOARM$GOAMD64$GORISCV64"
+          if ! _NAME=$(jq -er --arg k "$key" '.[$k].friendlyName' < install/friendly-filenames.json); then
+            echo "::error::no friendly filename for matrix key '$key' in install/friendly-filenames.json; add it with a unique friendlyName before publishing"
+            exit 1
+          fi
+          # Printing the lookup key makes it self-evident in the log which
+          # GORISCV64/GOARM/GOAMD64 values a matrix leg resolved with (the
+          # riscv64 include entries collapse to one leg, so this is the only
+          # place the surviving value becomes visible).
+          echo "GOOS: $GOOS, GOARCH: $GOARCH, GOARM: $GOARM, GOAMD64: $GOAMD64, GORISCV64: $GORISCV64"
+          echo "matrix key: $key -> RELEASE_NAME: $_NAME"
           echo "ASSET_NAME=$_NAME" >> $GITHUB_OUTPUT
           echo "ASSET_NAME=$_NAME" >> $GITHUB_ENV
 
@@ -123,14 +166,16 @@ jobs:
           git submodule update --init --recursive
           GOMODCACHE="${PWD}"/go-mod go mod download -modcacherw
           find ./go-mod/ -maxdepth 1 ! -name "cache" ! -name "go-mod" -exec rm -rf {} \;
-          sed -i 's/#export GOMODCACHE=$(PWD)\/go-mod/export GOMODCACHE=$(PWD)\/go-mod/' Makefile
 
       - name: Build dae
+        env:
+          # Build inputs are passed to the build, never written into the
+          # Makefile: an edited Makefile is no longer the tag being released
+          # (the full-source archive is created from the same checkout).
+          GOMODCACHE: ${{ github.workspace }}/go-mod
+          GOFLAGS: "-trimpath -modcacherw"
         run: |
           mkdir -p ./build/
-          export GOFLAGS="-trimpath -modcacherw"
-          # Go 1.26 optimization: newinliner, simd, heapminimum512kib, and randomizedheapbase64.
-          export GOEXPERIMENT="newinliner,simd,heapminimum512kib,randomizedheapbase64"
           export OUTPUT=build/dae-$ASSET_NAME
           export VERSION=${{ steps.get_version.outputs.VERSION }}
           export CLANG=clang-15
@@ -138,8 +183,10 @@ jobs:
           make
           cp ./install/dae.service ./build/
           cp ./example.dae ./build/
-          curl -L -o ./build/geoip.dat https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
-          curl -L -o ./build/geosite.dat https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+          ./scripts/fetch-geo-data.sh ./build
+
+      - name: Assert artifact build inputs (trace tag, GOEXPERIMENT)
+        run: ./scripts/check-artifact-build-env.sh "build/dae-$ASSET_NAME" "$GOARCH"
 
       - name: Smoking test
         if: matrix.goarch == 'amd64' && matrix.goamd64 == 'v1'
@@ -152,7 +199,10 @@ jobs:
           path: build/*
 
       - name: Report result
-        uses: daeuniverse/ci-seed-jobs/common/report-check-run@master
+        # Cross-repository reference pinned to a 40-hex commit (P2-25). The
+        # previous `@master` moved with the upstream repository on every run.
+        # daeuniverse/ci-seed-jobs@5d0b8710ae2b7fcc2051e5e9379671c6662b278e
+        uses: daeuniverse/ci-seed-jobs/common/report-check-run@5d0b8710ae2b7fcc2051e5e9379671c6662b278e
         if: always() && inputs.build-type == 'pr-build' && startsWith(github.event.pull_request.head.repo.full_name, github.repository_owner)
         with:
           app_id: ${{ secrets.GH_APP_ID }}

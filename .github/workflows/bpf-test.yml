@@ -9,6 +9,7 @@ on:
       - "pkg/ebpf_internal/**"
       - "trace/**"
       - "scripts/ebpf-audit.sh"
+      - "scripts/check-trace-arch-matrix.sh"
       - "Makefile"
       - "go.mod"
       - "go.sum"
@@ -24,6 +25,7 @@ on:
       - "pkg/ebpf_internal/**"
       - "trace/**"
       - "scripts/ebpf-audit.sh"
+      - "scripts/check-trace-arch-matrix.sh"
       - "Makefile"
       - "go.mod"
       - "go.sum"
@@ -63,10 +65,62 @@ jobs:
           git submodule update --init
           sudo CLANG=clang-$VERSION make ebpf-test || (echo "Run 'make ebpf-test' locally to investigate failures"; exit 1)
           if [ "$VERSION" = 19 ]; then
+            set -euo pipefail
             sudo CLANG=clang-$VERSION make ebpf
-            go test -c ./control -o /tmp/dae-control-hookset.test
-            sudo /tmp/dae-control-hookset.test -test.run '^TestTCHookSetKernelUpdateAndRollback$' -test.count=1
+            # Whitelist of the test cases that must actually RUN from the three
+            # !dae_stub_ebpf test files. Before this step only one case
+            # (TestTCHookSetKernelUpdateAndRollback) ran while eight real
+            # datapath cases were merely compiled.
+            whitelist=(
+              TestTCHookSetKernelUpdateAndRollback
+              TestOffloadObjectsInSpec
+              TestDataplaneProgramsAndMapsComplete
+              TestAssignDataplaneToBpfCopiesMandatoryObjects
+              TestBatchDeleteIgnoringMissingResumesSuffix
+              TestBatchDeleteIgnoringMissingAllAbsent
+              TestBatchDeleteIgnoringMissingPreservesPartialCountOnError
+              TestBatchDeleteIgnoringMissingRejectsSilentPartialProgress
+              TestBpfMapBatchDeleteRealMapResumesAfterMissingKey
+            )
+            printf '%s\n' "${whitelist[@]}" | sort -u > /tmp/datapath-whitelist.txt
+
+            # Direction 1: every func Test* in a !dae_stub_ebpf test file must be
+            # whitelisted, so a new/renamed case cannot silently stop running.
+            mapfile -t tagged_files < <(git grep -l 'go:build !dae_stub_ebpf' -- '*_test.go')
+            declared="$(grep -hE '^func (Test[A-Za-z0-9_]*)\(' "${tagged_files[@]}" \
+              | sed -E 's/^func (Test[A-Za-z0-9_]*)\(.*/\1/' \
+              | grep -v '^TestMain$' | sort -u)"
+            missing="$(comm -23 <(printf '%s\n' "$declared") /tmp/datapath-whitelist.txt)"
+            if [ -n "$missing" ]; then
+              echo "::error::!dae_stub_ebpf test case(s) missing from the -test.run whitelist in bpf-test.yml: $(echo $missing | tr '\n' ' ')"
+              exit 1
+            fi
+
+            # Direction 2: every whitelisted case must actually pass.
+            run_regex="^($(paste -sd'|' /tmp/datapath-whitelist.txt))$"
+            go test -c ./control -o /tmp/dae-control-datapath.test
+            sudo /tmp/dae-control-datapath.test -test.run "$run_regex" -test.count=1 -test.v | tee /tmp/datapath.log
+            failed=0
+            while IFS= read -r name; do
+              if ! grep -qE -- "--- PASS: ${name}([[:space:]]|$)" /tmp/datapath.log; then
+                echo "::error::whitelisted test '${name}' did not report '--- PASS' (renamed, removed or skipped?)"
+                failed=1
+              fi
+            done < /tmp/datapath-whitelist.txt
+            [ "$failed" -eq 0 ] || exit 1
           fi
+
+      # P2-22: TRACE_UNSUPPORTED_GOARCH is a machine-checked claim, not a
+      # comment. Every listed architecture must really fail to generate trace
+      # (and a control architecture must really succeed, so a missing compiler
+      # cannot make the gate pass vacuously). Guarded to one matrix leg: it
+      # compiles trace once per checked architecture.
+      - name: Trace architecture ledger
+        if: matrix.env.VERSION == 19
+        env: ${{ matrix.env }}
+        run: |
+          git submodule update --init
+          CLANG=clang-$VERSION STRIP=llvm-strip-$VERSION ./scripts/check-trace-arch-matrix.sh
 
   bpf_abi_big_endian:
     name: BPF ABI (s390x)

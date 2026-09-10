@@ -1,0 +1,22 @@
+# Keep the third-party and cross-repository action references current.
+#
+# P2-25: cross-repository reusable workflows and actions must be pinned to a
+# 40-hex commit (`daeuniverse/ci-seed-jobs@<sha>`, `daeuniverse/dae@<sha>`),
+# which silently rots without an update bot. Dependabot's github-actions
+# ecosystem rewrites those pins in place.
+#
+# Note: `dependabot` PRs must be reviewed like any other change — never
+# auto-merge a supply-chain pin bump.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

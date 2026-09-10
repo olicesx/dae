@@ -8,8 +8,77 @@ on:
         type: string
         required: true
 
+permissions:
+  contents: read
+
 jobs:
+  preflight:
+    name: Preflight (tag commit, gates, asset names)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag }}
+
+      # See release.yml: the published source must be the tag, not a tree that
+      # the workflow edited in place before packing the full-source archive.
+      - name: Assert the working tree matches the tag
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::working tree differs from tag ${{ inputs.tag }}"
+            git status --porcelain
+            exit 1
+          fi
+
+      - name: Assert required gates are green on the tag commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs?per_page=100" > /tmp/check-runs.json
+          # `name:` matches a check run exactly, `prefix:` matches the matrix
+          # jobs whose check runs carry their matrix values in the name (the
+          # real names are "BPF Unit Test (15)" ... "(19)", never the bare job
+          # name). Every distinct name matching a gate must be green, so one
+          # failed matrix leg fails the preflight.
+          # "Lint" is the workflow name; its jobs are go-lint/ebpf-lint.
+          for gate in \
+            "name:Go Unit Test" \
+            "name:Go Race Detector" \
+            "name:Go Vet (real eBPF datapath)" \
+            "prefix:BPF Unit Test" \
+            "name:go-lint" \
+            "name:ebpf-lint" \
+            "name:build-env"; do
+            mode="${gate%%:*}"
+            pattern="${gate#*:}"
+            conclusion="$(jq -r --arg n "$pattern" --arg m "$mode" '
+              [ .[].check_runs[]
+                | select(if $m == "prefix" then (.name | startswith($n)) else .name == $n end) ]
+              | group_by(.name)
+              | map(sort_by(.started_at // "") | last)
+              | if length == 0 then "absent"
+                elif (map(select(.status != "completed")) | length) > 0 then "incomplete"
+                else (map(.conclusion // "unknown") | unique | join(",")) end' /tmp/check-runs.json)"
+            echo "gate '$pattern' ($mode) on ${sha}: ${conclusion}"
+            if [ "$conclusion" != "success" ]; then
+              echo "::error::gate '$pattern' ($mode) on ${sha} is '${conclusion}', expected 'success'"
+              exit 1
+            fi
+          done
+
+      - name: Assert release asset names are unique
+        run: ./scripts/check-asset-names.sh install/friendly-filenames.json
+
   build:
+    needs: [preflight]
     strategy:
       matrix:
         goos: [ linux ]
@@ -37,6 +106,15 @@ jobs:
             goarch: amd64
             goamd64: v3
           # END Linux AMD64 v1 v2 v3
+          # NOTE (P3-20): GitHub currently runs a single `linux, riscv64` job
+          # for these three entries (upstream Build (Main) run 32984376230 and
+          # fork run 34340446868: 17 matrix jobs, 17 artifacts, one
+          # dae-linux-riscv64.zip), so the rva22u64/rva23u64 builds these
+          # entries declare are never produced at all. All four possible
+          # GORISCV64 keys are nevertheless present in
+          # install/friendly-filenames.json, because the per-leg `jq -er`
+          # lookup now fails the build instead of publishing `dae-null.zip`
+          # when a leg carries a value the JSON does not know.
           # BEGIN Linux RISCV64 rva20u64 rva22u64 rva23u64
           - goos: linux
             goarch: riscv64
@@ -78,8 +156,18 @@ jobs:
       - name: Show workflow information
         id: get_filename
         run: |
-          export _NAME=$(jq ".[\"$GOOS-$GOARCH$GOARM$GOAMD64\"].friendlyName" -r < install/friendly-filenames.json)
-          echo "GOOS: $GOOS, GOARCH: $GOARCH, RELEASE_NAME: $_NAME"
+          set -euo pipefail
+          key="$GOOS-$GOARCH$GOARM$GOAMD64$GORISCV64"
+          if ! _NAME=$(jq -er --arg k "$key" '.[$k].friendlyName' < install/friendly-filenames.json); then
+            echo "::error::no friendly filename for matrix key '$key' in install/friendly-filenames.json; add it with a unique friendlyName before publishing"
+            exit 1
+          fi
+          # Printing the lookup key makes it self-evident in the log which
+          # GORISCV64/GOARM/GOAMD64 values a matrix leg resolved with (the
+          # riscv64 include entries collapse to one leg, so this is the only
+          # place the surviving value becomes visible).
+          echo "GOOS: $GOOS, GOARCH: $GOARCH, GOARM: $GOARM, GOAMD64: $GOAMD64, GORISCV64: $GORISCV64"
+          echo "matrix key: $key -> RELEASE_NAME: $_NAME"
           echo "ASSET_NAME=$_NAME" >> $GITHUB_OUTPUT
           echo "ASSET_NAME=$_NAME" >> $GITHUB_ENV
 
@@ -108,7 +196,6 @@ jobs:
           git submodule update --init --recursive
           GOMODCACHE="${PWD}"/go-mod go mod download -modcacherw
           find ./go-mod/ -maxdepth 1 ! -name "cache" ! -name "go-mod" -exec rm -rf {} \;
-          sed -i 's/#export GOMODCACHE=$(PWD)\/go-mod/export GOMODCACHE=$(PWD)\/go-mod/' Makefile
 
       - name: Create directory for placing archives & packages temporarily
         run: mkdir -p ./bundled/
@@ -120,11 +207,13 @@ jobs:
           tar -I 'xz -9' -cvf ./bundled/dae-full-src.tar.xz --exclude .git --exclude bundled .
 
       - name: Build dae
+        env:
+          # Build inputs are passed to the build, never written into the
+          # Makefile (see release.yml).
+          GOMODCACHE: ${{ github.workspace }}/go-mod
+          GOFLAGS: "-trimpath -modcacherw"
         run: |
           export CGO_ENABLED=0
-          export GOFLAGS="-trimpath -modcacherw"
-          # Go 1.26 optimization: newinliner, simd, heapminimum512kib, and randomizedheapbase64.
-          export GOEXPERIMENT="newinliner,simd,heapminimum512kib,randomizedheapbase64"
           export OUTPUT=pkgdir/usr/bin/dae
           export VERSION=${{ env.VERSION }}
           export CLANG=clang-15
@@ -133,10 +222,12 @@ jobs:
           install -Dm644 ./install/dae.service -t ./pkgdir/usr/lib/systemd/system/
           install -Dm640 ./example.dae -t ./pkgdir/etc/dae/
           install -d ./pkgdir/usr/share/dae/
-          curl -L -o ./pkgdir/usr/share/dae/geoip.dat https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
-          curl -L -o ./pkgdir/usr/share/dae/geosite.dat https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+          ./scripts/fetch-geo-data.sh ./pkgdir/usr/share/dae
           install -D pkgdir/usr/share/dae/geo{ip,site}.dat install/{dae.service,empty.dae} example.dae -t ./zip/
           install -D pkgdir/usr/bin/dae ./zip/dae-$ASSET_NAME
+
+      - name: Assert artifact build inputs (trace tag, GOEXPERIMENT)
+        run: ./scripts/check-artifact-build-env.sh "pkgdir/usr/bin/dae" "$GOARCH"
 
       - name: Smoking test
         if: matrix.goarch == 'amd64' && matrix.goamd64 == 'v1'
@@ -240,6 +331,9 @@ jobs:
   upload-release:
     needs: [build]
     runs-on: ubuntu-latest
+    # Only this job may write: action-gh-release attaches the assets to the tag.
+    permissions:
+      contents: write
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4.1.4

@@ -14,11 +14,18 @@ on:
         required: true
         default: true
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Generate changelogs
     runs-on: ubuntu-latest
+    # Job-level permissions replace the workflow-level block: `contents: read`
+    # must be listed again, otherwise `actions/checkout` runs with
+    # contents: none.
     permissions:
+      contents: read
       issues: write
     steps:
       - uses: actions/checkout@v6

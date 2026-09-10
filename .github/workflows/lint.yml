@@ -8,6 +8,11 @@ on:
       - "**/*.h"
       - "go.mod"
       - "go.sum"
+      - "Makefile"
+      - "Dockerfile"
+      - "scripts/check-build-env.sh"
+      - "hack/maintenance/append_license_signature.sh"
+      - ".github/workflows/**"
       - ".github/workflows/lint.yml"
   push:
     branches:
@@ -19,7 +24,15 @@ on:
       - "**/*.h"
       - "go.mod"
       - "go.sum"
+      - "Makefile"
+      - "Dockerfile"
+      - "scripts/check-build-env.sh"
+      - "hack/maintenance/append_license_signature.sh"
+      - ".github/workflows/**"
       - ".github/workflows/lint.yml"
+
+permissions:
+  contents: read
 
 jobs:
   go-lint:
@@ -50,3 +63,40 @@ jobs:
 
     - name: Run lint
       run: make ebpf-lint
+
+  build-env:
+    name: Build env single owner
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v6
+
+    # P3-19/P3-23: build inputs (GOEXPERIMENT, geo data pins) are owned by the
+    # Makefile and scripts/fetch-geo-data.sh; a second copy in .github/ or in
+    # the Dockerfile forks the released configuration and fails this gate.
+    - name: Assert build inputs have a single owner
+      run: ./scripts/check-build-env.sh
+
+  spdx-headers:
+    name: SPDX headers (changed files)
+    # Incremental by design: only the *.go files this pull request adds or
+    # modifies are checked, so the 58-file pre-existing backlog (P3-21) is
+    # triaged separately instead of turning every PR red.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - name: Check SPDX headers on files changed by this PR
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: |
+        set -euo pipefail
+        mapfile -t files < <(git diff --diff-filter=ACMR --name-only "$BASE_SHA"...HEAD -- '*.go')
+        if [ "${#files[@]}" -eq 0 ]; then
+          echo "no changed .go files"
+          exit 0
+        fi
+        printf 'changed: %s\n' "${files[@]}"
+        ./hack/maintenance/append_license_signature.sh --check "${files[@]}"

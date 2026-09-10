@@ -71,6 +71,11 @@ jobs:
             # !dae_stub_ebpf test files. Before this step only one case
             # (TestTCHookSetKernelUpdateAndRollback) ran while eight real
             # datapath cases were merely compiled.
+            #
+            # Direction 1 below rejects any func Test* in a !dae_stub_ebpf file
+            # that is not listed here, so a new case in such a file must be
+            # added below even when it needs no datapath: the point is that it
+            # runs in the real (non-stub) build rather than only compiling.
             whitelist=(
               TestTCHookSetKernelUpdateAndRollback
               TestOffloadObjectsInSpec
@@ -81,6 +86,10 @@ jobs:
               TestBatchDeleteIgnoringMissingPreservesPartialCountOnError
               TestBatchDeleteIgnoringMissingRejectsSilentPartialProgress
               TestBpfMapBatchDeleteRealMapResumesAfterMissingKey
+              # Log-level contracts for the real loader (they exercise the
+              # production helper and its source contract; no BPF map needed).
+              TestRemovedIncompatiblePinnedMapWarnsWithConsequence
+              TestIncompatiblePinRemovalIsNotAnInfoStep
             )
             printf '%s\n' "${whitelist[@]}" | sort -u > /tmp/datapath-whitelist.txt
 

@@ -76,6 +76,9 @@ generate() {
 last_output_line() {
   local line
   line="$(grep -vE '^[[:space:]]*$' "$1" 2>/dev/null | tail -n 1 || true)"
+  if [ -z "$line" ]; then
+    line="<the generator produced no output at all>"
+  fi
   printf '%s' "${line:0:160}"
 }
 

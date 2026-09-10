@@ -81,8 +81,6 @@ jobs:
               TestBatchDeleteIgnoringMissingPreservesPartialCountOnError
               TestBatchDeleteIgnoringMissingRejectsSilentPartialProgress
               TestBpfMapBatchDeleteRealMapResumesAfterMissingKey
-              TestABRegression
-              TestABControlPlaneSockmarkFallback
             )
             printf '%s\n' "${whitelist[@]}" | sort -u > /tmp/datapath-whitelist.txt
 

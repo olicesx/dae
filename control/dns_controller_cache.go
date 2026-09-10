@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
@@ -35,11 +36,16 @@ func parseDnsKnowledgeEntry(value any) (dnsKnowledgeEntry, bool) {
 	}
 }
 
+// storeDnsCache publishes a cache entry and keeps the base-key index in sync.
+// Callers must hold cacheProjectionMu for writing: the index and the size
+// counter are only ever mutated under that lock, which is what lets the janitor
+// reconciliation read both as one consistent snapshot.
 func (c *DnsController) storeDnsCache(cacheKey string, cache *DnsCache) (previous any, loaded bool) {
 	previous, loaded = c.dnsCache.Swap(cacheKey, cache)
 	if !loaded {
 		c.dnsCacheSize.Add(1)
 	}
+	c.dnsCacheIndexAdd(cacheKey)
 	return previous, loaded
 }
 
@@ -47,6 +53,7 @@ func (c *DnsController) loadAndDeleteDnsCache(cacheKey string) (value any, loade
 	value, loaded = c.dnsCache.LoadAndDelete(cacheKey)
 	if loaded {
 		c.decrementDnsCacheSize()
+		c.dnsCacheIndexRemove(cacheKey)
 	}
 	return value, loaded
 }
@@ -56,7 +63,145 @@ func (c *DnsController) compareAndDeleteDnsCache(cacheKey string, cache *DnsCach
 		return false
 	}
 	c.decrementDnsCacheSize()
+	c.dnsCacheIndexRemove(cacheKey)
 	return true
+}
+
+// deleteDnsCacheEntry drops a cache entry addressed by its raw sync.Map key,
+// keeping the entry-removal side effects in one place. The base-key index only
+// tracks string keys, so a non-string key (reachable only from corrupted state)
+// is dropped from the map and the size counter without an index update.
+func (c *DnsController) deleteDnsCacheEntry(key any) {
+	cacheKey, ok := key.(string)
+	if !ok {
+		if _, loaded := c.dnsCache.LoadAndDelete(key); loaded {
+			c.decrementDnsCacheSize()
+		}
+		return
+	}
+	c.loadAndDeleteDnsCache(cacheKey)
+}
+
+// dnsCacheKeySet is the exact set of cache keys stored under one base cache
+// key. Each set owns its mutex so stores and deletes for different names never
+// serialize on a controller-wide lock.
+type dnsCacheKeySet struct {
+	mu   sync.Mutex
+	keys map[string]struct{}
+}
+
+func newDnsCacheKeySet(cacheKey string) *dnsCacheKeySet {
+	return &dnsCacheKeySet{keys: map[string]struct{}{cacheKey: {}}}
+}
+
+// dnsCacheIndexAdd records cacheKey under its base key. A concurrent
+// dnsCacheIndexRemove publishes emptiness while holding the set lock and only
+// then drops the set from the index, so an insert either lands in a set that is
+// still registered (and therefore non-empty before the remover looks) or it
+// observes the drop and retries with a fresh set. Without that re-check under
+// the set lock, an insert racing the drop would be lost and family removal
+// would silently stop matching the entry.
+func (c *DnsController) dnsCacheIndexAdd(cacheKey string) {
+	baseKey := dnsCacheBaseKey(cacheKey)
+	if baseKey == "" {
+		return
+	}
+	for {
+		if actual, ok := c.dnsCacheByBase.Load(baseKey); ok {
+			set, ok := actual.(*dnsCacheKeySet)
+			if !ok {
+				return
+			}
+			set.mu.Lock()
+			if current, ok := c.dnsCacheByBase.Load(baseKey); ok && current == actual {
+				set.keys[cacheKey] = struct{}{}
+				set.mu.Unlock()
+				return
+			}
+			// The set was dropped between the load and the lock; retry.
+			set.mu.Unlock()
+			continue
+		}
+		// The set is published already containing cacheKey, so a concurrent
+		// remover can never observe it as empty and drop it.
+		if _, loaded := c.dnsCacheByBase.LoadOrStore(baseKey, newDnsCacheKeySet(cacheKey)); !loaded {
+			return
+		}
+	}
+}
+
+// dnsCacheIndexRemove drops cacheKey from its base key's set and drops the set
+// itself once it becomes empty. Emptiness is decided while holding the set
+// lock, and the set is unregistered under that same lock so the check cannot be
+// invalidated by a concurrent insert.
+func (c *DnsController) dnsCacheIndexRemove(cacheKey string) {
+	baseKey := dnsCacheBaseKey(cacheKey)
+	if baseKey == "" {
+		return
+	}
+	actual, ok := c.dnsCacheByBase.Load(baseKey)
+	if !ok {
+		return
+	}
+	set, ok := actual.(*dnsCacheKeySet)
+	if !ok {
+		return
+	}
+	set.mu.Lock()
+	delete(set.keys, cacheKey)
+	if len(set.keys) == 0 {
+		c.dnsCacheByBase.CompareAndDelete(baseKey, set)
+	}
+	set.mu.Unlock()
+}
+
+// dnsCacheIndexSnapshot returns the exact cache keys indexed for baseKey. It is
+// lock-free with respect to cacheProjectionMu: callers use it to decide whether
+// a family has entries before taking the projection write lock.
+func (c *DnsController) dnsCacheIndexSnapshot(baseKey string) []string {
+	if baseKey == "" {
+		return nil
+	}
+	actual, ok := c.dnsCacheByBase.Load(baseKey)
+	if !ok {
+		return nil
+	}
+	set, ok := actual.(*dnsCacheKeySet)
+	if !ok {
+		return nil
+	}
+	set.mu.Lock()
+	defer set.mu.Unlock()
+	if len(set.keys) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(set.keys))
+	for cacheKey := range set.keys {
+		keys = append(keys, cacheKey)
+	}
+	return keys
+}
+
+func (c *DnsController) dnsCacheIndexLen() int {
+	total := 0
+	c.dnsCacheByBase.Range(func(_, value any) bool {
+		set, ok := value.(*dnsCacheKeySet)
+		if !ok {
+			return true
+		}
+		set.mu.Lock()
+		total += len(set.keys)
+		set.mu.Unlock()
+		return true
+	})
+	return total
+}
+
+func (c *DnsController) clearDnsCacheIndex() {
+	c.dnsCacheByBase.Range(func(key, _ any) bool {
+		c.dnsCacheByBase.Delete(key)
+		return true
+	})
 }
 
 func (c *DnsController) decrementDnsCacheSize() {
@@ -215,28 +360,41 @@ func ensureDNSCacheRouteOwnerKey(cacheKey string, cache *DnsCache) *DnsCache {
 	return cache
 }
 
+// RemoveDnsRespCacheFamily drops every cache entry stored under baseKey.
+//
+// The lookup is index-driven: a base key that was never cached costs one
+// sync.Map load and no lock at all, instead of a table-wide scan under
+// cacheProjectionMu (which blocked every cache store and projection callback
+// for the full scan). On a match the projection write lock is held only for
+// the deletions themselves.
 func (c *DnsController) RemoveDnsRespCacheFamily(baseKey string) {
 	c.requireStore()
 	if baseKey == "" {
 		return
 	}
+	cacheKeys := c.dnsCacheIndexSnapshot(baseKey)
+	if len(cacheKeys) == 0 {
+		return
+	}
 	c.cacheProjectionMu.Lock()
-	defer c.cacheProjectionMu.Unlock()
-	c.dnsCache.Range(func(key, value any) bool {
-		cacheKey, ok := key.(string)
-		if !ok || dnsCacheBaseKey(cacheKey) != baseKey {
-			return true
+	for _, cacheKey := range cacheKeys {
+		value, ok := c.dnsCache.Load(cacheKey)
+		if !ok {
+			continue
 		}
 		cache, ok := value.(*DnsCache)
 		if !ok {
-			c.loadAndDeleteDnsCache(cacheKey)
-			return true
+			c.deleteDnsCacheEntry(cacheKey)
+			continue
 		}
 		if c.compareAndDeleteDnsCache(cacheKey, cache) {
 			c.invokeCacheDeleteCallback(cacheKey, cache)
 		}
-		return true
-	})
+	}
+	c.cacheProjectionMu.Unlock()
+	// Deletions above leave the base-key index holding exactly the surviving
+	// keys of this family (normally none), so knowledge is recomputed from the
+	// index rather than from a second whole-table scan.
 	c.syncDnsKnowledge(baseKey)
 }
 
@@ -305,18 +463,23 @@ func (c *DnsController) syncDnsKnowledge(baseKey string) {
 	c.syncDnsKnowledgeLocked(baseKey)
 }
 
+// syncDnsKnowledgeLocked recomputes the knowledge entry for baseKey from the
+// base-key index. The index holds exactly the cache keys stored under baseKey,
+// so this touches one family instead of walking the whole cache.
 func (c *DnsController) syncDnsKnowledgeLocked(baseKey string) {
 	entry := dnsKnowledgeEntry{}
 
-	c.dnsCache.Range(func(key, value any) bool {
-		cacheKey, ok := key.(string)
-		if !ok || dnsCacheBaseKey(cacheKey) != baseKey {
-			return true
+	for _, cacheKey := range c.dnsCacheIndexSnapshot(baseKey) {
+		value, ok := c.dnsCache.Load(cacheKey)
+		if !ok {
+			continue
 		}
 		cache, ok := value.(*DnsCache)
 		if !ok {
-			c.loadAndDeleteDnsCache(cacheKey)
-			return true
+			// The index only ever records entries stored as *DnsCache; a
+			// different type means the index drifted from the cache, which the
+			// janitor reconciliation reports and repairs.
+			continue
 		}
 
 		expiresAt := cache.OriginalDeadline.UnixNano()
@@ -324,8 +487,7 @@ func (c *DnsController) syncDnsKnowledgeLocked(baseKey string) {
 		if expiresAt > entry.expiresAt {
 			entry.expiresAt = expiresAt
 		}
-		return true
-	})
+	}
 
 	if entry.cacheCount == 0 {
 		c.dnsKnowledge.Delete(baseKey)
@@ -466,9 +628,7 @@ func (c *DnsController) evictExpiredDnsCache(now time.Time) {
 		c.dnsCache.Range(func(key, value any) bool {
 			cacheKey, ok := key.(string)
 			if !ok {
-				if _, loaded := c.dnsCache.LoadAndDelete(key); loaded {
-					c.decrementDnsCacheSize()
-				}
+				c.deleteDnsCacheEntry(key)
 				return true
 			}
 			cache, ok := value.(*DnsCache)
@@ -620,6 +780,85 @@ func (c *DnsController) evictLRUIfFull(maxCacheSize int) {
 	}
 }
 
+// reconcileDnsCacheIndex compares the number of keys held by the base-key index
+// with the live cache size. A mismatch means family removal and knowledge
+// resync would silently stop matching entries, so it is reported and repaired
+// instead of being ignored; the cache table is the source of truth for both the
+// rebuilt index and the size counter.
+//
+// Both counters are read under the projection read lock: every mutation of
+// either one happens under the write lock, so reading them separately (without
+// the lock) would observe a half-applied store or delete and report drift that
+// does not exist.
+func (c *DnsController) reconcileDnsCacheIndex() {
+	c.requireStore()
+	c.cacheProjectionMu.RLock()
+	size := c.dnsCacheSize.Load()
+	indexed := int64(c.dnsCacheIndexLen())
+	c.cacheProjectionMu.RUnlock()
+	if indexed == size {
+		return
+	}
+	c.dnsCacheIndexReconciles.Add(1)
+	if c.log != nil {
+		c.log.Errorf("dns cache base-key index drift detected: indexed keys=%d, cache size=%d; rebuilding index", indexed, size)
+	}
+	c.rebuildDnsCacheIndex()
+}
+
+// rebuildDnsCacheIndex republishes the base-key index from the cache table.
+// It runs under cacheProjectionMu because every production cache store holds
+// that lock: without it, an entry stored between the scan and the publication
+// would be missing from the rebuilt index.
+func (c *DnsController) rebuildDnsCacheIndex() {
+	c.cacheProjectionMu.Lock()
+	defer c.cacheProjectionMu.Unlock()
+
+	live := make(map[string]struct{}, c.dnsCacheSize.Load())
+	nonStringKeys := 0
+	c.dnsCache.Range(func(key, _ any) bool {
+		cacheKey, ok := key.(string)
+		if !ok {
+			nonStringKeys++
+			return true
+		}
+		live[cacheKey] = struct{}{}
+		return true
+	})
+
+	// Drop indexed keys that no longer have a cache entry, and unregister the
+	// sets that become empty.
+	c.dnsCacheByBase.Range(func(baseKey, value any) bool {
+		set, ok := value.(*dnsCacheKeySet)
+		if !ok {
+			return true
+		}
+		set.mu.Lock()
+		for cacheKey := range set.keys {
+			if _, ok := live[cacheKey]; !ok {
+				delete(set.keys, cacheKey)
+			}
+		}
+		if len(set.keys) == 0 {
+			c.dnsCacheByBase.CompareAndDelete(baseKey, set)
+		}
+		set.mu.Unlock()
+		return true
+	})
+
+	// Re-register every live key. Keys that were already indexed are a no-op.
+	for cacheKey := range live {
+		c.dnsCacheIndexAdd(cacheKey)
+	}
+
+	// The table is authoritative for the entry count as well: a drifted
+	// counter would otherwise keep capacity enforcement skewed.
+	c.dnsCacheSize.Store(int64(len(live)))
+	if nonStringKeys > 0 && c.log != nil {
+		c.log.Errorf("dns cache holds %d non-string keys; they are not indexable and were excluded from the cache size", nonStringKeys)
+	}
+}
+
 // startDnsCacheJanitor runs a periodic goroutine that evicts expired DNS cache
 // entries and retires idle DNS forwarders.
 //
@@ -638,6 +877,7 @@ func (c *DnsController) startDnsCacheJanitor() {
 			case <-c.janitorStop:
 				return
 			case now := <-ticker.C:
+				c.reconcileDnsCacheIndex()
 				c.evictExpiredDnsCache(now)
 				c.evictIdleDnsForwarders(now)
 			}
@@ -720,8 +960,16 @@ func (c *DnsController) LookupDnsRespCache_(msg *dnsmessage.Msg, cacheKey string
 		// Fallback: pre-packed response not available, use the owned in-place path.
 		// LookupDnsRespCache_ already owns dnsMessage exclusively and is documented
 		// to mutate it in place, so this avoids the extra request copy on the
-		// remaining TTL-aware cache-hit fallback.
-		if resp = cache.fillIntoWithTTLInPlace(msg, now); resp != nil {
+		// remaining TTL-aware cache-hit fallback. A pack failure degrades into an
+		// upstream lookup, so it must be visible instead of silent.
+		resp, packErr := cache.fillIntoWithTTLInPlace(msg, now)
+		if packErr != nil {
+			if c.log != nil {
+				c.log.Warnf("failed to pack cached DNS response for %q, falling back to an upstream lookup: %v", cacheKey, packErr)
+			}
+			return nil, false
+		}
+		if resp != nil {
 			return resp, false
 		}
 		return nil, false

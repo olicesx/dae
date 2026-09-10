@@ -335,6 +335,59 @@ func (r *Router) exchangeTarget(ctx context.Context, upstream *componentdns.Upst
 	}
 }
 
+// dnsQuestionOfWire extracts the first question of a packed DNS message.
+func dnsQuestionOfWire(data []byte) (dnsmessage.Question, bool) {
+	var msg dnsmessage.Msg
+	if err := msg.Unpack(data); err != nil || len(msg.Question) == 0 {
+		return dnsmessage.Question{}, false
+	}
+	return msg.Question[0], true
+}
+
+// dnsQuestionEchoMatches reports whether a reply echoes the request question.
+// The transaction ID is only 16 bits, so a matching ID does not prove the reply
+// belongs to this request (RFC 5452); the echoed question is the second factor.
+func dnsQuestionEchoMatches(req dnsmessage.Question, resp *dnsmessage.Msg) bool {
+	if resp == nil || len(resp.Question) == 0 {
+		return false
+	}
+	echo := resp.Question[0]
+	return req.Qtype == echo.Qtype && req.Qclass == echo.Qclass &&
+		dnsmessage.CanonicalName(req.Name) == dnsmessage.CanonicalName(echo.Name)
+}
+
+// udpQuestionEchoMismatchLogInterval rate-limits the echo-mismatch warning: an
+// upstream that never echoes the question would otherwise log per query.
+const udpQuestionEchoMismatchLogInterval = time.Minute
+
+// noteUDPQuestionEchoMismatch records a reply whose transaction ID matched but
+// whose question section does not echo the request. The reply is still returned
+// (observe-only), so the mismatch only needs to be visible: it is counted
+// unconditionally and reported at most once per interval.
+func (r *Router) noteUDPQuestionEchoMismatch(target netip.AddrPort, req dnsmessage.Question, resp *dnsmessage.Msg) {
+	r.udpQuestionEchoMismatches.Add(1)
+	if r.log == nil {
+		return
+	}
+	nowNano := time.Now().UnixNano()
+	for {
+		last := r.lastUDPQuestionEchoMismatchAt.Load()
+		if nowNano-last < int64(udpQuestionEchoMismatchLogInterval) {
+			return
+		}
+		if r.lastUDPQuestionEchoMismatchAt.CompareAndSwap(last, nowNano) {
+			break
+		}
+	}
+	var echo string
+	if len(resp.Question) > 0 {
+		echo = resp.Question[0].String()
+	}
+	r.log.Warnf("UDP DNS reply from %v does not echo the request question (asked %v, got %q); "+
+		"the reply is still accepted (observe-only question echo validation, mismatches=%d)",
+		target, req.String(), echo, r.udpQuestionEchoMismatches.Load())
+}
+
 func (r *Router) queryUDP(ctx context.Context, target netip.AddrPort, data []byte) (*dnsmessage.Msg, error) {
 	conn, err := r.directDialer.DialContext(ctx, common.MagicNetwork("udp", r.soMark, r.mptcp), target.String())
 	if err != nil {
@@ -347,6 +400,7 @@ func (r *Router) queryUDP(ctx context.Context, target netip.AddrPort, data []byt
 		_ = conn.SetDeadline(deadline)
 	}
 	originalID := binary.BigEndian.Uint16(data[:2])
+	reqQuestion, hasReqQuestion := dnsQuestionOfWire(data)
 	if _, err = netutils.WriteUDPConn(conn, target.String(), data); err != nil {
 		return nil, err
 	}
@@ -359,11 +413,22 @@ func (r *Router) queryUDP(ctx context.Context, target netip.AddrPort, data []byt
 			return nil, readErr
 		}
 		if n < 2 || binary.BigEndian.Uint16(buf[:2]) != originalID {
+			// Stale datagram from an earlier query on this socket, or a
+			// malformed reply. Counting keeps the drop visible without logging
+			// per datagram.
+			r.udpStaleResponses.Add(1)
 			continue
 		}
 		var msg dnsmessage.Msg
 		if err = msg.Unpack(buf[:n]); err != nil {
 			return nil, err
+		}
+		if hasReqQuestion && !dnsQuestionEchoMatches(reqQuestion, &msg) {
+			// Observe-only for now: the ID matched, and the reply is still
+			// accepted so no currently working upstream regresses, but a reply
+			// that does not echo the question is counted and reported because
+			// it can only come from a spoofed or cross-talked datagram.
+			r.noteUDPQuestionEchoMismatch(target, reqQuestion, &msg)
 		}
 		if msg.Truncated {
 			return nil, errInternalDNSTruncated
@@ -454,6 +519,39 @@ func (r *Router) newHTTPTransport(upstream *componentdns.Upstream, target netip.
 	})
 }
 
+// exchangeDoQQuery performs one DoQ exchange on an already open stream: write
+// the length-prefixed query, close the send half (FIN), then read the
+// length-prefixed response.
+//
+// RFC 9250 §4.2 requires the client to send the query with the FIN bit set
+// before it reads, and §4.3.3 lists a missing expected FIN as a protocol error,
+// so a compliant server may legitimately never answer a query whose send half
+// is still open. The deferred close only fires when the FIN was never sent;
+// once it was, the receive half is read to completion normally.
+func exchangeDoQQuery(stream quic.Stream, wire []byte) (*dnsmessage.Msg, error) {
+	finSent := false
+	defer func() {
+		if !finSent {
+			// Best effort cleanup; the stream may already be closed by the
+			// QUIC implementation.
+			_ = stream.Close()
+		}
+	}()
+
+	if err := dnstransport.WriteFramedDNSQuery(stream, wire); err != nil {
+		return nil, err
+	}
+	if err := stream.Close(); err != nil {
+		// FIN could not be delivered: the peer will not answer a query whose
+		// send half never closed, so report the failure instead of reading a
+		// response that cannot arrive.
+		return nil, err
+	}
+	finSent = true
+
+	return dnstransport.ReadFramedDNSResponse(stream)
+}
+
 func (r *Router) queryQUIC(ctx context.Context, upstream *componentdns.Upstream, target netip.AddrPort, data []byte) (*dnsmessage.Msg, error) {
 	conn, err := r.directDialer.DialContext(ctx, common.MagicNetwork("udp", r.soMark, r.mptcp), target.String())
 	if err != nil {
@@ -479,11 +577,10 @@ func (r *Router) queryQUIC(ctx context.Context, upstream *componentdns.Upstream,
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = stream.Close() }()
 
 	wire := append([]byte(nil), data...)
 	binary.BigEndian.PutUint16(wire[:2], 0)
-	return dnstransport.SendStreamDNS(stream, wire)
+	return exchangeDoQQuery(stream, wire)
 }
 
 func upstreamTargets(upstream *componentdns.Upstream) []netip.AddrPort {

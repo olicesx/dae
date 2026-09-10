@@ -96,10 +96,22 @@ type DnsControllerOption struct {
 
 type dnsControllerStore struct {
 	// dnsCache uses sync.Map for lock-free concurrent access
-	dnsCache       sync.Map // map[string]*DnsCache
-	dnsCacheSize   atomic.Int64
-	dnsKnowledge   sync.Map // map[string]int64 (base cache key -> original deadline unix nano)
-	dnsKnowledgeMu sync.Mutex
+	dnsCache     sync.Map // map[string]*DnsCache
+	dnsCacheSize atomic.Int64
+	// dnsCacheByBase indexes the exact cache keys stored under each base cache
+	// key (map[string]*dnsCacheKeySet). It lets family removal and knowledge
+	// resync touch only the affected family instead of walking the whole cache
+	// while holding cacheProjectionMu. It is maintained exclusively by
+	// storeDnsCache, loadAndDeleteDnsCache and compareAndDeleteDnsCache (plus
+	// Close, which drops it wholesale), and the janitor reconciles it against
+	// dnsCacheSize so drift is reported instead of silently disabling family
+	// removal.
+	dnsCacheByBase sync.Map
+	// dnsCacheIndexReconciles counts janitor runs that found the base-key index
+	// out of sync with the live cache and rebuilt it.
+	dnsCacheIndexReconciles atomic.Uint64
+	dnsKnowledge            sync.Map // map[string]int64 (base cache key -> original deadline unix nano)
+	dnsKnowledgeMu          sync.Mutex
 	// runtimeState owns the complete immutable runtime and behavior snapshot so
 	// one load cannot combine fields from different reload generations.
 	runtimeState      atomic.Pointer[dnsControllerRuntimeState]
@@ -137,6 +149,21 @@ type dnsControllerStore struct {
 	// When ip_version_prefer is set, non-preferred responses wait briefly
 	// for preferred responses to arrive (RFC 8305 Happy Eyeballs).
 	prefWaitRegistry *preferenceWaitRegistry
+	// dnsPreferWaitNotified counts resolution-delay waits released by a
+	// preferred (A/AAAA) answer; dnsPreferWaitTimeout counts waits that ran to
+	// their full RFC 8305 delay without one. Both are visibility for the
+	// ipversion_prefer behavior, whose only remaining effect is that delay.
+	dnsPreferWaitNotified atomic.Uint64
+	dnsPreferWaitTimeout  atomic.Uint64
+
+	// Truncated-answer bookkeeping (RFC 7766 §5). Upgrades count UDP answers
+	// whose TC=1 bit triggered a TCP retry and whether that retry produced an
+	// answer; ClientReplies counts TC=1 answers handed back to a client because
+	// no TCP upgrade delivered the full answer.
+	dnsUdpTruncatedUpgrades        atomic.Uint64
+	dnsUdpTruncatedUpgradeFailures atomic.Uint64
+	dnsTruncatedRepliesToClient    atomic.Uint64
+	lastDnsTruncatedLogTime        atomic.Int64
 
 	// handleGate accounts for request handlers that entered through the
 	// active-plane dispatch. The publication RWMutex used to be held across
@@ -358,6 +385,7 @@ func (c *DnsController) Close() error {
 		return true
 	})
 	c.dnsCacheSize.Store(0)
+	c.clearDnsCacheIndex()
 	c.cacheProjectionMu.Unlock()
 	c.dnsKnowledge.Range(func(key, value any) bool {
 		c.dnsKnowledge.Delete(key)

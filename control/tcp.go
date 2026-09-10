@@ -827,11 +827,25 @@ func (c *ControlPlane) handleTCPDnsFastPathOwned(
 
 	// Handle DNS queries in a loop (TCP connections can be persistent)
 	for {
+		var activeController *DnsController
 		err := withActiveDNSController(fallback, flow.Context(), func(queryCtx context.Context, dnsController *DnsController) error {
+			activeController = dnsController
 			return dnsController.HandleWithResponseWriter_(queryCtx, msg, req, writer)
 		})
 		if err != nil {
-			if !stderrors.Is(err, ErrDNSQueryConcurrencyLimitExceeded) {
+			switch {
+			case stderrors.Is(err, ErrDNSQueryConcurrencyLimitExceeded):
+				// REFUSED response has already been written by the controller.
+			case stderrors.Is(err, ErrDNSTruncated) && activeController != nil:
+				// The upstream answer did not fit a single upstream datagram
+				// and no TCP upgrade delivered it. RFC 7766 §5 keeps the query
+				// on TCP and reports TC=1; SERVFAIL would claim the name does
+				// not resolve instead of that the answer did not fit.
+				activeController.noteDnsTruncatedReplyToClient()
+				if writeErr := activeController.sendDnsTruncatedResponse_(msg, req, writer); writeErr != nil {
+					return true, nil
+				}
+			default:
 				// A single failed query must not tear down a persistent DNS/TCP
 				// session. Report SERVFAIL and continue with the next frame.
 				errMsg := new(dnsmessage.Msg)

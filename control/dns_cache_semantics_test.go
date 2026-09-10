@@ -616,7 +616,7 @@ func TestRefreshNegativeSupersedesExpiredPositive(t *testing.T) {
 			A:   net.ParseIP("198.51.100.77").To4(),
 		}},
 	}
-	c.dnsCache.Store(cacheKey, expired)
+	c.storeDnsCache(cacheKey, expired)
 
 	c.evictSupersededExpiredPositive(cacheKey)
 	if _, ok := c.dnsCache.Load(cacheKey); ok {
@@ -626,7 +626,7 @@ func TestRefreshNegativeSupersedesExpiredPositive(t *testing.T) {
 	// A fresh entry (newer positive stored while the refresh was in flight)
 	// must be left untouched.
 	fresh := &DnsCache{Deadline: time.Now().Add(time.Hour)}
-	c.dnsCache.Store(cacheKey, fresh)
+	c.storeDnsCache(cacheKey, fresh)
 	c.evictSupersededExpiredPositive(cacheKey)
 	if _, ok := c.dnsCache.Load(cacheKey); !ok {
 		t.Fatal("fresh entry must survive a delayed negative refresh")

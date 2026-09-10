@@ -74,9 +74,18 @@ func (c *DnsController) forwardWithFallback(
 
 	primaryErr := err
 
-	// For tcp+udp upstream, perform immediate same-request fallback:
-	// prefer UDP, fallback to TCP on failure.
-	if upstream == nil || upstream.Scheme != dns.UpstreamScheme_TCP_UDP || primaryDialArg.l4proto != consts.L4ProtoStr_UDP {
+	// RFC 7766 §5 requires a forwarder that receives a truncated answer to
+	// retry the query over TCP, whatever transport carried the first attempt. A
+	// `tcp+udp://` upstream already retried on every UDP failure; a `udp://`
+	// upstream only does so for the truncation signal, so an operator that
+	// answers large zones with TC=1 over UDP (which RFC 1035 §4.2.1 permits)
+	// no longer turns into a client-visible failure. Every other scheme keeps
+	// its declared transport contract unchanged.
+	truncated := errors.Is(primaryErr, ErrDNSTruncated)
+	if upstream == nil ||
+		(upstream.Scheme != dns.UpstreamScheme_TCP_UDP &&
+			!(truncated && upstream.Scheme == dns.UpstreamScheme_UDP)) ||
+		primaryDialArg.l4proto != consts.L4ProtoStr_UDP {
 		return nil, primaryDialArg, primaryErr
 	}
 
@@ -104,10 +113,74 @@ func (c *DnsController) forwardWithFallback(
 
 	respMsg, err = c.forwardWithDialArg(fallbackCtx, upstream, fallbackDialArg, data)
 	if err != nil {
+		if truncated {
+			c.reportDnsTruncatedFallback(upstream, false, primaryErr, err)
+		}
 		return nil, fallbackDialArg, fmt.Errorf("udp forward failed: %w; tcp fallback failed: %w", primaryErr, err)
+	}
+	if truncated {
+		c.reportDnsTruncatedFallback(upstream, true, primaryErr, nil)
 	}
 
 	return respMsg, fallbackDialArg, nil
+}
+
+// dnsTruncatedFallbackLogInterval rate-limits the truncation warnings: an
+// upstream that answers every large query with TC=1 would otherwise log on
+// every query.
+const dnsTruncatedFallbackLogInterval = time.Minute
+
+// reportDnsTruncatedFallback records the outcome of a TCP retry that was
+// triggered by a truncated (TC=1) UDP answer. Upgrades and failures are counted
+// separately, and a failure additionally reports the retry error, so an
+// upstream whose answers never survive UDP stays visible instead of degrading
+// into a silent client-visible failure.
+func (c *DnsController) reportDnsTruncatedFallback(upstream *dns.Upstream, upgraded bool, primaryErr, fallbackErr error) {
+	if c.dnsControllerStore == nil {
+		return
+	}
+	if upgraded {
+		c.dnsUdpTruncatedUpgrades.Add(1)
+	} else {
+		c.dnsUdpTruncatedUpgradeFailures.Add(1)
+	}
+	if c.log == nil || !c.allowDnsTruncatedLog(time.Now()) {
+		return
+	}
+	fields := logrus.Fields{}
+	if upstream != nil {
+		fields["upstream"] = upstream.String()
+		fields["scheme"] = upstream.Scheme
+	}
+	if upgraded {
+		c.log.WithFields(fields).Warn("UDP DNS answer was truncated (TC=1); the TCP retry succeeded")
+		return
+	}
+	c.log.WithError(fallbackErr).WithFields(fields).Warnf("UDP DNS answer was truncated (TC=1) and the TCP retry failed "+
+		"(primary error: %v)", primaryErr)
+}
+
+func (c *DnsController) allowDnsTruncatedLog(now time.Time) bool {
+	nowNano := now.UnixNano()
+	for {
+		last := c.lastDnsTruncatedLogTime.Load()
+		if nowNano-last < int64(dnsTruncatedFallbackLogInterval) {
+			return false
+		}
+		if c.lastDnsTruncatedLogTime.CompareAndSwap(last, nowNano) {
+			return true
+		}
+	}
+}
+
+// noteDnsTruncatedReplyToClient records a TC=1 answer handed back to a client
+// because the upstream answer did not survive the UDP attempt and no TCP
+// upgrade delivered it.
+func (c *DnsController) noteDnsTruncatedReplyToClient() {
+	if c == nil || c.dnsControllerStore == nil {
+		return
+	}
+	c.dnsTruncatedRepliesToClient.Add(1)
 }
 
 func (c *DnsController) Handle_(ctx context.Context, dnsMessage *dnsmessage.Msg, req *udpRequest) (err error) {
@@ -195,6 +268,12 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 
 		// res is the *dnsmessage.Msg
 		respMsg := res.(*dnsmessage.Msg)
+
+		// RFC 8305 resolution delay runs here, outside the singleflight leader:
+		// the shared resolution is complete, so waiting for the preferred
+		// address family only delays this delivery instead of stalling every
+		// follower behind the same key.
+		respMsg = c.applyPreferenceWait(respMsg)
 
 		// Optimization: Try to get pre-packed response from cache after singleflight.
 		// This avoids another Pack() call which is common in high-concurrency scenarios.
@@ -309,6 +388,11 @@ func (c *DnsController) serveFromRespCacheWithRefresh_(dnsMessage *dnsmessage.Ms
 	if resp == nil {
 		return false, nil
 	}
+	// A cache hit can answer a query waiting out the RFC 8305 resolution delay:
+	// the preferred address family is available now, so release the waiter
+	// instead of letting it pay the full delay. This is the delivery side, so
+	// the wake-up is not deferred behind the upstream resolution.
+	c.notifyPreferenceWait(dnsMessage)
 	if needRefresh {
 		go c.backgroundRefresh(responseCacheKey, dnsMessage, req, upstreamIndex, upstream)
 	}
@@ -519,10 +603,10 @@ func (c *DnsController) resolveDNSUpstream(
 		return c.resolveDNSUpstream(ctx, invokingDepth+1, req, data, nextUpstream)
 	}
 
-	// Apply preference wait logic for A/AAAA responses.
-	// This must happen before logging and sending the response.
-	respMsg = c.applyPreferenceWait(respMsg)
-
+	// NOTE: RFC 8305 resolution-delay handling is deliberately NOT applied
+	// here. resolveDNSUpstream also runs inside the singleflight leader (and in
+	// background refreshes), where sleeping would hold the shared key for every
+	// follower. Delivery paths call applyPreferenceWait instead.
 	return &dnsUpstreamResolution{
 		response:      respMsg,
 		networkType:   networkType,

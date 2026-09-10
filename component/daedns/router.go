@@ -70,6 +70,16 @@ type Router struct {
 	httpSendFunc          httpDNSQueryFunc
 	httpTransportFactory  httpTransportFactoryFunc
 	closed                bool
+
+	// Upstream UDP reply validation (observe-only). udpStaleResponses counts
+	// datagrams whose transaction ID does not match the request (previously
+	// dropped with no signal at all); udpQuestionEchoMismatches counts replies
+	// whose ID matched but whose question section does not echo the request
+	// (RFC 5452). Neither changes the accept condition yet: they make the
+	// condition observable before it is tightened.
+	udpStaleResponses             atomic.Uint64
+	udpQuestionEchoMismatches     atomic.Uint64
+	lastUDPQuestionEchoMismatchAt atomic.Int64
 }
 
 type lookupCall struct {

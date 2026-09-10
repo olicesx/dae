@@ -32,7 +32,7 @@ func FuzzDnsCache_FillIntoWithTTL(f *testing.F) {
 	f.Fuzz(func(t *testing.T, qname string, qtype uint16) {
 		req := new(dnsmessage.Msg)
 		req.SetQuestion(qname, qtype)
-		_ = cache.FillIntoWithTTL(req, now)
+		_, _ = cache.FillIntoWithTTL(req, now)
 	})
 }
 

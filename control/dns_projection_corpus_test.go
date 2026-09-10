@@ -25,8 +25,8 @@ func TestPhase5DnsProjectionLifecycleCorpusTTLRetrySharedIPAcrossEpoch(t *testin
 	cacheB.RouteProjectionEpoch = 1
 	cacheB.Deadline = t0.Add(2 * time.Minute)
 	cacheB.OriginalDeadline = cacheB.Deadline
-	controller.dnsCache.Store(cacheA.RouteOwnerKey, cacheA)
-	controller.dnsCache.Store(cacheB.RouteOwnerKey, cacheB)
+	controller.storeDnsCache(cacheA.RouteOwnerKey, cacheA)
+	controller.storeDnsCache(cacheB.RouteOwnerKey, cacheB)
 
 	var oldProjectionCalls int
 	failCacheA := false
@@ -78,8 +78,8 @@ func TestPhase5DnsProjectionLifecycleCorpusTTLRetrySharedIPAcrossEpoch(t *testin
 	cacheB2 := cacheB.CloneForReload()
 	cacheB2.RouteProjectionEpoch = 2
 	cacheB2.DomainBitmap = domainRoutingBitmap(0x2)
-	controller.dnsCache.Store(cacheA2.RouteOwnerKey, cacheA2)
-	controller.dnsCache.Store(cacheB2.RouteOwnerKey, cacheB2)
+	controller.storeDnsCache(cacheA2.RouteOwnerKey, cacheA2)
+	controller.storeDnsCache(cacheB2.RouteOwnerKey, cacheB2)
 
 	var newProjectionCalls int
 	setTestDnsControllerRuntime(controller, func(rt *dnsControllerRuntimeState) {

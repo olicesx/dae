@@ -108,6 +108,69 @@ func truncateDNSResponse(packed []byte, limit int) []byte {
 	return packed
 }
 
+// echoWireQuestionCase rewrites the question name of a packed DNS response with
+// the spelling the requester used. The response cache stores one canonical wire
+// per name, so without this rewrite every client that spelled the name
+// differently would see its own question echoed in someone else's case: DNS
+// name comparison is case-insensitive (RFC 1035 §4.1.2), but stub resolvers and
+// 0x20-randomizing clients compare the echoed question byte for byte.
+//
+// The rewrite is a same-length, in-place copy inside the question section at
+// offset 12, so no offset in the message can move. A response whose question
+// name has a different wire length (a different name, or an escaped spelling)
+// is left untouched and reported at debug level. resp must be caller-owned.
+func (c *DnsController) echoWireQuestionCase(resp []byte, reqMsg *dnsmessage.Msg) bool {
+	if len(resp) < 12 || reqMsg == nil || len(reqMsg.Question) == 0 {
+		return false
+	}
+	bufPtr := dnsResponseBufPool.Get().(*[]byte)
+	defer dnsResponseBufPool.Put(bufPtr)
+	want := packQuestionWireName(reqMsg.Question[0].Name, *bufPtr)
+	if len(want) == 0 {
+		return false
+	}
+	end := skipDnsWireName(resp, 12)
+	if end < 0 {
+		return false
+	}
+	if end-12 != len(want) {
+		c.debugQuestionCaseMismatch(end-12, len(want), reqMsg.Question[0].Name)
+		return false
+	}
+	copy(resp[12:end], want)
+	return true
+}
+
+// echoMsgQuestionCase is the unpacked-message counterpart of
+// echoWireQuestionCase for delivery paths that hand a *dnsmessage.Msg to a
+// ResponseWriter. It only substitutes the name, and only when both spellings
+// encode to the same wire length, so the packed size cannot change.
+func (c *DnsController) echoMsgQuestionCase(respMsg, reqMsg *dnsmessage.Msg) bool {
+	if respMsg == nil || reqMsg == nil || len(respMsg.Question) == 0 || len(reqMsg.Question) == 0 {
+		return false
+	}
+	bufPtr := dnsResponseBufPool.Get().(*[]byte)
+	defer dnsResponseBufPool.Put(bufPtr)
+	wantLen := len(packQuestionWireName(reqMsg.Question[0].Name, *bufPtr))
+	if wantLen == 0 {
+		return false
+	}
+	if gotLen := len(packQuestionWireName(respMsg.Question[0].Name, *bufPtr)); gotLen != wantLen {
+		c.debugQuestionCaseMismatch(gotLen, wantLen, reqMsg.Question[0].Name)
+		return false
+	}
+	respMsg.Question[0].Name = reqMsg.Question[0].Name
+	return true
+}
+
+func (c *DnsController) debugQuestionCaseMismatch(responseWireLen, requesterWireLen int, requesterName string) {
+	if c.log == nil || !c.log.IsLevelEnabled(logrus.DebugLevel) {
+		return
+	}
+	c.log.Debugf("kept the cached DNS question spelling: response question is %d wire bytes, requester %q is %d",
+		responseWireLen, requesterName, requesterWireLen)
+}
+
 // writeCachedResponse sends a cached DNS response to the client.
 // OPTIMIZED: Uses pre-packed response with ID patching to avoid Pack() overhead.
 // For responseWriter path, uses Unpack/WriteMsg (slower but handles ID correctly).
@@ -127,6 +190,8 @@ func (c *DnsController) writeCachedResponse(resp []byte, reqId uint16, req *udpR
 		}
 		// Set the correct ID from the original request
 		respMsg.Id = reqId
+		// Restore the requester's own question spelling before delivery.
+		c.echoMsgQuestionCase(&respMsg, reqMsg)
 		return responseWriter.WriteMsg(&respMsg)
 	}
 
@@ -144,6 +209,9 @@ func (c *DnsController) writeCachedResponse(resp []byte, reqId uint16, req *udpR
 		patchedResp := (*bufPtr)[:len(resp)]
 		copy(patchedResp, resp)
 		binary.BigEndian.PutUint16(patchedResp[0:2], reqId)
+		// Restore the requester's own question spelling on this private copy;
+		// the shared cached wire must never be rewritten in place.
+		c.echoWireQuestionCase(patchedResp, reqMsg)
 
 		// Truncate oversized UDP responses with the TC bit set so the client
 		// retries over TCP (RFC 1035). Without this the client receives a
@@ -170,6 +238,8 @@ func (c *DnsController) writeCachedResponse(resp []byte, reqId uint16, req *udpR
 	if len(resp) >= 2 {
 		binary.BigEndian.PutUint16(patchedResp[0:2], reqId)
 	}
+	// Restore the requester's own question spelling on this private copy.
+	c.echoWireQuestionCase(patchedResp, reqMsg)
 
 	limit := dnsDefaultUDPSize
 	if reqMsg != nil {
@@ -240,6 +310,30 @@ func (c *DnsController) sendRejectWithResponseWriter_(dnsMessage *dnsmessage.Msg
 	return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeSuccess, false, "Reject", req, responseWriter)
 }
 
+// notifyPreferenceWait releases any query that is waiting out the RFC 8305
+// resolution delay for msg's name and address family. It is the single entry
+// point for "a preferred answer is now available", so every delivery path -
+// freshly resolved and served from the response cache - wakes the waiter
+// instead of leaving it to run out its full delay.
+func (c *DnsController) notifyPreferenceWait(msg *dnsmessage.Msg) bool {
+	if msg == nil || len(msg.Question) == 0 {
+		return false
+	}
+	qtypePrefer := c.currentQtypePrefer()
+	if qtypePrefer == 0 {
+		return false
+	}
+	q := msg.Question[0]
+	if !isPreferredType(q.Qtype, qtypePrefer) {
+		return false
+	}
+	if !c.prefWaitRegistry.notifyPreferred(dnsmessage.CanonicalName(q.Name), q.Qtype, qtypePrefer) {
+		return false
+	}
+	c.dnsPreferWaitNotified.Add(1)
+	return true
+}
+
 // applyPreferenceWait implements RFC 8305 Happy Eyeballs Resolution Delay.
 // When ip_version_prefer is set and a non-preferred A/AAAA response is received,
 // wait briefly (50ms) for the preferred response to arrive before proceeding.
@@ -252,6 +346,10 @@ func (c *DnsController) sendRejectWithResponseWriter_(dnsMessage *dnsmessage.Msg
 // when the caller releases this response downstream, giving a preferred
 // response a chance to arrive first; the preferred message itself is never
 // substituted here.
+//
+// It must be called on the delivery side (after a shared singleflight
+// resolution returns, not inside it), so the delay is paid per delivered
+// response instead of holding the singleflight key for followers.
 func (c *DnsController) applyPreferenceWait(respMsg *dnsmessage.Msg) *dnsmessage.Msg {
 	c.requireStore()
 	// Fast path: preference not enabled
@@ -275,7 +373,7 @@ func (c *DnsController) applyPreferenceWait(respMsg *dnsmessage.Msg) *dnsmessage
 	qtypePrefer := c.currentQtypePrefer()
 	if isPreferredType(q.Qtype, qtypePrefer) {
 		// Notify any waiting requests for this domain
-		if c.prefWaitRegistry.notifyPreferred(qname, q.Qtype, qtypePrefer) {
+		if c.notifyPreferenceWait(respMsg) {
 			if c.log.IsLevelEnabled(logrus.TraceLevel) {
 				c.log.Tracef("Preferred %v response for %v notified waiting request", QtypeToString(q.Qtype), qname)
 			}
@@ -302,9 +400,12 @@ func (c *DnsController) applyPreferenceWait(respMsg *dnsmessage.Msg) *dnsmessage
 				c.log.Tracef("Preferred %v response arrived for %v during wait for %v",
 					QtypeToString(qtypePrefer), qname, QtypeToString(q.Qtype))
 			}
-		} else if c.log.IsLevelEnabled(logrus.TraceLevel) {
-			c.log.Tracef("Preferred %v response not arrived for %v within %v, using %v response",
-				QtypeToString(qtypePrefer), qname, PreferenceResolutionDelay, QtypeToString(q.Qtype))
+		} else {
+			c.dnsPreferWaitTimeout.Add(1)
+			if c.log.IsLevelEnabled(logrus.TraceLevel) {
+				c.log.Tracef("Preferred %v response not arrived for %v within %v, using %v response",
+					QtypeToString(qtypePrefer), qname, PreferenceResolutionDelay, QtypeToString(q.Qtype))
+			}
 		}
 
 		// Always return the original response. The wait only changes when we

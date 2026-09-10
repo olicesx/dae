@@ -15,6 +15,7 @@ import (
 	"math/bits"
 	"net"
 	"net/http"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -992,6 +993,50 @@ const (
 	dnsUdpDirectPoolMaxIdleTime = 30 * time.Second
 )
 
+// dnsUDPResponseSourceMismatchLogInterval rate-limits the source-mismatch
+// warning: an upstream behind a transport that synthesizes the sender address
+// would otherwise log on every reply.
+const dnsUDPResponseSourceMismatchLogInterval = time.Minute
+
+// Observe-only upstream source validation state. A mismatch is counted and
+// rate-limit logged, never dropped, until every transport dae can dial is known
+// to report a truthful datagram source (transports that synthesize the sender
+// address cannot be distinguished from a forged reply yet).
+var (
+	dnsUDPResponseSourceMismatchCount  atomic.Uint64
+	lastDnsUDPResponseSourceMismatchAt atomic.Int64
+)
+
+// udpResponseSourceMismatch reports whether a datagram's reported source
+// differs from the endpoint dae dialed. A transport that does not report a
+// source address at all yields an invalid address and is treated as unknown,
+// not as a mismatch.
+func udpResponseSourceMismatch(from, target netip.AddrPort) bool {
+	if !from.IsValid() || !target.IsValid() {
+		return false
+	}
+	return from != target
+}
+
+func noteDnsUDPResponseSourceMismatch(log *logrus.Logger, target, from netip.AddrPort) {
+	dnsUDPResponseSourceMismatchCount.Add(1)
+	if log == nil {
+		return
+	}
+	nowNano := time.Now().UnixNano()
+	for {
+		last := lastDnsUDPResponseSourceMismatchAt.Load()
+		if nowNano-last < int64(dnsUDPResponseSourceMismatchLogInterval) {
+			return
+		}
+		if lastDnsUDPResponseSourceMismatchAt.CompareAndSwap(last, nowNano) {
+			break
+		}
+	}
+	log.Warnf("UDP DNS reply reported source %v but %v was dialed; the reply is still processed "+
+		"(observe-only source validation, mismatches=%d)", from, target, dnsUDPResponseSourceMismatchCount.Load())
+}
+
 func newUdpConnPool(maxIdle, maxActive int, dialer func(context.Context) (netproxy.Conn, error)) *udpConnPool {
 	if maxIdle <= 0 {
 		maxIdle = 1
@@ -1298,7 +1343,7 @@ func (d *DoUDP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 	staleResponses := 0
 
 	for {
-		n, err := netutils.ReadUDPConn(conn, respBuf)
+		n, from, err := netutils.ReadUDPConnFrom(conn, respBuf)
 		if err != nil {
 			// Direct UDP sockets can usually survive a single DNS timeout, but a
 			// proxy-backed UDP timeout often means the relay-side session has gone
@@ -1319,6 +1364,17 @@ func (d *DoUDP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 			udpPool.discard(conn)
 			badConn = true
 			return nil, err
+		}
+
+		// Observe-only upstream source validation: a datagram that claims to
+		// come from a different endpoint than the one dae dialed can only be a
+		// spoofed or cross-talked reply. The fix keeps observing for now -
+		// transports that synthesize the sender address (some proxy protocols)
+		// cannot be told apart from a forged one yet, and dropping on a
+		// false positive would break resolution - so the datagram is still
+		// processed, but the mismatch is counted and rate-limit logged.
+		if udpResponseSourceMismatch(from, d.dialArgument.bestTarget) {
+			noteDnsUDPResponseSourceMismatch(d.log, d.dialArgument.bestTarget, from)
 		}
 
 		if n < 2 {

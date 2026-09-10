@@ -69,7 +69,10 @@ func TestDNSCachePreservesEDNSMetadata(t *testing.T) {
 					wire := cache.GetPackedResponseWithApproximateTTL(phase0NamedUpstreamScopeQName, dnsmessage.TypeA, cache.Deadline.Add(-30*time.Second))
 					var got dnsmessage.Msg
 					require.NoError(t, got.Unpack(wire))
-					require.EqualValues(t, 30, got.Answer[0].Header().Ttl)
+					// dae zeroes the TTL of its own A/AAAA answers so downstream
+					// resolvers do not cache them; the TTL refresh must preserve
+					// that zero (P2-5) while still ageing ordinary records.
+					require.EqualValues(t, 0, got.Answer[0].Header().Ttl, "dae-managed address answers keep their zero TTL")
 					require.EqualValues(t, 30, got.Extra[1].Header().Ttl, "ordinary additional records still receive the remaining TTL")
 					require.Equal(t, opt, got.IsEdns0())
 					require.Equal(t, opt, cache.Extra[0], "refresh must not mutate shared stored records")

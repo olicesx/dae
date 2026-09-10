@@ -34,7 +34,8 @@ func TestResolveForSingleflightRechecksCache(t *testing.T) {
 		t.Fatalf("PrepackResponse() error = %v", err)
 	}
 	const cacheKey = "singleflight-cache-key"
-	controller.dnsCache.Store(cacheKey, cache)
+	// Publish through the controller's store so the base-key index stays in sync.
+	controller.storeDnsCache(cacheKey, cache)
 
 	response, err := controller.resolveForSingleflight(
 		context.Background(),

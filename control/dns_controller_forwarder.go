@@ -493,6 +493,11 @@ func (c *DnsController) dialSend(
 	}
 	respMsg := resolution.response
 
+	// RFC 8305 resolution delay: this is the delivery side, so a non-preferred
+	// A/AAAA answer waits here for a preferred one without holding any shared
+	// resolution state.
+	respMsg = c.applyPreferenceWait(respMsg)
+
 	if resolution.upstreamIndex.IsReserved() && c.log.IsLevelEnabled(logrus.DebugLevel) {
 		var (
 			qname string

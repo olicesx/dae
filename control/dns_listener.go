@@ -454,7 +454,9 @@ func (h *dnsHandler) ServeDNS(w dnsmessage.ResponseWriter, r *dnsmessage.Msg) {
 		_ = w.WriteMsg(m)
 		return
 	}
+	var activeController *DnsController
 	err = withActiveDNSController(controller, nil, func(queryCtx context.Context, dnsController *DnsController) error {
+		activeController = dnsController
 		return dnsController.HandleWithResponseWriter_(queryCtx, r, udpReq, w)
 	})
 	if err != nil {
@@ -465,6 +467,19 @@ func (h *dnsHandler) ServeDNS(w dnsmessage.ResponseWriter, r *dnsmessage.Msg) {
 		if isDNSClientWriteGoneError(err) {
 			if h.log.IsLevelEnabled(logrus.DebugLevel) {
 				h.log.WithError(err).Debug("Drop DNS response because client connection is already gone")
+			}
+			return
+		}
+		if errors.Is(err, ErrDNSTruncated) && activeController != nil {
+			// The upstream answer did not fit a single upstream datagram and no
+			// TCP upgrade delivered it. RFC 7766 §5 keeps the query on TCP and
+			// reports TC=1; answering SERVFAIL would tell the client the name
+			// does not resolve instead of that the answer did not fit.
+			activeController.noteDnsTruncatedReplyToClient()
+			if writeErr := activeController.sendDnsTruncatedResponse_(r, udpReq, w); writeErr != nil && !isDNSClientWriteGoneError(writeErr) {
+				if h.log.IsLevelEnabled(logrus.DebugLevel) {
+					h.log.WithError(writeErr).Debug("Failed to write DNS truncated response")
+				}
 			}
 			return
 		}

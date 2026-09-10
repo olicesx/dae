@@ -8,7 +8,29 @@ package control
 import (
 	"encoding/binary"
 	stderrors "errors"
+
+	dnsmessage "github.com/miekg/dns"
 )
+
+// packQuestionWireName encodes one domain name into dst as an uncompressed DNS
+// wire name and returns the encoded bytes. It returns nil when the name cannot
+// be encoded (not fully qualified, label longer than 63 bytes, name longer than
+// 255 bytes, or dst too small), so callers can keep the existing wire unchanged
+// rather than guess.
+//
+// The question name of a packed message is never compressed (it is the first
+// name in the message), which makes the encoded length directly comparable with
+// the question name already present in that message.
+func packQuestionWireName(name string, dst []byte) []byte {
+	if name == "" || len(dst) == 0 {
+		return nil
+	}
+	end, err := dnsmessage.PackDomainName(name, dst, 0, nil, false)
+	if err != nil || end <= 0 {
+		return nil
+	}
+	return dst[:end]
+}
 
 // dnsRRTypeOpt is the EDNS0 OPT pseudo-RR type. Its 32-bit field after the
 // name carries flags and the advertised UDP size, not a TTL, so it must be

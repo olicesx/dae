@@ -146,6 +146,20 @@ type UdpEndpoint struct {
 
 	log *logrus.Logger
 
+	// sentReporter, when non-nil, owns the upload accounting and traffic health
+	// reporting for datagrams this endpoint hands to the batch aggregator:
+	// WriteTo only queues them, so the caller cannot report them at submission
+	// time. It is invoked with the endpoint, the number of datagrams actually
+	// handed to the transport, and their payload bytes, and only when that
+	// count is > 0. Nil for non-batched endpoints (the caller reports inline)
+	// and for endpoints built without a control plane (tests, pool-only use).
+	sentReporter func(sent *UdpEndpoint, datagrams int, bytes int)
+
+	// batchFlushFailureCount counts failed asynchronous flushes. The flush runs
+	// off the caller's stack, so without this counter (and its rate-limited
+	// warn) a failing batched transport was completely invisible.
+	batchFlushFailureCount atomic.Uint64
+
 	dead   atomic.Bool
 	failed atomic.Bool
 
@@ -294,6 +308,10 @@ type UdpEndpointOptions struct {
 	// process-owned session lifecycle before it is published in the pool.
 	sessionManager *SessionManager
 	egressRuntime  *egressRuntime
+	// SentReporter reports datagrams actually sent by the batch aggregator,
+	// which is the only place that knows the real sent count. Nil keeps the
+	// caller-side inline accounting (non-batched endpoints).
+	SentReporter func(sent *UdpEndpoint, datagrams int, bytes int)
 }
 
 var DefaultUdpEndpointPool = NewUdpEndpointPool()
@@ -711,6 +729,7 @@ dialSuccess:
 	if udpWriteBatchOptedIn() {
 		if _, ok := packetConn.(netproxy.PacketBatchWriter); ok {
 			ue.writeBatch = newUDPWriteBatchAggregator(ue)
+			ue.sentReporter = createOption.SentReporter
 		}
 	}
 	if createOption.sessionManager != nil {

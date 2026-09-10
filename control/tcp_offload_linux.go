@@ -120,6 +120,13 @@ type tcpRelayOffloadSession struct {
 	forceCloseOnce sync.Once
 	closeOnce      sync.Once
 
+	// pendingErrs collects fuse-map failures detected after the session
+	// started (lift deletes) so Close joins them into its own error instead of
+	// them being visible only as a log line. Guarded by pendingErrsMu; Run is
+	// the only writer today, but Close reads it from the caller's goroutine.
+	pendingErrsMu sync.Mutex
+	pendingErrs   []error
+
 	// epollArmed is true while both fds are in the session epoll set.
 	// Run is the only writer, so a plain bool is enough. Fuse recovery
 	// must not EPOLL_CTL_ADD an already-armed fd (EEXIST is not fatal).
@@ -299,13 +306,63 @@ func (s *tcpRelayOffloadSession) Close() error {
 			errs = append(errs, fmt.Errorf("delete right fast_sock key: %w", err))
 		}
 		// Clear fuse state so a future connection reusing the same tuples
-		// starts with a clean backlog baseline and no residual pause.
-		_ = s.pauseMap.Delete(&s.leftKey)
-		_ = s.pauseMap.Delete(&s.rightKey)
-		_ = s.sentMap.Delete(&s.leftKey)
-		_ = s.sentMap.Delete(&s.rightKey)
+		// starts with a clean backlog baseline and no residual pause. A
+		// missing key is the normal case (the fuse never engaged), anything
+		// else is counted and warned about instead of being dropped: a
+		// residual pause entry would keep the next connection's datapath
+		// paused with no way to detect it.
+		for _, cleanup := range []struct {
+			name string
+			m    *ebpf.Map
+			key  *bpfTuplesKey
+		}{
+			{"pause-left", s.pauseMap, &s.leftKey},
+			{"pause-right", s.pauseMap, &s.rightKey},
+			{"sent-left", s.sentMap, &s.leftKey},
+			{"sent-right", s.sentMap, &s.rightKey},
+		} {
+			if err := cleanup.m.Delete(cleanup.key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+				s.reportOffloadMapFailure(cleanup.name, err)
+				errs = append(errs, fmt.Errorf("delete %s map key: %w", cleanup.name, err))
+			}
+		}
+		s.pendingErrsMu.Lock()
+		errs = append(errs, s.pendingErrs...)
+		s.pendingErrsMu.Unlock()
 	})
 	return errors.Join(errs...)
+}
+
+// tcpOffloadMapFailureCount counts fuse-map maintenance failures (pause/sent
+// updates, deletes and rollbacks) across all offload sessions. The failures do
+// not stop the relay - it keeps running in userspace - but they must not be
+// silent, because a paused-but-not-lifted or not-paused-while-expected map
+// changes which path carries the data.
+var tcpOffloadMapFailureCount atomic.Uint64
+
+// reportOffloadMapFailure counts one fuse-map failure and warns on the first
+// and every 2^n-th occurrence so a persistently failing map stays visible
+// without flooding the log (the fuse guard runs once per epoll wait cap).
+func (s *tcpRelayOffloadSession) reportOffloadMapFailure(op string, err error) {
+	if err == nil {
+		return
+	}
+	count := tcpOffloadMapFailureCount.Add(1)
+	if s.log == nil || !s.log.IsLevelEnabled(logrus.WarnLevel) || count&(count-1) != 0 {
+		return
+	}
+	fields := logrus.Fields{
+		"op":       op,
+		"error":    err.Error(),
+		"failures": count,
+	}
+	if s.left != nil {
+		fields["left"] = s.left.RemoteAddr().String()
+	}
+	if s.right != nil {
+		fields["right"] = s.right.RemoteAddr().String()
+	}
+	s.log.WithFields(fields).Warn("TCP relay eBPF offload fuse map maintenance failed")
 }
 
 // fuseStep evaluates the backlog fuse once: it computes the egress retry
@@ -346,8 +403,22 @@ func (s *tcpRelayOffloadSession) fuseStep(lastProgress *time.Time) (engage, lift
 				return false, false, nil
 			}
 			s.fused = false
-			_ = s.pauseMap.Delete(&s.leftKey)
-			_ = s.pauseMap.Delete(&s.rightKey)
+			// A failed lift leaves the kernel verdict paused while userspace
+			// stops forwarding: the relay would wedge until the idle timeout.
+			// Surface it (counted + warned, and joined into Close's errs)
+			// instead of ignoring the returned error.
+			var liftErrs []error
+			for _, key := range []*bpfTuplesKey{&s.leftKey, &s.rightKey} {
+				if err := s.pauseMap.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+					s.reportOffloadMapFailure("pause-lift", err)
+					liftErrs = append(liftErrs, err)
+				}
+			}
+			if len(liftErrs) > 0 {
+				s.pendingErrsMu.Lock()
+				s.pendingErrs = append(s.pendingErrs, errors.Join(liftErrs...))
+				s.pendingErrsMu.Unlock()
+			}
 			if s.log != nil && s.log.IsLevelEnabled(logrus.DebugLevel) {
 				s.log.Debugf("TCP relay eBPF offload fuse lifted: %v <-> %v", s.left.RemoteAddr(), s.right.RemoteAddr())
 			}
@@ -356,11 +427,29 @@ func (s *tcpRelayOffloadSession) fuseStep(lastProgress *time.Time) (engage, lift
 		return false, false, nil
 	}
 	if backlog > int64(tcpOffloadMaxPeerBacklog) {
+		// Engage all-or-nothing: the pause must cover BOTH directions before
+		// the caller drops the fds from epoll (delFds). With the fds removed
+		// from epoll but only one side paused, the still-redirecting side is
+		// served by the kernel while the paused side's data sits in a receive
+		// queue nobody drains. On a partial failure, roll back the side that
+		// was written and keep the relay on the userspace path (availability
+		// first, failure visible).
+		one := uint8(1)
+		updateErr := s.pauseMap.Update(&s.leftKey, &one, ebpf.UpdateAny)
+		if updateErr == nil {
+			updateErr = s.pauseMap.Update(&s.rightKey, &one, ebpf.UpdateAny)
+		}
+		if updateErr != nil {
+			for _, key := range []*bpfTuplesKey{&s.leftKey, &s.rightKey} {
+				if err := s.pauseMap.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+					s.reportOffloadMapFailure("pause-rollback", err)
+				}
+			}
+			s.reportOffloadMapFailure("pause-engage", updateErr)
+			return false, false, nil
+		}
 		s.fused = true
 		s.fuseDrainUntil = time.Now().Add(tcpOffloadFuseDrainWait)
-		one := uint8(1)
-		_ = s.pauseMap.Update(&s.leftKey, &one, ebpf.UpdateAny)
-		_ = s.pauseMap.Update(&s.rightKey, &one, ebpf.UpdateAny)
 		if s.log != nil && s.log.IsLevelEnabled(logrus.DebugLevel) {
 			s.log.Debugf("TCP relay eBPF offload fuse engaged (backlog=%d): %v <-> %v", backlog, s.left.RemoteAddr(), s.right.RemoteAddr())
 		}

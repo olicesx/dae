@@ -16,6 +16,7 @@ import (
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -168,50 +169,93 @@ func (a *udpWriteBatchAggregator) flush() {
 		// defensive fallback that preserves ordering via synchronous writes.
 		// It also runs under the mutex for the same buffer-lifetime reason.
 		var fallbackErr error
-		sentAny := false
+		sentDatagrams := 0
+		sentBytes := 0
 		for _, it := range items {
 			if _, err := a.ue.conn.WriteTo(it.Data, it.Addr); err != nil {
 				fallbackErr = err
 				break
 			}
-			sentAny = true
+			sentDatagrams++
+			sentBytes += len(it.Data)
 		}
 		a.mu.Unlock()
+		a.reportFlushed(sentDatagrams, sentBytes)
 		if fallbackErr != nil {
-			_ = a.ue.handleWriteError(fallbackErr)
-			if sentAny {
-				// Some datagrams already left the socket; keep the
-				// send timestamp honest even though the rest failed.
-				a.ue.hasSent.Store(true)
-				a.ue.lastSendNano.Store(time.Now().UnixNano())
-			}
+			a.reportFlushFailure(fallbackErr)
 			return
 		}
-		a.ue.hasSent.Store(true)
-		a.ue.lastSendNano.Store(time.Now().UnixNano())
 		return
 	}
 	n, err := bw.WriteBatch(items)
+	// Sum the accepted prefix while the mutex is still held: Append reuses the
+	// items backing array, so reading items[i].Data after the unlock would race
+	// with the next Append (the -race gate catches exactly that).
+	sentBytes := 0
+	for i := 0; i < n && i < len(items); i++ {
+		sentBytes += len(items[i].Data)
+	}
 	a.mu.Unlock()
 
+	a.reportFlushed(n, sentBytes)
 	if err != nil {
-		_ = a.ue.handleWriteError(err)
-		if n > 0 {
-			a.ue.hasSent.Store(true)
-			a.ue.lastSendNano.Store(time.Now().UnixNano())
-		}
+		a.reportFlushFailure(err)
 		return
 	}
 	if n < len(items) {
-		_ = a.ue.handleWriteError(fmt.Errorf("%w: batched write sent %d/%d datagrams", io.ErrShortWrite, n, len(items)))
-		if n > 0 {
-			a.ue.hasSent.Store(true)
-			a.ue.lastSendNano.Store(time.Now().UnixNano())
-		}
+		a.reportFlushFailure(fmt.Errorf("%w: batched write sent %d/%d datagrams", io.ErrShortWrite, n, len(items)))
+	}
+}
+
+// reportFlushed accounts the datagrams the transport actually accepted. It is
+// the only place that knows the real count for a batched endpoint: the caller
+// observes a successful Append, not a send. Non-batched endpoints keep the
+// caller-side accounting and have no reporter installed.
+func (a *udpWriteBatchAggregator) reportFlushed(datagrams, bytes int) {
+	if a.ue == nil {
 		return
 	}
-	a.ue.hasSent.Store(true)
-	a.ue.lastSendNano.Store(time.Now().UnixNano())
+	if datagrams > 0 {
+		a.ue.hasSent.Store(true)
+		a.ue.lastSendNano.Store(time.Now().UnixNano())
+	}
+	if reporter := a.ue.sentReporter; reporter != nil && datagrams > 0 {
+		reporter(a.ue, datagrams, bytes)
+	}
+}
+
+// reportFlushFailure makes a failed asynchronous flush visible. The synchronous
+// WriteTo path returns its error to a caller that logs, penalizes and retires;
+// a flush runs on the aggregator's timer/Append stack where the endpoint's
+// tolerated-error policy would otherwise swallow it (no report, no count, no
+// log) while the batch's datagrams were already counted as uploaded.
+func (a *udpWriteBatchAggregator) reportFlushFailure(err error) {
+	if a.ue == nil || err == nil {
+		return
+	}
+	if werr := a.ue.handleWriteError(err); werr != nil {
+		a.ue.reportBatchFlushFailure(werr)
+	}
+}
+
+// reportBatchFlushFailure reports one failed batched flush to the health plane
+// and logs it (counted, first / 2^n-th occurrence) so a broken batched
+// transport cannot stay invisible.
+func (ue *UdpEndpoint) reportBatchFlushFailure(err error) {
+	if ue == nil || err == nil {
+		return
+	}
+	count := ue.batchFlushFailureCount.Add(1)
+	if lifecycle, ok := newUdpSessionLifecycleContext(ue, ""); ok {
+		lifecycle.reportUnavailable(fmt.Errorf("udp batch flush failed: %w", err))
+	}
+	if ue.log != nil && ue.log.IsLevelEnabled(logrus.WarnLevel) && count&(count-1) == 0 {
+		ue.log.WithError(err).WithFields(logrus.Fields{
+			"failures": count,
+			"laddr":    ue.lAddr.String(),
+			"proxy":    ue.DialTarget,
+		}).Warn("[UdpEndpoint] batched write flush failed")
+	}
 }
 
 // Close prevents future appends, waits for any active write, and flushes the

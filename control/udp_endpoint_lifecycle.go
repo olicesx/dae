@@ -76,47 +76,81 @@ func (ue *UdpEndpoint) setFlowBinding(binding UdpFlowBinding) {
 	ue.flowBindingSet = true
 }
 
+// TrackUdpConnStateTuplePair keeps this endpoint's conn_state tuples pinned for
+// the tuple pair it currently serves.
+//
+// The tracked set MOVES with the pair: a pair change releases the previous
+// pair's keys that the new pair does not use. Accumulating them instead (the
+// previous behavior) leaked one pin per observed pair for the endpoint's whole
+// lifetime, so a long-lived endpoint could pin an unbounded set of long-dead
+// tuples against the janitor. ReleaseUdpConnStateTuples deletes the kernel
+// entry only when the shared refcount reaches zero, so a tuple another endpoint
+// (or another flow) still pins survives the move.
+//
+// Lock order: udpConnStateMu protects the tuple set and the last-pair snapshot
+// together; it is never held while calling into the owner (Retain/Release take
+// udpStateMu downstream), matching releaseTrackedUdpConnState.
 func (ue *UdpEndpoint) TrackUdpConnStateTuplePair(src, dst netip.AddrPort) {
 	if ue == nil || !src.IsValid() || !dst.IsValid() {
 		return
 	}
-	if ue.udpConnStateLastPair.Load().matches(src, dst) {
-		return
-	}
-
 	forward := bpfTuplesKeyFromAddrPorts(src, dst, uint8(syscall.IPPROTO_UDP))
 	reverse := bpfTuplesKeyFromAddrPorts(dst, src, uint8(syscall.IPPROTO_UDP))
 
 	ue.udpConnStateMu.Lock()
-	defer ue.udpConnStateMu.Unlock()
-
-	if ue.udpConnStateClosed || ue.udpConnStateOwner == nil {
+	if ue.udpConnStateClosed {
+		ue.udpConnStateMu.Unlock()
+		return
+	}
+	owner := ue.udpConnStateOwner
+	if owner == nil {
+		ue.udpConnStateMu.Unlock()
+		return
+	}
+	// Swap publishes the new pair and hands back the previous one atomically
+	// with respect to the pin bookkeeping below.
+	previous := ue.udpConnStateLastPair.Swap(&udpConnStateTuplePairSnapshot{src: src, dst: dst})
+	if previous.matches(src, dst) {
+		ue.udpConnStateMu.Unlock()
 		return
 	}
 	if ue.udpConnStateTuples == nil {
 		ue.udpConnStateTuples = make(map[bpfTuplesKey]struct{}, 4)
 	}
-	forwardNew := false
-	if _, ok := ue.udpConnStateTuples[forward]; !ok {
-		ue.udpConnStateTuples[forward] = struct{}{}
-		forwardNew = true
-	}
-	reverseNew := false
-	if _, ok := ue.udpConnStateTuples[reverse]; !ok {
-		ue.udpConnStateTuples[reverse] = struct{}{}
-		reverseNew = true
-	}
-	if forwardNew || reverseNew {
-		switch {
-		case forwardNew && reverseNew:
-			newKeys := [2]bpfTuplesKey{forward, reverse}
-			ue.udpConnStateOwner.RetainUdpConnStateTuples(newKeys[:])
-		case forwardNew:
-			ue.udpConnStateOwner.RetainUdpConnStateTuples([]bpfTuplesKey{forward})
-		default:
-			ue.udpConnStateOwner.RetainUdpConnStateTuples([]bpfTuplesKey{reverse})
+	var retain []bpfTuplesKey
+	for _, key := range [2]bpfTuplesKey{forward, reverse} {
+		if _, ok := ue.udpConnStateTuples[key]; !ok {
+			ue.udpConnStateTuples[key] = struct{}{}
+			retain = append(retain, key)
 		}
-		ue.udpConnStateLastPair.Store(&udpConnStateTuplePairSnapshot{src: src, dst: dst})
+	}
+	var release []bpfTuplesKey
+	if previous != nil {
+		for _, key := range [2]bpfTuplesKey{
+			bpfTuplesKeyFromAddrPorts(previous.src, previous.dst, uint8(syscall.IPPROTO_UDP)),
+			bpfTuplesKeyFromAddrPorts(previous.dst, previous.src, uint8(syscall.IPPROTO_UDP)),
+		} {
+			if key == forward || key == reverse {
+				// Still part of the pair this endpoint serves.
+				continue
+			}
+			if _, held := ue.udpConnStateTuples[key]; !held {
+				continue
+			}
+			delete(ue.udpConnStateTuples, key)
+			release = append(release, key)
+		}
+	}
+	ue.udpConnStateMu.Unlock()
+
+	if len(retain) > 0 {
+		owner.RetainUdpConnStateTuples(retain)
+	}
+	if len(release) > 0 {
+		if err := owner.ReleaseUdpConnStateTuples(release); err != nil &&
+			ue.log != nil && ue.log.IsLevelEnabled(logrus.DebugLevel) {
+			ue.log.WithError(err).Debug("[UdpEndpoint] Failed to release superseded UDP conn-state tuples")
+		}
 	}
 }
 
@@ -631,6 +665,13 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	}
 	ue.hasSent.Store(true)
 	ue.lastSendNano.Store(time.Now().UnixNano())
+	if ue.writeBatch != nil && ue.sentReporter != nil {
+		// A batched endpoint that reached this point sent the datagram
+		// synchronously (the batch rejected it as oversized, see Append), and
+		// its caller skips the inline accounting because the aggregator owns
+		// it. Report it here so the bytes are not silently uncounted.
+		ue.sentReporter(ue, 1, len(b))
+	}
 	return n, nil
 }
 
@@ -871,8 +912,18 @@ func (ue *UdpEndpoint) RefreshTtlWithTime(nowNano int64) {
 
 // UpdateNatTimeout updates the NAT timeout and refreshes TTL with the new timeout.
 // This allows the timeout to adapt to changing forwarding state (e.g., QUIC upgrade, fixed policy).
+//
+// An unchanged timeout does not take the write lock nor force a deadline bump:
+// the fast paths recompute the same effective value on every packet, and
+// forcing it there cost a write-locked store plus an unconditional expiry store
+// and cached-reply-socket refresh per packet. The renewal is handed back to the
+// existing throttled RefreshTtl instead.
 func (ue *UdpEndpoint) UpdateNatTimeout(timeout time.Duration) {
 	if timeout <= 0 {
+		return
+	}
+	if ue.natTimeout() == timeout {
+		ue.RefreshTtl()
 		return
 	}
 	ue.setNatTimeout(timeout)

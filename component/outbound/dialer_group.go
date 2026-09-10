@@ -40,6 +40,12 @@ type DialerGroup struct {
 
 	resuscitateLastTime atomic.Int64
 	noAliveLogLastTimes [8]atomic.Int64
+	// alivePublishMissingSetCount counts availability publications that could
+	// not revalidate a policy that needs alive state because this network type
+	// has no AliveDialerSet. The last published value is kept in that case, so
+	// the counter (plus its rate-limited log) is the only signal that the
+	// revalidation contract broke.
+	alivePublishMissingSetCount atomic.Uint64
 
 	cachedMinCheckInterval time.Duration
 }
@@ -505,11 +511,71 @@ func (g *DialerGroup) publishAliveChange(alive bool, networkType *dialer.Network
 	defer g.alivePublishMu.Unlock()
 
 	if !isInit {
-		if set := g.MustGetAliveDialerSet(networkType); set != nil {
+		switch set := g.MustGetAliveDialerSet(networkType); {
+		case set != nil:
 			alive = set.Len() > 0
+		case groupPublishesOptimisticAlive(g.GetSelectionPolicy()):
+			// Fixed and Random select in userspace and never need the kernel to
+			// gate admission for the group, so a missing set means "publish
+			// alive" - exactly what the connectivity publication path does for
+			// these policies. Trusting the incoming bool here could write 0 and
+			// strand a perfectly usable group with no probe to repair it
+			// (Fixed has no alive set at all).
+			alive = true
+		case policyRevalidatesAliveState(g.GetSelectionPolicy()):
+			// Policy needs per-dialer alive state but this network type has no
+			// set: the incoming bool cannot be revalidated, so publishing it
+			// could regress the kernel connectivity slot to 0 for a live group.
+			// Keep the last published value (publish nothing), count, and log.
+			count := g.alivePublishMissingSetCount.Add(1)
+			if count&(count-1) == 0 && g.log != nil {
+				g.log.WithFields(logrus.Fields{
+					"group":       g.Name,
+					"network":     networkType.String(),
+					"policy":      g.GetSelectionPolicy(),
+					"notified":    alive,
+					"occurrences": count,
+				}).Error("availability notification has no AliveDialerSet to revalidate against; keeping the last published value")
+			}
+			return
+		default:
+			// No published selection policy yet (the group's first state is
+			// still being built, so its sets are not reachable through
+			// MustGetAliveDialerSet). There is no membership to revalidate
+			// against and no previous value to keep: trust the notification,
+			// exactly as before.
 		}
 	}
 	g.aliveChangeCallback(alive, networkType, isInit)
+}
+
+// groupPublishesOptimisticAlive reports whether the group's selection policy
+// keeps the kernel outbound-connectivity slot open regardless of per-dialer
+// health. Fixed and Random pick in userspace, so the kernel must always admit
+// flows for the group (mirrors resumeOutboundConnectivityUpdates).
+func groupPublishesOptimisticAlive(policy consts.DialerSelectionPolicy) bool {
+	switch policy {
+	case consts.DialerSelectionPolicy_Fixed, consts.DialerSelectionPolicy_Random:
+		return true
+	default:
+		return false
+	}
+}
+
+// policyRevalidatesAliveState reports whether the policy derives selection from
+// per-dialer alive state, i.e. whether a missing AliveDialerSet makes the
+// notification unsafe to publish. Deliberately distinct from
+// policyNeedsAliveState, which panics on the zero policy value that a
+// still-unpublished selection state reports.
+func policyRevalidatesAliveState(policy consts.DialerSelectionPolicy) bool {
+	switch policy {
+	case consts.DialerSelectionPolicy_MinLastLatency,
+		consts.DialerSelectionPolicy_MinAverage10Latencies,
+		consts.DialerSelectionPolicy_MinMovingAverageLatencies:
+		return true
+	default:
+		return false
+	}
 }
 
 func (g *DialerGroup) registerAliveDialerSets(aliveDialerSets [8]*dialer.AliveDialerSet) {

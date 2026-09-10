@@ -1058,6 +1058,21 @@ getNew:
 			NowNano:        nowNano,
 			sessionManager: sessionManager,
 			egressRuntime:  c.egressRuntime,
+			// The batch aggregator is the only component that knows how many
+			// datagrams really left the socket, so it owns the upload meter
+			// and the health report for batched endpoints. The plain
+			// (non-batched) path keeps the inline accounting below.
+			SentReporter: func(sent *UdpEndpoint, datagrams, bytes int) {
+				if bytes > 0 {
+					c.recordUploadTraffic(int64(bytes))
+				}
+				if datagrams <= 0 {
+					return
+				}
+				if lifecycle, ok := newUdpSessionLifecycleContext(sent, ""); ok {
+					lifecycle.reportTrafficSuccess()
+				}
+			},
 			GetDialOption: func(ctx context.Context) (option *DialOption, err error) {
 				dialParam := &proxyDialParam{
 					Outbound:    consts.OutboundIndex(routingResult.Outbound),
@@ -1146,6 +1161,12 @@ getNew:
 	}
 	ue.TrackUdpConnStateTuplePair(realSrc, realDst)
 
+	// A batched endpoint only queues the datagram inside WriteTo; the flush
+	// reports the real bytes and the health signal from the aggregator's
+	// reportFlushed. Counting here would meter datagrams that a later failed or
+	// never-run flush dropped, and mark the dialer healthy for them (P3-25).
+	batchOwnsAccounting := ue.sentReporter != nil
+
 	for packetIndex < len(payloads) {
 		_, err = ue.WriteTo(payloads[packetIndex], dialTarget)
 		if err != nil {
@@ -1183,11 +1204,15 @@ getNew:
 			retry++
 			goto getNew
 		}
-		c.recordUploadTraffic(int64(len(payloads[packetIndex])))
+		if !batchOwnsAccounting {
+			c.recordUploadTraffic(int64(len(payloads[packetIndex])))
+		}
 		packetIndex++
 	}
-	if lifecycle, ok := newUdpSessionLifecycleContext(ue, ""); ok {
-		lifecycle.reportTrafficSuccess()
+	if !batchOwnsAccounting {
+		if lifecycle, ok := newUdpSessionLifecycleContext(ue, ""); ok {
+			lifecycle.reportTrafficSuccess()
+		}
 	}
 
 	// Per-flow routing traces are Debug, and only for new endpoints.

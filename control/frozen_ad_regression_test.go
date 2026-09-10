@@ -106,7 +106,8 @@ func TestBackgroundRefreshFailureKeepsStaleAndClearsRefreshing(t *testing.T) {
 		OriginalDeadline: time.Now().Add(-time.Minute),
 	}
 	stale.refreshing.Store(true)
-	ctrl.dnsCache.Store(cacheKey, stale)
+	// Publish through the controller's store so the base-key index stays in sync.
+	ctrl.storeDnsCache(cacheKey, stale)
 
 	q := new(dnsmessage.Msg)
 	q.SetQuestion("stale.example.com.", dnsmessage.TypeA)

@@ -236,6 +236,20 @@ type collectionUpdate struct {
 	alive             bool
 	movingAverage     time.Duration
 	aliveDialerGroups []*AliveDialerSet
+	// borrowedGroups/borrowedAlive carry the data-UDP fan-out produced by a
+	// DNS-UDP domain update. The data-UDP domain has no latency probe of its
+	// own and borrows the DNS domain's latency (see
+	// snapshotLatencyForPolicy), but its AliveDialerSets are only notified
+	// while the domain itself is still dead (ReportAvailableTraffic gates on
+	// !MustGetAlive) - so without this fan-out their borrowed sorting
+	// latency freezes at the value captured on the revival.
+	//
+	// borrowedAlive is ALWAYS the data-UDP collection's own Alive.Load(), and
+	// borrowedGroups is snapshotted under the same collectionFineMu critical
+	// section as the update itself. Both notifications are delivered after
+	// that lock is released (see informDialerGroupUpdate).
+	borrowedGroups []*AliveDialerSet
+	borrowedAlive  bool
 }
 
 func (d *Dialer) hasAliveDialerSets(typ *NetworkType) bool {
@@ -298,7 +312,7 @@ func (d *Dialer) snapshotLatencyForPolicy(
 }
 
 func (d *Dialer) snapshotAliveDialerGroupsLocked(collection *collection) []*AliveDialerSet {
-	if len(collection.AliveDialerSetSet) == 0 {
+	if collection == nil || len(collection.AliveDialerSetSet) == 0 {
 		return nil
 	}
 	groups := make([]*AliveDialerSet, 0, len(collection.AliveDialerSetSet))
@@ -306,6 +320,58 @@ func (d *Dialer) snapshotAliveDialerGroupsLocked(collection *collection) []*Aliv
 		groups = append(groups, a)
 	}
 	return groups
+}
+
+// dataUdpBorrowerGroupsLocked resolves, for a DNS-UDP domain update, the
+// same-ipversion data-UDP AliveDialerSets that borrow this domain's latency,
+// together with the data-UDP domain's OWN alive state.
+//
+// Callers must hold collectionFineMu: the whole point is that the fan-out
+// target set and its alive bit are snapshotted inside the very critical
+// section that produced the update. It performs no notification and no I/O.
+//
+// Lock order: AliveDialerSet.mu -> collectionFineMu is the established order
+// (NotifyLatencyChange holds the set lock while calling
+// snapshotLatencyForPolicy). This helper is only ever called with
+// collectionFineMu held and never takes a set lock, so the order is kept
+// one-way here; the delivery happens after the unlock.
+//
+// ok is false when typ is not a DNS-UDP domain or the data-UDP domain has no
+// registered sets, in which case the update has no borrowed fan-out.
+func (d *Dialer) dataUdpBorrowerGroupsLocked(typ *NetworkType) (groups []*AliveDialerSet, alive bool, ok bool) {
+	if typ == nil || typ.L4Proto != consts.L4ProtoStr_UDP ||
+		typ.EffectiveUdpHealthDomain() != UdpHealthDomainDns {
+		return nil, false, false
+	}
+	dataType := &NetworkType{
+		L4Proto:         consts.L4ProtoStr_UDP,
+		IpVersion:       typ.IpVersion,
+		UdpHealthDomain: UdpHealthDomainData,
+	}
+	collection := d.mustGetCollection(dataType)
+	if collection == nil {
+		return nil, false, false
+	}
+	groups = d.snapshotAliveDialerGroupsLocked(collection)
+	if len(groups) == 0 {
+		return nil, false, false
+	}
+	// The data-UDP alive flag must come from the data-UDP collection itself:
+	// borrowing the DNS domain's value would flip data-UDP aliveness from a
+	// DNS probe, which the health-domain split deliberately forbids.
+	return groups, collection.Alive.Load(), true
+}
+
+// attachBorrowedUdpFanOutLocked fills update's borrowed fan-out fields.
+// Callers must hold collectionFineMu.
+func (d *Dialer) attachBorrowedUdpFanOutLocked(typ *NetworkType, update *collectionUpdate) {
+	if update == nil {
+		return
+	}
+	if groups, alive, ok := d.dataUdpBorrowerGroupsLocked(typ); ok {
+		update.borrowedGroups = groups
+		update.borrowedAlive = alive
+	}
 }
 
 func parseIp46FromList(ip []string) *netutils.Ip46 {
@@ -1137,6 +1203,7 @@ func (d *Dialer) markUnavailableInternal(typ *NetworkType, force bool, isTraffic
 		movingAverage:     collection.MovingAverage,
 		aliveDialerGroups: d.snapshotAliveDialerGroupsLocked(collection),
 	}
+	d.attachBorrowedUdpFanOutLocked(typ, &update)
 	d.collectionFineMu.Unlock()
 
 	if wasAlive != alive {
@@ -1171,6 +1238,7 @@ func (d *Dialer) markAvailable(typ *NetworkType, latency time.Duration) (collect
 		movingAverage:     collection.MovingAverage,
 		aliveDialerGroups: d.snapshotAliveDialerGroupsLocked(collection),
 	}
+	d.attachBorrowedUdpFanOutLocked(typ, &update)
 	d.collectionFineMu.Unlock()
 
 	// Notify about health check success.
@@ -1199,6 +1267,7 @@ func (d *Dialer) markAvailableTraffic(typ *NetworkType) collectionUpdate {
 		movingAverage:     collection.MovingAverage,
 		aliveDialerGroups: d.snapshotAliveDialerGroupsLocked(collection),
 	}
+	d.attachBorrowedUdpFanOutLocked(typ, &update)
 	d.collectionFineMu.Unlock()
 
 	isRevival := !wasAlive
@@ -1212,6 +1281,15 @@ func (d *Dialer) markAvailableTraffic(typ *NetworkType) collectionUpdate {
 func (d *Dialer) informDialerGroupUpdate(update collectionUpdate) {
 	for _, a := range update.aliveDialerGroups {
 		a.NotifyLatencyChange(d, update.alive)
+	}
+	// Borrowed fan-out (data-UDP domains of the same ipversion). Delivered
+	// here, i.e. strictly AFTER collectionFineMu was released: the
+	// established lock order is AliveDialerSet.mu -> collectionFineMu
+	// (NotifyLatencyChange holds the set lock while snapshotLatencyForPolicy
+	// takes the collection lock), so notifying inside the critical section
+	// that produced the snapshot would invert the order and deadlock.
+	for _, a := range update.borrowedGroups {
+		a.NotifyLatencyChange(d, update.borrowedAlive)
 	}
 }
 

@@ -169,18 +169,38 @@ func (a *AliveDialerSet) GetMinLatency(excluded *Dialer) (d *Dialer, latency tim
 	return nil, time.Hour
 }
 
-func (a *AliveDialerSet) printLatencies() {
+// latencySnapshotEntry is one dialer's display state copied by value while
+// a.mu is held. The dialer pointer, its subscription tag, and its name are
+// all captured here on purpose: property is replaced wholesale on reload and
+// aliveEntries is mutated in place (append / swap-remove), so carrying either
+// the slice header or a *Dialer out of the lock would race with the writer.
+type latencySnapshotEntry struct {
+	name    string
+	tag     string
+	latency time.Duration
+	offset  time.Duration
+}
+
+// latencySnapshot is the lock-free rendering input for printLatenciesOutOfLock.
+type latencySnapshot struct {
+	group   string
+	network string
+	entries []latencySnapshotEntry
+}
+
+// snapshotLatenciesLocked copies the per-dialer display state while a.mu is
+// held. It must be called with a.mu held (read or write); it performs no I/O
+// and no logging.
+func (a *AliveDialerSet) snapshotLatenciesLocked() (latencySnapshot, bool) {
 	if !a.log.IsLevelEnabled(logrus.InfoLevel) {
-		// The caller logs at Info; skip building the sorted snapshot
-		// (which walks every entry) when it would be discarded anyway.
-		return
+		// The caller logs at Info; skip building the snapshot (which walks
+		// every entry) when it would be discarded anyway.
+		return latencySnapshot{}, false
 	}
-	var builder strings.Builder
-	fmt.Fprintf(&builder, "Group '%v' [%v]:\n", a.dialerGroupName, a.CheckTyp.String())
-	var alive []*struct {
-		d *Dialer
-		l time.Duration
-		o time.Duration
+	snap := latencySnapshot{
+		group:   a.dialerGroupName,
+		network: a.CheckTyp.String(),
+		entries: make([]latencySnapshotEntry, 0, len(a.aliveEntries)),
 	}
 	for i := range a.aliveEntries {
 		d := a.aliveEntries[i].dialer
@@ -188,18 +208,32 @@ func (a *AliveDialerSet) printLatencies() {
 		if !ok {
 			continue
 		}
-		offset := a.dialerToLatencyOffset[d]
-		alive = append(alive, &struct {
-			d *Dialer
-			l time.Duration
-			o time.Duration
-		}{d, latency, offset})
+		entry := latencySnapshotEntry{
+			latency: latency,
+			offset:  a.dialerToLatencyOffset[d],
+		}
+		if d != nil && d.property != nil {
+			entry.name = d.property.Name
+			entry.tag = d.property.SubscriptionTag
+		}
+		snap.entries = append(snap.entries, entry)
 	}
+	return snap, true
+}
+
+// printLatenciesOutOfLock sorts and renders a snapshot taken by
+// snapshotLatenciesLocked. It must run with a.mu RELEASED: the whole point is
+// to keep list formatting and log I/O out of the latency-update critical
+// section (the 30s health cycle calls this for the whole group).
+func (a *AliveDialerSet) printLatenciesOutOfLock(snap latencySnapshot) {
+	alive := snap.entries
 	sort.SliceStable(alive, func(i, j int) bool {
-		return alive[i].l+alive[i].o < alive[j].l+alive[j].o
+		return alive[i].latency+alive[i].offset < alive[j].latency+alive[j].offset
 	})
+	var builder strings.Builder
+	fmt.Fprintf(&builder, "Group '%v' [%v]:\n", snap.group, snap.network)
 	for i, dl := range alive {
-		fmt.Fprintf(&builder, "%4d. [%v] %v: %v\n", i+1, dl.d.property.SubscriptionTag, dl.d.property.Name, latencyString(dl.l, dl.o))
+		fmt.Fprintf(&builder, "%4d. [%v] %v: %v\n", i+1, dl.tag, dl.name, latencyString(dl.latency, dl.offset))
 	}
 	a.log.Infoln(strings.TrimSuffix(builder.String(), "\n"))
 }
@@ -398,7 +432,17 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 					}).Infof("Group %vselects dialer", re)
 				}
 
-				a.printLatencies()
+				// Lock order / critical-section discipline: the snapshot is
+				// taken under a.mu and the formatting + log write happen
+				// after unlocking, mirroring the aliveChangeCallback calls
+				// below. Holding a.mu across the render would serialize every
+				// other latency update behind a full-list sort and a log
+				// write (the caller may hold the group's publish lock too).
+				if snap, ok := a.snapshotLatenciesLocked(); ok {
+					a.mu.Unlock()
+					a.printLatenciesOutOfLock(snap)
+					a.mu.Lock()
+				}
 			} else {
 				// Alive -> not alive
 				a.mu.Unlock()

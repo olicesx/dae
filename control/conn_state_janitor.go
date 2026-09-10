@@ -6,10 +6,12 @@
 package control
 
 import (
+	"sync/atomic"
 	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/daeuniverse/dae/common"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
@@ -428,16 +430,37 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 		tcpStats.usagePercent = tcpStats.entries * 100 / int(maxEntries)
 	}
 
-	// Recheck pins while blocking process-owned flow adoption and release. This
-	// closes the scan-to-delete race without holding the manager locks during a
-	// potentially large map walk. generationsMu guards flow registration and
-	// refcount mutation; pinnedUDP keeps its dedicated lock.
-	if manager != nil && (len(udpKeysToDelete) > 0 || len(tcpKeysToDelete) > 0) {
-		manager.generationsMu.Lock()
+	// Recheck pins while blocking process-owned flow adoption and release, then
+	// delete inside the SAME critical section. This closes the scan-to-delete
+	// race without holding the manager locks during the potentially large map
+	// walk.
+	//
+	// The two key classes take disjoint locks, so each delete is scoped to the
+	// lock that actually protects its key class and a UDP-only cycle never
+	// queues behind the generationsMu write lock that guards TCP flow
+	// registration/release:
+	//   - UDP keys live in manager.pinnedUDP, exclusively guarded by
+	//     udpStateMu (see RetainUdpConnStateTuples / ReleaseUdpConnStateTuples).
+	//   - TCP keys live in the manager.pinnedShards, which generationsMu
+	//     covers for registration/unpin bookkeeping.
+	// No path holds both locks here, so the former generationsMu -> udpStateMu
+	// nesting (the order releaseFlow still uses) is not exercised by the
+	// janitor at all. The deletes must NOT move outside these critical
+	// sections: a pin slipping between the recheck and the delete would lose a
+	// live entry.
+	// A delete failure is not fatal (the next cycle retries), but it must not
+	// be silent: Debug-level made a persistently failing map invisible to
+	// operators. Every failure is counted and warned about.
+	deleteKeys := func(keys []bpfTuplesKey, label string) {
+		if len(keys) == 0 {
+			return
+		}
+		if _, err := BpfMapBatchDelete(bpf.ConnStateMap, keys); err != nil {
+			countConnStateJanitorDeleteError(label, err)
+		}
+	}
+	if manager != nil && len(udpKeysToDelete) > 0 {
 		manager.udpStateMu.RLock()
-		defer manager.generationsMu.Unlock()
-		defer manager.udpStateMu.RUnlock()
-
 		udpPinnedFiltered := udpKeysToDelete[:0]
 		for _, key := range udpKeysToDelete {
 			if manager.pinnedUDP[key] == 0 {
@@ -445,7 +468,15 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 			}
 		}
 		udpKeysToDelete = udpPinnedFiltered
+		deleteKeys(udpKeysToDelete, "UDP")
+		manager.udpStateMu.RUnlock()
+	} else {
+		deleteKeys(udpKeysToDelete, "UDP")
+	}
+	udpStats.deleted = len(udpKeysToDelete)
 
+	if manager != nil && len(tcpKeysToDelete) > 0 {
+		manager.generationsMu.Lock()
 		tcpPinnedFiltered := tcpKeysToDelete[:0]
 		for _, key := range tcpKeysToDelete {
 			shard := &manager.pinnedShards[tuplesShardIndex(&key)]
@@ -457,19 +488,10 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 			}
 		}
 		tcpKeysToDelete = tcpPinnedFiltered
-	}
-
-	if len(udpKeysToDelete) > 0 {
-		if _, err := BpfMapBatchDelete(bpf.ConnStateMap, udpKeysToDelete); err != nil {
-			c.log.Debugf("cleanupConnStateMap: UDP batch delete error: %v", err)
-		}
-	}
-	udpStats.deleted = len(udpKeysToDelete)
-
-	if len(tcpKeysToDelete) > 0 {
-		if _, err := BpfMapBatchDelete(bpf.ConnStateMap, tcpKeysToDelete); err != nil {
-			c.log.Debugf("cleanupConnStateMap: TCP batch delete error: %v", err)
-		}
+		deleteKeys(tcpKeysToDelete, "TCP")
+		manager.generationsMu.Unlock()
+	} else {
+		deleteKeys(tcpKeysToDelete, "TCP")
 	}
 	tcpStats.deleted = len(tcpKeysToDelete)
 
@@ -491,6 +513,30 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 	}
 
 	return udpStats, tcpStats
+}
+
+// connStateJanitorDeleteErrorCount counts failed janitor deletions from
+// conn_state_map. A failure only delays retirement to the next cycle, but a
+// persistently failing map must stay visible: it was Debug-level before, which
+// made a broken map invisible at the default log level.
+var connStateJanitorDeleteErrorCount atomic.Uint64
+
+// countConnStateJanitorDeleteError counts one failed janitor deletion and warns
+// on the first and every 2^n-th occurrence so a recurring failure cannot flood
+// the log while never going unreported.
+func countConnStateJanitorDeleteError(class string, err error) {
+	if err == nil {
+		return
+	}
+	count := connStateJanitorDeleteErrorCount.Add(1)
+	if !shouldReportEveryPow2(count) {
+		return
+	}
+	logrus.WithFields(logrus.Fields{
+		"class": class,
+		"error": err.Error(),
+		"count": count,
+	}).Warn("cleanupConnStateMap: batch delete failed")
 }
 
 func (c *ControlPlane) connStateJanitorScratch() *connStateJanitorScratch {

@@ -19,6 +19,7 @@ import (
 	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/routing"
 	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
 
@@ -604,35 +605,67 @@ func (m *SessionManager) releaseFlow(flow *FlowRuntime) {
 		// mirrors the invariant ReleaseUdpConnStateTuples documents and
 		// enforces for UDP under udpStateMu. Lock order generationsMu ->
 		// udpStateMu matches the janitor's scan-to-delete recheck.
+		//
+		// deleteKeys is the set of keys whose refcount reached zero in the
+		// loop above. The refcount is manager-global (pinnedShards), so a key
+		// in deleteKeys is held by no flow in any table: the migrated maps
+		// must be scrubbed with exactly the same gate, inside this same
+		// critical section. Deleting the whole pinKeys set unconditionally
+		// (the previous behavior, outside generationsMu) removed entries that
+		// a still-live same-tuple flow pins.
 		if len(deleteKeys) > 0 {
 			m.udpStateMu.RLock()
 			if bpf := m.udpBPF.Load(); bpf != nil && bpf.ConnStateMap != nil {
-				_, _ = BpfMapBatchDelete(bpf.ConnStateMap, deleteKeys)
+				if _, err := connStateScrubDelete(bpf.ConnStateMap, deleteKeys); err != nil {
+					countConnStateScrubError("primary", err)
+				}
+			}
+			for _, bpf := range migratedMaps {
+				if bpf == nil || bpf.ConnStateMap == nil {
+					continue
+				}
+				if _, err := connStateScrubDelete(bpf.ConnStateMap, deleteKeys); err != nil {
+					countConnStateScrubError("migrated", err)
+				}
 			}
 			m.udpStateMu.RUnlock()
 		}
 	}
 	m.generationsMu.Unlock()
 
-	// Also scrub every map this flow was migrated into. The refcounts
-	// for these keys were already unwound above, so we only need to
-	// physically remove the entries from the migrated maps. This runs
-	// outside generationsMu: only this flow's own migrate() appends to
-	// migratedBpf, and migrate() is serialized against releaseFlow by
-	// lifecycleMu, so no pin can interleave here.
-	for _, bpf := range migratedMaps {
-		if bpf != nil && bpf.ConnStateMap != nil {
-			migrateKeys := make([]bpfTuplesKey, 0, flow.pinKeyCount)
-			for i := range int(flow.pinKeyCount) {
-				migrateKeys = append(migrateKeys, flow.pinKeys[i])
-			}
-			_, _ = BpfMapBatchDelete(bpf.ConnStateMap, migrateKeys)
-		}
-	}
 	if flow.cancel != nil {
 		flow.cancel()
 	}
 	_ = flow.egressLease.release()
+}
+
+// connStateScrubErrorCount counts failed physical conn_state deletions issued
+// from releaseFlow after the last in-process pin for a tuple disappeared.
+//
+// The deletion is best-effort by design (the janitor retires leftovers), but
+// a silent failure would hide a broken map for a whole generation, so every
+// failure is counted and the first / 2^n-th occurrence is logged.
+var connStateScrubErrorCount atomic.Uint64
+
+// connStateScrubDelete is the package-local seam for the physical conn_state
+// deletion performed by releaseFlow. Production wiring is BpfMapBatchDelete;
+// tests substitute it to observe exactly which keys the refcount gate released
+// (and that a still-pinned tuple releases none) without a real BPF map.
+var connStateScrubDelete = BpfMapBatchDelete
+
+func countConnStateScrubError(stage string, err error) {
+	if err == nil {
+		return
+	}
+	count := connStateScrubErrorCount.Add(1)
+	if !shouldReportEveryPow2(count) {
+		return
+	}
+	logrus.WithFields(logrus.Fields{
+		"stage": stage,
+		"error": err.Error(),
+		"count": count,
+	}).Error("failed to scrub conn_state entry after the last flow pin dropped")
 }
 
 func (m *SessionManager) retainGenerationLocked(epoch routing.PolicyEpoch) {

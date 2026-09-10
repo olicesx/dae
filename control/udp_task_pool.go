@@ -481,6 +481,20 @@ func runConvoyTask(task UdpTask) {
 	task.Run()
 }
 
+// runDirectDispatchTask executes one directly dispatched ingress task with the
+// same panic isolation the convoy path has: the task's own defers (dispatch
+// semaphore, admission ticket, packet buffer, pooled task object) already ran
+// during the unwind, so the recovery handler must only report - releasing
+// anything again here would double-free the buffer and the pool slot.
+func runDirectDispatchTask(task *udpIngressTask, panicCount *atomic.Uint64) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			reportPacketPathPanic("direct_dispatch", "run", panicCount, recovered)
+		}
+	}()
+	task.Run()
+}
+
 // shouldReportEveryPow2 returns true on the 1st, 2nd, 4th, ... occurrence so
 // recurring panics log at exponentially decreasing rates.
 func shouldReportEveryPow2(count uint64) bool {

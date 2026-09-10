@@ -847,3 +847,85 @@ func TestDialerGroup_Select_SingleDialerLenientFallsBackToFixed(t *testing.T) {
 		t.Fatalf("lenient Select() returned %v, want the only dialer", dLenient)
 	}
 }
+
+// TestPublishAliveChangeWithoutAliveSetIsPolicyDriven is the P3-13 regression:
+// when the network type has no AliveDialerSet, publishAliveChange used to trust
+// the incoming bool, which could write 0 into the kernel outbound-connectivity
+// slot for a group that is usable (Fixed groups have no set at all and no probe
+// that would ever repair the slot).
+func TestPublishAliveChangeWithoutAliveSetIsPolicyDriven(t *testing.T) {
+	type call struct {
+		alive bool
+		init  bool
+	}
+	newGroup := func(policy consts.DialerSelectionPolicy) (*DialerGroup, *[]call) {
+		var calls []call
+		g := &DialerGroup{
+			log:  log,
+			Name: "test-group",
+			aliveChangeCallback: func(alive bool, _ *dialer.NetworkType, isInit bool) {
+				calls = append(calls, call{alive: alive, init: isInit})
+			},
+		}
+		g.selectionState.Store(&dialerGroupSelectionState{
+			policy: DialerSelectionPolicy{Policy: policy},
+		})
+		return g, &calls
+	}
+	nt := TestDataUdp4NetworkType
+
+	t.Run("fixed publishes alive", func(t *testing.T) {
+		g, calls := newGroup(consts.DialerSelectionPolicy_Fixed)
+		g.publishAliveChange(false, nt, false)
+		if len(*calls) != 1 || !(*calls)[0].alive {
+			t.Fatalf("Fixed group with no alive set must publish alive=true, got %+v", *calls)
+		}
+		if got := g.alivePublishMissingSetCount.Load(); got != 0 {
+			t.Fatalf("Fixed must not be counted as a missing-set defect: %d", got)
+		}
+	})
+
+	t.Run("random publishes alive", func(t *testing.T) {
+		g, calls := newGroup(consts.DialerSelectionPolicy_Random)
+		g.publishAliveChange(false, nt, false)
+		if len(*calls) != 1 || !(*calls)[0].alive {
+			t.Fatalf("Random group with no alive set must publish alive=true, got %+v", *calls)
+		}
+	})
+
+	t.Run("min policy keeps last value and counts", func(t *testing.T) {
+		g, calls := newGroup(consts.DialerSelectionPolicy_MinLastLatency)
+		g.publishAliveChange(false, nt, false)
+		if len(*calls) != 0 {
+			t.Fatalf("a missing set for a policy that needs alive state must not publish, got %+v", *calls)
+		}
+		if got := g.alivePublishMissingSetCount.Load(); got != 1 {
+			t.Fatalf("missing-set occurrences = %d, want 1", got)
+		}
+		// Init publications stay trusted: a fresh group publishes optimistic
+		// aliveness before its health converges.
+		g.publishAliveChange(true, nt, true)
+		if len(*calls) != 1 || !(*calls)[0].alive || !(*calls)[0].init {
+			t.Fatalf("init publication must be passed through, got %+v", *calls)
+		}
+	})
+}
+
+// TestGroupPublishesOptimisticAlive pins the policy set whose kernel admission
+// stays open regardless of per-dialer health.
+func TestGroupPublishesOptimisticAlive(t *testing.T) {
+	for _, tc := range []struct {
+		policy consts.DialerSelectionPolicy
+		want   bool
+	}{
+		{consts.DialerSelectionPolicy_Fixed, true},
+		{consts.DialerSelectionPolicy_Random, true},
+		{consts.DialerSelectionPolicy_MinLastLatency, false},
+		{consts.DialerSelectionPolicy_MinAverage10Latencies, false},
+		{consts.DialerSelectionPolicy_MinMovingAverageLatencies, false},
+	} {
+		if got := groupPublishesOptimisticAlive(tc.policy); got != tc.want {
+			t.Fatalf("groupPublishesOptimisticAlive(%v) = %v, want %v", tc.policy, got, tc.want)
+		}
+	}
+}

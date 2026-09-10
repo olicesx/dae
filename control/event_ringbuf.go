@@ -25,12 +25,19 @@ const (
 	// daeEventSynRebindRejected: a pure SYN was refused rewrite of a live
 	// flow's routing metadata (P3-14).
 	daeEventSynRebindRejected
-	// daeEventStatelessTcpPassthrough: established TCP forwarded without a
-	// cached routing decision (P2-30).
-	daeEventStatelessTcpPassthrough
-	// daeEventFragTailPassed: non-initial fragment forwarded without routing
-	// (P2-8).
-	daeEventFragTailPassed
+	// daeEventReservedStatelessTcpPassthrough (6) and
+	// daeEventReservedFragTailPassed (7) are reserved and never emitted. Both
+	// described a by-design passthrough whose normal steady state (established
+	// TCP of a pre-existing flow after a restart, a forwarded fragment tail)
+	// cannot be reported per event: their rate key was shared by every
+	// affected flow, so the ringbuf delivered one sample per second for as
+	// long as the state lasted. The datapath counts them per packet in
+	// bpf_stats_map instead, and ControlPlane.reportDatapathPassthroughSummary
+	// reports the interval delta. The numbers stay reserved so the remaining
+	// types keep their wire values, and
+	// TestDaeEventTypeNumbersMatchKernelSource pins that numbering.
+	daeEventReservedStatelessTcpPassthrough
+	daeEventReservedFragTailPassed
 	// daeEventRedirectUpdateFailed: redirect_track could not store a reply
 	// binding (P2-29). The matching bpf_stats_map counter separates a full
 	// map from any other update error.
@@ -159,10 +166,14 @@ func (r *bpfMaintenanceRuntime) readEvents() {
 			reportDatapathAnomaly(target, &ev, "pure SYN refused rewrite of a live flow's routing metadata")
 		case daeEventSynRebindRerouted:
 			reportDatapathAnomaly(target, &ev, "pure SYN moved a live flow that outlived a rules change onto the current routing epoch")
-		case daeEventStatelessTcpPassthrough:
-			reportDatapathAnomaly(target, &ev, "established TCP forwarded without cached routing (pre-existing flow, e.g. across a restart)")
-		case daeEventFragTailPassed:
-			reportDatapathAnomaly(target, &ev, "non-initial fragment forwarded without routing")
+		case daeEventReservedStatelessTcpPassthrough, daeEventReservedFragTailPassed:
+			// Both types are reserved and never emitted; see the type table
+			// above. The matching bpf_stats_map counters reach the operator
+			// through reportDatapathPassthroughSummary instead, so an event
+			// of these types can only mean the binaries disagree (the kernel
+			// object and this Go side ship together): report that as the ABI
+			// drift it is, without reviving the per-event warning.
+			logrus.Debugf("reserved datapath event type %d received; kernel object and userspace disagree", ev.Type)
 		case daeEventBlockedAlive:
 			// Kernel blocked a packet because the selected outbound is
 			// not alive (wan_outbound_is_alive == false). Userspace never
@@ -184,9 +195,13 @@ func (r *bpfMaintenanceRuntime) readEvents() {
 }
 
 // reportDatapathAnomaly logs a kernel-reported datapath anomaly. The kernel
-// rate-limits each anomaly event type to one per second per key, so this
-// cannot flood the log, and the per-packet counters in bpf_stats_map remain
-// the authoritative count.
+// rate-limits each anomaly event type to one emission per second, but the rate
+// key is shared by every flow of that type: the bound is on the log, not on the
+// condition, and the tuple carried here is one arbitrary sample of it. That is
+// why only genuine anomalies belong on this path: a by-design steady state is
+// counted per packet and summarised by reportDatapathPassthroughSummary
+// instead. The per-packet counters in bpf_stats_map remain the authoritative
+// count either way.
 func reportDatapathAnomaly(c *ControlPlane, ev *daeEvent, msg string) {
 	if c == nil || c.log == nil {
 		return

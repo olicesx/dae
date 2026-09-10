@@ -586,8 +586,14 @@ struct dae_event_rate {
 	__u32 redirect_rebind_key;      // ... DAE_EVENT_REDIRECT_REBIND_REJECTED
 	__u32 overflow_key;             // ... the conn-state/map overflow events
 	__u32 syn_rebind_key;           // ... DAE_EVENT_SYN_REBIND_REJECTED
-	__u32 stateless_tcp_key;        // ... DAE_EVENT_STATELESS_TCP_PASSTHROUGH
-	__u32 frag_tail_key;            // ... DAE_EVENT_FRAG_TAIL_PASSED
+	// stateless_tcp_key and frag_tail_key are reserved: the two event types
+	// they throttled (6 and 7) are no longer emitted, because a by-design
+	// passthrough must not warn per event. They stay in place so the .rodata
+	// layout, the ARRAY capacity derived from the highest key, and the
+	// userspace mirror (eventRateSpec in control/event_rate_contract.go) stay
+	// byte-identical.
+	__u32 stateless_tcp_key;        // reserved: DAE_EVENT_RESERVED_* (6)
+	__u32 frag_tail_key;            // reserved: DAE_EVENT_RESERVED_* (7)
 	// Explicit padding: the Go mirror is written with packed binary encoding,
 	// so the C layout must not carry implicit alignment holes either.
 	__u32 padding[2];
@@ -635,10 +641,19 @@ enum dae_event_type {
 	DAE_EVENT_REDIRECT_REBIND_REJECTED = 4,
 	// A pure SYN was refused rewrite of an ACTIVE flow's routing (P3-14).
 	DAE_EVENT_SYN_REBIND_REJECTED = 5,
-	// Established TCP forwarded without a cached routing decision (P2-30).
-	DAE_EVENT_STATELESS_TCP_PASSTHROUGH = 6,
-	// Non-initial fragment forwarded without routing (P2-8).
-	DAE_EVENT_FRAG_TAIL_PASSED = 7,
+	// Reserved, never emitted (P2-30): established TCP forwarded without a
+	// cached routing decision is the normal state of every pre-existing flow
+	// after a restart, so it is counted per packet
+	// (BPF_STATS_STATELESS_TCP_PASSTHROUGH) and summarised by userspace on the
+	// health tick instead of warning per event. The number stays reserved so
+	// the remaining types keep their wire values.
+	DAE_EVENT_RESERVED_STATELESS_TCP_PASSTHROUGH = 6,
+	// Reserved, never emitted (P2-8): forwarding a non-initial fragment is the
+	// intended policy and it is counted per packet
+	// (BPF_STATS_FRAG_TAIL_PASSED). The tuple such an event could carry has no
+	// L4 header to read either: the parser returns before L4 parsing
+	// (parse_transport_fast), so its ports are scratch values, not wire data.
+	DAE_EVENT_RESERVED_FRAG_TAIL_PASSED = 7,
 	// redirect_track could not store a reply binding (P2-29). The matching
 	// bpf_stats_map key separates "map full" from "update failed".
 	DAE_EVENT_REDIRECT_UPDATE_FAILED = 8,
@@ -808,6 +823,15 @@ send_blocked_event(__u8 outbound, __u8 l4proto, const __u32 *sip,
 // reserved rate key. The bpf_stats_map counter for the same condition always
 // advances per occurrence; this call only bounds the ringbuf cost of a flood.
 // key may be NULL when the packet was never classified (e.g. a non-IP frame).
+//
+// The rate key is per event type, not per flow: every flow of the type shares
+// one 1s budget, so this bounds the emission rate but says nothing about how
+// many flows are affected, and the tuple it reports is one arbitrary sample.
+// Only use it for a genuine anomaly. A path that is the normal steady state
+// (established TCP without cached routing after a restart, a forwarded
+// fragment tail) must count per packet with bump_stat() instead and let
+// userspace summarise the counter's interval delta, or the log carries one
+// warning per second for as long as the state lasts.
 static __always_inline void
 send_anomaly_event(__u32 rate_key, __u32 type, __u8 l4proto,
 		   const struct tuples_key *key)
@@ -970,12 +994,19 @@ tcp_listener_l4proto(const struct tcphdr *tcph)
 // fragments or non-TCP/UDP traffic is a policy decision tracked apart from
 // this visibility work.
 static __always_inline void
-report_parse_passthrough(int ret, __u8 l4proto, const struct tuples_key *key)
+report_parse_passthrough(int ret)
 {
 	if (ret == PARSE_FRAGMENT) {
+		/* Forwarding a non-initial fragment is the intended policy,
+		 * not an anomaly: only the counter is advanced here. The
+		 * per-event warning this used to emit shared one 1s budget
+		 * across every fragmenting flow in the datapath, so a
+		 * steadily fragmenting path logged one line per second
+		 * forever, while the tuple it carried said nothing the
+		 * operator could act on. Userspace reports the counter's
+		 * interval delta instead (see reportDatapathPassthroughSummary
+		 * in control/control_plane.go). */
 		bump_stat(BPF_STATS_FRAG_TAIL_PASSED);
-		send_anomaly_event(EVENT_RATE.frag_tail_key,
-				   DAE_EVENT_FRAG_TAIL_PASSED, l4proto, key);
 	} else if (ret == PARSE_UNSUPPORTED_L4) {
 		bump_stat(BPF_STATS_PARSE_UNSUPPORTED_L4);
 	}
@@ -2643,7 +2674,7 @@ static __noinline int do_tproxy_lan_egress(struct __sk_buff *skb, __u32 link_h_l
 			bpf_printk("parse_transport error: %d, dropping", ret);
 			return TC_ACT_SHOT;
 		}
-		report_parse_passthrough(ret, ctx->l4proto, NULL);
+		report_parse_passthrough(ret);
 		return TC_ACT_OK;
 	}
 
@@ -2764,15 +2795,17 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 					  NULL, NULL, NULL, NULL,
 					  0, NULL, 0,
 					  ROUTING_EPOCH_SLOT_UNKNOWN);
-		// No cached state for an established packet: keep the historical
-		// passthrough behavior instead of recomputing routing, but make it
-		// visible (P2-30): this is what every pre-existing TCP flow does
-		// after a restart, and it silently bypasses routing today.
+		/* No cached state for an established packet: keep the historical
+		 * passthrough behavior instead of recomputing routing, and count
+		 * it (P2-30) without warning per event. This is what every
+		 * pre-existing TCP flow does after a restart, and it silently
+		 * bypasses routing today: a steady state must not log one line
+		 * per second, so the counter is the per-packet record and
+		 * userspace reports its interval delta
+		 * (reportDatapathPassthroughSummary in control/control_plane.go).
+		 */
 		if (!tcp_state) {
 			bump_stat(BPF_STATS_STATELESS_TCP_PASSTHROUGH);
-			send_anomaly_event(EVENT_RATE.stateless_tcp_key,
-					   DAE_EVENT_STATELESS_TCP_PASSTHROUGH,
-					   pkt->l4proto, &pkt->tuples.five);
 			return TC_ACT_OK;
 		}
 
@@ -3043,7 +3076,7 @@ static __noinline int do_tproxy_lan_ingress(struct __sk_buff *skb, __u32 link_h_
 			bpf_printk("parse_transport error: %d, dropping", ret);
 			return TC_ACT_SHOT;
 		}
-		report_parse_passthrough(ret, pkt->l4proto, &pkt->tuples.five);
+		report_parse_passthrough(ret);
 		return TC_ACT_OK;
 	}
 
@@ -3165,7 +3198,7 @@ static __noinline int do_tproxy_wan_ingress(struct __sk_buff *skb, __u32 link_h_
 			bpf_printk("parse_transport error: %d, dropping", ret);
 			return TC_ACT_SHOT;
 		}
-		report_parse_passthrough(ret, pkt->l4proto, &pkt->tuples.five);
+		report_parse_passthrough(ret);
 		return TC_ACT_OK;
 	}
 
@@ -3207,7 +3240,7 @@ do_tproxy_wan_lan_ingress(struct __sk_buff *skb, __u32 link_h_len)
 				   ret);
 			return TC_ACT_SHOT;
 		}
-		report_parse_passthrough(ret, pkt->l4proto, &pkt->tuples.five);
+		report_parse_passthrough(ret);
 		/* The wan_ingress role used to consume the packet first and
 		 * return TC_ACT_OK for an unclassifiable frame, which made the
 		 * dual-role hook stop before the lan_ingress role. Preserve
@@ -3388,11 +3421,10 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 			/* No conn state for an established TCP packet: this is
 			 * what every pre-existing flow does after a restart, and
 			 * it silently bypasses routing (P2-30). Keep the
-			 * historical passthrough but make it visible. */
+			 * historical passthrough and count it; no per-event
+			 * warning, for the same reason as the LAN-ingress twin
+			 * above. */
 			bump_stat(BPF_STATS_STATELESS_TCP_PASSTHROUGH);
-			send_anomaly_event(EVENT_RATE.stateless_tcp_key,
-					   DAE_EVENT_STATELESS_TCP_PASSTHROUGH,
-					   tuples->five.l4proto, &tuples->five);
 			return DAE_TC_CONTINUE;
 		}
 		if (!tcp_conn->meta.data.has_routing)
@@ -3622,7 +3654,7 @@ static __noinline int do_tproxy_wan_egress(struct __sk_buff *skb, __u32 link_h_l
 			bpf_printk("wan_egress parse error: %d, dropping", ret);
 			return TC_ACT_SHOT;
 		}
-		report_parse_passthrough(ret, pkt->l4proto, &pkt->tuples.five);
+		report_parse_passthrough(ret);
 		return DAE_TC_CONTINUE;
 	}
 

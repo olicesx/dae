@@ -38,6 +38,9 @@ var (
 	// captures the body of "enum bpf_stats_key { ... }".
 	bpfStatsEnumPattern = regexp.MustCompile(`enum\s+bpf_stats_key\s*\{([^}]*)\}`)
 
+	// captures the body of "enum dae_event_type { ... }".
+	daeEventTypeEnumPattern = regexp.MustCompile(`enum\s+dae_event_type\s*\{([^}]*)\}`)
+
 	// captures "NAME = <n>" entries inside an enum body. Anchored at the start
 	// of a line so the comment lines ("// key=0: ...") of the C enum do not
 	// count as entries.
@@ -209,6 +212,60 @@ func TestEventRateFallbackConstantsMatchGoOwner(t *testing.T) {
 	}
 	if stale != redirectRebindStaleNs {
 		t.Fatalf("C fallback REDIRECT_REBIND_STALE_NS_FALLBACK=%d diverges from the Go-owned redirectRebindStaleNs=%d", stale, redirectRebindStaleNs)
+	}
+}
+
+// TestDaeEventTypeNumbersMatchKernelSource pins the ringbuf event numbering
+// against the Go iota table in event_ringbuf.go. The numbers are a wire
+// contract: the kernel writes the type into the record and userspace decodes it
+// without any other discriminator, so an inserted or removed entry on either
+// side silently turns one event into another. Two of the entries are reserved
+// (established TCP without cached routing, forwarded fragment tails) because
+// they are counted and summarised instead of emitted; this test is what keeps
+// them reserved and keeps the emitted types on their historical numbers.
+func TestDaeEventTypeNumbersMatchKernelSource(t *testing.T) {
+	m := daeEventTypeEnumPattern.FindStringSubmatch(tproxySource)
+	if m == nil {
+		t.Fatal("enum dae_event_type not found in kern/tproxy.c")
+	}
+	cTypes := map[string]uint32{}
+	for _, em := range enumEntryPattern.FindAllStringSubmatch(m[1], -1) {
+		value, err := strconv.ParseUint(em[2], 10, 32)
+		if err != nil {
+			t.Fatalf("parse enum entry %s: %v", em[0], err)
+		}
+		cTypes[em[1]] = uint32(value)
+	}
+
+	contract := []struct {
+		cName  string
+		goType uint32
+	}{
+		{"DAE_EVENT_BLOCKED", daeEventBlocked},
+		{"DAE_EVENT_UDP_CONN_OVERFLOW", daeEventUdpConnOverflow},
+		{"DAE_EVENT_TCP_CONN_OVERFLOW", daeEventTcpConnOverflow},
+		{"DAE_EVENT_BLOCKED_ALIVE", daeEventBlockedAlive},
+		{"DAE_EVENT_REDIRECT_REBIND_REJECTED", daeEventRedirectRebindRejected},
+		{"DAE_EVENT_SYN_REBIND_REJECTED", daeEventSynRebindRejected},
+		{"DAE_EVENT_RESERVED_STATELESS_TCP_PASSTHROUGH", daeEventReservedStatelessTcpPassthrough},
+		{"DAE_EVENT_RESERVED_FRAG_TAIL_PASSED", daeEventReservedFragTailPassed},
+		{"DAE_EVENT_REDIRECT_UPDATE_FAILED", daeEventRedirectUpdateFailed},
+		{"DAE_EVENT_SYN_REBIND_REROUTED", daeEventSynRebindRerouted},
+	}
+	for _, entry := range contract {
+		value, ok := cTypes[entry.cName]
+		if !ok {
+			t.Errorf("enum dae_event_type has no %s entry", entry.cName)
+			continue
+		}
+		if value != entry.goType {
+			t.Errorf("event type %s = %d in C but %d in Go; the ringbuf consumer would decode it as another event",
+				entry.cName, value, entry.goType)
+		}
+	}
+	if len(cTypes) != len(contract) {
+		t.Errorf("enum dae_event_type declares %d entries but Go mirrors %d; every emitted type needs a Go-side decoder (or the enum has a stale entry)",
+			len(cTypes), len(contract))
 	}
 }
 

@@ -94,6 +94,12 @@ type ControlPlane struct {
 	// control/datapath_overflow_report.go.
 	datapathOverflowReport controlPlaneDatapathOverflowReport
 
+	// Datapath passthrough report state, on the same terms and the same tick:
+	// the two by-design passthrough counters are not part of the report above,
+	// because they are normal rather than resource exhaustion. See
+	// control/datapath_passthrough_report.go.
+	datapathPassthroughReport controlPlaneDatapathPassthroughReport
+
 	wanInterface []string
 	lanInterface []string
 
@@ -1859,6 +1865,10 @@ func (c *ControlPlane) checkBpfMapHealth(udpOverflow, tcpOverflow uint64) {
 	if snapshotErr != nil {
 		c.log.Warnf("checkBpfMapHealth: %v", snapshotErr)
 	}
+
+	// The by-design passthrough counters are published from this same snapshot
+	// on the same tick; see control/datapath_passthrough_report.go.
+	c.reportDatapathPassthroughSummary(now, snap)
 
 	// The conn-state capacity is the operator's lever on an overflowing
 	// conn-state map, so it is carried into the report rather than read by it.

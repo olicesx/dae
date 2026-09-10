@@ -3182,21 +3182,64 @@ int test_ab_redirect_reply_refresh_publisher(struct __sk_buff *skb)
 	return 0;
 }
 
+/* Number of packets the stateless-passthrough and fragment-tail bursts below
+ * push through the datapath. Large enough that an unthrottled per-event
+ * emission could not hide behind the 1s rate window of a single emission. */
+#define AB_PASSTHROUGH_BURST_PACKETS 8
+
+/* Clears a reserved event rate slot and proves it stays clear afterwards.
+ * The slot is the only witness a userspace consumer would ever see: an
+ * emission must first claim it through blocked_event_rate_limited(), which
+ * overwrites it with the current monotonic time. A slot written to zero is
+ * always outside the 1s window on a host that has been up for more than a
+ * second, so a single emission would leave a non-zero timestamp behind. */
+static __always_inline bool ab_rate_slot_armed_at_zero(__u32 key)
+{
+	__u64 zero = 0;
+
+	if (bpf_map_update_elem(&alive_block_rate_map, &key, &zero, BPF_ANY))
+		return false;
+	return true;
+}
+
+static __always_inline bool ab_rate_slot_is_untouched(__u32 key)
+{
+	__u64 *slot = bpf_map_lookup_elem(&alive_block_rate_map, &key);
+
+	return slot && *slot == 0;
+}
+
 /* P2-30: an established TCP packet with no cached routing is forwarded (policy
- * unchanged) and now counted. */
+ * unchanged) and counted per packet. A burst of packets must therefore count
+ * exactly one per packet and emit no event at all: the event this path used to
+ * emit shared one 1s budget across every affected flow, so the normal steady
+ * state (what every pre-existing flow does after a restart) produced one
+ * warning per second for as long as the flows lived. Its upper bound is 0. */
 SEC("tc/ab_test/stateless_tcp_passthrough")
 int test_ab_stateless_tcp_passthrough(struct __sk_buff *skb)
 {
+	__u32 key = EVENT_RATE.stateless_tcp_key;
 	__u64 before;
+	int i;
 
-	if (ab_build_ipv4_tcp(skb, IPV4(192, 168, 1, 1), IPV4(5, 5, 5, 5),
-			      33333, 443, 5, TCPH_ACK, 0))
+	if (!ab_rate_slot_armed_at_zero(key))
 		return 1;
+
 	before = ab_read_stat(BPF_STATS_STATELESS_TCP_PASSTHROUGH);
-	if (do_tproxy_lan_ingress(skb, ETH_HLEN) != TC_ACT_OK)
-		return 2;
-	if (ab_read_stat(BPF_STATS_STATELESS_TCP_PASSTHROUGH) != before + 1)
-		return 3;
+	for (i = 0; i < AB_PASSTHROUGH_BURST_PACKETS; i++) {
+		if (ab_build_ipv4_tcp(skb, IPV4(192, 168, 1, 1),
+				      IPV4(5, 5, 5, 5), 33333, 443, 5, TCPH_ACK, 0))
+			return 2;
+		if (do_tproxy_lan_ingress(skb, ETH_HLEN) != TC_ACT_OK)
+			return 3;
+	}
+	/* Counter exactness: one increment per packet, no more and no less. */
+	if (ab_read_stat(BPF_STATS_STATELESS_TCP_PASSTHROUGH) !=
+	    before + AB_PASSTHROUGH_BURST_PACKETS)
+		return 4;
+	/* The event bound is zero: no packet of the burst emitted anything. */
+	if (!ab_rate_slot_is_untouched(key))
+		return 5;
 	return 0;
 }
 
@@ -3250,21 +3293,34 @@ int test_ab_unsolicited_udp_wan_ingress(struct __sk_buff *skb)
 	return 0;
 }
 
-/* P2-8: a non-initial fragment is still forwarded, and now counted. */
+/* P2-8: a non-initial fragment is still forwarded and counted per packet, with
+ * no per-event emission: forwarding it is the intended policy, and the tuple
+ * such an event could carry has no L4 header to read (the parser returns
+ * before L4 parsing), so it reported scratch ports rather than wire data. */
 SEC("tc/ab_test/frag_tail_passthrough")
 int test_ab_frag_tail_passthrough(struct __sk_buff *skb)
 {
+	__u32 key = EVENT_RATE.frag_tail_key;
 	__u64 before;
+	int i;
 
-	/* Fragment offset 1 (8 bytes): non-initial. */
-	if (ab_build_ipv4_udp(skb, IPV4(192, 168, 2, 1), IPV4(9, 9, 9, 9),
-			      34567, 4500, 1))
+	if (!ab_rate_slot_armed_at_zero(key))
 		return 1;
+
 	before = ab_read_stat(BPF_STATS_FRAG_TAIL_PASSED);
-	if (do_tproxy_lan_ingress(skb, ETH_HLEN) != TC_ACT_OK)
-		return 2;
-	if (ab_read_stat(BPF_STATS_FRAG_TAIL_PASSED) != before + 1)
-		return 3;
+	for (i = 0; i < AB_PASSTHROUGH_BURST_PACKETS; i++) {
+		/* Fragment offset 1 (8 bytes): non-initial. */
+		if (ab_build_ipv4_udp(skb, IPV4(192, 168, 2, 1),
+				      IPV4(9, 9, 9, 9), 34567, 4500, 1))
+			return 2;
+		if (do_tproxy_lan_ingress(skb, ETH_HLEN) != TC_ACT_OK)
+			return 3;
+	}
+	if (ab_read_stat(BPF_STATS_FRAG_TAIL_PASSED) !=
+	    before + AB_PASSTHROUGH_BURST_PACKETS)
+		return 4;
+	if (!ab_rate_slot_is_untouched(key))
+		return 5;
 	return 0;
 }
 

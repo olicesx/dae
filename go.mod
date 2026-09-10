@@ -7,14 +7,14 @@ require (
 	github.com/antlr/antlr4/runtime/Go/antlr/v4 v4.0.0-20230305170008-8188dc5388df
 	github.com/cilium/ebpf v0.22.0
 	github.com/daeuniverse/dae-config-dist/go/dae_config v0.0.0-20230604120805-1c27619b592d
-	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260909102757-319c8e694f48
+	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20260910085120-b9d2ec323791
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/json-iterator/go v1.1.12
 	github.com/mholt/archives v0.1.5
 	github.com/miekg/dns v1.1.72
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
 	github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac
-	github.com/olicesx/quic-go v0.0.0-20260907084439-1f471a6b94bd
+	github.com/olicesx/quic-go v0.0.0-20260910085030-57ab883ec249
 	github.com/panjf2000/ants/v2 v2.11.5
 	github.com/safchain/ethtool v0.7.0
 	github.com/shirou/gopsutil/v4 v4.26.1
@@ -62,7 +62,7 @@ require (
 	github.com/minio/minlz v1.0.1 // indirect
 	github.com/nwaples/rardecode/v2 v2.2.0 // indirect
 	github.com/oklog/ulid/v2 v2.1.1 // indirect
-	github.com/olicesx/qpack v0.0.0-20260831031549-0844ed36f1cd // indirect
+	github.com/olicesx/qpack v0.6.1-0.20260910082543-032163e75837 // indirect
 	github.com/onsi/ginkgo/v2 v2.28.1 // indirect
 	github.com/pierrec/lz4/v4 v4.1.25 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
@@ -115,7 +115,7 @@ require (
 // control, and explicit-transport address behavior. Performance and security
 // claims are enforced in the fork's own unit/race gates; no GC behavior is
 // inferred from pool implementation choice here.
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260907084439-1f471a6b94bd
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260910085030-57ab883ec249
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
@@ -126,4 +126,4 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260907
 // remote-FIN data preservation, gRPC zero-deadline clearing, and
 // chain-constructed dialer ownership. Includes cancellable dial queues,
 // immediate TUIC retirement signals, and explicit write-deadline behavior.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260909112349-ac339275a7ad
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260910085120-b9d2ec323791

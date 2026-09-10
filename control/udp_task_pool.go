@@ -78,13 +78,69 @@ type UdpTaskQueue struct {
 	refs atomic.Int32
 
 	// 1-byte fields
-	overflowLen  atomic.Int32 // track overflow length for lock-free idle check
+	overflowLen atomic.Int32 // track overflow length for lock-free idle check
+	closed      bool         // guarded by enqueueMu
+	chReturned  atomic.Bool  // guards queueChPool.Put against defensive double cleanup
+
+	// Producer-side tier choice: set when a channel send observed the channel
+	// full, cleared by popOverflowTask once overflow drains. The flag and the
+	// tier writes it orders are both made under enqueueMu, so the convoy never
+	// sees a channel task that is newer than a queued overflow task.
 	overflowMode bool
-	closed       bool        // guarded by enqueueMu
-	chReturned   atomic.Bool // guards queueChPool.Put against defensive double cleanup
 
 	key UdpFlowKey
 }
+
+// udpTaskQueueTrace and udpTaskTraceEvent belong to the ordering diagnostic
+// (udp_task_pool_order_diag_test.go). The production type only carries the
+// attachment point.
+type udpTaskQueueTrace struct {
+	// The ring is written without a lock: its slots are claimed by an atomic
+	// ordinal, and the diagnostic reads it after the pool has quiesced. A lock
+	// (or an append under one) would change the very timing under study.
+	written atomic.Uint64
+	ring    [udpTaskTraceCap]udpTaskTraceEvent
+}
+
+type udpTaskTraceEvent struct {
+	ord          int
+	op           string
+	seq          int
+	chLen        int
+	ovfLen       int
+	overflowMode bool
+	poppedFromCh bool
+}
+
+func (tr *udpTaskQueueTrace) record(e udpTaskTraceEvent) {
+	n := tr.written.Add(1)
+	if n > udpTaskTraceCap {
+		return
+	}
+	e.ord = int(n)
+	tr.ring[(n-1)%udpTaskTraceCap] = e
+}
+
+// snapshot returns the recorded events in ordinal order.
+func (tr *udpTaskQueueTrace) snapshot() []udpTaskTraceEvent {
+	written := tr.written.Load()
+	n := written
+	if n > udpTaskTraceCap {
+		n = udpTaskTraceCap
+	}
+	out := make([]udpTaskTraceEvent, 0, n)
+	start := written - n
+	for i := start; i < written; i++ {
+		e := tr.ring[i%udpTaskTraceCap]
+		if e.ord == int(i)+1 {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// udpTaskTraceCap bounds the lock-free event ring the diagnostic reads.
+const udpTaskTraceCap = 4096
 
 func (q *UdpTaskQueue) notifyWake() {
 	select {
@@ -93,6 +149,22 @@ func (q *UdpTaskQueue) notifyWake() {
 	}
 }
 
+// enqueue keeps accepted work FIFO across the channel-to-overflow transition.
+//
+// The queue has two storage tiers and one consumer. The channel holds the
+// older tasks and overflow the newer ones, so popReadyTask drains the channel
+// first. That ordering only holds if the producer's tier decision is atomic
+// with respect to the dequeue: a channel send that succeeds *after* an earlier
+// task was appended to overflow publishes a newer task into the older tier,
+// and the convoy then runs it before the overflow task - precisely the
+// out-of-order execution issue #8 reports.
+//
+// enqueueMu is therefore held across the tier decision *and* the tier write.
+// The channel send cannot block while it is held: the channel is only reached
+// when overflowMode is false, and overflowMode is only set when that send was
+// observed full, so the channel has room. Overflow bookkeeping stays under the
+// same lock, which makes "task is in overflow" and "task is in the channel"
+// mutually ordered rather than interleaved.
 func (q *UdpTaskQueue) enqueue(task UdpTask) bool {
 	q.enqueueMu.Lock()
 	defer q.enqueueMu.Unlock()
@@ -100,34 +172,102 @@ func (q *UdpTaskQueue) enqueue(task UdpTask) bool {
 	if q.closed {
 		return false
 	}
+	if tr := q.p.traceOf(); tr != nil {
+		if v, ok := task.(udpTaskTraceSeq); ok {
+			tr.record(udpTaskTraceEvent{
+				op: "enq-pre", seq: v.traceSeq(), chLen: len(q.ch),
+				ovfLen: len(q.overflow), overflowMode: q.overflowMode,
+			})
+		}
+	}
+	// overflowMode means the channel was full at the last send attempt and is
+	// drained before overflow, so new work belongs to overflow until the
+	// channel empties again (popOverflowTask clears the flag).
 	if q.overflowMode {
 		if len(q.overflow) >= UdpTaskQueueMaxOverflow {
 			return false
 		}
 		q.overflow = append(q.overflow, task)
 		q.overflowLen.Store(int32(len(q.overflow)))
+		q.traceRecord("enq-ovf", task, len(q.ch), len(q.overflow), true)
 		q.notifyWake()
 		return true
 	}
 
+	// Same ordering contract without blocking producers: the transition to
+	// overflow appends the task that did not fit and keeps it FIFO. UDP
+	// overload drops the newest task once the bounded overflow tier is full.
 	select {
 	case q.ch <- task:
+		q.traceRecord("enq-ch", task, len(q.ch), len(q.overflow), false)
 		return true
 	default:
-		// Keep accepted work FIFO without blocking producers. UDP overload
-		// drops the newest task once the bounded overflow tier is full.
 		q.overflowMode = true
 		q.overflow = append(q.overflow, task)
 		q.overflowLen.Store(1)
+		q.traceRecord("enq-ovf", task, len(q.ch), len(q.overflow), true)
 		q.notifyWake()
 		return true
 	}
 }
 
+// udpTaskTraceSeq is implemented by tasks that carry their submission index so
+// the ordering diagnostic can line the pool's tier timeline up with the
+// execution order it observes. Production tasks do not implement it.
+type udpTaskTraceSeq interface {
+	traceSeq() int
+}
+
+// traceRecord appends one enqueue event to the queue's attached trace. It is a
+// no-op unless a diagnostic attached one.
+func (q *UdpTaskQueue) traceRecord(op string, task UdpTask, chLen, ovfLen int, overflowMode bool) {
+	tr := q.p.traceOf()
+	if tr == nil {
+		return
+	}
+	seq := -1
+	if v, ok := task.(udpTaskTraceSeq); ok {
+		seq = v.traceSeq()
+	}
+	tr.record(udpTaskTraceEvent{
+		op: op, seq: seq, chLen: chLen, ovfLen: ovfLen, overflowMode: overflowMode,
+	})
+}
+
+// tracePop records one pop event with the tier it was served from.
+func (q *UdpTaskQueue) tracePop(op string, task UdpTask, chLen, ovfLen int) {
+	tr := q.p.traceOf()
+	if tr == nil {
+		return
+	}
+	seq := -1
+	if v, ok := task.(udpTaskTraceSeq); ok {
+		seq = v.traceSeq()
+	}
+	// overflowMode is deliberately not read here: the convoy does not hold
+	// enqueueMu, so reading the producer-owned flag would itself be a race.
+	// The enqueue events already carry it.
+	tr.record(udpTaskTraceEvent{
+		op: op, seq: seq, chLen: chLen, ovfLen: ovfLen,
+		poppedFromCh: op == "pop-ch",
+	})
+}
+
+// traceOf returns the diagnostic trace attached to the pool, if any.
+func (p *UdpTaskPool) traceOf() *udpTaskQueueTrace {
+	return p.trace.Load()
+}
+
+// popOverflowTask pops the oldest overflow task. It takes enqueueMu itself;
+// callers that already hold it (popReadyTask) use popOverflowTaskLocked.
 func (q *UdpTaskQueue) popOverflowTask() (UdpTask, bool) {
 	q.enqueueMu.Lock()
 	defer q.enqueueMu.Unlock()
+	return q.popOverflowTaskLocked()
+}
 
+// popOverflowTaskLocked is popOverflowTask with enqueueMu already held.
+func (q *UdpTaskQueue) popOverflowTaskLocked() (UdpTask, bool) {
 	if len(q.overflow) == 0 {
 		q.overflowMode = false
 		return nil, false
@@ -156,13 +296,31 @@ func (q *UdpTaskQueue) popOverflowTask() (UdpTask, bool) {
 	return task, true
 }
 
+// popReadyTask returns the oldest queued task: the channel first, then
+// overflow.
+//
+// The tier choice is made under enqueueMu, the same lock the producer holds
+// across its send and its overflow append. Without that, the two sides race:
+// the producer can observe a full channel, decide to overflow, and a dequeue
+// running in between sees an empty channel and serves overflow - handing the
+// convoy a task that is newer than the ones the producer is about to publish
+// into the channel. Serializing the choice with the publication is what makes
+// "channel is older than overflow" true at every instant (issue #8).
 func (q *UdpTaskQueue) popReadyTask() (UdpTask, bool) {
+	q.enqueueMu.Lock()
+	defer q.enqueueMu.Unlock()
+
 	select {
 	case task := <-q.ch:
+		q.tracePop("pop-ch", task, len(q.ch), len(q.overflow))
 		return task, true
 	default:
 	}
-	return q.popOverflowTask()
+	if task, ok := q.popOverflowTaskLocked(); ok {
+		q.tracePop("pop-ovf", task, len(q.ch), len(q.overflow))
+		return task, true
+	}
+	return nil, false
 }
 
 // drainAndRelease empties any tasks still queued before the channel returns
@@ -305,6 +463,8 @@ type UdpTaskPool struct {
 	convoys     sync.WaitGroup
 	closed      atomic.Bool
 	dropped     atomic.Uint64
+	// trace is attached by the ordering diagnostic only; nil in production.
+	trace atomic.Pointer[udpTaskQueueTrace]
 }
 
 func NewUdpTaskPool() *UdpTaskPool {

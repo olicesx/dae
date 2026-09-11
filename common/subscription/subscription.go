@@ -190,24 +190,39 @@ func ResolveSubscription(log *logrus.Logger, client *http.Client, configDir stri
 	resp, err = client.Do(req)
 	if err != nil {
 		if persistToFile {
-			log.Warnln("failed to fetch subscription, try to read from file")
-			u.Host = "persist.d/" + tag + ".sub"
-			u.Path = ""
-			b, err = ResolveFile(u, configDir)
-
-			if err != nil {
-				return "", nil, err
-			}
-			goto resolve
+			goto fallback
 		}
 
 		return "", nil, err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		statusErr := fmt.Errorf("subscription request failed with status %s", resp.Status)
+		_ = resp.Body.Close()
+		if persistToFile {
+			err = statusErr
+			goto fallback
+		}
+		return "", nil, statusErr
 	}
 	defer func() { _ = resp.Body.Close() }()
 	b, err = io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024)) // 10MB max subscription size
 	if err != nil {
 		return "", nil, err
 	}
+	goto resolve
+
+fallback:
+	if persistToFile {
+		log.Warnln("failed to fetch subscription, try to read from file")
+		u.Host = "persist.d/" + tag + ".sub"
+		u.Path = ""
+		b, err = ResolveFile(u, configDir)
+		if err != nil {
+			return "", nil, err
+		}
+		goto resolve
+	}
+	return "", nil, err
 
 resolve:
 	// Resolve nodes BEFORE touching the persisted cache. A subscription server

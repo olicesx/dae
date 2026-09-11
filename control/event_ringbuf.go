@@ -165,7 +165,7 @@ func (r *bpfMaintenanceRuntime) readEvents() {
 		case daeEventSynRebindRejected:
 			reportDatapathAnomaly(target, &ev, "pure SYN refused rewrite of a live flow's routing metadata")
 		case daeEventSynRebindRerouted:
-			reportDatapathAnomaly(target, &ev, "pure SYN moved a live flow that outlived a rules change onto the current routing epoch")
+			reportDatapathFlowEvent(target, &ev, "pure SYN moved a live flow that outlived a rules change onto the current routing epoch")
 		case daeEventReservedStatelessTcpPassthrough, daeEventReservedFragTailPassed:
 			// Both types are reserved and never emitted; see the type table
 			// above. The matching bpf_stats_map counters reach the operator
@@ -203,10 +203,28 @@ func (r *bpfMaintenanceRuntime) readEvents() {
 // instead. The per-packet counters in bpf_stats_map remain the authoritative
 // count either way.
 func reportDatapathAnomaly(c *ControlPlane, ev *daeEvent, msg string) {
+	reportDatapathEventAt(c, logrus.WarnLevel, ev, msg)
+}
+
+// reportDatapathFlowEvent logs a per-flow datapath decision that is by
+// design rather than an anomaly — the live flow whose next pure SYN adopts
+// the current routing epoch after a staged reload handoff. Under the
+// grading rule (per-flow or per-connection decisions are debug-level) it
+// carries the same tuple at debug level; the bpf_stats_map counter
+// BPF_STATS_REBIND_REROUTED_AFTER_EPOCH_CHANGE remains the authoritative
+// count, and the health tick can surface it to operators regardless of
+// log level.
+func reportDatapathFlowEvent(c *ControlPlane, ev *daeEvent, msg string) {
+	reportDatapathEventAt(c, logrus.DebugLevel, ev, msg)
+}
+
+// reportDatapathEventAt is the shared formatter for kernel datapath event
+// reports; level is the only thing the two outlets disagree on.
+func reportDatapathEventAt(c *ControlPlane, level logrus.Level, ev *daeEvent, msg string) {
 	if c == nil || c.log == nil {
 		return
 	}
-	c.log.Warnf("datapath anomaly: %s (type=%d pid=%d outbound=%d l4proto=%d %s:%d > %s:%d)",
+	c.log.Logf(level, "datapath anomaly: %s (type=%d pid=%d outbound=%d l4proto=%d %s:%d > %s:%d)",
 		msg, ev.Type, ev.Pid, ev.Outbound, ev.L4proto,
 		netIPString(ev.Sip), netPortString(ev.Sport),
 		netIPString(ev.Dip), netPortString(ev.Dport))

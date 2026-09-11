@@ -24,10 +24,12 @@ import (
 // its paced lines without losing the packets that arrived in between.
 
 // passthroughReportLogger returns a logger writing parseable lines into buf.
+// The level is Debug: the summary is a by-design steady-state report and logs
+// at debug level, so the assertions below must observe debug output.
 func passthroughReportLogger(buf *bytes.Buffer) *logrus.Logger {
 	log := logrus.New()
 	log.SetOutput(buf)
-	log.SetLevel(logrus.InfoLevel)
+	log.SetLevel(logrus.DebugLevel)
 	log.SetFormatter(&logrus.TextFormatter{DisableColors: true, DisableTimestamp: true})
 	return log
 }
@@ -104,7 +106,7 @@ func TestDatapathPassthroughReportCarriesTheIntervalMagnitude(t *testing.T) {
 	})
 	first := buf.String()
 	for _, want := range []string{
-		"level=warning",
+		"level=debug",
 		"stateless_tcp_passthrough=1000",
 		"frag_tail_passed=0",
 		"stateless_tcp_passthrough_total=1000",

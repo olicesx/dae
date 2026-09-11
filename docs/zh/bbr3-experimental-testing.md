@@ -32,7 +32,7 @@ make dae
 ```
 
 该分支把 `go.mod` 的 outbound 钉到 fork 的 `feat/bbr3-experimental`
-（`v0.0.0-sticky-ip.0.20260909101419-8ef1d1b9d0a6`）。若你的环境走代理拉不到该提交：
+（`v0.0.0-sticky-ip.0.20260909101419-b2c4e6d561c6`）。若你的环境走代理拉不到该提交：
 
 ```bash
 GOPROXY=direct GOPRIVATE='github.com/olicesx/*' go mod download github.com/olicesx/outbound
@@ -102,8 +102,8 @@ tuic://...?congestion_control=bbr&cc_override=bbr
 **② 代码级**：特性已合入基线分支 `kdae`（以合并提交形式），所以回退就是撤销合并：
 
 ```bash
-# outbound：合并提交 319c8e6（基线 7a32a56 与特性分支 934b37c 的合并）
-cd <outbound 仓库> && git revert -m 1 319c8e6
+# outbound：合并提交 f8cd144（基线 2e9dc21 与特性分支 5568d1b 的合并）
+cd <outbound 仓库> && git revert -m 1 f8cd144
 
 # dae：合并提交用下面的命令查（本页提交时尚未生成）
 cd <dae 仓库> && git log --merges -1 --format='%h %s' kdae
@@ -116,8 +116,8 @@ git revert -m 1 <上面查到的 sha>   # 恢复 go.mod 旧钉法并移除本指
 **③ 产品级**：把 `go.mod` 的 outbound 钉回旧提交
 
 ```bash
-go mod edit -require github.com/daeuniverse/outbound@v0.0.0-sticky-ip.0.20260907140516-07427f11deb3
-go mod edit -replace github.com/daeuniverse/outbound=github.com/olicesx/outbound@v0.0.0-sticky-ip.0.20260907140516-07427f11deb3
+go mod edit -require github.com/daeuniverse/outbound@v0.0.0-sticky-ip.0.20260907140516-887df86296c0
+go mod edit -replace github.com/daeuniverse/outbound=github.com/olicesx/outbound@v0.0.0-sticky-ip.0.20260907140516-887df86296c0
 go mod tidy
 ```
 

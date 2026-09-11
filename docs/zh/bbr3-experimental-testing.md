@@ -89,7 +89,7 @@ level=debug msg="installing experimental bbr3 congestion controller" cc=bbr3 hin
 
 ## 4. 回退（三级，任选）
 
-**① 链接级（立即生效，无需重编译，首选）**
+**① 链接级**（立即生效，无需重编译，首选）
 
 ```text
 # 去掉 cc_override，回到服务端回显

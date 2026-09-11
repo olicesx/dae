@@ -158,7 +158,6 @@ docs/zh/README.md:115:15 MD009/no-trailing-spaces Trailing spaces [Expected: 0 o
 docs/zh/README.md:273 MD022/blanks-around-headings/blanks-around-headers Headings should be surrounded by blank lines [Expected: 1; Actual: 0; Below] [Context: "## PPPoE"]
 docs/zh/README.md:76 MD028/no-blanks-blockquote Blank line inside blockquote
 docs/zh/README.md:77:36 enhanced-proper-names Proper names should have the correct capitalization [Expected: Linux; Actual: linux]
-docs/zh/bbr3-experimental-testing.md:87 MD036/no-emphasis-as-heading/no-emphasis-as-header Emphasis used instead of a heading [Context: "① 链接级（立即生效，无需重编译，首选）"]
 docs/zh/configuration/dns.md:5 MD025/single-title/single-h1 Multiple top-level headings in the same document [Context: "# Schema"]
 docs/zh/tutorials/run-on-alpine.md:3:8 MD009/no-trailing-spaces Trailing spaces [Expected: 0 or 2; Actual: 1]
 docs/zh/tutorials/run-on-alpine.md:4 MD032/blanks-around-lists Lists should be surrounded by blank lines [Context: "1. Alpine Linux 3.18 或更新版本已完全支..."]

@@ -137,6 +137,14 @@ func (c *controlPlaneCore) logBindOutcome(ifname string, lan bool, err error) {
 // describes), with attempt counting restarted. The recorded failure count is
 // cleared with it: those failures belonged to the previous link, and carrying
 // them over would mislabel the new link's first attempt as a repeat.
+//
+// The entries are deleted rather than reset in place. bindEventState's fields
+// are exactly the three counters below, so an entry that has been reset and an
+// entry that is absent are the same state to bindStateFor, and deleting is what
+// keeps the map's size tied to the interfaces that currently exist instead of
+// to every interface name that has ever matched a lan/wan pattern in this
+// generation. A host that creates veth/bridge devices at runtime is normal for
+// dae, so "ever matched" is unbounded while "currently present" is not.
 func (c *controlPlaneCore) forgetBindState(ifname string) {
 	if c == nil {
 		return
@@ -144,13 +152,7 @@ func (c *controlPlaneCore) forgetBindState(ifname string) {
 	c.bindStateMu.Lock()
 	defer c.bindStateMu.Unlock()
 	for _, lan := range []bool{true, false} {
-		state := c.bindStates[bindEventKey{ifname: ifname, lan: lan}]
-		if state == nil {
-			continue
-		}
-		state.bound = false
-		state.attempts = 0
-		state.consecutiveFailures = 0
+		delete(c.bindStates, bindEventKey{ifname: ifname, lan: lan})
 	}
 }
 

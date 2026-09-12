@@ -126,4 +126,4 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260910
 // remote-FIN data preservation, gRPC zero-deadline clearing, and
 // chain-constructed dialer ownership. Includes cancellable dial queues,
 // immediate TUIC retirement signals, and explicit write-deadline behavior.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260912060738-b3c5caa823d4
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260912070929-ebd5cd55cbda

@@ -38,6 +38,7 @@ import (
 	internal "github.com/daeuniverse/dae/pkg/ebpf_internal"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
+	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/direct"
 	dnsmessage "github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
@@ -522,6 +523,35 @@ func NewControlPlaneWithContextOptions(
 	locationFinder := assets.NewLocationFinder(externGeoDataDirs)
 	option := dialer.NewGlobalOption(global, log)
 	option.SetRuntimeDependencies(directDialer, fullconeDirectDialer, systemDNSResolver)
+
+	// A proxy transport may have to resolve a peer-supplied domain-typed address
+	// on its datagram read path. Point that lookup at this generation's DNS view
+	// -- the system resolver with its configured fallback -- instead of the bare
+	// process resolver: inside a netns, or on a host whose /etc/resolv.conf is
+	// empty or points back at dae itself, the process resolver hangs or fails.
+	// The answer becomes the source address of a datagram sent to a client, so
+	// it must be a real record: no routing rewrite, no synthetic address.
+	protocol.SetDatapathResolver(func(ctx context.Context, host string) (netip.Addr, error) {
+		dns, err := systemDNSResolver.SystemDNS()
+		if err != nil {
+			return netip.Addr{}, err
+		}
+		ips, err4, err6 := netutils.ResolveIp46(ctx, directDialer, dns, host, "udp", true)
+		if ips.Ip4.IsValid() {
+			return ips.Ip4, nil
+		}
+		if ips.Ip6.IsValid() {
+			return ips.Ip6, nil
+		}
+		if err4 != nil {
+			return netip.Addr{}, err4
+		}
+		if err6 != nil {
+			return netip.Addr{}, err6
+		}
+		return netip.Addr{}, fmt.Errorf("no address for %q", host)
+	})
+
 	option.DaeDNS, err = daedns.NewWithOption(log, global, dnsConfig, &daedns.NewOption{
 		LocationFinder: locationFinder,
 		DirectDialer:   directDialer,

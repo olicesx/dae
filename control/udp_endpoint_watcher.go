@@ -15,6 +15,7 @@ import (
 	"github.com/daeuniverse/dae/common/errors"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
+	"github.com/daeuniverse/outbound/protocol"
 	"github.com/sirupsen/logrus"
 )
 
@@ -142,6 +143,23 @@ func (ue *UdpEndpoint) enqueueReceivedReply(data []byte, from netip.AddrPort, re
 // error is fatal and delivery must stop.
 func (ue *UdpEndpoint) applyUpstreamReadErrorPolicy(err error, retire func()) bool {
 	if stderrors.Is(err, io.ErrShortBuffer) {
+		return false
+	}
+	// A peer-supplied address that could not be resolved in time is a datagram
+	// we cannot attribute, not a broken session. The outbound reader has already
+	// consumed the frame, so dropping this one datagram keeps the stream aligned
+	// and keeps the session: under full-cone NAT this endpoint carries every
+	// destination of the client, and no single unresolvable source address may
+	// take all of them down.
+	if stderrors.Is(err, protocol.ErrDomainResolution) {
+		if ue.log != nil && ue.log.IsLevelEnabled(logrus.DebugLevel) {
+			ue.log.WithFields(logrus.Fields{
+				"lAddr":      ue.lAddr.String(),
+				"dialer":     ue.Dialer.Property().Name,
+				"proxy_addr": ue.DialTarget,
+				"sniffed":    ue.SniffedDomain,
+			}).WithError(err).Debug("UdpEndpoint dropped a datagram whose source address did not resolve")
+		}
 		return false
 	}
 	if errors.IsReplayAttackError(err) || errors.IsAuthError(err) {

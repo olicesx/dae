@@ -26,6 +26,7 @@ import (
 
 	"github.com/daeuniverse/dae/cmd/internal"
 	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/component/outbound"
 	outbounddialer "github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
@@ -58,6 +59,7 @@ var (
 	beginReloadProxyFailureSuppression = outbounddialer.BeginReloadProxyFailureSuppression
 	endReloadProxyFailureSuppression   = outbounddialer.EndReloadProxyFailureSuppression
 	resetReloadProxyRuntimeState       = outbounddialer.ResetGlobalProxyStateForReload
+	resetReloadFilterRegexpCache       = outbound.ResetRegexpCacheForReload
 	listenControlPlaneFunc             = func(c *control.ControlPlane, port uint16) (*control.Listener, error) {
 		listener, err := c.Listen(port)
 		if err != nil {

@@ -20,6 +20,26 @@ import (
 
 var regexpCache sync.Map
 
+// ResetRegexpCacheForReload drops the compiled-filter cache.
+//
+// The keys are the regex literals of the configured group filters, so entries
+// can only accumulate across in-process reloads: without this, the map's
+// membership is the union of every config the process has ever loaded rather
+// than the live config, and the process never gives that memory back. dae keeps
+// the rest of its process-global proxy state on the same footing (see
+// dialer.ResetGlobalProxyStateForReload, called from the reload worker
+// alongside this).
+//
+// Rebuilding costs one regexp2 compile per distinct pattern still in use, which
+// is the work the first evaluation of that pattern would have done anyway, so
+// no result changes.
+func ResetRegexpCacheForReload() {
+	regexpCache.Range(func(key, _ any) bool {
+		regexpCache.Delete(key)
+		return true
+	})
+}
+
 const (
 	FilterInput_Name            = "name"
 	FilterInput_SubscriptionTag = "subtag"

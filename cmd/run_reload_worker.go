@@ -81,6 +81,7 @@ func (w *reloadWorker) run() {
 		_ = setRunSignalProgress(consts.ReloadProcessing, "")
 		w.reloadManager.setReloadError(nil)
 		resetReloadProxyRuntimeState()
+		resetReloadFilterRegexpCache()
 
 		// Load new config.
 		abortConnections := os.Remove(AbortFile) == nil

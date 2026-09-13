@@ -59,7 +59,8 @@ func TestRespCacheHitNotifiesPreferenceWait(t *testing.T) {
 		t.Fatalf("served answer = %s, want the cached IPv6 answer", got)
 	}
 
-	if !wait.waitFor() {
+	preferred, _ := wait.waitFor()
+	if !preferred {
 		t.Fatal("the served preferred answer must release the waiting query")
 	}
 	if got := ctrl.dnsPreferWaitNotified.Load(); got != 1 {

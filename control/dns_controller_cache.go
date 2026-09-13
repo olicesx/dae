@@ -398,6 +398,95 @@ func (c *DnsController) RemoveDnsRespCacheFamily(baseKey string) {
 	c.syncDnsKnowledge(baseKey)
 }
 
+// counterpartAddressQtype returns the other A/AAAA family.
+func counterpartAddressQtype(qtype uint16) (uint16, bool) {
+	switch qtype {
+	case dnsmessage.TypeA:
+		return dnsmessage.TypeAAAA, true
+	case dnsmessage.TypeAAAA:
+		return dnsmessage.TypeA, true
+	default:
+		return 0, false
+	}
+}
+
+// dropCachedAddressFamily removes every cached answer of one address family for
+// qname. While the preferred family has records, ipversion_prefer answers the
+// other family with an empty reply, and the response-cache fast path releases a
+// cached answer without consulting the preference at all, so such an entry must
+// not survive. It returns true when entries were dropped.
+func (c *DnsController) dropCachedAddressFamily(qname string, qtype uint16) bool {
+	if qtype != dnsmessage.TypeA && qtype != dnsmessage.TypeAAAA {
+		return false
+	}
+	baseKey := c.cacheKey(qname, qtype)
+	if baseKey == "" || len(c.dnsCacheIndexSnapshot(baseKey)) == 0 {
+		return false
+	}
+	c.RemoveDnsRespCacheFamily(baseKey)
+	return true
+}
+
+// cachedAddressFamilyHasRecords reports whether the response cache holds at
+// least one unexpired answer record of qtype for qname. The scan walks the
+// family index instead of a single scoped key, so the answer does not depend on
+// which upstream produced it.
+func (c *DnsController) cachedAddressFamilyHasRecords(qname string, qtype uint16) bool {
+	if qtype != dnsmessage.TypeA && qtype != dnsmessage.TypeAAAA {
+		return false
+	}
+	cacheKeys := c.dnsCacheIndexSnapshot(c.cacheKey(qname, qtype))
+	if len(cacheKeys) == 0 {
+		return false
+	}
+	now := time.Now()
+	for _, cacheKey := range cacheKeys {
+		value, ok := c.dnsCache.Load(cacheKey)
+		if !ok {
+			continue
+		}
+		cache, ok := value.(*DnsCache)
+		if !ok || cache == nil || !cache.Deadline.After(now) {
+			continue
+		}
+		for _, rr := range cache.Answer {
+			if rr != nil && rr.Header().Rrtype == qtype {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// suppressNonPreferredCacheHit reports whether a cached answer for this query
+// must be suppressed because the other address family is preferred and has
+// records. The response-cache fast path releases a cached answer without ever
+// reaching applyPreferenceWait, and entries can also be stored by paths that do
+// not run the delivery filter (the optimistic background refresh and the
+// forwarder store), so the preference is enforced here, at the point a cached
+// answer is released. The cached non-preferred family is dropped as well, so
+// later queries do not pay the check again.
+func (c *DnsController) suppressNonPreferredCacheHit(msg *dnsmessage.Msg) bool {
+	if msg == nil || len(msg.Question) == 0 {
+		return false
+	}
+	q := msg.Question[0]
+	qtypePrefer := c.currentQtypePrefer()
+	if qtypePrefer == 0 || isPreferredType(q.Qtype, qtypePrefer) {
+		return false
+	}
+	if q.Qtype != dnsmessage.TypeA && q.Qtype != dnsmessage.TypeAAAA {
+		return false
+	}
+	qname := dnsmessage.CanonicalName(q.Name)
+	if !c.cachedAddressFamilyHasRecords(qname, qtypePrefer) {
+		return false
+	}
+	c.dropCachedAddressFamily(qname, q.Qtype)
+	c.dnsPreferFiltered.Add(1)
+	return true
+}
+
 func (c *DnsController) rememberDnsKnowledge(baseKey string, originalDeadline time.Time, newCacheEntry bool) {
 	if baseKey == "" {
 		return

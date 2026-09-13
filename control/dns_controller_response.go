@@ -327,25 +327,28 @@ func (c *DnsController) notifyPreferenceWait(msg *dnsmessage.Msg) bool {
 	if !isPreferredType(q.Qtype, qtypePrefer) {
 		return false
 	}
-	if !c.prefWaitRegistry.notifyPreferred(dnsmessage.CanonicalName(q.Name), q.Qtype, qtypePrefer) {
+	if !c.prefWaitRegistry.notifyPreferred(dnsmessage.CanonicalName(q.Name), q.Qtype, qtypePrefer, hasAddressRecords(msg, q.Qtype)) {
 		return false
 	}
 	c.dnsPreferWaitNotified.Add(1)
 	return true
 }
 
-// applyPreferenceWait implements RFC 8305 Happy Eyeballs Resolution Delay.
+// applyPreferenceWait implements RFC 8305 Happy Eyeballs Resolution Delay and
+// the documented ipversion_prefer answer filter.
 // When ip_version_prefer is set and a non-preferred A/AAAA response is received,
 // wait briefly (50ms) for the preferred response to arrive before proceeding.
 //
 // This function handles two scenarios:
-// 1. Non-preferred response arrives (e.g., A when prefer=6): Register wait and wait for preferred
-// 2. Preferred response arrives (e.g., AAAA when prefer=6): Notify any waiting requests
-//
-// The original response is always returned unchanged. The wait only delays
-// when the caller releases this response downstream, giving a preferred
-// response a chance to arrive first; the preferred message itself is never
-// substituted here.
+//  1. Preferred response arrives (e.g., AAAA when prefer=6): Notify any waiting
+//     requests and drop the cached non-preferred family, which must not be
+//     served while the preferred family has records.
+//  2. Non-preferred response arrives (e.g., A when prefer=6): Register wait and
+//     wait for the preferred family. If the preferred family is known to have
+//     records - already in the response cache, or delivered during the wait -
+//     the non-preferred answer is replaced by an empty reply, which is what
+//     ipversion_prefer documents and what steers clients to the preferred
+//     family. With no such knowledge the original answer is returned unchanged.
 //
 // It must be called on the delivery side (after a shared singleflight
 // resolution returns, not inside it), so the delay is paid per delivered
@@ -372,6 +375,15 @@ func (c *DnsController) applyPreferenceWait(respMsg *dnsmessage.Msg) *dnsmessage
 	// Case 1: This is the preferred response type - notify waiting requests
 	qtypePrefer := c.currentQtypePrefer()
 	if isPreferredType(q.Qtype, qtypePrefer) {
+		// The response-cache fast path releases a cached answer without ever
+		// reaching this function, so the non-preferred family must not stay
+		// cached while the preferred family has records: that entry would be
+		// served verbatim to the next non-preferred query.
+		if hasAddressRecords(respMsg, q.Qtype) {
+			if counterpart, ok := counterpartAddressQtype(q.Qtype); ok && c.dropCachedAddressFamily(qname, counterpart) {
+				c.dnsPreferFiltered.Add(1)
+			}
+		}
 		// Notify any waiting requests for this domain
 		if c.notifyPreferenceWait(respMsg) {
 			if c.log.IsLevelEnabled(logrus.TraceLevel) {
@@ -381,7 +393,17 @@ func (c *DnsController) applyPreferenceWait(respMsg *dnsmessage.Msg) *dnsmessage
 		return respMsg
 	}
 
-	// Case 2: This is a non-preferred response - register wait and wait for preferred
+	// Case 2: This is a non-preferred response. When the preferred family is
+	// already cached there is nothing to wait for: answer with the empty reply
+	// the preference promises instead of paying the resolution delay.
+	if c.cachedAddressFamilyHasRecords(qname, qtypePrefer) {
+		if filtered := c.filterNonPreferredResponse(qname, respMsg); filtered != nil {
+			return filtered
+		}
+	}
+
+	// Otherwise register a wait and give the preferred response a chance to
+	// arrive before this non-preferred answer is released.
 	if wait := c.prefWaitRegistry.registerWait(qname, q.Qtype, qtypePrefer); wait != nil {
 		// Non-preferred response arrived before preferred - wait briefly for preferred
 		if c.log.IsLevelEnabled(logrus.TraceLevel) {
@@ -390,10 +412,32 @@ func (c *DnsController) applyPreferenceWait(respMsg *dnsmessage.Msg) *dnsmessage
 		}
 
 		// Wait for preferred response or timeout
-		preferred := wait.waitFor()
+		preferred, preferredHasRecords := wait.waitFor()
 
 		// Clean up wait registry
 		c.prefWaitRegistry.remove(wait)
+
+		if !preferred {
+			c.dnsPreferWaitTimeout.Add(1)
+		}
+
+		// The preferred family can become visible without notifying this wait:
+		// a cache hit notifies with the client's question (which carries no
+		// answers), and the optimistic refresh stores a preferred family
+		// without touching the registry at all. So the cache is re-read after
+		// the wait, including when the wait timed out, instead of trusting the
+		// wake-up alone.
+		if (preferred && preferredHasRecords) || c.cachedAddressFamilyHasRecords(qname, qtypePrefer) {
+			// The preferred family has records, so the non-preferred answer
+			// must not be delivered.
+			if filtered := c.filterNonPreferredResponse(qname, respMsg); filtered != nil {
+				if c.log.IsLevelEnabled(logrus.TraceLevel) {
+					c.log.Tracef("Preferred %v response with records for %v is known; answering the %v query with an empty reply",
+						QtypeToString(qtypePrefer), qname, QtypeToString(q.Qtype))
+				}
+				return filtered
+			}
+		}
 
 		if preferred {
 			if c.log.IsLevelEnabled(logrus.TraceLevel) {
@@ -401,17 +445,42 @@ func (c *DnsController) applyPreferenceWait(respMsg *dnsmessage.Msg) *dnsmessage
 					QtypeToString(qtypePrefer), qname, QtypeToString(q.Qtype))
 			}
 		} else {
-			c.dnsPreferWaitTimeout.Add(1)
 			if c.log.IsLevelEnabled(logrus.TraceLevel) {
 				c.log.Tracef("Preferred %v response not arrived for %v within %v, using %v response",
 					QtypeToString(qtypePrefer), qname, PreferenceResolutionDelay, QtypeToString(q.Qtype))
 			}
 		}
 
-		// Always return the original response. The wait only changes when we
-		// release the response, not the DNS question/answer type pairing.
+		// No preferred family was observed, so the answer is delivered as-is.
 		return respMsg
 	}
 
 	return respMsg
+}
+
+// filterNonPreferredResponse applies the documented ipversion_prefer contract:
+// while the preferred address family has records for qname, a non-preferred
+// A/AAAA answer is replaced by an empty NOERROR reply so clients fall back to
+// the preferred family. The cached non-preferred entry is dropped as well,
+// because a later query could otherwise be answered from the response-cache
+// fast path, which cannot perform this check.
+//
+// It returns nil when the answer carries no record of the non-preferred family
+// (there is nothing to filter), leaving the caller's response untouched. The
+// returned message is a copy: the input may be a shared singleflight result or
+// a cached message that other deliveries still use.
+func (c *DnsController) filterNonPreferredResponse(qname string, respMsg *dnsmessage.Msg) *dnsmessage.Msg {
+	if len(respMsg.Question) == 0 || !hasAddressRecords(respMsg, respMsg.Question[0].Qtype) {
+		return nil
+	}
+	c.dropCachedAddressFamily(qname, respMsg.Question[0].Qtype)
+
+	empty := *respMsg
+	empty.Answer = nil
+	empty.Truncated = false
+	empty.Response = true
+	empty.RecursionAvailable = true
+	empty.Compress = true
+	c.dnsPreferFiltered.Add(1)
+	return &empty
 }

@@ -160,10 +160,13 @@ type dnsControllerStore struct {
 	prefWaitRegistry *preferenceWaitRegistry
 	// dnsPreferWaitNotified counts resolution-delay waits released by a
 	// preferred (A/AAAA) answer; dnsPreferWaitTimeout counts waits that ran to
-	// their full RFC 8305 delay without one. Both are visibility for the
-	// ipversion_prefer behavior, whose only remaining effect is that delay.
+	// their full RFC 8305 delay without one; dnsPreferFiltered counts the
+	// answers an already-known preferred family replaced with an empty reply
+	// (the ipversion_prefer filter) plus the cached non-preferred entries that
+	// filter dropped.
 	dnsPreferWaitNotified atomic.Uint64
 	dnsPreferWaitTimeout  atomic.Uint64
+	dnsPreferFiltered     atomic.Uint64
 
 	// Truncated-answer bookkeeping (RFC 7766 §5). Upgrades count UDP answers
 	// whose TC=1 bit triggered a TCP retry and whether that retry produced an

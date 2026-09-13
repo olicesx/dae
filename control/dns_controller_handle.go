@@ -469,6 +469,15 @@ func (c *DnsController) serveFromRespCacheWithRefresh_(dnsMessage *dnsmessage.Ms
 	if resp == nil {
 		return false, nil
 	}
+	// ipversion_prefer: a cached non-preferred answer must not be released
+	// while the preferred family has records. The cache may hold such an entry
+	// because the optimistic refresh and the forwarder store bypass the
+	// delivery filter, so the preference is enforced here as well.
+	if c.suppressNonPreferredCacheHit(dnsMessage) {
+		empty := dnsMessage.Copy()
+		return true, c.sendDnsErrorResponse_(empty, dnsmessage.RcodeSuccess, false,
+			"ipversion_prefer: cached non-preferred answer replaced with an empty reply", req, responseWriter)
+	}
 	// A cache hit can answer a query waiting out the RFC 8305 resolution delay:
 	// the preferred address family is available now, so release the waiter
 	// instead of letting it pay the full delay. This is the delivery side, so

@@ -260,42 +260,15 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 			Timeout: epo,
 		}
 		log.Infoln("Waiting for network...")
-		attempts := 0
-		for i := 0; ; i++ {
-			attempts = i + 1
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			default:
-			}
-
-			resp, err := client.Get(CheckNetworkLinks[i%len(CheckNetworkLinks)])
-			if err != nil {
-				log.Debugln("CheckNetwork:", err)
-				var neterr net.Error
-				if errors.As(err, &neterr) && neterr.Timeout() {
-					// Do not sleep.
-					continue
-				}
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(epo):
-				}
-				continue
-			}
-			_ = resp.Body.Close()
-			if resp.StatusCode >= 200 && resp.StatusCode < 500 {
-				break
-			}
-			log.Infof("Bad status: %v (%v)", resp.Status, resp.StatusCode)
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(epo):
-			}
+		attempts, online, err := waitForNetworkOnline(ctx, &client, log, CheckNetworkLinks, epo, networkWaitTimeout)
+		if err != nil {
+			return nil, err
 		}
-		log.Infoln("Network online.")
+		if online {
+			log.Infoln("Network online.")
+		} else {
+			log.Warnf("Network still unreachable after %v (%d attempt(s)); resolving subscriptions anyway so local nodes keep working. Check the network, or set disable_waiting_network: true to skip this wait.", networkWaitTimeout, attempts)
+		}
 		log.Infof("Network check took %v (%d attempt(s))", time.Since(networkWaitStart), attempts)
 	}
 	if len(conf.Subscription) > 0 {

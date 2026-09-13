@@ -83,7 +83,7 @@ endif
 
 BUILD_ARGS := -trimpath -ldflags "-s -w -X github.com/daeuniverse/dae/cmd.Version=$(VERSION) -X github.com/daeuniverse/dae/common/consts.MaxMatchSetLen_=$(MAX_MATCH_SET_LEN)" $(BUILD_ARGS)
 
-.PHONY: clean-ebpf ebpf ebpf-sync ebpf-sync-check ebpf-test-tagged ebpf-test-debug ebpf-test-debug-tagged ebpf-audit dae submodule submodules print-goexperiment print-goexperiment-env print-trace-unsupported
+.PHONY: clean-ebpf clean-ebpf-test ebpf ebpf-sync ebpf-sync-check ebpf-test-tagged ebpf-test-debug ebpf-test-debug-tagged ebpf-audit dae submodule submodules print-goexperiment print-goexperiment-env print-trace-unsupported
 
 ## Begin Dae Build
 dae: export GOOS=linux
@@ -123,6 +123,16 @@ clean-ebpf:
 			rm -f control/bpftest_bpf*.o
 	@rm -f trace/bpf_*_bpf*.go && \
 			rm -f trace/bpf_*_bpf*.o
+	@rm -f control/kern/tests/bpftest_bpf*.go && \
+			rm -f control/kern/tests/bpftest_bpf*.o
+## clean-ebpf-test removes only what the eBPF test targets regenerate: the
+## bpftest variants. Depending on clean-ebpf deleted the production objects as
+## well, so after `make ebpf-test` the tree no longer built ("undefined:
+## bpfObjects") until `make ebpf` ran again, even though the test targets never
+## regenerate those files.
+clean-ebpf-test:
+	@rm -f control/bpftest_bpf*.go && \
+			rm -f control/bpftest_bpf*.o
 	@rm -f control/kern/tests/bpftest_bpf*.go && \
 			rm -f control/kern/tests/bpftest_bpf*.o
 fmt:
@@ -186,7 +196,7 @@ ebpf-test: export BPF_STRIP_FLAG := $(STRIP_FLAG)
 ebpf-test: export BPF_CFLAGS := $(CFLAGS)
 ebpf-test: export BPF_TARGET := $(TARGET)
 ebpf-test: export BPF_TRACE_TARGET := $(GOARCH)
-ebpf-test: ebpf-sync submodule clean-ebpf
+ebpf-test: ebpf-sync submodule clean-ebpf-test
 	@unset GOOS && \
     unset GOARCH && \
     unset GOARM && \
@@ -201,7 +211,7 @@ ebpf-test-tagged: export BPF_STRIP_FLAG := $(STRIP_FLAG)
 ebpf-test-tagged: export BPF_CFLAGS := $(CFLAGS)
 ebpf-test-tagged: export BPF_TARGET := $(TARGET)
 ebpf-test-tagged: export BPF_TRACE_TARGET := $(GOARCH)
-ebpf-test-tagged: ebpf-sync submodule clean-ebpf
+ebpf-test-tagged: ebpf-sync submodule clean-ebpf-test
 	@unset GOOS && \
     unset GOARCH && \
     unset GOARM && \
@@ -216,7 +226,7 @@ ebpf-test-debug: export BPF_STRIP_FLAG := $(STRIP_FLAG)
 ebpf-test-debug: export BPF_CFLAGS := $(CFLAGS) -D__BPF_TEST_ENABLE_DEBUG
 ebpf-test-debug: export BPF_TARGET := $(TARGET)
 ebpf-test-debug: export BPF_TRACE_TARGET := $(GOARCH)
-ebpf-test-debug: ebpf-sync submodule clean-ebpf
+ebpf-test-debug: ebpf-sync submodule clean-ebpf-test
 	@unset GOOS && \
     unset GOARCH && \
     unset GOARM && \
@@ -231,7 +241,7 @@ ebpf-test-debug-tagged: export BPF_STRIP_FLAG := $(STRIP_FLAG)
 ebpf-test-debug-tagged: export BPF_CFLAGS := $(CFLAGS) -D__BPF_TEST_ENABLE_DEBUG
 ebpf-test-debug-tagged: export BPF_TARGET := $(TARGET)
 ebpf-test-debug-tagged: export BPF_TRACE_TARGET := $(GOARCH)
-ebpf-test-debug-tagged: ebpf-sync submodule clean-ebpf
+ebpf-test-debug-tagged: ebpf-sync submodule clean-ebpf-test
 	@unset GOOS && \
     unset GOARCH && \
     unset GOARM && \

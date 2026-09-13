@@ -1015,7 +1015,11 @@ func udpResponseSourceMismatch(from, target netip.AddrPort) bool {
 	if !from.IsValid() || !target.IsValid() {
 		return false
 	}
-	return from != target
+	// An IPv4-mapped IPv6 source (::ffff:a.b.c.d, as reported by a dual-stack
+	// socket) denotes the same endpoint as its plain IPv4 form. Comparing the
+	// raw values would flag every reply from such an upstream as a mismatch.
+	// netip.AddrPort has no Unmap, so unmap both addresses individually.
+	return from.Addr().Unmap() != target.Addr().Unmap() || from.Port() != target.Port()
 }
 
 func noteDnsUDPResponseSourceMismatch(log *logrus.Logger, target, from netip.AddrPort) {

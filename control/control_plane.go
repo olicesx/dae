@@ -222,6 +222,64 @@ var (
 	resolveIp46ForRealDomainProbe = netutils.ResolveIp46
 )
 
+// containerMountHint explains the container case without making it the only
+// hypothesis: an LXC container whose host does not expose bpffs cannot fix this
+// from inside.
+const containerMountHint = " (inside a container the host must expose a bpffs mount; if it cannot, use higher virtualization such as kvm/qemu)"
+
+// ensureBpfPinDir creates the BPF pin directory and, when that fails, reports
+// the actual state of the pin root instead of a fixed hypothesis. The previous
+// message blamed containers for every mkdir failure, which sent users after the
+// wrong cause: dae has already created its datapath devices by this point, a
+// container with a proper bpffs mount works fine, and the raw mkdir text never
+// told anyone what to do.
+func ensureBpfPinDir(pinPath string, log *logrus.Logger) error {
+	err := os.MkdirAll(pinPath, 0o755)
+	if err == nil || os.IsExist(err) {
+		return nil
+	}
+	wrapped := bpfPinDirError(pinPath, err, isBpfPinRootMounted())
+	if log != nil {
+		log.Warnln(wrapped)
+	}
+	return wrapped
+}
+
+// bpfPinDirError builds the message from the observed state of the pin root.
+// Only a missing mount makes the mount advice actionable; a permission or
+// not-a-directory failure keeps its raw cause and gains no container hint, so
+// the message never points at the wrong problem.
+func bpfPinDirError(pinPath string, mkdirErr error, pinRootMounted bool) error {
+	if !pinRootMounted {
+		return fmt.Errorf("bpf pin root %s is not a bpffs mount, so %s cannot be created: %w; mount it with \"mount -t bpf bpffs %s\"%s",
+			consts.BpfPinRoot, pinPath, mkdirErr, consts.BpfPinRoot, containerMountHint)
+	}
+	return fmt.Errorf("cannot create bpf pin directory %s: %w", pinPath, mkdirErr)
+}
+
+// bpfPinRootMountedFrom reports whether /proc/mounts content contains a bpffs
+// mount at root. It is split out so the parser can be tested against fixtures
+// instead of trusting the host's own mount table.
+func bpfPinRootMountedFrom(mounts string) bool {
+	for line := range strings.Lines(mounts) {
+		fields := strings.Fields(line)
+		if len(fields) >= 3 && fields[1] == consts.BpfPinRoot && fields[2] == "bpf" {
+			return true
+		}
+	}
+	return false
+}
+
+// isBpfPinRootMounted reports whether bpffs is mounted at the pin root, read
+// from /proc/mounts so the diagnosis matches the running kernel.
+func isBpfPinRootMounted() bool {
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return false
+	}
+	return bpfPinRootMountedFrom(string(data))
+}
+
 func isIPLikeDomain(domain string) bool {
 	if domain == "" {
 		return false
@@ -375,10 +433,7 @@ func NewControlPlaneWithContextOptions(
 		pinPath = filepath.Join(pinPath, fmt.Sprintf("reload-%d-%d", os.Getpid(), time.Now().UnixNano()))
 		ephemeralPinPath = true
 	}
-	if err = os.MkdirAll(pinPath, 0755); err != nil && !os.IsExist(err) {
-		if os.IsNotExist(err) {
-			log.Warnln("Perhaps you are in a container environment (such as lxc). If so, please use higher virtualization (kvm/qemu).")
-		}
+	if err = ensureBpfPinDir(pinPath, log); err != nil {
 		return nil, err
 	}
 	if ephemeralPinPath {

@@ -34,7 +34,7 @@ func TestConnStateJanitorBoundaries(t *testing.T) {
 	if err != nil {
 		t.Skipf("cannot create conn_state_map: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	cp := &ControlPlane{}
 	log := logrus.New()

@@ -7,6 +7,7 @@ package routing
 
 import (
 	"encoding/binary"
+	stderrors "errors"
 	"fmt"
 	"net/netip"
 	"strconv"
@@ -114,7 +115,12 @@ func L4ProtoParserFactory(callback func(f *config_parser.Function, l4protoType c
 				l4protoType |= consts.L4ProtoType_TCP
 			case "udp":
 				l4protoType |= consts.L4ProtoType_UDP
+			default:
+				return fmt.Errorf("l4proto: unknown value %v; supported values are tcp and udp", strconv.Quote(v))
 			}
+		}
+		if l4protoType == 0 {
+			return stderrors.New("l4proto: at least one of tcp and udp is required")
 		}
 		return callback(f, l4protoType, overrideOutbound)
 	})
@@ -129,7 +135,12 @@ func IpVersionParserFactory(callback func(f *config_parser.Function, ipVersion c
 				ipVersion |= consts.IpVersion_4
 			case "6":
 				ipVersion |= consts.IpVersion_6
+			default:
+				return fmt.Errorf("ipversion: unknown value %v; supported values are 4 and 6", strconv.Quote(v))
 			}
+		}
+		if ipVersion == 0 {
+			return stderrors.New("ipversion: at least one of 4 and 6 is required")
 		}
 		return callback(f, ipVersion, overrideOutbound)
 	})

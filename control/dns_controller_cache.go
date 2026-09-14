@@ -978,33 +978,6 @@ func (c *DnsController) startDnsCacheJanitor() {
 	}()
 }
 
-func (c *DnsController) LookupDnsRespCache(cacheKey string, ignoreFixedTtl bool) (cache *DnsCache) {
-	c.requireStore()
-	val, ok := c.dnsCache.Load(cacheKey)
-	if !ok {
-		return nil
-	}
-	cache = val.(*DnsCache)
-	now := time.Now()
-	var deadline time.Time
-	if !ignoreFixedTtl {
-		deadline = cache.Deadline
-	} else {
-		deadline = cache.OriginalDeadline
-	}
-	// We should make sure the cache did not expire, or
-	// return nil and request a new lookup to refresh the cache.
-	if !deadline.After(now) {
-		c.evictDnsRespCacheIfSame(cacheKey, cache)
-		return nil
-	}
-	// OPTIMIZATION: Asynchronous BPF map update to keep hot path fast.
-	// BPF update happens in background goroutine with bounded queue.
-	// CAS in NeedsBpfUpdate ensures update is triggered at most once per interval.
-	c.triggerBpfUpdateIfNeeded(cache, now)
-	return cache
-}
-
 // LookupDnsRespCache_ will modify the msg in place.
 
 // OPTIMIZED: Uses pre-packed response with approximate TTL for near-zero latency.

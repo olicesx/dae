@@ -65,11 +65,6 @@ const (
 	idxDataUdp = 2
 )
 
-var (
-	ErrUnexpectedField  = fmt.Errorf("unexpected field")
-	ErrInvalidParameter = fmt.Errorf("invalid parameters")
-)
-
 var cachedTimeNano atomic.Int64
 
 func init() {

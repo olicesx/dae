@@ -316,17 +316,6 @@ func (c *controlPlaneCore) getUdpConnStateTracker() *udpConnStateTracker {
 	return c.udpConnStateTracker.Load()
 }
 
-func (c *controlPlaneCore) Flip() {
-	// Use CAS loop to avoid race condition between Load and Store.
-	for {
-		old := atomic.LoadInt32(&coreFlip)
-		newVal := old&1 ^ 1
-		if atomic.CompareAndSwapInt32(&coreFlip, old, newVal) {
-			break
-		}
-	}
-}
-
 // addBpfHookDetach adds a BPF hook detachment function to the dedicated list.
 // These functions will be executed immediately on SIGTERM before other cleanup.
 // Uses bpfHookMu to avoid deadlock with c.mu held by callers like _bindLan/_bindWan.

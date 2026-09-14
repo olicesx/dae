@@ -43,7 +43,6 @@ func ResetRegexpCacheForReload() {
 const (
 	FilterInput_Name            = "name"
 	FilterInput_SubscriptionTag = "subtag"
-	FilterInput_Link            = "link"
 )
 
 const (

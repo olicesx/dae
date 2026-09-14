@@ -24,23 +24,9 @@ type ParamKey uint32
 
 const (
 	ZeroKey ParamKey = iota
-	BigEndianTproxyPortKey
-	DisableL4TxChecksumKey
-	DisableL4RxChecksumKey
-	ControlPlanePidKey
-	ControlPlaneNatDirectKey
-	ControlPlaneDnsRoutingKey
 
 	OneKey ParamKey = 1
 	TwoKey ParamKey = 2
-)
-
-type DisableL4ChecksumPolicy uint32
-
-const (
-	DisableL4ChecksumPolicy_EnableL4Checksum DisableL4ChecksumPolicy = iota
-	DisableL4ChecksumPolicy_Restore
-	DisableL4ChecksumPolicy_SetZero
 )
 
 func (i OutboundIndex) String() string {
@@ -97,18 +83,13 @@ func (v IpVersionType) ToIpVersionStr() IpVersionStr {
 var (
 	BasicFeatureVersion = internal.Version{5, 2, 0}
 	// Deprecated: Ftrace does not support arm64 yet (Linux 6.2).
-	FtraceFeatureVersion                      = internal.Version{5, 5, 0}
 	UserspaceBatchUpdateFeatureVersion        = internal.Version{5, 6, 0}
-	CgSocketCookieFeatureVersion              = internal.Version{5, 7, 0}
 	SkAssignFeatureVersion                    = internal.Version{5, 7, 0}
 	ChecksumFeatureVersion                    = internal.Version{5, 8, 0}
-	ProgTypeSkLookupFeatureVersion            = internal.Version{5, 9, 0}
-	SockmapFeatureVersion                     = internal.Version{5, 10, 0}
 	UserspaceBatchUpdateLpmTrieFeatureVersion = internal.Version{5, 13, 0}
 	BpfTimerFeatureVersion                    = internal.Version{5, 15, 0}
 	HelperBpfGetFuncIpVersionFeatureVersion   = internal.Version{5, 15, 0}
 	BpfLoopFeatureVersion                     = internal.Version{5, 17, 0}
-	TcxFeatureVersion                         = internal.Version{6, 6, 0}
 	NetkitFeatureVersion                      = internal.Version{6, 7, 0}
 	// RedirectPeerSafeVersion is the mainline kernel version that fixed
 	// CVE-2025-37959 ("bpf: Scrub packet on bpf_redirect_peer"): stale skb
@@ -173,10 +154,8 @@ func IsTcpSockmapPanicSafeKernel(v internal.Version) bool {
 }
 
 const (
-	TproxyMark       uint32 = 0x08000000
-	TproxyMarkString string = "0x08000000" // Should be aligned with nftables
-	Recognize        uint16 = 0x2017
-	LoopbackIfIndex         = 1
+	TproxyMark      uint32 = 0x08000000
+	LoopbackIfIndex int    = 1
 )
 
 const (

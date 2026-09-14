@@ -374,29 +374,6 @@ func (r *Router) WrapNodeDialer(base netproxy.Dialer, meta NodeMeta) (netproxy.D
 	return newResolvingDialer(base, r, upstream, upstream, meta.AddressHost), nil
 }
 
-func (r *Router) MatchSubscriptionUpstream(rawSubscription string) (string, bool) {
-	if r == nil {
-		return "", false
-	}
-	tag, link := common.GetTagFromLinkLikePlaintext(rawSubscription)
-	return r.subMatcher.Match(subscriptionMeta{
-		Tag:  tag,
-		Link: link,
-	})
-}
-
-func (r *Router) MatchNodeUpstream(meta NodeMeta) (string, bool) {
-	if r == nil {
-		return "", false
-	}
-	if meta.SubscriptionTag != "" {
-		if upstream, ok := r.subNodeMatcher.Match(meta); ok {
-			return upstream, true
-		}
-	}
-	return r.nodeMatcher.Match(meta)
-}
-
 func (r *Router) compileSubscriptionMatcher(rules []*config_parser.RoutingRule) (*compiledMatcher[subscriptionMeta], error) {
 	return compileMatcher(r.upstreams, rules, functionSub, compileSubscriptionPredicate)
 }

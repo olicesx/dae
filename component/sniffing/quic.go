@@ -14,19 +14,13 @@ import (
 )
 
 const (
-	QuicFlag_PacketNumberLength = 0
-	QuicFlag_Reserved           = 2
-	QuicFlag_LongPacketType     = 4
-	QuicFlag_FixedBit           = 6
-	QuicFlag_HeaderForm         = 7
+	QuicFlag_LongPacketType = 4
+	QuicFlag_FixedBit       = 6
+	QuicFlag_HeaderForm     = 7
 )
 const (
 	QuicFlag_HeaderForm_LongHeader  = 1
 	QuicFlag_LongPacketType_Initial = 0
-)
-
-const (
-	QuicVersion1 = 0x00000001
 )
 
 // IsLikelyQuicInitialPacket checks if the buffer appears to be a QUIC Initial packet.

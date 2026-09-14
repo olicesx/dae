@@ -330,10 +330,6 @@ func (g *DialerGroup) Select(networkType *dialer.NetworkType, strictIpVersion bo
 // failover scenarios). Note that Fixed policy ignores 'excluded' because user
 // configuration takes precedence over automatic exclusion.
 // If 'strictIpVersion' is false and no alive dialer, it will fallback to another ipversion.
-func (g *DialerGroup) SelectWithExclusion(networkType *dialer.NetworkType, strictIpVersion bool, excluded *dialer.Dialer) (d *dialer.Dialer, latency time.Duration, err error) {
-	d, latency, _, err = g.SelectWithExclusionResult(networkType, strictIpVersion, excluded)
-	return d, latency, err
-}
 
 // SelectWithExclusionResult returns the chosen dialer together with the health
 // domain actually used to admit that dialer. For ordinary selections this is

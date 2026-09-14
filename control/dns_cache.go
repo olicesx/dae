@@ -575,15 +575,6 @@ func (c *DnsCache) FillIntoWithTTL(req *dnsmessage.Msg, now time.Time) ([]byte, 
 	return c.fillIntoWithTTLInPlace(resp, now)
 }
 
-func (c *DnsCache) IncludeIp(ip netip.Addr) bool {
-	for _, ans := range c.Answer {
-		if a, ok := dnsAnswerIP(ans); ok && a == ip {
-			return true
-		}
-	}
-	return false
-}
-
 func dnsAnswerIP(rr dnsmessage.RR) (netip.Addr, bool) {
 	switch body := rr.(type) {
 	case *dnsmessage.A:

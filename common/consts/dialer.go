@@ -51,16 +51,6 @@ const (
 	L4ProtoStr_UDP L4ProtoStr = "udp"
 )
 
-func (l L4ProtoStr) ToL4Proto() uint8 {
-	switch l {
-	case L4ProtoStr_TCP:
-		return IPPROTO_TCP
-	case L4ProtoStr_UDP:
-		return IPPROTO_UDP
-	}
-	panic("unsupported l4proto")
-}
-
 func (l L4ProtoStr) ToL4ProtoType() L4ProtoType {
 	switch l {
 	case L4ProtoStr_TCP:

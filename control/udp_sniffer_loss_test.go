@@ -305,8 +305,10 @@ func TestHandlePkt_QuicSnifferRemovalDropsBufferedPacket(t *testing.T) {
 	if !DefaultPacketSnifferSessionMgr.pool.CompareAndDelete(snifferKey, sniffer) {
 		t.Fatalf("Remove(sniffer): session not found in the pool")
 	}
-	DefaultPacketSnifferSessionMgr.deleteFlowFamilyMember(snifferKey, sniffer)
-	DefaultPacketSnifferSessionMgr.releaseFlowFamily(snifferKey)
+	if family := DefaultPacketSnifferSessionMgr.loadFlowFamily(snifferKey); family != nil {
+		family.deleteMember(snifferKey, sniffer)
+	}
+	DefaultPacketSnifferSessionMgr.releaseFlowFamilyRef(snifferKey, DefaultPacketSnifferSessionMgr.loadFlowFamily(snifferKey))
 	_ = sniffer.Close()
 	if got := DefaultPacketSnifferSessionMgr.Get(snifferKey); got != nil {
 		t.Fatal("expected sniffer session to be removed")

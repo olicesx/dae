@@ -16,6 +16,15 @@ import (
 	"github.com/sirupsen/logrus/hooks/test"
 )
 
+// parseFailureCountOf reads the running dropped-node count under the set's own
+// mutex. The production code no longer exposes an accessor for it: the counter
+// is an implementation detail of the batched warning above.
+func parseFailureCountOf(s *DialerSet) uint64 {
+	s.parseFailuresMu.Lock()
+	defer s.parseFailuresMu.Unlock()
+	return s.parseFailures
+}
+
 // TestSkippedSubscriptionNodesWarnOnceThenAggregate is the Q4 contract. A node
 // whose link cannot be parsed is dropped from the dialer set, so it can never
 // be selected by any routing rule -- that is an anomaly, not a milestone, and
@@ -60,8 +69,8 @@ func TestSkippedSubscriptionNodesWarnOnceThenAggregate(t *testing.T) {
 	if !strings.Contains(summary.Message, "sub-a=2") || !strings.Contains(summary.Message, "sub-b=1") {
 		t.Fatalf("aggregate message = %q, want the per-subscription breakdown", summary.Message)
 	}
-	if got := set.ParseFailureCount(); got != 3 {
-		t.Fatalf("ParseFailureCount() = %d, want 3", got)
+	if got := parseFailureCountOf(set); got != 3 {
+		t.Fatalf("parse failure count = %d, want 3", got)
 	}
 	if got := len(set.AllDialers()); got != 0 {
 		t.Fatalf("DialerSet holds %d dialer(s) for three unparsable nodes, want 0", got)
@@ -83,8 +92,8 @@ func TestValidSubscriptionNodesAreSilent(t *testing.T) {
 	if got := len(hook.AllEntries()); got != 0 {
 		t.Fatalf("a clean subscription emitted %d warning(s), want 0:\n%s", got, formatOutboundEntries(hook.AllEntries()))
 	}
-	if got := set.ParseFailureCount(); got != 0 {
-		t.Fatalf("ParseFailureCount() = %d, want 0", got)
+	if got := parseFailureCountOf(set); got != 0 {
+		t.Fatalf("parse failure count = %d, want 0", got)
 	}
 	if got := len(set.AllDialers()); got != 1 {
 		t.Fatalf("DialerSet holds %d dialer(s), want 1", got)

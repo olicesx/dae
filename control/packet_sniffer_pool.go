@@ -991,12 +991,6 @@ func (p *PacketSnifferPool) loadFlowFamily(key PacketSnifferKey) *packetSnifferF
 	return value.(*packetSnifferFlowFamilyRef)
 }
 
-func (p *PacketSnifferPool) deleteFlowFamilyMember(key PacketSnifferKey, sniffer *PacketSniffer) {
-	if family := p.loadFlowFamily(key); family != nil {
-		family.deleteMember(key, sniffer)
-	}
-}
-
 func (p *PacketSnifferPool) retainFlowFamilyRef(key PacketSnifferKey) *packetSnifferFlowFamilyRef {
 	if p == nil || !key.HasCacheableDcid() {
 		return nil
@@ -1036,10 +1030,6 @@ func (p *PacketSnifferPool) retainFlowFamilyRef(key PacketSnifferKey) *packetSni
 			}
 		}
 	}
-}
-
-func (p *PacketSnifferPool) releaseFlowFamily(key PacketSnifferKey) {
-	p.releaseFlowFamilyRef(key, p.loadFlowFamily(key))
 }
 
 func (p *PacketSnifferPool) releaseFlowFamilyRef(key PacketSnifferKey, ref *packetSnifferFlowFamilyRef) {

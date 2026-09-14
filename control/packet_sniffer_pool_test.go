@@ -23,7 +23,7 @@ func TestPacketSnifferFlowFamilyReleaseRemovesLastEntry(t *testing.T) {
 		t.Fatal("expected retained flow family session to be visible")
 	}
 
-	pool.releaseFlowFamily(key)
+	pool.releaseFlowFamilyRef(key, pool.loadFlowFamily(key))
 	if pool.HasFlowFamilySession(key) {
 		t.Fatal("expected released flow family session to disappear")
 	}
@@ -42,7 +42,7 @@ func TestPacketSnifferFlowFamilyReleaseKeepsEntryWhileRefsRemain(t *testing.T) {
 
 	pool.retainFlowFamily(key)
 	pool.retainFlowFamily(key)
-	pool.releaseFlowFamily(key)
+	pool.releaseFlowFamilyRef(key, pool.loadFlowFamily(key))
 
 	if !pool.HasFlowFamilySession(key) {
 		t.Fatal("expected flow family session to remain after releasing one of two refs")

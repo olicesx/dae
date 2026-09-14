@@ -78,18 +78,6 @@ func (s *DialerSet) AllDialers() []*dialer.Dialer {
 	return append([]*dialer.Dialer(nil), s.dialers...)
 }
 
-// ParseFailureCount reports how many nodes were skipped because their link
-// could not be parsed. An unparsed node never becomes a dialer, so it cannot
-// be selected by any routing rule built from this set.
-func (s *DialerSet) ParseFailureCount() uint64 {
-	if s == nil {
-		return 0
-	}
-	s.parseFailuresMu.Lock()
-	defer s.parseFailuresMu.Unlock()
-	return s.parseFailures
-}
-
 // noteParseFailure records one dropped node. The first dropped node of the
 // build warns with the concrete parse error; the rest are folded into a single
 // aggregate line, because a subscription refresh can invalidate hundreds of
@@ -129,8 +117,7 @@ func (s *DialerSet) noteParseFailure(subscriptionTag string, err error) {
 
 // logParseFailureSummary emits the one line that closes a batch of dropped
 // nodes. It reports the number of nodes dropped since the last summary, so a
-// later refresh reports its own total, and the running count stays available
-// through ParseFailureCount.
+// later refresh reports its own total.
 func (s *DialerSet) logParseFailureSummary() {
 	if s == nil || s.log == nil {
 		return

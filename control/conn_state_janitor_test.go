@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && !dae_stub_ebpf
 
 /*
  * SPDX-License-Identifier: AGPL-3.0-only

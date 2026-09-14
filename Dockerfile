@@ -3,14 +3,15 @@
 # digest is recorded here — do not invent one. Replace the tags below with
 # `<repo>@sha256:<digest>` once a registry lookup is available.
 FROM golang:1.26-bookworm AS builder
-RUN apt-get update && apt-get install -y llvm-15 clang-15 git make
+RUN apt-get update && apt-get install -y --no-install-recommends llvm-15 clang-15 make \
+    && rm -rf /var/lib/apt/lists/*
 ENV CLANG=clang-15
 WORKDIR /build/
-ADD go.mod go.sum ./
+ARG VERSION=unstable-docker
+COPY go.mod go.sum ./
 RUN go mod download
-ADD . .
-RUN git submodule update --init
-RUN make OUTPUT=dae GOFLAGS="-buildvcs=false" CC=clang CGO_ENABLED=0
+COPY . .
+RUN make OUTPUT=dae VERSION="${VERSION}" GOFLAGS="-buildvcs=false" CC=clang CGO_ENABLED=0
 
 # TODO(P3-23): same digest pin pending (the `alpine` tag is mutable).
 FROM alpine

@@ -21,6 +21,7 @@ name: Docker
 #   Makefile                      the generation logic and the
 #                                 TRACE_UNSUPPORTED_GOARCH ledger it reads
 #   Dockerfile                    the image recipe
+#   .dockerignore                 the build context
 #   .github/workflows/docker.yml  the workflow itself
 # Dropped, with the reason:
 #   `**/*.go`, `**/*.c`, `**/*.h` - the only non-amd64 Go files in this tree are
@@ -52,6 +53,7 @@ on:
       - "trace/kern/**"
       - "Makefile"
       - "Dockerfile"
+      - ".dockerignore"
       - ".github/workflows/docker.yml"
   release:
     types: [ prereleased ]
@@ -67,6 +69,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
+          submodules: recursive
       - name: Prepare
         id: prep
         env:
@@ -86,6 +89,7 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@2b82ce82d56a2a04d2637cd93a637ae1b359c0a7 # v2
       - name: Set up Docker Buildx
+        id: buildx
         uses: docker/setup-buildx-action@885d1462b80bc1c1c7f0b00334ad271f09369c55 # v2
 
       # A fork holds no DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secret. Letting the
@@ -129,6 +133,8 @@ jobs:
           tags: |
             ${{ steps.prep.outputs.IMAGE }}:${{ steps.prep.outputs.TAG }}
             ${{ steps.prep.outputs.IMAGE }}:latest
+          build-args: |
+            VERSION=${{ steps.prep.outputs.TAG }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

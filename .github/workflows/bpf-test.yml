@@ -37,6 +37,8 @@ jobs:
   bpf_tests:
     name: BPF Unit Test
     runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: 0
     strategy:
       matrix:
         env:
@@ -53,6 +55,14 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Set up Go 1.26
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.26
+
+      - name: Apply the canonical build experiments
+        run: make -s print-goexperiment-env >> "$GITHUB_ENV"
+
       - name: Install Dependencies
         env: ${{ matrix.env }}
         run: |
@@ -63,10 +73,10 @@ jobs:
         env: ${{ matrix.env }}
         run: |
           git submodule update --init
-          sudo CLANG=clang-$VERSION make ebpf-test || (echo "Run 'make ebpf-test' locally to investigate failures"; exit 1)
+          sudo --preserve-env=PATH,HOME,GOCACHE,GOMODCACHE,GOPATH,GOFLAGS,GOEXPERIMENT,CGO_ENABLED CLANG=clang-$VERSION make ebpf-test || (echo "Run 'make ebpf-test' locally to investigate failures"; exit 1)
           if [ "$VERSION" = 19 ]; then
             set -euo pipefail
-            sudo CLANG=clang-$VERSION make ebpf
+            sudo --preserve-env=PATH,HOME,GOCACHE,GOMODCACHE,GOPATH,GOFLAGS,GOEXPERIMENT,CGO_ENABLED CLANG=clang-$VERSION make ebpf
             # Whitelist of the test cases that must actually RUN from the three
             # !dae_stub_ebpf test files. Before this step only one case
             # (TestTCHookSetKernelUpdateAndRollback) ran while eight real
@@ -134,19 +144,29 @@ jobs:
           # regenerate them ("unable to open output file ... Operation not
           # permitted"). Run the ledger with the same privileges and keep the Go
           # environment, which is the form scripts/ebpf-audit.sh already uses.
-          sudo --preserve-env=PATH,HOME,GOCACHE,GOMODCACHE,GOPATH,GOFLAGS,GOEXPERIMENT \
+          sudo --preserve-env=PATH,HOME,GOCACHE,GOMODCACHE,GOPATH,GOFLAGS,GOEXPERIMENT,CGO_ENABLED \
             CLANG=clang-$VERSION STRIP=llvm-strip-$VERSION \
             ./scripts/check-trace-arch-matrix.sh
 
   bpf_abi_big_endian:
     name: BPF ABI (s390x)
     runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: 0
 
     steps:
       - name: Checkout code
         uses: actions/checkout@d632683dd7b4114ad314bca15554477dd762a938 # v4.2.0
         with:
           persist-credentials: false
+
+      - name: Set up Go 1.26
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.26
+
+      - name: Apply the canonical build experiments
+        run: make -s print-goexperiment-env >> "$GITHUB_ENV"
 
       - name: Install s390x emulator
         run: |

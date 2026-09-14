@@ -3,12 +3,13 @@
  * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
  */
 
-package scripts_test
+package cmd
 
 import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -63,10 +64,13 @@ func runForkHarness(t *testing.T, goBody string) (string, error) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git is required")
 	}
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
+	// Resolve the harness relative to this source file so the test does not
+	// depend on the working directory it happens to run under.
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot resolve the path of this test file")
 	}
+	harness := filepath.Join(filepath.Dir(thisFile), "..", "scripts", "fork-cross-repo-test.sh")
 	root := t.TempDir()
 	cmd := exec.Command("git", "init", "-q", root)
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -94,7 +98,7 @@ replace (
 		"github.com/olicesx/quic-go v0.0.0-20260831031827-fbf90cb0a47d\n" +
 		"github.com/olicesx/qpack v0.0.0-20260831031549-0844ed36f1cd\n" +
 		"github.com/other/unrelated v0.0.0-20260831031549-0844ed36f1cd"
-	cmd = exec.Command("bash", filepath.Join(wd, "fork-cross-repo-test.sh"), "--dry-run", "--clone-missing", "--short", "--strict", "--", "-race", "-p=1")
+	cmd = exec.Command("bash", harness, "--dry-run", "--clone-missing", "--short", "--strict", "--", "-race", "-p=1")
 	cmd.Dir = root
 	cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"), "FORK_TEST_MODULE_GRAPH="+graph)
 	output, err := cmd.CombinedOutput()

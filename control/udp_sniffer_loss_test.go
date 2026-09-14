@@ -99,7 +99,7 @@ func TestHandlePkt_QuicSnifferNeedMoreHoldsFirstPacket(t *testing.T) {
 		Outbound: uint8(consts.OutboundUserDefinedMin),
 	}
 
-	if err := cp.handlePktWithPrefetch(nil, first, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(first, src, dst, routingResult, flowDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("handlePkt(first): %v", err)
 	}
 	if got := underlay.calls.Load(); got != 0 {
@@ -193,7 +193,7 @@ func TestHandlePkt_QuicSnifferCompletionReplaysBufferedPackets(t *testing.T) {
 		Outbound: uint8(consts.OutboundUserDefinedMin),
 	}
 
-	if err := cp.handlePktWithPrefetch(nil, first, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(first, src, dst, routingResult, flowDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("handlePkt(first): %v", err)
 	}
 
@@ -201,7 +201,7 @@ func TestHandlePkt_QuicSnifferCompletionReplaysBufferedPackets(t *testing.T) {
 	if !secondDecision.IsQuicInitial {
 		t.Fatal("expected second payload to stay on QUIC Initial path")
 	}
-	if err := cp.handlePktWithPrefetch(nil, second, src, dst, routingResult, secondDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(second, src, dst, routingResult, secondDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("handlePkt(second): %v", err)
 	}
 
@@ -252,15 +252,15 @@ func TestHandlePkt_QuicSnifferCompletionReplaysAllBufferedPackets(t *testing.T) 
 		Outbound: uint8(consts.OutboundUserDefinedMin),
 	}
 
-	if err := cp.handlePktWithPrefetch(nil, first, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(first, src, dst, routingResult, flowDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("handlePkt(first #1): %v", err)
 	}
-	if err := cp.handlePktWithPrefetch(nil, first, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(first, src, dst, routingResult, flowDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("handlePkt(first #2): %v", err)
 	}
 
 	secondDecision := ClassifyUdpFlow(src, dst, second).EnsureSnifferSession()
-	if err := cp.handlePktWithPrefetch(nil, second, src, dst, routingResult, secondDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(second, src, dst, routingResult, secondDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("handlePkt(second): %v", err)
 	}
 
@@ -290,7 +290,7 @@ func TestHandlePkt_QuicSnifferRemovalDropsBufferedPacket(t *testing.T) {
 		Outbound: uint8(consts.OutboundUserDefinedMin),
 	}
 
-	if err := cp.handlePktWithPrefetch(nil, first, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(first, src, dst, routingResult, flowDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("handlePkt(first before removal): %v", err)
 	}
 
@@ -318,11 +318,11 @@ func TestHandlePkt_QuicSnifferRemovalDropsBufferedPacket(t *testing.T) {
 	// complete sniffing with the second packet. Without the removal above, this
 	// sequence would replay three packets. After removal, only the retransmitted
 	// first packet and the second packet survive.
-	if err := cp.handlePktWithPrefetch(nil, first, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(first, src, dst, routingResult, flowDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("handlePkt(first after removal): %v", err)
 	}
 	secondDecision := ClassifyUdpFlow(src, dst, second).EnsureSnifferSession()
-	if err := cp.handlePktWithPrefetch(nil, second, src, dst, routingResult, secondDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(second, src, dst, routingResult, secondDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("handlePkt(second after removal): %v", err)
 	}
 

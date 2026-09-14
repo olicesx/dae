@@ -735,10 +735,6 @@ func (d *Dialer) recoveryIdxForType(typ *NetworkType) int {
 	return d.ensureRecoveryManager().indexForType(typ)
 }
 
-func (d *Dialer) protoIdx(proto consts.L4ProtoStr) int {
-	return d.ensureRecoveryManager().indexForProto(proto)
-}
-
 // NotifyProxyFailure is called when a proxy server connection fails (e.g., connection refused).
 // It immediately invalidates the cached IP for the failed protocol and address family so that
 // the next connection can try a different IP without discarding healthy families.
@@ -789,7 +785,7 @@ func (d *Dialer) triggerRecoveryDetection(typ *NetworkType) {
 // cancelPendingRecoveryConfirmation cancels any pending recovery confirmation timer for a specific protocol.
 // This is called when the dialer fails again during recovery observation period.
 func (d *Dialer) cancelPendingRecoveryConfirmation(proto consts.L4ProtoStr) {
-	protoIdx := d.protoIdx(proto)
+	protoIdx := idxTcp
 	d.cancelPendingRecoveryConfirmationByIndex(protoIdx, proto)
 }
 
@@ -863,7 +859,7 @@ func (d *Dialer) getBackoffPenaltyByIndex(protoIdx int) time.Duration {
 // NotifyPeriodicCheckResult handles stability-based "wash white" logic for a protocol.
 // Any failure resets the counter. A single success (with no failures) increments the stability counter.
 func (d *Dialer) NotifyPeriodicCheckResult(proto consts.L4ProtoStr, success bool, failure bool) {
-	protoIdx := d.protoIdx(proto)
+	protoIdx := idxTcp
 	d.notifyPeriodicCheckResultByIndex(protoIdx, proto, success, failure)
 }
 

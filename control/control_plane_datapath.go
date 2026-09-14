@@ -116,7 +116,7 @@ func (c *ControlPlane) commitInterfaceBindings() (err error) {
 		return nil
 	}
 	c.core.configureTCHookPatterns(c.lanInterface, c.wanInterface)
-	if _, err = c.core.beginTCHookReplace(); err != nil {
+	if err = c.core.beginTCHookReplace(); err != nil {
 		return fmt.Errorf("begin TC HookSet transaction: %w", err)
 	}
 	committed := false
@@ -223,7 +223,7 @@ func (c *ControlPlane) CommitPreparedDatapath() error {
 	}
 	if c.routingKernspaceSnapshot != nil {
 		c.log.Infoln("Loading routing rules into kernel space (BPF)...")
-		if _, err := c.core.buildRoutingKernspaceForSlot(c.log, c.routingKernspaceSnapshot); err != nil {
+		if err := c.core.buildRoutingKernspaceForSlot(c.log, c.routingKernspaceSnapshot); err != nil {
 			return fmt.Errorf("routing kernspace snapshot: %w", err)
 		}
 		if err := c.core.StageRoutingEpoch(); err != nil {
@@ -324,7 +324,7 @@ func (c *ControlPlane) RestoreDatapathForReloadRollback() error {
 		return fmt.Errorf("restore interface bindings: %w", err)
 	}
 	if c.routingKernspaceSnapshot != nil {
-		if _, err := c.core.buildRoutingKernspaceForSlot(c.log, c.routingKernspaceSnapshot); err != nil {
+		if err := c.core.buildRoutingKernspaceForSlot(c.log, c.routingKernspaceSnapshot); err != nil {
 			return fmt.Errorf("restore routing kernspace: %w", err)
 		}
 		if err := c.core.StageRoutingEpoch(); err != nil {

@@ -443,7 +443,7 @@ func closeWriteRelayConn(conn netproxy.Conn) {
 // a deadline. A nil context is treated as context.Background(). A relayCore
 // orchestrates shared cancellation and force-close fallback.
 func RelayTCPContextWithRecords(ctx context.Context, lConn, rConn netproxy.Conn, leftRecord func(int64), rightRecord func(int64)) (err error) {
-	core := newRelayCore(lConn, rConn, defaultRelayCopyEngine{}, leftRecord, rightRecord)
+	core := newRelayCore(lConn, rConn, leftRecord, rightRecord)
 	return core.run(ctx)
 }
 

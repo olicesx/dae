@@ -256,7 +256,7 @@ func TestHandlePkt_RepeatedSameIngressReusesSingleUdpEndpoint(t *testing.T) {
 	key := flowDecision.FullConeNatEndpointKey()
 
 	for i := 0; i < 5; i++ {
-		if err := cp.handlePktWithPrefetch(nil, payload, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+		if err := cp.handlePktWithPrefetch(payload, src, dst, routingResult, flowDecision, nil, UdpEndpointKey{}, false); err != nil {
 			t.Fatalf("handlePkt call %d: %v", i+1, err)
 		}
 	}
@@ -317,7 +317,7 @@ func TestHandlePkt_ProxyBackedSoftReadLoopExitRedialsFreshEndpoint(t *testing.T)
 	flowDecision := ClassifyUdpFlow(src, dst, payload)
 	key := flowDecision.FullConeNatEndpointKey()
 
-	if err := cp.handlePktWithPrefetch(nil, payload, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(payload, src, dst, routingResult, flowDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("first handlePkt: %v", err)
 	}
 
@@ -337,7 +337,7 @@ func TestHandlePkt_ProxyBackedSoftReadLoopExitRedialsFreshEndpoint(t *testing.T)
 		t.Fatal("timed out waiting for simulated soft read exit")
 	}
 
-	if err := cp.handlePktWithPrefetch(nil, payload, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(payload, src, dst, routingResult, flowDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("second handlePkt after soft read exit: %v", err)
 	}
 
@@ -403,7 +403,7 @@ func TestHandlePkt_TransportLifecycleShutdownRedialsFreshProxyEndpoint(t *testin
 	flowDecision := ClassifyUdpFlow(src, dst, payload)
 	key := flowDecision.FullConeNatEndpointKey()
 
-	if err := cp.handlePktWithPrefetch(nil, payload, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(payload, src, dst, routingResult, flowDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("first handlePkt: %v", err)
 	}
 
@@ -419,7 +419,7 @@ func TestHandlePkt_TransportLifecycleShutdownRedialsFreshProxyEndpoint(t *testin
 		t.Fatal("expected transport lifecycle shutdown to remove the endpoint from the pool")
 	}
 
-	if err := cp.handlePktWithPrefetch(nil, payload, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(payload, src, dst, routingResult, flowDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("second handlePkt after transport shutdown: %v", err)
 	}
 
@@ -471,7 +471,7 @@ func TestAnyfromPool_ConcurrentExistingSocketReusesCachedBind(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			conn, isNew, err := pool.getOrCreateWithMark(lAddr, 0, AnyfromTimeout)
+			conn, isNew, err := pool.getOrCreateWithMark(lAddr, 0)
 			if err != nil {
 				errCh <- err
 				return
@@ -525,7 +525,7 @@ func TestAnyfromPool_ConcurrentFailedBindEntrySuppressesRetryStorm(t *testing.T)
 		go func() {
 			defer wg.Done()
 			<-start
-			conn, isNew, err := pool.getOrCreateWithMark(lAddr, 0, AnyfromTimeout)
+			conn, isNew, err := pool.getOrCreateWithMark(lAddr, 0)
 			if !stderrors.Is(err, ErrAnyfromBindFailed) {
 				errCh <- fmt.Errorf("GetOrCreate err = %v, want %v", err, ErrAnyfromBindFailed)
 				return

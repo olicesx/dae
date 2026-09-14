@@ -148,14 +148,14 @@ func (c *controlPlaneCore) restorePreparedTCHookSet(previous *controlPlaneCore) 
 	return nil
 }
 
-func (c *controlPlaneCore) beginTCHookReplace() (bool, error) {
+func (c *controlPlaneCore) beginTCHookReplace() error {
 	if c == nil {
-		return false, nil
+		return nil
 	}
 	c.tcHookMu.Lock()
 	if c.tcHookStage != nil {
 		c.tcHookMu.Unlock()
-		return false, fmt.Errorf("TC HookSet staging already active")
+		return fmt.Errorf("TC HookSet staging already active")
 	}
 	target := c.tcHooks
 	deferred := false
@@ -173,9 +173,9 @@ func (c *controlPlaneCore) beginTCHookReplace() (bool, error) {
 
 	if err := target.beginReplace(); err != nil {
 		c.clearTCHookStage(target)
-		return false, err
+		return err
 	}
-	return deferred, nil
+	return nil
 }
 
 func (c *controlPlaneCore) stageTCHook(spec tcHookSpec) error {

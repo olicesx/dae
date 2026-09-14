@@ -157,7 +157,7 @@ func (ue *UdpEndpoint) prewarmResponseConn(target string) {
 	if GetDaeNetns() == nil || DefaultAnyfromPool == nil {
 		return
 	}
-	af, _, err := DefaultAnyfromPool.getOrCreateWithMark(bindAddr, replySoMark, AnyfromTimeout)
+	af, _, err := DefaultAnyfromPool.getOrCreateWithMark(bindAddr, replySoMark)
 	if err != nil {
 		return
 	}

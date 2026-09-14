@@ -89,11 +89,11 @@ type relayResult struct {
 	err error
 }
 
-func newRelayCore(lConn, rConn netproxy.Conn, engine relayCopyEngine, leftRecord func(int64), rightRecord func(int64)) *relayCore {
+func newRelayCore(lConn, rConn netproxy.Conn, leftRecord func(int64), rightRecord func(int64)) *relayCore {
 	return &relayCore{
 		left:             lConn,
 		right:            rConn,
-		copyEngine:       engine,
+		copyEngine:       defaultRelayCopyEngine{},
 		halfCloseTimeout: relayHalfCloseTimeout,
 		idleTimeout:      relayIdleTimeout,
 		idleCheckPeriod:  relayIdleCheckInterval,

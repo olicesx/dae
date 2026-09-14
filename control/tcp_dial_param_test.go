@@ -6,7 +6,6 @@
 package control
 
 import (
-	"context"
 	"net/netip"
 	"testing"
 
@@ -52,7 +51,7 @@ func TestTCPDialParamsPropagateMustToDialResult(t *testing.T) {
 				t.Fatal("TCP dial parameter lost must flag")
 			}
 
-			result, err := cp.chooseProxyDialer(context.Background(), dialParam)
+			result, err := cp.chooseProxyDialer(dialParam)
 			if err != nil {
 				t.Fatalf("chooseProxyDialer() error = %v", err)
 			}

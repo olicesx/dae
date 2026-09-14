@@ -65,7 +65,7 @@ func (s *ConnSniffer) Read(p []byte) (n int, err error) {
 // so breaks proxied TCP. Only bufioConn and prefixedConn, whose prefixes are
 // fully drained before the continuation runs, may implement that interface.
 func (s *ConnSniffer) CopyRelayRemainder(dst io.Writer, buf []byte) (int64, error) {
-	return copyDirect(dst, s.Conn, buf, nil)
+	return copyDirect(dst, s.Conn, buf)
 }
 
 func (s *ConnSniffer) TakeRelaySegments() [][]byte {
@@ -193,22 +193,19 @@ func (s *ConnSniffer) ReadFrom(r io.Reader) (int64, error) {
 	bufPtr := relayBufPool.Get().(*[]byte)
 	buf := *bufPtr
 	defer relayBufPool.Put(bufPtr)
-	return copyDirect(s.Conn, r, buf, nil)
+	return copyDirect(s.Conn, r, buf)
 }
 
 // copyDirect copies from src to dst using the provided buf without delegating
 // to io.WriterTo or io.ReaderFrom interfaces. This prevents stdlib wrappers
 // (e.g. net.TCPConn.ReadFrom) from silently heap-allocating their own buffers.
 // record, when non-nil, observes every successfully written chunk.
-func copyDirect(dst io.Writer, src io.Reader, buf []byte, record func(int64)) (written int64, err error) {
+func copyDirect(dst io.Writer, src io.Reader, buf []byte) (written int64, err error) {
 	for {
 		nr, er := src.Read(buf)
 		if nr > 0 {
 			nw, ew := dst.Write(buf[:nr])
 			written += int64(nw)
-			if nw > 0 && record != nil {
-				record(int64(nw))
-			}
 			if ew != nil {
 				return written, ew
 			}

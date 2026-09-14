@@ -373,14 +373,14 @@ func (s *tcpRelayOffloadSession) reportOffloadMapFailure(op string, err error) {
 // Returns (engage, lift, err): engage demands the fds be dropped from epoll
 // while the kernel drains already-redirected skbs; lift demands they be
 // re-added.
-func (s *tcpRelayOffloadSession) fuseStep(lastProgress *time.Time) (engage, lift bool, err error) {
+func (s *tcpRelayOffloadSession) fuseStep(lastProgress *time.Time) (engage, lift bool) {
 	lrx, err := tcpConnRxBytes(s.left)
 	if err != nil {
-		return false, false, nil // transient; skip this round
+		return false, false // transient; skip this round
 	}
 	rrx, err := tcpConnRxBytes(s.right)
 	if err != nil {
-		return false, false, nil
+		return false, false
 	}
 	var lSent, rSent uint64
 	var lv, rv []uint64
@@ -400,7 +400,7 @@ func (s *tcpRelayOffloadSession) fuseStep(lastProgress *time.Time) (engage, lift
 			// redirects again, late userspace writes would compete with the
 			// kernel redirect on the peer send path and reorder bytes.
 			if s.drainResidual(lastProgress) {
-				return false, false, nil
+				return false, false
 			}
 			s.fused = false
 			// A failed lift leaves the kernel verdict paused while userspace
@@ -422,9 +422,9 @@ func (s *tcpRelayOffloadSession) fuseStep(lastProgress *time.Time) (engage, lift
 			if s.log != nil && s.log.IsLevelEnabled(logrus.DebugLevel) {
 				s.log.Debugf("TCP relay eBPF offload fuse lifted: %v <-> %v", s.left.RemoteAddr(), s.right.RemoteAddr())
 			}
-			return false, true, nil
+			return false, true
 		}
-		return false, false, nil
+		return false, false
 	}
 	if backlog > int64(tcpOffloadMaxPeerBacklog) {
 		// Engage all-or-nothing: the pause must cover BOTH directions before
@@ -446,16 +446,16 @@ func (s *tcpRelayOffloadSession) fuseStep(lastProgress *time.Time) (engage, lift
 				}
 			}
 			s.reportOffloadMapFailure("pause-engage", updateErr)
-			return false, false, nil
+			return false, false
 		}
 		s.fused = true
 		s.fuseDrainUntil = time.Now().Add(tcpOffloadFuseDrainWait)
 		if s.log != nil && s.log.IsLevelEnabled(logrus.DebugLevel) {
 			s.log.Debugf("TCP relay eBPF offload fuse engaged (backlog=%d): %v <-> %v", backlog, s.left.RemoteAddr(), s.right.RemoteAddr())
 		}
-		return true, false, nil
+		return true, false
 	}
-	return false, false, nil
+	return false, false
 }
 
 // drainResidual forwards SK_PASS data still queued in the receive queues
@@ -569,11 +569,7 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 		// starve it.
 		if time.Since(lastGuard) >= tcpOffloadEpollWaitCap {
 			lastGuard = time.Now()
-			engage, lift, err := s.fuseStep(&lastProgress)
-			if err != nil {
-				s.forceClose()
-				return 0, 0, nil
-			}
+			engage, lift := s.fuseStep(&lastProgress)
 			if engage {
 				// Drop the fds from epoll while the kernel drains the
 				// already-redirected skbs; level-triggered IN would

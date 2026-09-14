@@ -433,7 +433,7 @@ func TestTCHookHandoffTransfersCloseOwnership(t *testing.T) {
 	if err := candidate.prepareTCHookHandoff(previous); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := candidate.beginTCHookReplace(); err != nil {
+	if err := candidate.beginTCHookReplace(); err != nil {
 		t.Fatal(err)
 	}
 	_ = candidate.stageTCHook(testTCHookSpec(1, new(ebpf.Program)))
@@ -479,7 +479,7 @@ func TestTCHookHandoffRestoresOwnershipBeforeRollback(t *testing.T) {
 	if err := candidate.prepareTCHookHandoff(previous); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := candidate.beginTCHookReplace(); err != nil {
+	if err := candidate.beginTCHookReplace(); err != nil {
 		t.Fatal(err)
 	}
 	_ = candidate.stageTCHook(testTCHookSpec(1, newProgram))

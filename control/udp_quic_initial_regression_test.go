@@ -99,7 +99,7 @@ func TestHandlePkt_FailedQuicDcidKeepsExistingDomainlessEndpoint(t *testing.T) {
 		Outbound: uint8(consts.OutboundUserDefinedMin),
 	}
 
-	if err := cp.handlePktWithPrefetch(nil, payload, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(payload, src, dst, routingResult, flowDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("first handlePkt: %v", err)
 	}
 	if got := underlay.calls.Load(); got != 1 {
@@ -111,7 +111,7 @@ func TestHandlePkt_FailedQuicDcidKeepsExistingDomainlessEndpoint(t *testing.T) {
 
 	MarkQuicDcidFailed(NewPacketSnifferKey(src, dst, payload), quicDcidFailureReasonDecryptFailure)
 
-	if err := cp.handlePktWithPrefetch(nil, payload, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(payload, src, dst, routingResult, flowDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("second handlePkt: %v", err)
 	}
 	if got := underlay.calls.Load(); got != 1 {
@@ -140,7 +140,7 @@ func TestHandlePkt_PendingDomainlessEndpointReusesSameQuicInitial(t *testing.T) 
 		Outbound: uint8(consts.OutboundUserDefinedMin),
 	}
 
-	if err := cp.handlePktWithPrefetch(nil, payload, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(payload, src, dst, routingResult, flowDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("first handlePkt: %v", err)
 	}
 	ueBefore, ok := DefaultUdpEndpointPool.Get(key)
@@ -151,7 +151,7 @@ func TestHandlePkt_PendingDomainlessEndpointReusesSameQuicInitial(t *testing.T) 
 		t.Fatal("expected endpoint to remain probing before any reply")
 	}
 
-	if err := cp.handlePktWithPrefetch(nil, payload, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(payload, src, dst, routingResult, flowDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("second handlePkt: %v", err)
 	}
 	if got := underlay.calls.Load(); got != 1 {
@@ -198,7 +198,7 @@ func TestHandlePkt_ActiveQuicSnifferMismatchResetsDomainlessEndpoint(t *testing.
 		Outbound: uint8(consts.OutboundUserDefinedMin),
 	}
 
-	if err := cp.handlePktWithPrefetch(nil, firstPayload, src, dst, routingResult, firstDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(firstPayload, src, dst, routingResult, firstDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("handlePkt(first): %v", err)
 	}
 	ueBefore, ok := DefaultUdpEndpointPool.Get(key)
@@ -210,7 +210,7 @@ func TestHandlePkt_ActiveQuicSnifferMismatchResetsDomainlessEndpoint(t *testing.
 	if !secondDecision.IsQuicInitial {
 		t.Fatal("expected second payload to stay on QUIC Initial path")
 	}
-	if err := cp.handlePktWithPrefetch(nil, secondPayload, src, dst, routingResult, secondDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(secondPayload, src, dst, routingResult, secondDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("handlePkt(second): %v", err)
 	}
 	if got := underlay.calls.Load(); got != 2 {
@@ -259,7 +259,7 @@ func TestHandlePkt_EstablishedDomainlessEndpointSurvivesQuicInitialHeuristic(t *
 		Outbound: uint8(consts.OutboundUserDefinedMin),
 	}
 
-	if err := cp.handlePktWithPrefetch(nil, payload, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(payload, src, dst, routingResult, flowDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("first handlePkt: %v", err)
 	}
 	if got := underlay.calls.Load(); got != 1 {
@@ -275,7 +275,7 @@ func TestHandlePkt_EstablishedDomainlessEndpointSurvivesQuicInitialHeuristic(t *
 		t.Fatal("expected endpoint to enter established state after upstream reply")
 	}
 
-	if err := cp.handlePktWithPrefetch(nil, payload, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(payload, src, dst, routingResult, flowDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("second handlePkt: %v", err)
 	}
 	if got := underlay.calls.Load(); got != 1 {
@@ -312,7 +312,7 @@ func TestHandlePkt_NonSniffPortBypassesInitialShapedPayload(t *testing.T) {
 	if gameDecision.IsQuicInitial {
 		t.Fatal("expected game payload to avoid QUIC Initial classification")
 	}
-	if err := cp.handlePktWithPrefetch(nil, gamePayload, src, dst, routingResult, gameDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(gamePayload, src, dst, routingResult, gameDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("handlePkt(game): %v", err)
 	}
 	if got := underlay.calls.Load(); got != 1 {
@@ -339,7 +339,7 @@ func TestHandlePkt_NonSniffPortBypassesInitialShapedPayload(t *testing.T) {
 	if initialLikeDecision.HasSnifferSession {
 		t.Fatal("expected non-sniff port to avoid creating a sniffer session")
 	}
-	if err := cp.handlePktWithPrefetch(nil, initialLikePayload, src, dst, routingResult, initialLikeDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(initialLikePayload, src, dst, routingResult, initialLikeDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("handlePkt(Initial-shaped payload on non-sniff port): %v", err)
 	}
 
@@ -386,7 +386,7 @@ func TestHandlePkt_NonSniffPortInitialShapedPayloadKeepsFullConeReuse(t *testing
 	if initialLikeDecision.IsQuicInitial {
 		t.Fatal("expected non-sniff port to bypass QUIC Initial classification")
 	}
-	if err := cp.handlePktWithPrefetch(nil, initialLikePayload, src, dst, routingResult, initialLikeDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(initialLikePayload, src, dst, routingResult, initialLikeDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("handlePkt(Initial-shaped payload on non-sniff port): %v", err)
 	}
 	if got := underlay.calls.Load(); got != 1 {
@@ -410,7 +410,7 @@ func TestHandlePkt_NonSniffPortInitialShapedPayloadKeepsFullConeReuse(t *testing
 	if ordinaryDecision.HasSnifferSession {
 		t.Fatal("expected non-sniff port sibling packet to avoid sniffer state")
 	}
-	if err := cp.handlePktWithPrefetch(nil, ordinaryPayload, src, dst, routingResult, ordinaryDecision, false, nil, UdpEndpointKey{}, false); err != nil {
+	if err := cp.handlePktWithPrefetch(ordinaryPayload, src, dst, routingResult, ordinaryDecision, nil, UdpEndpointKey{}, false); err != nil {
 		t.Fatalf("handlePkt(ordinary sibling): %v", err)
 	}
 

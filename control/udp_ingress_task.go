@@ -343,7 +343,7 @@ func (t *udpIngressTask) Run() {
 		}
 	}
 
-	if e := c.handlePktWithPrefetch(t.lConn, data, convergeSrc, realDst, routingResult, flowDecision, false, cacheLookup.prefetch, cacheLookup.prefetchKey, cacheLookup.prefetchOK); e != nil {
+	if e := c.handlePktWithPrefetch(data, convergeSrc, realDst, routingResult, flowDecision, cacheLookup.prefetch, cacheLookup.prefetchKey, cacheLookup.prefetchOK); e != nil {
 		// Both branches report a condition that repeats per packet: the
 		// reload-window routing-epoch ownership loss, and any other failure
 		// that persists for the flow (and therefore for every later packet of

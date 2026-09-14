@@ -229,10 +229,6 @@ func (d UdpFlowDecision) EnsureSnifferSession() UdpFlowDecision {
 	return d
 }
 
-func (d UdpFlowDecision) ShouldAttemptSniff() bool {
-	return d.HasSnifferSession || d.IsQuicInitial
-}
-
 func (d UdpFlowDecision) ShouldUseOrderedIngress() bool {
 	// Preserve ingress order for every session-oriented UDP flow once dae has
 	// accepted the packet. Without this, ordinary UDP/game traffic can reach

@@ -36,7 +36,7 @@ func (m *blockingMockConn) SetWriteDeadline(t time.Time) error         { return 
 func TestRelayIdleWatchdogReclaimsIdleRelay(t *testing.T) {
 	l := &blockingMockConn{}
 	r := &blockingMockConn{}
-	rc := newRelayCore(l, r, defaultRelayCopyEngine{}, nil, nil)
+	rc := newRelayCore(l, r, nil, nil)
 	// Inject a short idle bound and fast check cadence for the test.
 	rc.idleTimeout = 200 * time.Millisecond
 	rc.idleCheckPeriod = 50 * time.Millisecond
@@ -60,7 +60,7 @@ func TestRelayIdleWatchdogReclaimsIdleRelay(t *testing.T) {
 func TestRelayIdleWatchdogKeepsActiveRelay(t *testing.T) {
 	l := &blockingMockConn{}
 	r := &activeMockConn{}
-	rc := newRelayCore(l, r, defaultRelayCopyEngine{}, nil, nil)
+	rc := newRelayCore(l, r, nil, nil)
 	rc.idleTimeout = 300 * time.Millisecond
 	rc.idleCheckPeriod = 50 * time.Millisecond
 
@@ -111,7 +111,7 @@ func (m *activeMockConn) SetWriteDeadline(t time.Time) error         { return ni
 // unblocked by forceClose), whatever the surfaced error.
 func TestRelayIdleWatchdogCoexistsWithHalfClose(t *testing.T) {
 	l := &blockingMockConn{}
-	rc := newRelayCore(l, l, defaultRelayCopyEngine{}, nil, nil)
+	rc := newRelayCore(l, l, nil, nil)
 	rc.idleTimeout = 100 * time.Millisecond
 	rc.idleCheckPeriod = 20 * time.Millisecond
 
@@ -207,7 +207,7 @@ func TestRelayIdleWatchdogKeepsNudgingUntilReadsReturn(t *testing.T) {
 	r := newRepeatedNudgeMockConn()
 	defer l.releaseRead()
 	defer r.releaseRead()
-	rc := newRelayCore(l, r, defaultRelayCopyEngine{}, nil, nil)
+	rc := newRelayCore(l, r, nil, nil)
 	rc.idleTimeout = 40 * time.Millisecond
 	rc.idleCheckPeriod = 20 * time.Millisecond
 
@@ -231,7 +231,7 @@ func TestRelayCancelNudgesFasterThanIdleCadence(t *testing.T) {
 	r := newRepeatedNudgeMockConn()
 	defer l.releaseRead()
 	defer r.releaseRead()
-	rc := newRelayCore(l, r, defaultRelayCopyEngine{}, nil, nil)
+	rc := newRelayCore(l, r, nil, nil)
 	rc.idleTimeout = time.Hour
 	rc.idleCheckPeriod = time.Hour
 
@@ -254,7 +254,7 @@ func TestRelayWatchdogSurvivesCtxCancel(t *testing.T) {
 	// Conn whose Read releases 200ms after Close (simulating quic-go delay).
 	l := newDelayedReleaseMockConn(200 * time.Millisecond)
 	r := newDelayedReleaseMockConn(200 * time.Millisecond)
-	rc := newRelayCore(l, r, defaultRelayCopyEngine{}, nil, nil)
+	rc := newRelayCore(l, r, nil, nil)
 	rc.idleTimeout = 5 * time.Second // long idle; we test ctx-cancel, not idle
 	rc.idleCheckPeriod = 50 * time.Millisecond
 
@@ -390,7 +390,7 @@ func TestRelayHalfCloseRefreshOutlivesPriorIdle(t *testing.T) {
 	)
 	src := &delayedEOFConn{delay: eofDelay}
 	dst := &deadlineBlockConn{}
-	rc := newRelayCore(src, dst, defaultRelayCopyEngine{}, nil, nil)
+	rc := newRelayCore(src, dst, nil, nil)
 	rc.idleTimeout = idleTimeout
 	rc.idleCheckPeriod = idleCheckPeriod
 	rc.halfCloseTimeout = halfCloseTimeout
@@ -415,7 +415,7 @@ func TestRelayHalfCloseRefreshOutlivesPriorIdle(t *testing.T) {
 func TestRelayWatcherStopsOnNormalCompletion(t *testing.T) {
 	l := &eofMockConn{}
 	r := &eofMockConn{}
-	rc := newRelayCore(l, r, defaultRelayCopyEngine{}, nil, nil)
+	rc := newRelayCore(l, r, nil, nil)
 	rc.idleTimeout = time.Hour
 	rc.idleCheckPeriod = time.Hour
 
@@ -441,7 +441,7 @@ func TestRelayWatcherStopsOnNormalCompletion(t *testing.T) {
 func TestRelayWatcherForceClosesOnParentCancel(t *testing.T) {
 	l := &blockingMockConn{}
 	r := &blockingMockConn{}
-	rc := newRelayCore(l, r, defaultRelayCopyEngine{}, nil, nil)
+	rc := newRelayCore(l, r, nil, nil)
 	rc.idleTimeout = time.Hour
 	rc.idleCheckPeriod = time.Hour
 

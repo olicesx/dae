@@ -133,7 +133,7 @@ func TestHandlePkt_EpochOwnerUnavailableWhenTuplePinned(t *testing.T) {
 	manager.RetainUdpConnStateTuples([]bpfTuplesKey{key})
 	defer func() { _ = manager.ReleaseUdpConnStateTuples([]bpfTuplesKey{key}) }()
 
-	err := cp.handlePktWithPrefetch(nil, payload, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false)
+	err := cp.handlePktWithPrefetch(payload, src, dst, routingResult, flowDecision, nil, UdpEndpointKey{}, false)
 	if !errors.Is(err, errRoutingEpochOwnerUnavailable) {
 		t.Fatalf("handlePkt err = %v, want errRoutingEpochOwnerUnavailable", err)
 	}
@@ -295,7 +295,7 @@ func TestHandlePkt_EpochOwnerUnavailable_RetiringPlaneClosedDrops(t *testing.T) 
 	}
 	flowDecision := ClassifyUdpFlow(src, dst, payload)
 
-	err := cp.handlePktWithPrefetch(nil, payload, src, dst, routingResult, flowDecision, false, nil, UdpEndpointKey{}, false)
+	err := cp.handlePktWithPrefetch(payload, src, dst, routingResult, flowDecision, nil, UdpEndpointKey{}, false)
 	if !errors.Is(err, errRoutingEpochOwnerUnavailable) {
 		t.Fatalf("handlePkt err = %v, want errRoutingEpochOwnerUnavailable", err)
 	}

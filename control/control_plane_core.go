@@ -538,19 +538,19 @@ func (c *controlPlaneCore) EjectBpf() *bpfObjects {
 // buildRoutingKernspaceForSlot builds and records a generation's LPM indices
 // while holding the same core lock used by Close. This keeps map rollback and
 // generation-owned index cleanup from running concurrently.
-func (c *controlPlaneCore) buildRoutingKernspaceForSlot(log *logrus.Logger, snapshot *routingKernspaceSnapshot) ([]uint32, error) {
+func (c *controlPlaneCore) buildRoutingKernspaceForSlot(log *logrus.Logger, snapshot *routingKernspaceSnapshot) error {
 	if c == nil {
-		return nil, fmt.Errorf("nil control plane core")
+		return fmt.Errorf("nil control plane core")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	indices, err := snapshot.BuildKernspaceForSlot(log, c.bpf.Load(), c.RoutingEpochSlot())
 	if err != nil {
-		return nil, err
+		return err
 	}
 	c.lpmTrieIndices = append([]uint32(nil), indices...)
-	return indices, nil
+	return nil
 }
 
 // ReplaceLpmIndices installs a new active LPM index set for this generation.

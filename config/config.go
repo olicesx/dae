@@ -199,10 +199,6 @@ func New(sections []*config_parser.Section) (conf *Config, err error) {
 	for _, spec := range configSectionSpecs {
 		section, ok := nameToSection[spec.name]
 		if !ok {
-			if spec.required {
-				// Unreachable: the required check above already failed.
-				return nil, fmt.Errorf("section %v is required but not provided", spec.name)
-			}
 			// Optional section that the user did not write. It must still be
 			// decoded from an empty section, otherwise the documented
 			// `default:` tags on its fields never run and the whole section

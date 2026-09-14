@@ -871,11 +871,9 @@ func (ue *UdpEndpoint) acceptsInitialReplyFrom(from netip.AddrPort) bool {
 	return false
 }
 
-func (ue *UdpEndpoint) setExpiry(deadlineNano int64, refreshCachedResponseConns bool) {
+func (ue *UdpEndpoint) setExpiry(deadlineNano int64) {
 	ue.expiresAtNano.Store(deadlineNano)
-	if refreshCachedResponseConns {
-		ue.refreshCachedResponseConnsWithTime(deadlineNano)
-	}
+	ue.refreshCachedResponseConnsWithTime(deadlineNano)
 }
 
 // RefreshTtlWithTime updates the expiration time using a pre-calculated
@@ -901,7 +899,7 @@ func (ue *UdpEndpoint) RefreshTtlWithTime(nowNano int64) {
 	// CAS to avoid thundering herd on the same connection.
 	if ue.lastRefreshNano.CompareAndSwap(last, nowNano) {
 		deadlineNano := nowNano + int64(timeout)
-		ue.setExpiry(deadlineNano, true)
+		ue.setExpiry(deadlineNano)
 		// Keep cached reply sockets alive as long as the endpoint is alive.
 		// Without this, Anyfrom entries can expire before the owning UDP
 		// endpoint does, forcing a bind syscall on a later reply and causing
@@ -930,7 +928,7 @@ func (ue *UdpEndpoint) UpdateNatTimeout(timeout time.Duration) {
 	now := time.Now().UnixNano()
 	// Force immediate refresh on timeout change (bypass throttling).
 	ue.lastRefreshNano.Store(now)
-	ue.setExpiry(now+int64(timeout), true)
+	ue.setExpiry(now + int64(timeout))
 }
 
 func (ue *UdpEndpoint) IsExpired(nowNano int64) bool {

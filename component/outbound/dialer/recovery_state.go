@@ -106,13 +106,6 @@ func (m *dialerRecoveryManager) indexForType(typ *NetworkType) int {
 	return idxDataUdp
 }
 
-func (m *dialerRecoveryManager) indexForProto(proto consts.L4ProtoStr) int {
-	if proto == consts.L4ProtoStr_UDP {
-		return idxDnsUdp
-	}
-	return idxTcp
-}
-
 func (m *dialerRecoveryManager) init(checkInterval time.Duration) {
 	maxBackoff := max(time.Duration(float64(checkInterval)*2.0/3.0), minRecoveryBackoff)
 	for i := range m.recoveryState {

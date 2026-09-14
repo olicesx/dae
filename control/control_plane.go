@@ -779,7 +779,7 @@ func NewControlPlaneWithContextOptions(
 	kernspaceSnapshot := builder.KernspaceSnapshot()
 	if !buildOpts.DelayDatapathCommit {
 		log.Infoln("Loading routing rules into kernel space (BPF)...")
-		if _, err = core.buildRoutingKernspaceForSlot(log, kernspaceSnapshot); err != nil {
+		if err = core.buildRoutingKernspaceForSlot(log, kernspaceSnapshot); err != nil {
 			return nil, fmt.Errorf("routing kernspace snapshot: %w", err)
 		}
 		if err = core.StageRoutingEpoch(); err != nil {
@@ -3245,5 +3245,5 @@ func (c *ControlPlane) StartPreparedDNSListener() error {
 	if c == nil {
 		return nil
 	}
-	return c.startPreparedDNSListener(c.ctx, c.log, &c.deferFuncs, c.stopOwnedDNSListener)
+	return c.startPreparedDNSListener(c.ctx, &c.deferFuncs, c.stopOwnedDNSListener)
 }

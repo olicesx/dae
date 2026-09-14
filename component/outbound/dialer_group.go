@@ -262,7 +262,7 @@ func (g *DialerGroup) HandleNoAliveDialer(
 	logInterval := max(g.cachedMinCheckInterval*5, 10*time.Second)
 
 	if g.tryDoRateLimitedAction(&g.noAliveLogLastTimes[idx], logInterval) {
-		g.logNoAlive(origNetworkType, selectionNetworkType, src, dst, domain, strictIpVersion, logInterval)
+		g.logNoAlive(origNetworkType, selectionNetworkType, src, dst, domain, logInterval)
 	}
 }
 
@@ -297,7 +297,6 @@ func (g *DialerGroup) logNoAlive(
 	src netip.AddrPort,
 	dst netip.AddrPort,
 	domain string,
-	strictIpVersion bool,
 	interval time.Duration,
 ) {
 	total := len(g.Dialers)

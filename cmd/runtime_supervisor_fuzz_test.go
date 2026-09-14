@@ -66,7 +66,7 @@ func FuzzRuntimeSupervisorOperations(f *testing.F) {
 				}
 			case 3:
 				if snapshot.retiring != nil {
-					_ = supervisor.markRetirementComplete(snapshot.retiring)
+					supervisor.markRetirementComplete(snapshot.retiring)
 				}
 			case 4:
 				if active != nil {

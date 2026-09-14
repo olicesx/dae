@@ -1,3 +1,8 @@
+/*
+*  SPDX-License-Identifier: AGPL-3.0-only
+*  Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+ */
+
 package cmd
 
 import (
@@ -43,7 +48,7 @@ func (m *mockRetirementPlane) StopRoutingEpochExecutionWithTimeout(time.Duration
 // would kill active relay flows and break hot-reload connectivity.
 func TestRetireDrainIdlePreservesConnections(t *testing.T) {
 	plane := &mockRetirementPlane{activeSessions: 0, idleCh: make(chan struct{})}
-	retireControlPlaneConnections(logrus.New(), context.Background(), plane, false, false, time.Second)
+	retireControlPlaneConnections(logrus.New(), context.Background(), plane, false, time.Second)
 	if plane.abortConnectionsCalls != 0 {
 		t.Fatalf("drain-idle retirement must NOT call AbortConnections (would kill active flows), got %d calls", plane.abortConnectionsCalls)
 	}
@@ -61,7 +66,7 @@ func TestRetireDrainCanceledAbortsPending(t *testing.T) {
 	plane := &mockRetirementPlane{activeSessions: 1, idleCh: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	retireControlPlaneConnections(logrus.New(), ctx, plane, false, false, time.Second)
+	retireControlPlaneConnections(logrus.New(), ctx, plane, false, time.Second)
 	if plane.abortPendingCalls != 1 {
 		t.Fatalf("canceled retirement must abort pending connections, got %d", plane.abortPendingCalls)
 	}
@@ -74,7 +79,7 @@ func TestRetireDrainCanceledAbortsPending(t *testing.T) {
 // only pending work is aborted; active connections are preserved.
 func TestRetireDrainTimeoutAbortsPending(t *testing.T) {
 	plane := &mockRetirementPlane{activeSessions: 1, idleCh: make(chan struct{})}
-	retireControlPlaneConnections(logrus.New(), context.Background(), plane, false, false, 50*time.Millisecond)
+	retireControlPlaneConnections(logrus.New(), context.Background(), plane, false, 50*time.Millisecond)
 	if plane.abortPendingCalls != 1 {
 		t.Fatalf("timeout retirement must abort pending connections, got %d", plane.abortPendingCalls)
 	}
@@ -87,7 +92,7 @@ func TestRetireDrainTimeoutAbortsPending(t *testing.T) {
 // during full shutdown, not reload): AbortConnections is expected here.
 func TestRetireAbortPathKeepsBehavior(t *testing.T) {
 	plane := &mockRetirementPlane{activeSessions: 1, idleCh: make(chan struct{})}
-	retireControlPlaneConnections(logrus.New(), context.Background(), plane, true, false, time.Second)
+	retireControlPlaneConnections(logrus.New(), context.Background(), plane, true, time.Second)
 	if plane.abortConnectionsCalls != 1 {
 		t.Fatalf("abort retirement must call AbortConnections, got %d", plane.abortConnectionsCalls)
 	}

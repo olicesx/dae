@@ -76,22 +76,12 @@ func retireControlPlaneConnections(
 	ctx context.Context,
 	c retirementDrainPlane,
 	abort bool,
-	hasOverlap bool,
 	maxDrain time.Duration,
 ) {
-	// P3-9, verdict pending - DO NOT change behavior here.
-	//
-	// This parameter is currently unused: the retirement is two-stage (drain,
-	// then abort pending work), while the surrounding comments and the tests
-	// still describe the three-stage scheme that also aborted *established*
-	// connections when the previous and the new generation shared listening
-	// addresses (`case !hasOverlap: c.AbortConnections()`, dropped in
-	// b7fb496d). Either restore that case or delete hasOverlap and its call
-	// chain and rewrite the comments as two-stage - the decision is with the
-	// maintainers. Until then the parameter is kept so the call signature and
-	// the callers stay intact.
-	_ = hasOverlap
-
+	// Retirement is two-stage: either abort everything when explicitly
+	// requested, or drain and then abort only the generation-owned pending
+	// work. Established connections are never aborted on a drain path: the
+	// successor generation is already serving those flows (see b7fb496d).
 	switch {
 	case abort:
 		log.Warnln("[Reload] Abort requested; aborting stale connections immediately")

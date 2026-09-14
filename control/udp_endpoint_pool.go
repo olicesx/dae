@@ -43,7 +43,6 @@ type UdpHandler func(ue *UdpEndpoint, data []byte, from netip.AddrPort) error
 
 type udpConnStateOwner interface {
 	RetainUdpConnStateTuples(keys []bpfTuplesKey)
-	TransferRetainedUdpConnStateTuplesFrom(previous udpConnStateOwner, keys []bpfTuplesKey)
 	ReleaseUdpConnStateTuples(keys []bpfTuplesKey) error
 }
 

@@ -62,42 +62,6 @@ func (m *SessionManager) RetainUdpConnStateTuples(keys []bpfTuplesKey) {
 	m.udpStateMu.Unlock()
 }
 
-// TransferRetainedUdpConnStateTuplesFrom moves tuple ownership without
-// deleting the shared BPF entries between owners.
-func (m *SessionManager) TransferRetainedUdpConnStateTuplesFrom(previous udpConnStateOwner, keys []bpfTuplesKey) {
-	if m == nil || previous == nil || sameUdpConnStateOwner(m, previous) || len(keys) == 0 {
-		return
-	}
-	m.RetainUdpConnStateTuples(keys)
-	switch owner := previous.(type) {
-	case *SessionManager:
-		owner.forgetUdpConnStateTuples(keys)
-	case *controlPlaneCore:
-		if tracker := owner.getUdpConnStateTracker(); tracker != nil {
-			tracker.Forget(keys)
-		}
-	}
-}
-
-func (m *SessionManager) forgetUdpConnStateTuples(keys []bpfTuplesKey) {
-	if m == nil || len(keys) == 0 {
-		return
-	}
-	// udpStateMu alone: see RetainUdpConnStateTuples.
-	m.udpStateMu.Lock()
-	for _, key := range keys {
-		if refs := m.pinnedUDP[key]; refs <= 1 {
-			delete(m.pinnedUDP, key)
-		} else {
-			m.pinnedUDP[key] = refs - 1
-		}
-		redirectKey := redirectTupleForFlow(key)
-		refShard := &m.refShards[redirectShardIndex(&redirectKey)]
-		refShard.unpin(redirectKey)
-	}
-	m.udpStateMu.Unlock()
-}
-
 // ReleaseUdpConnStateTuples drops tuple references and removes entries after
 // the final process-owned endpoint releases them.
 //

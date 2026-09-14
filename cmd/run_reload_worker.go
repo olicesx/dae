@@ -257,7 +257,7 @@ func (w *reloadWorker) run() {
 					newC.SetReloadDnsCacheSource(oldC.CloneDnsCache)
 				}
 			}
-			hasOverlap := newC.InheritDialerHealthFrom(oldC)
+			newC.InheritDialerHealthFrom(oldC)
 			configureTransparentHugePages(w.log, newConf.Global.DisableTHP)
 			activeGeneration := &runtimeGeneration{
 				controlPlane: oldC,
@@ -279,7 +279,7 @@ func (w *reloadWorker) run() {
 				failSupervisorStep(err, "install staged reload candidate", candidateGeneration, nil, nil)
 				continue
 			}
-			handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections, hasOverlap)
+			handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections)
 			handoff.preparedDNSHandoff = true
 			handoff.sharedBpfHandoff = true
 			w.reloadManager.setPendingStagedHandoff(handoff, reloadStartedAt, reloadStartedAtMono)
@@ -326,7 +326,7 @@ func (w *reloadWorker) run() {
 			oldConf := w.conf
 			oldListener := w.listener
 
-			hasOverlap := newC.InheritDialerHealthFrom(oldC)
+			newC.InheritDialerHealthFrom(oldC)
 			configureTransparentHugePages(w.log, newConf.Global.DisableTHP)
 			activeGeneration := &runtimeGeneration{
 				controlPlane: oldC,
@@ -348,7 +348,7 @@ func (w *reloadWorker) run() {
 				failSupervisorStep(err, "install fresh datapath reload candidate", candidateGeneration, nil, nil)
 				continue
 			}
-			handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections, hasOverlap)
+			handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections)
 			handoff.freshDatapath = true
 			w.reloadManager.setPendingStagedHandoff(handoff, reloadStartedAt, reloadStartedAtMono)
 			w.reloadManager.beginHandoff()
@@ -444,7 +444,7 @@ func (w *reloadWorker) run() {
 		oldCancel := w.currCancel
 		oldConf := w.conf
 
-		hasOverlap := newC.InheritDialerHealthFrom(oldC)
+		newC.InheritDialerHealthFrom(oldC)
 		configureTransparentHugePages(w.log, newConf.Global.DisableTHP)
 		activeGeneration := &runtimeGeneration{
 			controlPlane: oldC,
@@ -481,7 +481,7 @@ func (w *reloadWorker) run() {
 			failSupervisorStep(err, "install reload candidate", candidateGeneration, restoreBpfOwnership, restartOldDNSListener)
 			continue
 		}
-		handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections, hasOverlap)
+		handoff := newStagedReloadHandoff(activeGeneration, candidateGeneration, abortConnections)
 		handoff.bpfTransferred = !freshDatapathReload
 		w.reloadManager.setPendingStagedHandoff(handoff, reloadStartedAt, reloadStartedAtMono)
 		w.reloadManager.clearPendingRetirement()

@@ -69,7 +69,6 @@ type ControlPlane struct {
 	controlPlaneDNSRuntime
 	dnsHandoffMu         sync.Mutex
 	dnsHandoffController atomic.Pointer[DnsController]
-	dnsHandoffOwned      bool
 	onceNetworkReady     sync.Once
 
 	ctx       context.Context
@@ -1096,15 +1095,12 @@ func (c *ControlPlane) acquireDrainTicket() func() {
 }
 
 // InheritDialerHealthFrom copies health snapshots from a previous control plane
-// generation into the current one. It returns true when at least one dialer
-// matched by group+name between the old and new generation, indicating that
-// active connections on those dialers may survive the reload.
-func (c *ControlPlane) InheritDialerHealthFrom(previous *ControlPlane) bool {
+// generation into the current one, so a reload does not reset health for
+// dialers that both generations share.
+func (c *ControlPlane) InheritDialerHealthFrom(previous *ControlPlane) {
 	if c == nil || previous == nil {
-		return false
+		return
 	}
-
-	var hasOverlap bool
 
 	previousGroups := make(map[string]*outbound.DialerGroup, len(previous.outbounds))
 	for _, group := range previous.outbounds {
@@ -1135,7 +1131,6 @@ func (c *ControlPlane) InheritDialerHealthFrom(previous *ControlPlane) bool {
 				continue
 			}
 			if oldDialer := oldDialers[d.Property().Name]; oldDialer != nil {
-				hasOverlap = true
 				if dialerHealthCheckConfigEqual(d, oldDialer) {
 					d.RestoreHealthSnapshot(oldDialer.ReloadHealthSnapshot())
 				}
@@ -1143,7 +1138,6 @@ func (c *ControlPlane) InheritDialerHealthFrom(previous *ControlPlane) bool {
 		}
 		group.EnsureReloadSelectionFloor(fallback)
 	}
-	return hasOverlap
 }
 
 func dialerHealthCheckConfigEqual(current, previous *dialer.Dialer) bool {
@@ -3102,9 +3096,9 @@ func (c *ControlPlane) releaseRetainedState() {
 		return
 	}
 
-	if handoff, owned := c.takeDNSHandoffController(); owned && handoff != nil {
-		_ = handoff.Close()
-	}
+	// Detach the handoff slot so the retired plane no longer references the
+	// controller. It is not owned here, so it is deliberately left open.
+	c.takeDNSHandoffController()
 	c.bpfMaintenance = nil
 	c.ClearReloadDnsCacheSource()
 }

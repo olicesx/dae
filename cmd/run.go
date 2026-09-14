@@ -162,7 +162,6 @@ type stagedReloadHandoff struct {
 	newCancel             context.CancelFunc
 	newListener           *control.Listener
 	abortConnections      bool
-	hasOverlap            bool
 	freshDatapath         bool
 	preparedDNSHandoff    bool
 	bpfTransferred        bool
@@ -183,7 +182,7 @@ type stagedReloadHandoff struct {
 // newStagedReloadHandoff builds the base handoff from the two supervisor
 // generations; path-specific flags (freshDatapath, preparedDNSHandoff,
 // bpfTransferred, ...) are set by the caller.
-func newStagedReloadHandoff(active, candidate *runtimeGeneration, abortConnections, hasOverlap bool) *stagedReloadHandoff {
+func newStagedReloadHandoff(active, candidate *runtimeGeneration, abortConnections bool) *stagedReloadHandoff {
 	return &stagedReloadHandoff{
 		preparedGeneration: candidate,
 		oldControlPlane:    active.controlPlane,
@@ -194,7 +193,6 @@ func newStagedReloadHandoff(active, candidate *runtimeGeneration, abortConnectio
 		newCancel:          candidate.cancel,
 		newListener:        candidate.listener,
 		abortConnections:   abortConnections,
-		hasOverlap:         hasOverlap,
 	}
 }
 
@@ -796,7 +794,6 @@ loop:
 					oldC := handoff.oldControlPlane
 					oldCancel := handoff.oldCancel
 					abortConnections := handoff.abortConnections
-					hasOverlap := handoff.hasOverlap
 					if oldC != nil && !handoff.freshDatapath && !handoff.bpfTransferred {
 						bpf := oldC.EjectBpf()
 						serveControlPlane.InjectBpf(bpf)
@@ -836,7 +833,7 @@ loop:
 					handoff.oldRuntimeStopped = true
 
 					if oldC != nil {
-						reloadManager.startControlPlaneRetirement(w.log, oldC, w.c, oldCancel, abortConnections, hasOverlap, runtimeSupervisor, retiringGeneration)
+						reloadManager.startControlPlaneRetirement(w.log, oldC, w.c, oldCancel, abortConnections, runtimeSupervisor, retiringGeneration)
 					}
 				}
 				_ = sdnotify.Ready()

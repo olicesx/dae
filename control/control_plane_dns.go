@@ -217,56 +217,44 @@ func (c *ControlPlane) SharesActiveDnsControllerWith(other *ControlPlane) bool {
 	return controller != nil && controller == other.ActiveDnsController()
 }
 
-func (c *ControlPlane) replaceDNSHandoffController(controller *DnsController, owned bool) (*DnsController, bool) {
+func (c *ControlPlane) clearDNSHandoffControllerIfMatch(controller *DnsController) (*DnsController, bool) {
 	if c == nil {
 		return nil, false
-	}
-	c.dnsHandoffMu.Lock()
-	defer c.dnsHandoffMu.Unlock()
-
-	previous := c.dnsHandoffController.Load()
-	previousOwned := c.dnsHandoffOwned
-	c.dnsHandoffOwned = owned && controller != nil
-	c.dnsHandoffController.Store(controller)
-	return previous, previousOwned
-}
-
-func (c *ControlPlane) clearDNSHandoffControllerIfMatch(controller *DnsController) (*DnsController, bool, bool) {
-	if c == nil {
-		return nil, false, false
 	}
 	c.dnsHandoffMu.Lock()
 	defer c.dnsHandoffMu.Unlock()
 
 	current := c.dnsHandoffController.Load()
 	if current != controller {
-		return current, false, false
+		return current, false
 	}
-	owned := c.dnsHandoffOwned
-	c.dnsHandoffOwned = false
 	c.dnsHandoffController.Store(nil)
-	return current, owned, true
+	return current, true
 }
 
-func (c *ControlPlane) takeDNSHandoffController() (*DnsController, bool) {
+// takeDNSHandoffController detaches and returns the slotted handoff controller,
+// if any. The slot only tracks the reference; the controller itself is owned by
+// the caller that installed it, so detaching never closes it.
+func (c *ControlPlane) takeDNSHandoffController() *DnsController {
 	if c == nil {
-		return nil, false
+		return nil
 	}
 	c.dnsHandoffMu.Lock()
 	defer c.dnsHandoffMu.Unlock()
 
 	controller := c.dnsHandoffController.Load()
-	owned := c.dnsHandoffOwned
-	c.dnsHandoffOwned = false
 	c.dnsHandoffController.Store(nil)
-	return controller, owned
+	return controller
 }
 
+// SetDNSHandoffController publishes the controller the next generation should
+// take over. The previous slot value is not closed here: ownership stays with
+// whoever installed it.
 func (c *ControlPlane) SetDNSHandoffController(controller *DnsController) {
 	if c == nil {
 		return
 	}
-	if previous, previousOwned := c.replaceDNSHandoffController(controller, false); previous != nil && previousOwned && previous != controller {
-		_ = previous.Close()
-	}
+	c.dnsHandoffMu.Lock()
+	defer c.dnsHandoffMu.Unlock()
+	c.dnsHandoffController.Store(controller)
 }

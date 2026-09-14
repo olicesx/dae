@@ -406,7 +406,6 @@ func (m *reloadManager) startControlPlaneRetirement(
 	successor *control.ControlPlane,
 	oldCancel context.CancelFunc,
 	abortConnections bool,
-	hasOverlap bool,
 	supervisor *runtimeSupervisor,
 	retiringGeneration *runtimeGeneration,
 ) {
@@ -456,7 +455,7 @@ func (m *reloadManager) startControlPlaneRetirement(
 		}()
 
 		oldControlPlane.MarkRetired()
-		retireControlPlaneConnections(log, retireCtx, oldControlPlane, abortConnections, hasOverlap, drainBudget)
+		retireControlPlaneConnections(log, retireCtx, oldControlPlane, abortConnections, drainBudget)
 
 		if oldCancel != nil {
 			oldCancel()

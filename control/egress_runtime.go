@@ -135,59 +135,6 @@ func (r *egressRuntime) acquireEgress(selected *dialer.Dialer, group *outbound.D
 	return &egressRuntimeLease{runtime: r, dialer: selected}, retainedGroup, true
 }
 
-// transferLease acquires an equivalent lease from this runtime for a dialer
-// that was previously referenced through oldLease. Matching is by dialer
-// identity (Name/Protocol/Link/Address/SubscriptionTag), not pointer, so a
-// reload that reconstructs the same node can keep established TCP flows.
-// Reference counts remain pointer-keyed on the matched instance.
-func (r *egressRuntime) transferLease(oldLease *egressRuntimeLease) (*egressRuntimeLease, *outbound.DialerGroup) {
-	if r == nil || oldLease == nil || oldLease.dialer == nil {
-		return nil, nil
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.ownerReleased || r.closed {
-		return nil, nil
-	}
-	matched := oldLease.dialer
-	if r.resourceMode {
-		matched = r.dialerByIdentityLocked(oldLease.dialer)
-		if matched == nil {
-			return nil, nil
-		}
-		r.dialerRefs[matched]++
-	}
-	r.refs++
-	return &egressRuntimeLease{runtime: r, dialer: matched}, nil
-}
-
-func (r *egressRuntime) dialerByIdentityLocked(old *dialer.Dialer) *dialer.Dialer {
-	if r == nil || old == nil || !r.resourceMode {
-		return nil
-	}
-	if _, exists := r.dialerRefs[old]; exists {
-		return old
-	}
-	want := old.Property()
-	for d := range r.dialerRefs {
-		if d != nil && dialerIdentityEqual(want, d.Property()) {
-			return d
-		}
-	}
-	return nil
-}
-
-func dialerIdentityEqual(a, b *dialer.Property) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	return a.Name == b.Name &&
-		a.Protocol == b.Protocol &&
-		a.Link == b.Link &&
-		a.Address == b.Address &&
-		a.SubscriptionTag == b.SubscriptionTag
-}
-
 func (r *egressRuntime) releaseOwner() error {
 	if r == nil {
 		return nil

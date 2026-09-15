@@ -129,5 +129,6 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260910
 // Now also: symmetric-direct WriteMsgUDP keeps OOB cmsgs (QUIC GSO),
 // bbr3 low-RTT pacing-cwnd deadlock broken with a CwndGain-scaled
 // pacing-support floor, STARTUP no longer aborts on background loss,
-// and hy2 defaults to bbr3 again.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260915135305-a2498ce2f7b3
+// and hy2 defaults to bbr3 again. AnyTLS TLS records are coalesced into
+// one socket write per framed burst (-41% write syscalls on the relay path).
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260915153105-723da22f60c9

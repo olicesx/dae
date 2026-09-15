@@ -21,8 +21,13 @@ import (
 
 const (
 	// udpWriteBatchMaxItems bounds the explicitly enabled experimental batch.
-	// Real-kernel validation found no end-to-end throughput gain, so batching
-	// stays off unless an operator has workload-specific evidence.
+	// Direct-UDP sendmmsg showed no end-to-end throughput gain in real-kernel
+	// validation. Stream transports are a different story: anytls UDP-over-TLS
+	// measured socket writes 107,934 -> 11,141 (-90%) and daemon CPU -22.5%
+	// at 1Gbps/1200B (1.04M datagrams / 10s) with zero loss, because each
+	// per-datagram write otherwise costs its own TLS record burst + flush.
+	// Batching stays opt-in (1ms tail-latency budget, see udpWriteBatchWindow);
+	// latency-sensitive UDP workloads should keep it off.
 	udpWriteBatchMaxItems = 32
 	// udpWriteBatchWindow is the opt-in batch's hard tail-latency budget.
 	udpWriteBatchWindow = time.Millisecond

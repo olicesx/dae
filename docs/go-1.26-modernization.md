@@ -146,6 +146,39 @@ produced these additional changes:
   than required. `JSONv2` is not enabled: it would not replace the `jsoniter`-based
   fuzzy decoding in `common/json`.
 
+## Green Tea GC
+
+Green Tea (`greenteagc`) is the Go 1.26 default collector and part of the toolchain
+baseline, not a `GOEXPERIMENT` this repository selects. The stock go1.26.8 build
+compiles `internal/goexperiment/exp_greenteagc_on.go`; the opt-out is
+`GOEXPERIMENT=nogreenteagc`. Nothing needs to be enabled and it should not be added
+to `DEFAULT_GOEXPERIMENT`: that list carries deviations only, and pinning a
+baseline experiment would mask a future upstream default change.
+
+Fit for this daemon: the heap is dominated by small, pointerful objects (per-flow
+state, DNS cache entries, dialer and endpoint objects), the case the
+[Go 1.26 announcement](https://go.dev/blog/greenteagc) reports as 10–40% cheaper in
+GC CPU. A local A/B on the two most allocation-heavy stub benchmarks
+(`BenchmarkUdpProxyDial/cache=miss`, `BenchmarkSniffer_SniffUdp_QUICMultiPacket`,
+`-benchtime=1s -count=5`, with and without `nogreenteagc`) did **not** resolve a
+difference: the spread between samples of one configuration (10–30%) exceeded any
+effect, because GC was only 5–9% of CPU in those runs. Confirming the benefit for
+dae needs a production-like load rather than stub microbenchmarks; the measured
+data gives no reason to deviate from the default in either direction.
+
+One upstream hazard is worth knowing, since the collector's AVX-512 span scan is on
+by default: it originally gated on `AVX512VL/BW/GFNI/BITALG/VBMI` while executing
+`KMOVB`, which requires `AVX512DQ`, so CPUs or hypervisors exposing the first set
+without the second died with SIGILL
+([golang/go#79871](https://github.com/golang/go/issues/79871)). The gate now also
+checks `HasAVX512DQ` — present in go1.26.8, and backported for 1.26.5 and later
+(the backport was approved 2026-06-09, after 1.26.4). Release builds are unaffected
+because `release.yml` and the `Dockerfile` use the floating `1.26` /
+`golang:1.26-bookworm` pins. The only pin predating the backport is `lint.yml`'s
+exact `"1.26.0"`, which builds CI tooling only. If a deployed daemon is ever seen
+dying with SIGILL on such a host, `GOEXPERIMENT=nogreenteagc` is the documented
+workaround.
+
 ## Keeping it clean
 
 `go fix -diff` exits non-zero when a fix is pending, so it can back a CI guard:

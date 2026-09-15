@@ -122,8 +122,8 @@ func validRoutingEpochSlot(slot uint32) bool {
 	return slot < routingEpochSlotCount
 }
 
-func (c *controlPlaneCore) hasRoutingEpochMaps(bpf *bpfObjects) bool {
-	return bpf != nil && bpf.ActiveRoutingEpochMap != nil && bpf.RoutingEpochMap != nil
+func (c *controlPlaneCore) hasActiveRoutingEpochMap(bpf *bpfObjects) bool {
+	return bpf != nil && bpf.ActiveRoutingEpochMap != nil
 }
 
 func (c *controlPlaneCore) clearStagedRoutingEpochLocked() {
@@ -212,7 +212,7 @@ func (c *controlPlaneCore) readActiveRoutingEpochSlot() (uint32, error) {
 			}
 		}
 		bpf := c.PeekBpf()
-		if !c.hasRoutingEpochMaps(bpf) {
+		if !c.hasActiveRoutingEpochMap(bpf) {
 			return 0, nil
 		}
 		var slot uint32
@@ -311,11 +311,13 @@ func (c *controlPlaneCore) routingEpochEnabled() bool {
 	if c == nil {
 		return false
 	}
-	return c.hasRoutingEpochMaps(c.PeekBpf()) && validRoutingEpochSlot(c.routingEpochSlot.Load())
+	return c.hasActiveRoutingEpochMap(c.PeekBpf()) && validRoutingEpochSlot(c.routingEpochSlot.Load())
 }
 
 // StageRoutingEpoch records the policy epoch for this generation's prepared
-// slot. The selector is deliberately not changed here.
+// slot. The selector is deliberately not changed here. The policy epoch is
+// owned by the control plane; the datapath only needs the active slot and its
+// routing metadata length.
 func (c *controlPlaneCore) StageRoutingEpoch() error {
 	if c == nil {
 		return nil
@@ -325,7 +327,7 @@ func (c *controlPlaneCore) StageRoutingEpoch() error {
 	c.clearStagedRoutingEpochLocked()
 
 	bpf := c.PeekBpf()
-	if !c.hasRoutingEpochMaps(bpf) {
+	if !c.hasActiveRoutingEpochMap(bpf) {
 		return nil
 	}
 	slot := c.routingEpochSlot.Load()
@@ -335,9 +337,6 @@ func (c *controlPlaneCore) StageRoutingEpoch() error {
 	}
 	if epoch == 0 {
 		return fmt.Errorf("routing epoch slot %d has no policy epoch", slot)
-	}
-	if err := bpf.RoutingEpochMap.Update(slot, epoch, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("stage routing epoch %d in slot %d: %w", epoch, slot, err)
 	}
 	c.routingEpochStaged = true
 	c.routingEpochStagedSlot = slot
@@ -362,7 +361,7 @@ func (c *controlPlaneCore) PublishRoutingEpoch(peerCaches ...*controlPlaneCore) 
 	defer c.routingEpochMu.Unlock()
 
 	bpf := c.PeekBpf()
-	if !c.hasRoutingEpochMaps(bpf) {
+	if !c.hasActiveRoutingEpochMap(bpf) {
 		return nil
 	}
 	slot := c.routingEpochSlot.Load()
@@ -389,7 +388,7 @@ func (c *controlPlaneCore) RollbackRoutingEpoch(peerCaches ...*controlPlaneCore)
 	defer c.routingEpochMu.Unlock()
 
 	bpf := c.PeekBpf()
-	if !c.hasRoutingEpochMaps(bpf) {
+	if !c.hasActiveRoutingEpochMap(bpf) {
 		return nil
 	}
 	if c.routingEpochRollbackOff.Load() {
@@ -410,11 +409,6 @@ func (c *controlPlaneCore) RollbackRoutingEpoch(peerCaches ...*controlPlaneCore)
 
 func clearPreviousRoutingEpochMaps(bpf *bpfObjects, previous uint32) error {
 	var errs []error
-	if bpf != nil && bpf.RoutingEpochMap != nil {
-		if err := bpf.RoutingEpochMap.Update(previous, uint64(0), ebpf.UpdateAny); err != nil {
-			errs = append(errs, fmt.Errorf("clear routing epoch metadata for slot %d: %w", previous, err))
-		}
-	}
 	if bpf != nil && bpf.RoutingMetaMap != nil {
 		if err := bpf.RoutingMetaMap.Update(previous, uint32(0), ebpf.UpdateAny); err != nil {
 			errs = append(errs, fmt.Errorf("clear routing metadata for slot %d: %w", previous, err))

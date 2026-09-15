@@ -451,6 +451,18 @@ func TestWanEgressUdpRedirectTrack(t *testing.T) {
 	runProgramSetByID(t, "WanEgressUdpRedirectTrack")
 }
 
+func TestLanWanEgressCombinedUdpRedirect(t *testing.T) {
+	runProgramSetByID(t, "LanWanEgressCombinedUdpRedirect")
+}
+
+func TestWanEgressUdpExpiredStateRecreatesHandoff(t *testing.T) {
+	runProgramSetByID(t, "WanEgressUdpExpiredStateRecreatesHandoff")
+}
+
+func TestLanWanEgressCombinedTcpRedirect(t *testing.T) {
+	runProgramSetByID(t, "LanWanEgressCombinedTcpRedirect")
+}
+
 func TestConntrackArgsScratchReset(t *testing.T) {
 	runProgramSetByID(t, "ConntrackArgsScratchReset")
 }

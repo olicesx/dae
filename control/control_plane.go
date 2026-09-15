@@ -1031,7 +1031,6 @@ func validateRequiredBpfMapsLoaded(bpf *bpfObjects) error {
 		{name: "routing_map", m: bpf.RoutingMap},
 		{name: "routing_meta_map", m: bpf.RoutingMetaMap},
 		{name: "active_routing_epoch_map", m: bpf.ActiveRoutingEpochMap},
-		{name: "routing_epoch_map", m: bpf.RoutingEpochMap},
 	}
 	for _, r := range required {
 		if r.m == nil {

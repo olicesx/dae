@@ -378,7 +378,6 @@ type bpfDataplaneMaps struct {
 	PktScratchMap            *ebpf.Map `ebpf:"pkt_scratch_map"`
 	RedirectTrack            *ebpf.Map `ebpf:"redirect_track"`
 	RouteCtxScratchMap       *ebpf.Map `ebpf:"route_ctx_scratch_map"`
-	RoutingEpochMap          *ebpf.Map `ebpf:"routing_epoch_map"`
 	RoutingHandoffMap        *ebpf.Map `ebpf:"routing_handoff_map"`
 	RoutingMap               *ebpf.Map `ebpf:"routing_map"`
 	RoutingMetaMap           *ebpf.Map `ebpf:"routing_meta_map"`
@@ -798,7 +797,6 @@ func assignDataplaneToBpf(bpf *bpfObjects, dp *bpfDataplane) {
 	bpf.PktScratchMap = dp.PktScratchMap
 	bpf.RedirectTrack = dp.RedirectTrack
 	bpf.RouteCtxScratchMap = dp.RouteCtxScratchMap
-	bpf.RoutingEpochMap = dp.RoutingEpochMap
 	bpf.RoutingHandoffMap = dp.RoutingHandoffMap
 	bpf.RoutingMap = dp.RoutingMap
 	bpf.RoutingMetaMap = dp.RoutingMetaMap

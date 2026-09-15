@@ -710,13 +710,28 @@ int testsetup_wan_egress_tcp_non_syn_cached_proxy_redirect(struct __sk_buff *skb
 	if (ret)
 		return TC_ACT_SHOT;
 
-	return do_tproxy_wan_egress(skb, 14);
+	return do_tproxy_wan_egress(skb, 14, NULL);
 }
 
 SEC("tc/check/wan_egress_tcp_non_syn_cached_proxy_redirect")
 int testcheck_wan_egress_tcp_non_syn_cached_proxy_redirect(struct __sk_buff *skb)
 {
-	return check_redirect_non_syn_tcp(skb);
+	struct tuples_key key = {};
+
+	if (check_redirect_non_syn_tcp(skb) != TC_ACT_OK)
+		return TC_ACT_SHOT;
+	key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.sip.u6_addr32[3] = bpf_htonl(IPV4(192,168,10,1));
+	key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.dip.u6_addr32[3] = bpf_htonl(IPV4(9,9,9,9));
+	key.sport = bpf_htons(34567);
+	key.dport = bpf_htons(443);
+	key.l4proto = IPPROTO_TCP;
+	if (bpf_map_lookup_elem(&routing_handoff_map, &key)) {
+		bpf_printk("steady TCP routing handoff was written\n");
+		return TC_ACT_SHOT;
+	}
+	return TC_ACT_OK;
 }
 
 SEC("tc/pktgen/wan_egress_tcp_non_syn_stateless_passthrough")
@@ -744,7 +759,7 @@ int testsetup_wan_egress_tcp_non_syn_stateless_passthrough(struct __sk_buff *skb
 
 	set_routing_fallback(OUTBOUND_DIRECT, true);
 
-	return do_tproxy_wan_egress(skb, 14);
+	return do_tproxy_wan_egress(skb, 14, NULL);
 }
 
 SEC("tc/check/wan_egress_tcp_non_syn_stateless_passthrough")
@@ -796,9 +811,113 @@ int testsetup_wan_egress_udp_redirect_track(struct __sk_buff *skb)
 SEC("tc/check/wan_egress_udp_redirect_track")
 int testcheck_wan_egress_udp_redirect_track(struct __sk_buff *skb)
 {
-	return check_redirect_with_listener_l4proto_and_track_ipv4(skb,
-								   IPPROTO_UDP,
-								   1);
+	struct tuples_key key = {};
+
+	if (check_redirect_with_listener_l4proto_and_track_ipv4(
+			skb, IPPROTO_UDP, 1) != TC_ACT_OK)
+		return TC_ACT_SHOT;
+	key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.sip.u6_addr32[3] = bpf_htonl(IPV4(192,168,10,3));
+	key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.dip.u6_addr32[3] = bpf_htonl(IPV4(9,9,9,11));
+	key.sport = bpf_htons(34569);
+	key.dport = bpf_htons(443);
+	key.l4proto = IPPROTO_UDP;
+	if (!bpf_map_lookup_elem(&routing_handoff_map, &key)) {
+		bpf_printk("new UDP routing handoff is missing\n");
+		return TC_ACT_SHOT;
+	}
+	return TC_ACT_OK;
+}
+
+SEC("tc/pktgen/wan_egress_udp_expired_state_recreates_handoff")
+int testpktgen_wan_egress_udp_expired_state_recreates_handoff(struct __sk_buff *skb)
+{
+	return set_ipv4_udp_fastpath_with_dscp(
+		skb, IPV4(192,168,11,3), IPV4(9,9,9,12), 34570, 8443, 0);
+}
+
+SEC("tc/setup/wan_egress_udp_expired_state_recreates_handoff")
+int testsetup_wan_egress_udp_expired_state_recreates_handoff(
+	struct __sk_buff *skb)
+{
+	struct test_routing_cache_ctx *ctx;
+	struct conn_state *state;
+
+	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
+	if (setup_cached_routing_result_for_proto(
+			IPV4(192,168,11,3), IPV4(9,9,9,12), 34570, 8443,
+			IPPROTO_UDP, OUTBOUND_USER_DEFINED_MIN, TPROXY_MARK))
+		return TC_ACT_SHOT;
+	ctx = bpf_map_lookup_elem(&test_routing_cache_ctx_map, &zero_key);
+	if (!ctx)
+		return TC_ACT_SHOT;
+	state = bpf_map_lookup_elem(&conn_state_map, &ctx->key);
+	if (!state)
+		return TC_ACT_SHOT;
+	state->last_seen_ns = 0;
+	return do_tproxy_wan_egress(skb, ETH_HLEN, NULL);
+}
+
+SEC("tc/check/wan_egress_udp_expired_state_recreates_handoff")
+int testcheck_wan_egress_udp_expired_state_recreates_handoff(
+	struct __sk_buff *skb)
+{
+	struct tuples_key key = {};
+
+	if (check_redirect_with_listener_l4proto(skb, IPPROTO_UDP) != TC_ACT_OK)
+		return TC_ACT_SHOT;
+	key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.sip.u6_addr32[3] = bpf_htonl(IPV4(192,168,11,3));
+	key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.dip.u6_addr32[3] = bpf_htonl(IPV4(9,9,9,12));
+	key.sport = bpf_htons(34570);
+	key.dport = bpf_htons(8443);
+	key.l4proto = IPPROTO_UDP;
+	if (!bpf_map_lookup_elem(&conn_state_map, &key) ||
+	    !bpf_map_lookup_elem(&routing_handoff_map, &key))
+		return TC_ACT_SHOT;
+	return TC_ACT_OK;
+}
+
+SEC("tc/pktgen/lan_wan_egress_combined_udp_redirect")
+int testpktgen_lan_wan_egress_combined_udp_redirect(struct __sk_buff *skb)
+{
+	return set_ipv4_udp_fastpath_with_dscp(
+		skb, IPV4(192,168,30,1), IPV4(10,30,0,1), 43001, 8443, 0);
+}
+
+SEC("tc/setup/lan_wan_egress_combined_udp_redirect")
+int testsetup_lan_wan_egress_combined_udp_redirect(struct __sk_buff *skb)
+{
+	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
+	return do_tproxy_lan_wan_egress(skb, ETH_HLEN);
+}
+
+SEC("tc/check/lan_wan_egress_combined_udp_redirect")
+int testcheck_lan_wan_egress_combined_udp_redirect(struct __sk_buff *skb)
+{
+	return check_redirect_with_listener_l4proto(skb, IPPROTO_UDP);
+}
+
+SEC("tc/pktgen/lan_wan_egress_combined_tcp_redirect")
+int testpktgen_lan_wan_egress_combined_tcp_redirect(struct __sk_buff *skb)
+{
+	return set_ipv4_tcp(skb, IPV4(192,168,31,1), IPV4(10,31,0,1), 43101,
+			    8443);
+}
+
+SEC("tc/setup/lan_wan_egress_combined_tcp_redirect")
+int testsetup_lan_wan_egress_combined_tcp_redirect(struct __sk_buff *skb)
+{
+	set_routing_fallback(OUTBOUND_USER_DEFINED_MIN, false);
+	return do_tproxy_lan_wan_egress(skb, ETH_HLEN);
+}
+
+SEC("tc/check/lan_wan_egress_combined_tcp_redirect")
+int testcheck_lan_wan_egress_combined_tcp_redirect(struct __sk_buff *skb)
+{
+	return check_redirect_with_listener_l4proto(skb, IPPROTO_TCP);
 }
 
 SEC("tc/pktgen/tcp_active_idle_state_retained")
@@ -1022,7 +1141,7 @@ int testsetup_wan_tcp_cached_outbound_survives_connectivity_change(
 	if (ret || set_test_outbound_connectivity(outbound, IPPROTO_TCP, 0))
 		return TC_ACT_SHOT;
 
-	ret = do_tproxy_wan_egress(skb, ETH_HLEN);
+	ret = do_tproxy_wan_egress(skb, ETH_HLEN, NULL);
 	if (set_test_outbound_connectivity(outbound, IPPROTO_TCP, 1))
 		return TC_ACT_SHOT;
 	return ret;
@@ -1090,7 +1209,7 @@ int testsetup_wan_udp_cached_outbound_survives_connectivity_change(
 	if (ret || set_test_outbound_connectivity(outbound, IPPROTO_UDP, 0))
 		return TC_ACT_SHOT;
 
-	ret = do_tproxy_wan_egress(skb, ETH_HLEN);
+	ret = do_tproxy_wan_egress(skb, ETH_HLEN, NULL);
 	if (set_test_outbound_connectivity(outbound, IPPROTO_UDP, 1))
 		return TC_ACT_SHOT;
 	return ret;
@@ -1100,8 +1219,23 @@ SEC("tc/check/wan_udp_cached_outbound_survives_connectivity_change")
 int testcheck_wan_udp_cached_outbound_survives_connectivity_change(
 	struct __sk_buff *skb)
 {
-	return check_redirect_with_listener_l4proto_and_track_ipv4(
-		skb, IPPROTO_UDP, 1);
+	struct tuples_key key = {};
+
+	if (check_redirect_with_listener_l4proto_and_track_ipv4(
+			skb, IPPROTO_UDP, 1) != TC_ACT_OK)
+		return TC_ACT_SHOT;
+	key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.sip.u6_addr32[3] = bpf_htonl(IPV4(192,168,20,6));
+	key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.dip.u6_addr32[3] = bpf_htonl(IPV4(10,20,0,6));
+	key.sport = bpf_htons(41005);
+	key.dport = bpf_htons(8443);
+	key.l4proto = IPPROTO_UDP;
+	if (bpf_map_lookup_elem(&routing_handoff_map, &key)) {
+		bpf_printk("steady UDP routing handoff was written\n");
+		return TC_ACT_SHOT;
+	}
+	return TC_ACT_OK;
 }
 
 SEC("tc/pktgen/wan_tcp_new_outbound_obeys_connectivity_change")
@@ -1124,7 +1258,7 @@ int testsetup_wan_tcp_new_outbound_obeys_connectivity_change(
 	if (set_test_outbound_connectivity(outbound, IPPROTO_TCP, 0))
 		return TC_ACT_SHOT;
 
-	ret = do_tproxy_wan_egress(skb, ETH_HLEN);
+	ret = do_tproxy_wan_egress(skb, ETH_HLEN, NULL);
 	if (set_test_outbound_connectivity(outbound, IPPROTO_TCP, 1))
 		return TC_ACT_SHOT;
 	return ret;
@@ -1156,7 +1290,7 @@ int testsetup_wan_udp_new_outbound_obeys_connectivity_change(
 	if (set_test_outbound_connectivity(outbound, IPPROTO_UDP, 0))
 		return TC_ACT_SHOT;
 
-	ret = do_tproxy_wan_egress(skb, ETH_HLEN);
+	ret = do_tproxy_wan_egress(skb, ETH_HLEN, NULL);
 	if (set_test_outbound_connectivity(outbound, IPPROTO_UDP, 1))
 		return TC_ACT_SHOT;
 	return ret;
@@ -3393,5 +3527,69 @@ int test_ab_control_plane_sockmark_fallback(struct __sk_buff *skb)
 	skb->mark = 0x200;
 	if (pid_is_control_plane(skb, &p))
 		return 3;
+	return 0;
+}
+
+SEC("tc/ab_test/udp_refresh_bypasses_routing_args")
+int test_ab_udp_refresh_bypasses_routing_args(struct __sk_buff *skb)
+{
+	struct tuples_key key = {};
+	struct conntrack_args *args;
+	struct conn_state *state;
+	__u8 outbound = OUTBOUND_USER_DEFINED_MIN;
+	__u8 must = 1;
+	__u32 mark = 0x12345678;
+	__u8 status = UDP_CONN_STATE_STATUS_UNAVAILABLE;
+
+	key.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.sip.u6_addr32[3] = bpf_htonl(IPV4(192,168,40,1));
+	key.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
+	key.dip.u6_addr32[3] = bpf_htonl(IPV4(10,40,0,1));
+	key.sport = bpf_htons(44001);
+	key.dport = bpf_htons(8443);
+	key.l4proto = IPPROTO_UDP;
+	bpf_map_delete_elem(&conn_state_map, &key);
+
+	args = bpf_map_lookup_elem(&conntrack_args_map, &zero_key);
+	if (!args)
+		return 1;
+	conntrack_args_set(args, &outbound, &mark, &must, NULL, 0, NULL, 0,
+			   ROUTING_EPOCH_SLOT_UNKNOWN);
+
+	state = mark_udp_seen_with_status(&key, false, NULL, NULL, NULL, NULL,
+					  0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN,
+					  &status);
+	if (!state || status != UDP_CONN_STATE_STATUS_CREATED)
+		return 2;
+	if (state->meta.data.has_routing || state->meta.data.outbound ||
+	    state->meta.data.mark || state->meta.data.must)
+		return 3;
+
+	bpf_map_delete_elem(&conn_state_map, &key);
+	return 0;
+}
+
+SEC("tc/ab_test/cookie_pid_lazy_refresh")
+int test_ab_cookie_pid_lazy_refresh(struct __sk_buff *skb)
+{
+	struct pid_pname entry = {};
+	struct pid_pname *mapped = NULL;
+	__u64 cookie = bpf_get_socket_cookie(skb);
+	__u64 now = bpf_ktime_get_ns();
+	__u64 stale = now - COOKIE_PID_UPDATE_INTERVAL_NS - 1;
+
+	entry.last_seen_ns = now;
+	if (bpf_map_update_elem(&cookie_pid_map, &cookie, &entry, BPF_ANY))
+		return 1;
+	pid_is_control_plane(skb, &mapped);
+	if (!mapped || mapped->last_seen_ns != now)
+		return 2;
+
+	mapped->last_seen_ns = stale;
+	pid_is_control_plane(skb, &mapped);
+	if (!mapped || mapped->last_seen_ns <= stale)
+		return 3;
+
+	bpf_map_delete_elem(&cookie_pid_map, &cookie);
 	return 0;
 }

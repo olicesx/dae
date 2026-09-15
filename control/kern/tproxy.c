@@ -370,14 +370,6 @@ struct {
 	__uint(max_entries, 1);
 } active_routing_epoch_map SEC(".maps");
 
-// Slot-to-policy-epoch metadata. It is populated before the slot is published.
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__type(key, __u32);
-	__type(value, __u64);
-	__uint(max_entries, ROUTING_EPOCH_SLOT_NUM);
-} routing_epoch_map SEC(".maps");
-
 struct domain_routing {
 	__u32 bitmap[MAX_MATCH_SET_LEN / 32];
 };
@@ -407,6 +399,8 @@ struct pid_pname {
 	__u32 pid;
 	char pname[TASK_COMM_LEN];
 };
+
+#define COOKIE_PID_UPDATE_INTERVAL_NS 1000000000ULL  // 1 second
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -1439,6 +1433,7 @@ struct parsed_packet {
 	struct udphdr udph;
 	__u8 l4proto;
 	__u8 listener_l4proto;
+	__u8 handoff_required;
 	__u16 datapath_generation;
 };
 
@@ -1448,6 +1443,20 @@ struct {
 	__type(value, struct parsed_packet);
 	__uint(max_entries, 1);
 } pkt_scratch_map SEC(".maps");
+
+static __always_inline void
+populate_parsed_packet(struct __sk_buff *skb, struct parse_transport_ctx *ctx,
+		       struct parsed_packet *out)
+{
+	__builtin_memset(out, 0, sizeof(*out));
+	out->ethh = ctx->ethh;
+	out->tcph = ctx->tcph;
+	out->udph = ctx->udph;
+	out->l4proto = ctx->l4proto;
+	out->listener_l4proto = ctx->listener_l4proto;
+	get_tuples(skb, &out->tuples, &ctx->iph, &ctx->ipv6h, &ctx->tcph,
+		   &ctx->udph, ctx->l4proto);
+}
 
 static __always_inline int
 parse_packet(struct __sk_buff *skb, __u32 link_h_len,
@@ -1470,13 +1479,7 @@ parse_packet(struct __sk_buff *skb, __u32 link_h_len,
 		return PARSE_UNSUPPORTED_L4;
 
 	// PARSE_FRAGMENT still populates the IP tuple for callers.
-	__builtin_memset(out, 0, sizeof(*out));
-	out->ethh = ctx->ethh;
-	out->tcph = ctx->tcph;
-	out->udph = ctx->udph;
-	out->l4proto = ctx->l4proto;
-	out->listener_l4proto = ctx->listener_l4proto;
-	get_tuples(skb, &out->tuples, &ctx->iph, &ctx->ipv6h, &ctx->tcph, &ctx->udph, ctx->l4proto);
+	populate_parsed_packet(skb, ctx, out);
 	return ret;
 }
 
@@ -2275,18 +2278,19 @@ static __always_inline bool is_short_lived_udp_traffic(struct tuples_key *key)
 	       (key->dport == bpf_htons(53) || key->sport == bpf_htons(53));
 }
 
-static __always_inline bool
-udp_wan_egress_handoff_mandatory(const struct tuples *tuples,
-				 const struct conn_state *udp_conn_state)
-{
-	return is_short_lived_udp_traffic((struct tuples_key *)&tuples->five) ||
-	       !udp_conn_state;
-}
-
 // mark_udp_seen: update/create UDP conn state with optional routing metadata.
 // Expired entries are pruned on lookup. Map overflow increments bpf_stats_map.
 #define UDP_CONN_STATE_TIMEOUT_NS 300000000000ULL        // 300-second backstop, aligned with QuicNatTimeout; userspace endpoint teardown is the primary owner
 #define UDP_CONN_STATE_UPDATE_INTERVAL_NS 1000000000ULL  // 1 second
+
+enum udp_conn_state_status {
+	UDP_CONN_STATE_STATUS_UNAVAILABLE = 0,
+	UDP_CONN_STATE_STATUS_MISSING,
+	UDP_CONN_STATE_STATUS_EXPIRED,
+	UDP_CONN_STATE_STATUS_EXISTING,
+	UDP_CONN_STATE_STATUS_CREATED,
+	UDP_CONN_STATE_STATUS_OVERFLOW,
+};
 
 static __always_inline bool
 udp_conn_state_expired(const struct conn_state *state, __u64 now)
@@ -2294,12 +2298,25 @@ udp_conn_state_expired(const struct conn_state *state, __u64 now)
 	return state && now - state->last_seen_ns > UDP_CONN_STATE_TIMEOUT_NS;
 }
 
+static __always_inline bool
+conntrack_args_are_empty(__u8 *outbound, __u32 *mark, __u8 *must, __u8 *mac,
+			 __u8 dscp, const char *pname, __u32 pid,
+			 __u8 routing_epoch_slot)
+{
+	return !outbound && !mark && !must && !mac && dscp == 0 && !pname &&
+	       pid == 0 && routing_epoch_slot == ROUTING_EPOCH_SLOT_UNKNOWN;
+}
+
 static __noinline struct conn_state *
 __mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
-		const struct conntrack_args *args)
+		const struct conntrack_args *args, __u8 *status)
 {
+	struct conntrack_args empty_args = {};
+
 	if (!args)
-		return NULL;
+		args = &empty_args;
+	if (status)
+		*status = UDP_CONN_STATE_STATUS_MISSING;
 
 	__u64 now = bpf_ktime_get_ns();
 	struct conn_state *state =
@@ -2308,9 +2325,13 @@ __mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 	if (udp_conn_state_expired(state, now)) {
 		bpf_map_delete_elem(&conn_state_map, key);
 		state = NULL;
+		if (status)
+			*status = UDP_CONN_STATE_STATUS_EXPIRED;
 	}
 
 	if (state) {
+		if (status)
+			*status = UDP_CONN_STATE_STATUS_EXISTING;
 		// Fast path: lazy timestamp update (only if interval > 1 second)
 		if (now - state->last_seen_ns > UDP_CONN_STATE_UPDATE_INTERVAL_NS)
 			state->last_seen_ns = now;
@@ -2359,6 +2380,8 @@ __mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 				      &new_state, BPF_ANY);
 
 	if (unlikely(ret)) {
+		if (status)
+			*status = UDP_CONN_STATE_STATUS_OVERFLOW;
 		/* Map full or other error: the per-packet counter always advances
 		 * (userspace reads it to size the map), while the ringbuf event is
 		 * rate-limited: a full map would otherwise emit one event per
@@ -2379,26 +2402,46 @@ __mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 		return NULL;
 	}
 
+	if (status)
+		*status = UDP_CONN_STATE_STATUS_CREATED;
 	return bpf_map_lookup_elem(&conn_state_map, key);
 }
 
-// mark_udp_seen: thin inline wrapper that populates per-CPU scratch args once
-// and then delegates to the single-copy __mark_udp_seen body.
+// mark_udp_seen_with_status is the shared wrapper for state updates that also
+// exposes whether the key was already live to the caller.
+static __always_inline struct conn_state *
+mark_udp_seen_with_status(struct tuples_key *key, bool is_wan_ingress_direction,
+			  __u8 *outbound, __u32 *mark, __u8 *must, __u8 *mac,
+			  __u8 dscp, const char *pname, __u32 pid,
+			  __u8 routing_epoch_slot, __u8 *status)
+{
+	if (conntrack_args_are_empty(outbound, mark, must, mac, dscp, pname, pid,
+				     routing_epoch_slot))
+		return __mark_udp_seen(key, is_wan_ingress_direction, NULL, status);
+
+	__u32 zero = 0;
+	struct conntrack_args *args =
+		bpf_map_lookup_elem(&conntrack_args_map, &zero);
+
+	if (unlikely(!args)) {
+		if (status)
+			*status = UDP_CONN_STATE_STATUS_UNAVAILABLE;
+		return NULL;
+	}
+	conntrack_args_set(args, outbound, mark, must, mac, dscp, pname, pid,
+			   routing_epoch_slot);
+	return __mark_udp_seen(key, is_wan_ingress_direction, args, status);
+}
+
 static __always_inline struct conn_state *
 mark_udp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 	      __u8 *outbound, __u32 *mark, __u8 *must, __u8 *mac,
 	      __u8 dscp, const char *pname, __u32 pid,
 	      __u8 routing_epoch_slot)
 {
-	__u32 zero = 0;
-	struct conntrack_args *args =
-		bpf_map_lookup_elem(&conntrack_args_map, &zero);
-
-	if (unlikely(!args))
-		return NULL;
-	conntrack_args_set(args, outbound, mark, must, mac, dscp, pname, pid,
-			   routing_epoch_slot);
-	return __mark_udp_seen(key, is_wan_ingress_direction, args);
+	return mark_udp_seen_with_status(key, is_wan_ingress_direction, outbound,
+					 mark, must, mac, dscp, pname, pid,
+					 routing_epoch_slot, NULL);
 }
 
 // mark_tcp_seen: update/create TCP conn state with optional routing metadata.
@@ -2426,7 +2469,7 @@ tcp_conn_state_expired(const struct conn_state *state, __u64 now)
  * that cannot name its epoch is not evidence of equality, so it never inherits
  * a live flow's cached routing.
  *
- * The routing epoch identifies the rule set: a slot's rules and its epoch entry
+ * The routing epoch identifies the rule set: a slot's rules and routing metadata
  * are staged before the selector is published, and the selector only ever moves
  * to the slot prepared for the new generation, so "same slot" implies "same
  * rules". Equivalence between two generations is decided by the reload's staged
@@ -2461,8 +2504,10 @@ static __noinline struct conn_state *
 __mark_tcp_seen(struct tuples_key *key, bool is_wan_ingress_direction,
 		__u8 tcp_flags, struct conntrack_args *args)
 {
+	struct conntrack_args empty_args = {};
+
 	if (!args)
-		return NULL;
+		args = &empty_args;
 
 	__u64 now = bpf_ktime_get_ns();
 	struct conn_state *state =
@@ -2630,6 +2675,19 @@ mark_tcp_seen(struct tuples_key *key, const struct tcphdr *tcph,
 	      __u8 dscp, const char *pname, __u32 pid,
 	      __u8 routing_epoch_slot)
 {
+	if (conntrack_args_are_empty(outbound, mark, must, mac, dscp, pname, pid,
+				     routing_epoch_slot)) {
+		__u8 tcp_flags = 0;
+		__u8 flags = tcph_flags(tcph);
+
+		if ((flags & TCPH_SYN) && !(flags & TCPH_ACK))
+			tcp_flags |= 1;
+		if (flags & (TCPH_FIN | TCPH_RST))
+			tcp_flags |= 2;
+		return __mark_tcp_seen(key, is_wan_ingress_direction, tcp_flags,
+				       NULL);
+	}
+
 	__u32 zero = 0;
 	struct conntrack_args *args =
 		bpf_map_lookup_elem(&conntrack_args_map, &zero);
@@ -2656,8 +2714,42 @@ static __always_inline bool is_new_tcp_connection(const struct tcphdr *tcph)
 	return (flags & TCPH_SYN) && !(flags & TCPH_ACK);
 }
 
-// Reverse-direction conntrack refresh for LAN egress.
-static __noinline int do_tproxy_lan_egress(struct __sk_buff *skb, __u32 link_h_len)
+// Reverse-direction conntrack refresh shared by standalone and combined LAN
+// egress roles after a single packet parse.
+static __always_inline int
+tproxy_lan_egress_refresh(struct tuples *tuples, const struct tcphdr *tcph,
+			  const struct udphdr *udph, __u8 l4proto)
+{
+	if (l4proto == IPPROTO_TCP) {
+		struct tuples_key reversed_tuples_key;
+
+		copy_reversed_tuples(&tuples->five, &reversed_tuples_key);
+		// Reverse-side TCP packets should refresh the forward conn-state and
+		// surface FIN/RST so the lifecycle does not remain ACTIVE until the
+		// janitor backstop expires.
+		mark_tcp_seen(&reversed_tuples_key, tcph, true,
+			      NULL, NULL, NULL, NULL,
+			      0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
+	} else if (l4proto == IPPROTO_UDP) {
+		if (udph->source == bpf_htons(53) || udph->dest == bpf_htons(53))
+			return DAE_TC_CONTINUE;
+
+		struct tuples_key reversed_tuples_key;
+
+		copy_reversed_tuples(&tuples->five, &reversed_tuples_key);
+		mark_udp_seen(&reversed_tuples_key, true,
+			      NULL, NULL, NULL, NULL,
+			      0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
+	}
+
+	return DAE_TC_CONTINUE;
+}
+
+// Reverse-direction conntrack refresh for LAN egress. When out is provided,
+// retain the parsed packet for the combined LAN/WAN egress role.
+static __noinline int
+do_tproxy_lan_egress(struct __sk_buff *skb, __u32 link_h_len,
+		     struct parsed_packet *out)
 {
 	__u32 scratch_key = 0;
 	struct parse_transport_ctx *ctx =
@@ -2684,48 +2776,30 @@ static __noinline int do_tproxy_lan_egress(struct __sk_buff *skb, __u32 link_h_l
 		return TC_ACT_SHOT;
 	}
 
-	// Update UDP Conntrack
-	if (ctx->l4proto == IPPROTO_TCP) {
-		struct tuples tuples;
-		struct tuples_key reversed_tuples_key;
-
-		get_tuples(skb, &tuples, &ctx->iph, &ctx->ipv6h,
-			   &ctx->tcph, &ctx->udph, ctx->l4proto);
-		copy_reversed_tuples(&tuples.five, &reversed_tuples_key);
-		// Reverse-side TCP packets should refresh the forward conn-state and
-		// surface FIN/RST so the lifecycle does not remain ACTIVE until the
-		// janitor backstop expires.
-		mark_tcp_seen(&reversed_tuples_key, &ctx->tcph, true,
-			      NULL, NULL, NULL, NULL,
-			      0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
-	} else if (ctx->l4proto == IPPROTO_UDP) {
-		if (ctx->udph.source == bpf_htons(53) || ctx->udph.dest == bpf_htons(53))
-			return DAE_TC_CONTINUE;
-
-		struct tuples tuples;
-		struct tuples_key reversed_tuples_key;
-
-		get_tuples(skb, &tuples, &ctx->iph, &ctx->ipv6h,
-			   &ctx->tcph, &ctx->udph, ctx->l4proto);
-		copy_reversed_tuples(&tuples.five, &reversed_tuples_key);
-		mark_udp_seen(&reversed_tuples_key, true,
-			      NULL, NULL, NULL, NULL,
-			      0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
+	if (out) {
+		populate_parsed_packet(skb, ctx, out);
+		return tproxy_lan_egress_refresh(&out->tuples, &out->tcph, &out->udph,
+						out->l4proto);
 	}
 
-	return DAE_TC_CONTINUE;
+	struct tuples tuples;
+
+	get_tuples(skb, &tuples, &ctx->iph, &ctx->ipv6h,
+		   &ctx->tcph, &ctx->udph, ctx->l4proto);
+	return tproxy_lan_egress_refresh(&tuples, &ctx->tcph, &ctx->udph,
+					ctx->l4proto);
 }
 
 SEC("tc/lan_egress_l2")
 int tproxy_lan_egress_l2(struct __sk_buff *skb)
 {
-	return do_tproxy_lan_egress(skb, 14);
+	return do_tproxy_lan_egress(skb, 14, NULL);
 }
 
 SEC("tc/lan_egress_l3")
 int tproxy_lan_egress_l3(struct __sk_buff *skb)
 {
-	return do_tproxy_lan_egress(skb, 0);
+	return do_tproxy_lan_egress(skb, 0, NULL);
 }
 
 static __noinline bool
@@ -2741,7 +2815,6 @@ redirect_lan_packet_to_control_plane(struct __sk_buff *skb, __u32 link_h_len,
 	union routing_meta routing_meta = {
 		.raw = routing_meta_raw,
 	};
-	struct routing_handoff_entry handoff = {};
 
 	if (prep_redirect_to_control_plane(skb, link_h_len, &pkt->tuples,
 					   &pkt->ethh, 0)) {
@@ -2751,17 +2824,21 @@ redirect_lan_packet_to_control_plane(struct __sk_buff *skb, __u32 link_h_len,
 	skb->cb[0] = TPROXY_MARK;
 	skb->cb[1] = pkt->listener_l4proto;
 
-	handoff.last_seen_ns = bpf_ktime_get_ns();
-	handoff.result.mark = routing_meta.data.mark;
-	handoff.result.must = routing_meta.data.must;
-	handoff.result.outbound = routing_meta.data.outbound;
-	handoff.result.dscp = routing_meta.data.dscp;
-	handoff.result.routing_epoch_slot =
-		routing_epoch_slot_sanitize(routing_epoch_slot);
-	handoff.result.datapath_generation = pkt->datapath_generation;
-	__builtin_memcpy(handoff.result.mac, pkt->ethh.h_source, 6);
-	bpf_map_update_elem(&routing_handoff_map, &pkt->tuples.five,
-			    &handoff, BPF_ANY);
+	if (pkt->handoff_required) {
+		struct routing_handoff_entry handoff = {};
+
+		handoff.last_seen_ns = bpf_ktime_get_ns();
+		handoff.result.mark = routing_meta.data.mark;
+		handoff.result.must = routing_meta.data.must;
+		handoff.result.outbound = routing_meta.data.outbound;
+		handoff.result.dscp = routing_meta.data.dscp;
+		handoff.result.routing_epoch_slot =
+			routing_epoch_slot_sanitize(routing_epoch_slot);
+		handoff.result.datapath_generation = pkt->datapath_generation;
+		__builtin_memcpy(handoff.result.mac, pkt->ethh.h_source, 6);
+		bpf_map_update_elem(&routing_handoff_map, &pkt->tuples.five,
+				    &handoff, BPF_ANY);
+	}
 	return redirect_to_control_plane_ingress();
 }
 
@@ -2840,6 +2917,7 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 	__u32 route_flag[8] = {};
 	struct conn_state *tcp_state = NULL;
 	struct conn_state *udp_state = NULL;
+	__u8 udp_state_status = UDP_CONN_STATE_STATUS_UNAVAILABLE;
 
 	if (pkt->l4proto == IPPROTO_TCP) {
 		// Track TCP connection state for new connections from LAN.
@@ -2853,10 +2931,10 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 	} else {
 		if (!is_short_lived_udp_traffic(&pkt->tuples.five)) {
 			// Fast path: Check conn state for established UDP flows
-			udp_state = mark_udp_seen(&pkt->tuples.five, false,
-						  NULL, NULL, NULL, NULL,
-						  pkt->tuples.dscp, NULL, 0,
-						  ROUTING_EPOCH_SLOT_UNKNOWN);
+			udp_state = mark_udp_seen_with_status(
+				&pkt->tuples.five, false, NULL, NULL, NULL, NULL,
+				pkt->tuples.dscp, NULL, 0,
+				ROUTING_EPOCH_SLOT_UNKNOWN, &udp_state_status);
 			if (udp_state && udp_state->is_wan_ingress_direction) {
 				// Replay (outbound) of an inbound flow => direct.
 				return TC_ACT_OK;
@@ -3042,6 +3120,10 @@ tproxy_lan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 		goto block;
 	}
 	pkt->datapath_generation = PARAM.datapath_generation;
+	pkt->handoff_required =
+		(pkt->l4proto == IPPROTO_TCP && tcp_state) ||
+		(pkt->l4proto == IPPROTO_UDP &&
+		 udp_state_status != UDP_CONN_STATE_STATUS_EXISTING);
 	return redirect_lan_packet_to_control_plane(
 		skb, link_h_len, pkt,
 		build_routing_meta(outbound, mark, must, pkt->tuples.dscp).raw,
@@ -3095,6 +3177,15 @@ int tproxy_lan_ingress_l3(struct __sk_buff *skb)
 	return do_tproxy_lan_ingress(skb, 0);
 }
 
+static __always_inline void
+refresh_cookie_pid_last_seen(struct pid_pname *pid_pname)
+{
+	__u64 now = bpf_ktime_get_ns();
+
+	if (now - pid_pname->last_seen_ns > COOKIE_PID_UPDATE_INTERVAL_NS)
+		pid_pname->last_seen_ns = now;
+}
+
 // Cookie will change after the first packet, so we just use it for
 // handshake.
 static __always_inline bool pid_is_control_plane(struct __sk_buff *skb,
@@ -3105,7 +3196,7 @@ static __always_inline bool pid_is_control_plane(struct __sk_buff *skb,
 
 	pid_pname = bpf_map_lookup_elem(&cookie_pid_map, &cookie);
 	if (pid_pname) {
-		pid_pname->last_seen_ns = bpf_ktime_get_ns();
+		refresh_cookie_pid_last_seen(pid_pname);
 		if (p) {
 			// Assign.
 			*p = pid_pname;
@@ -3152,7 +3243,7 @@ tproxy_wan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 			      0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 	} else if (pkt->l4proto == IPPROTO_UDP) {
 		struct tuples_key reversed_tuples_key;
-		struct conn_state *forward_state;
+		__u8 state_status = UDP_CONN_STATE_STATUS_UNAVAILABLE;
 
 		if (pkt->udph.source == bpf_htons(53) ||
 		    pkt->udph.dest == bpf_htons(53))
@@ -3166,14 +3257,13 @@ tproxy_wan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 		 * wan_egress pass-through depends on (host-terminated UDP
 		 * services), so this is counted, not enforced. See fix-plan.md
 		 * decision A20. */
-		forward_state =
-			bpf_map_lookup_elem(&conn_state_map, &reversed_tuples_key);
-		if (!forward_state ||
-		    udp_conn_state_expired(forward_state, bpf_ktime_get_ns()))
+		mark_udp_seen_with_status(&reversed_tuples_key, true,
+					  NULL, NULL, NULL, NULL,
+					  0, NULL, 0,
+					  ROUTING_EPOCH_SLOT_UNKNOWN, &state_status);
+		if (state_status != UDP_CONN_STATE_STATUS_EXISTING &&
+		    state_status != UDP_CONN_STATE_STATUS_UNAVAILABLE)
 			bump_stat(BPF_STATS_UNSOLICITED_UDP_SEEN);
-		mark_udp_seen(&reversed_tuples_key, true,
-			      NULL, NULL, NULL, NULL,
-			      0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN);
 	}
 
 	return DAE_TC_CONTINUE;
@@ -3465,8 +3555,11 @@ do_tproxy_wan_egress_tcp(struct __sk_buff *skb, __u32 link_h_len,
 	fill_routing_result(&routing_result, mark, must, outbound, handoff_mac,
 			    tuples->dscp, handoff_pname, handoff_pid,
 			    routing_epoch_slot, datapath_generation);
-	/* TCP has embedded conn-state routing metadata; handoff is best-effort. */
-	publish_routing_handoff(&tuples->five, &routing_result);
+	/* TCP has embedded conn-state routing metadata after the SYN. Keep
+	 * handoff for the initial redirect only; established packets are read
+	 * from conn_state_map by userspace. */
+	if (tcp_state_syn)
+		publish_routing_handoff(&tuples->five, &routing_result);
 
 	/* TCP needs redirect_track before the kernel-side handshake completes.
 	 * Publishing it later from userspace is too late for the first SYN path.
@@ -3495,6 +3588,7 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 	__u8 routing_epoch_slot = ROUTING_EPOCH_SLOT_UNKNOWN;
 	__u16 datapath_generation = PARAM.datapath_generation;
 	bool cached_routing = false;
+	__u8 udp_state_status = UDP_CONN_STATE_STATUS_UNAVAILABLE;
 
 	__u32 scratch_key = 0;
 	struct wan_egress_route_scratch *scratch =
@@ -3513,10 +3607,9 @@ do_tproxy_wan_egress_udp(struct __sk_buff *skb, __u32 link_h_len,
 		return DAE_TC_CONTINUE;
 
 	if (!is_short_lived_udp_traffic(&tuples->five)) {
-		udp_conn_state = mark_udp_seen(&tuples->five, false,
-					       NULL, NULL, NULL, NULL,
-					       0, NULL, 0,
-					       ROUTING_EPOCH_SLOT_UNKNOWN);
+		udp_conn_state = mark_udp_seen_with_status(
+			&tuples->five, false, NULL, NULL, NULL, NULL,
+			0, NULL, 0, ROUTING_EPOCH_SLOT_UNKNOWN, &udp_state_status);
 		if (udp_conn_state && udp_conn_state->is_wan_ingress_direction)
 			return DAE_TC_CONTINUE;
 
@@ -3611,14 +3704,15 @@ fast_path_skip_routing:
 		return TC_ACT_SHOT;
 
 	struct routing_result routing_result = {};
-	bool handoff_mandatory = udp_wan_egress_handoff_mandatory(tuples,
-							      udp_conn_state);
+	bool handoff_mandatory =
+		is_short_lived_udp_traffic(&tuples->five) ||
+		udp_state_status != UDP_CONN_STATE_STATUS_EXISTING;
 
 	fill_routing_result(&routing_result, mark, must, outbound, mac,
 			    tuples->dscp, handoff_pname, handoff_pid,
 			    routing_epoch_slot, datapath_generation);
-	if (publish_routing_handoff(&tuples->five, &routing_result) &&
-	    handoff_mandatory)
+	if (handoff_mandatory &&
+	    publish_routing_handoff(&tuples->five, &routing_result))
 		return TC_ACT_SHOT;
 
 	if (prep_redirect_to_control_plane(skb, link_h_len, tuples,
@@ -3633,29 +3727,33 @@ fast_path_skip_routing:
 //
 // Pass-through returns DAE_TC_CONTINUE, not TC_ACT_OK, so later programs see
 // the packet under both classic cls_bpf and TCX multiprogram attachment.
-static __noinline int do_tproxy_wan_egress(struct __sk_buff *skb, __u32 link_h_len)
+static __noinline int
+do_tproxy_wan_egress(struct __sk_buff *skb, __u32 link_h_len,
+		     struct parsed_packet *provided_pkt)
 {
 	if (skb->ingress_ifindex != NOWHERE_IFINDEX)
 		return DAE_TC_CONTINUE;
 
 	__u32 scratch_key = 0;
-	struct parsed_packet *pkt =
-		bpf_map_lookup_elem(&pkt_scratch_map, &scratch_key);
+	struct parsed_packet *pkt = provided_pkt;
 
-	if (!pkt)
-		return TC_ACT_SHOT;
-
-	/* Zero-init for verifier. */
-	__builtin_memset(pkt, 0, sizeof(*pkt));
-	int ret = parse_packet(skb, link_h_len, pkt);
-
-	if (ret) {
-		if (ret < 0) {
-			bpf_printk("wan_egress parse error: %d, dropping", ret);
+	if (!pkt) {
+		pkt = bpf_map_lookup_elem(&pkt_scratch_map, &scratch_key);
+		if (!pkt)
 			return TC_ACT_SHOT;
+
+		/* Zero-init for verifier. */
+		__builtin_memset(pkt, 0, sizeof(*pkt));
+		int ret = parse_packet(skb, link_h_len, pkt);
+
+		if (ret) {
+			if (ret < 0) {
+				bpf_printk("wan_egress parse error: %d, dropping", ret);
+				return TC_ACT_SHOT;
+			}
+			report_parse_passthrough(ret);
+			return DAE_TC_CONTINUE;
 		}
-		report_parse_passthrough(ret);
-		return DAE_TC_CONTINUE;
 	}
 
 	if (pkt->l4proto == IPPROTO_TCP)
@@ -3664,29 +3762,41 @@ static __noinline int do_tproxy_wan_egress(struct __sk_buff *skb, __u32 link_h_l
 	if (pkt->l4proto == IPPROTO_UDP)
 		return do_tproxy_wan_egress_udp(skb, link_h_len, &pkt->tuples,
 						&pkt->ethh, &pkt->udph);
+	/* parse_packet classifies ICMPv6 as unsupported before reaching here.
+	 * The combined egress path uses parse_transport directly to preserve the
+	 * LAN role's NDP handling, so report that equivalent classification here. */
+	if (pkt->l4proto == IPPROTO_ICMPV6)
+		report_parse_passthrough(PARSE_UNSUPPORTED_L4);
 	return DAE_TC_CONTINUE;
 }
 
 SEC("tc/wan_egress_l2")
 int tproxy_wan_egress_l2(struct __sk_buff *skb)
 {
-	return do_tproxy_wan_egress(skb, 14);
+	return do_tproxy_wan_egress(skb, 14, NULL);
 }
 
 SEC("tc/wan_egress_l3")
 int tproxy_wan_egress_l3(struct __sk_buff *skb)
 {
-	return do_tproxy_wan_egress(skb, 0);
+	return do_tproxy_wan_egress(skb, 0, NULL);
 }
 
 static __always_inline int
 do_tproxy_lan_wan_egress(struct __sk_buff *skb, __u32 link_h_len)
 {
-	int ret = do_tproxy_lan_egress(skb, link_h_len);
+	__u32 scratch_key = 0;
+	struct parsed_packet *pkt =
+		bpf_map_lookup_elem(&pkt_scratch_map, &scratch_key);
+
+	if (!pkt)
+		return TC_ACT_SHOT;
+
+	int ret = do_tproxy_lan_egress(skb, link_h_len, pkt);
 
 	if (ret != DAE_TC_CONTINUE)
 		return ret;
-	return do_tproxy_wan_egress(skb, link_h_len);
+	return do_tproxy_wan_egress(skb, link_h_len, pkt);
 }
 
 SEC("tc/lan_wan_egress_l2")

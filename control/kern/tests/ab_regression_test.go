@@ -155,6 +155,14 @@ func TestABRegression(t *testing.T) {
 			t.Fatalf("host-netns UDP listener was not passed through: status=%d", status)
 		}
 	})
+
+	t.Run("UDP refresh bypasses routing args scratch", func(t *testing.T) {
+		runAbCheckProgram(t, obj.TestAbUdpRefreshBypassesRoutingArgs, "UDP refresh scratch bypass")
+	})
+
+	t.Run("cookie PID timestamp refresh is lazy", func(t *testing.T) {
+		runAbCheckProgram(t, obj.TestAbCookiePidLazyRefresh, "cookie PID lazy refresh")
+	})
 }
 
 // TestABControlPlaneSockmarkFallback pins the last-resort fallback of

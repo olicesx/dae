@@ -232,7 +232,6 @@ type bpfMapSpecs struct {
 	RouteCtxScratchMap       *ebpf.MapSpec `ebpf:"route_ctx_scratch_map"`
 	RoutingHandoffMap        *ebpf.MapSpec `ebpf:"routing_handoff_map"`
 	RoutingMap               *ebpf.MapSpec `ebpf:"routing_map"`
-	RoutingEpochMap          *ebpf.MapSpec `ebpf:"routing_epoch_map"`
 	RoutingMetaMap           *ebpf.MapSpec `ebpf:"routing_meta_map"`
 	ConnStateMap             *ebpf.MapSpec `ebpf:"conn_state_map"`
 	UnusedLpmType            *ebpf.MapSpec `ebpf:"unused_lpm_type"`
@@ -277,7 +276,6 @@ type bpfMaps struct {
 	RouteCtxScratchMap       *ebpf.Map `ebpf:"route_ctx_scratch_map"`
 	RoutingHandoffMap        *ebpf.Map `ebpf:"routing_handoff_map"`
 	RoutingMap               *ebpf.Map `ebpf:"routing_map"`
-	RoutingEpochMap          *ebpf.Map `ebpf:"routing_epoch_map"`
 	RoutingMetaMap           *ebpf.Map `ebpf:"routing_meta_map"`
 	ConnStateMap             *ebpf.Map `ebpf:"conn_state_map"`
 	UnusedLpmType            *ebpf.Map `ebpf:"unused_lpm_type"`
@@ -306,7 +304,6 @@ func (m *bpfMaps) Close() error {
 		m.RouteCtxScratchMap,
 		m.RoutingHandoffMap,
 		m.RoutingMap,
-		m.RoutingEpochMap,
 		m.RoutingMetaMap,
 		m.ConnStateMap,
 		m.UnusedLpmType,

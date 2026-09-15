@@ -105,11 +105,8 @@ func rewriteAndLoadBpf(ipVersion int, l4ProtoNo uint16, port int) (_ *bpfObjects
 	opts.Programs.LogLevel = ebpf.LogLevelInstruction
 	objs := bpfObjects{}
 	if err := spec.LoadAndAssign(&objs, &opts); err != nil {
-		var (
-			ve          *ebpf.VerifierError
-			verifierLog string
-		)
-		if errors.As(err, &ve) {
+		var verifierLog string
+		if ve, ok := errors.AsType[*ebpf.VerifierError](err); ok {
 			verifierLog = fmt.Sprintf("Verifier error: %+v\n", ve)
 		}
 		return nil, fmt.Errorf("failed to load BPF: %w\n%s", err, verifierLog)

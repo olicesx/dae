@@ -42,8 +42,9 @@ stale diff; treat those as noise and confirm against the file on disk.
 | `forvar` | redundant `x := x` loop copies (no-op under per-iteration loop variables) | several tests |
 | `plusbuild` | removed the last obsolete `// +build` lines | 3 |
 
-Counts overlap: one file can carry several rewrites. The pass changed 64 files
-overall (+149/−230).
+Counts overlap: one file can carry several rewrites. This pass changed 64 files
+(+184/−230). The follow-up sweep in [Beyond the modernizers](#beyond-the-modernizers)
+then touched 21 more Go files (+70/−91).
 
 Two follow-ups were needed beyond what `go fix` emitted directly:
 
@@ -59,25 +60,71 @@ Two follow-ups were needed beyond what `go fix` emitted directly:
   gate (`hack/maintenance/append_license_signature.sh --check`) covers every `.go`
   file a change touches, so those files received the standard header in this pass.
 
+## Beyond the modernizers
+
+`go fix` does not cover everything. A wider linter sweep (`unparam`, `errorlint`,
+`wastedassign`, `makezero`, `usestdlibvars`) plus a manual read of the error paths
+produced these additional changes:
+
+- **Latent panic fixed.** `component/outbound/dialer/connectivity_check.go` used
+  `if errAs(...); netErr.Timeout() {` — the `;` form discards the `errors.As`
+  result, so a `net.Error` target left nil by a failed match was dereferenced.
+  Any connectivity-check error that is not a `net.Error` panicked. It is now
+  `if netErr, ok := errors.AsType[net.Error](err); ok && netErr.Timeout() {`.
+- **`errors.AsType` adopted** (Go 1.26) at the sites where it removes a
+  pre-declared target variable, including `trace/trace.go`, `cmd/dae-ebpf-audit`,
+  `control/dns.go`, `control/dns_listener.go`, `control/control_plane.go`,
+  `control/tcp_sniff_policy.go`, `control/udp_lifecycle.go`,
+  `control/udp_endpoint_lifecycle.go`, `control/anyfrom_pool.go`,
+  `component/sniffing/sniffer.go`, and `component/dnstransport/owned_conn.go`.
+  Two kinds of site were deliberately left on `errors.As`:
+  `common/errors/errors.go`, where a `err.(net.Error)` type assertion is an
+  intentional hot-path fast path ahead of the `errors.As` fallback (the comments
+  say so), and predicates whose whole body is `return errors.As(...)`, where
+  `AsType` would need an extra `_, ok :=` line for no gain.
+- **Dead stores removed** in `control/tcp.go`: `offloaded`, `offloadReason`, and
+  `annotateOffload` were initialized to zero values and then unconditionally
+  overwritten before any read.
+- **`errors.Is` consistency.** `control/dial.go` compared
+  `err == ob.ErrNoAliveDialer` while four sibling call sites already used
+  `errors.Is`; a wrapped sentinel would have silently skipped the IP-version
+  fallback. `control/anyfrom_pool.go` and
+  `component/outbound/dialer/connectivity_check.go` had the same `==` shape for
+  `unix.EIO`/`EINVAL` and `ErrNoApplicableIP`.
+- **`http.MethodGet`** replaces the `"GET"` literal in
+  `common/subscription/subscription.go`.
+- **Test fixtures.** Unused results were dropped from `buildLargeDNSResponse` and
+  `cacheAddressAnswer`; an unused closure parameter in
+  `control/udp_task_pool_order_test.go` was removed, which also made the
+  surrounding `wg.Add(1)`/`go`/`defer wg.Done()` convertible to `wg.Go`. The dead
+  `fullcone` parameter of `newDirectDialer` was removed — one caller passed
+  `true` expecting an effect the helper never had (it always built full-cone
+  fixtures), so the helper now says so in a comment.
+- One ad-hoc finding was investigated and rejected: `makezero` flags
+  `append(lengthPrefix, payload...)` in `control/dns_tcp_ingress_corpus_test.go`,
+  but the two-byte prefix is intentionally part of the returned frame.
+
 ## Deliberately not applied
 
 - `pkg/geodata/common.pb.go` — protoc-gen-go output. Generated files are not
   hand-edited; regenerate with an updated generator instead. `go fix` keeps
   reporting this file, and that is expected.
 - `tmp/` — gitignored scratch, not part of the build.
-- `errors.AsType` — 26 `errors.As` sites exist, but the rewrite is a hand edit with
-  mixed readability (several sites only need `As` as a predicate). Not applied
-  mechanically; see below.
 - `unparam`'s remaining findings — `wrapReloadTimeoutError`'s `timeout` argument is
-  passed explicitly at all four call sites to document the deadline being wrapped,
-  and the rest are unused parameters on test helpers.
+  passed explicitly at all four call sites to document the deadline being wrapped;
+  `(*Dialer).check` uses its named `ok` result only inside the function, and
+  dropping it from the signature would split the loop's assignment across a
+  separate local; and the rest are constant-argument fixture knobs on test helpers
+  (`installCorpusCache`'s `ttl`, `seedConnState`'s `state`,
+  `newFactoryProxyEndpointDialer`'s `protocol`), which document the fixture shape.
+- `prealloc` suggestions (12 sites) are allocation micro-optimisations, not dead
+  code, and `component/sniffing`'s `start`/`indicatorLen` initialisers sit in
+  hot loops where the current form reads better.
+- `errorlint`'s `%v` → `%w` suggestions change which errors callers can unwrap and
+  were left for a separate decision.
 
 ## Available but not yet used
 
-- `errors.AsType[E](err)` (1.26) removes the mutable target variable from
-  `errors.As`. Best candidates are the sites that already unpack the result, e.g.
-  `control/anyfrom_pool.go`, `control/udp_endpoint_lifecycle.go`,
-  `common/errors/errors.go`.
 - `runtime.SetDefaultGOMAXPROCS` (1.25) plus the container-aware default: since the
   runtime already derives `GOMAXPROCS` from the cgroup CPU quota, code should only
   read `runtime.GOMAXPROCS(0)` (as `control/routing_matcher_builder.go` and
@@ -120,15 +167,22 @@ Applied and verified with:
 gofmt -l $(git diff --name-only -- '*.go')           # clean
 go build -tags dae_stub_ebpf ./... && go vet -tags dae_stub_ebpf ./...
 go build ./... && go vet ./...
+go build -tags trace ./... && go vet -tags trace ./...
 go vet -tags dae_bpf_tests ./control/kern/tests/...
 golangci-lint run --build-tags dae_stub_ebpf ./...   # 0 issues (CI gate)
 golangci-lint run ./...                              # 2 pre-existing SA1019, see below
 go test -tags dae_stub_ebpf -count=1 ./...           # green
 go test -race -tags dae_stub_ebpf -timeout 30m ./control/... ./component/... ./cmd/...
+make ebpf-test                                       # green
+make ebpf-lint && make ebpf-sync-check               # clean
+./hack/maintenance/append_license_signature.sh --check <changed .go files>
+bash scripts/check-markdownlint-baseline.sh <markdownlint log>   # 0 new
+npm run check-broken-link
 ```
 
-The real-build test suites (`make ebpf-test`) require a Linux kernel with eBPF
-support and were not run for this pass.
+`make ebpf-test` runs for real: the `dae_bpf_tests` bindings generate, the kernel
+datapath suite passes, and the stubbed `dae_stub_ebpf` run is not treated as
+evidence for it.
 
 The two `golangci-lint run ./...` findings are pre-existing and unrelated to this
 pass: `control/bpf_utils.go:138,152` reference

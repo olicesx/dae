@@ -361,8 +361,7 @@ func isDNSClientWriteGoneError(err error) bool {
 	if err == nil {
 		return false
 	}
-	var opErr *net.OpError
-	if errors.As(err, &opErr) && opErr.Op == "write" {
+	if opErr, ok := errors.AsType[*net.OpError](err); ok && opErr.Op == "write" {
 		return daerrors.IsIgnorableConnectionError(err) || daerrors.IsClosedConnection(err)
 	}
 	// Fallback for wrapped errors where net.OpError is lost.

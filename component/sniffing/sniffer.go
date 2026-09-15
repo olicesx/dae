@@ -193,8 +193,7 @@ func (s *Sniffer) readStreamOnceWithReadDeadline() error {
 	s.closeDataReady()
 	s.dataError = err
 
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
+	if netErr, ok := errors.AsType[net.Error](err); ok && netErr.Timeout() {
 		// Keep behavior consistent with context timeout path in the legacy async read.
 		return fmt.Errorf("%w: %w", ErrNotApplicable, context.DeadlineExceeded)
 	}

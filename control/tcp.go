@@ -303,19 +303,14 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 	}
 	defer closeEstablishedTCPFlow(rConn, flow)
 
-	offloaded := false
-	offloadReason := ""
-	annotateOffload := false
-
 	// Attempt kernel-side splice via fast_sock/sk_skb before falling back to
 	// the user-space relay. A registered offload session blocks until both
 	// sockets close; any pre-registration failure falls through silently.
-	var offloadErr error
-	offloaded, offloadReason, offloadErr = c.tryOffloadTCPRelay(flow.Context(), lRelayConn, rConn, RecordDownloadTraffic, RecordUploadTraffic)
+	offloaded, offloadReason, offloadErr := c.tryOffloadTCPRelay(flow.Context(), lRelayConn, rConn, RecordDownloadTraffic, RecordUploadTraffic)
 	if offloadErr != nil {
 		return fmt.Errorf("handleTCP offloaded relay error: %w", offloadErr)
 	}
-	annotateOffload = canResolveTCPRelayOffloadConn(rConn)
+	annotateOffload := canResolveTCPRelayOffloadConn(rConn)
 	if !offloaded && offloadReason != "" && c.log.IsLevelEnabled(logrus.DebugLevel) {
 		logOffloadSkipRateLimited(c.log, offloadReason)
 	}

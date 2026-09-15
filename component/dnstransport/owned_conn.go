@@ -66,15 +66,14 @@ func IsBenignConnCloseError(err error) bool {
 // must be replaced (closed transport, EOF, or any transport-level network
 // error) before the request is retried.
 func ShouldReplaceHTTPClient(err error) bool {
-	var urlErr *url.Error
-	if stderrors.As(err, &urlErr) && urlErr.Err != nil {
+	if urlErr, ok := stderrors.AsType[*url.Error](err); ok && urlErr.Err != nil {
 		err = urlErr.Err
 	}
 	if stderrors.Is(err, net.ErrClosed) || stderrors.Is(err, io.EOF) || stderrors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}
-	var netErr net.Error
-	return stderrors.As(err, &netErr)
+	_, ok := stderrors.AsType[net.Error](err)
+	return ok
 }
 
 // CloseHTTPClient closes a client's idle connections and its transport.

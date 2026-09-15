@@ -51,7 +51,10 @@ func init() {
 	logger.SetLogger(log, "trace", false, nil)
 }
 
-func newDirectDialer(option *dialer.GlobalOption, fullcone bool) *dialer.Dialer {
+// newDirectDialer builds a fixture dialer. These fixtures are always full-cone:
+// the group tests exercise selection and admission on top of a full-cone direct
+// dialer, and the full-cone/non-full-cone split is covered by the dialer tests.
+func newDirectDialer(option *dialer.GlobalOption) *dialer.Dialer {
 	_d, p := dialer.NewDirectDialer(option, true)
 	d := dialer.NewDialerContext(context.Background(), _d, option, dialer.InstanceOption{DisableCheck: false}, p)
 	return d
@@ -102,8 +105,8 @@ func newTestGroupForSelection(policy DialerSelectionPolicy) (*DialerGroup, []*di
 		CheckTolerance:    0,
 	}
 	dialers := []*dialer.Dialer{
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
+		newDirectDialer(option),
+		newDirectDialer(option),
 	}
 	group := NewDialerGroup(option, "test-group", dialers, newEmptyAnnotations(len(dialers)), policy, func(alive bool, networkType *dialer.NetworkType, isInit bool) {})
 	return group, dialers
@@ -129,8 +132,8 @@ func TestDialerGroup_Select_Fixed(t *testing.T) {
 		CheckDnsTcp:       false,
 	}
 	dialers := []*dialer.Dialer{
-		newDirectDialer(option, true),
-		newDirectDialer(option, false),
+		newDirectDialer(option),
+		newDirectDialer(option),
 	}
 	fixedIndex := 1
 	g := NewDialerGroup(option, "test-group", dialers, newEmptyAnnotations(len(dialers)),
@@ -173,16 +176,16 @@ func TestDialerGroup_Select_MinLastLatency(t *testing.T) {
 		CheckInterval:     15 * time.Second,
 	}
 	dialers := []*dialer.Dialer{
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
+		newDirectDialer(option),
+		newDirectDialer(option),
+		newDirectDialer(option),
+		newDirectDialer(option),
+		newDirectDialer(option),
+		newDirectDialer(option),
+		newDirectDialer(option),
+		newDirectDialer(option),
+		newDirectDialer(option),
+		newDirectDialer(option),
 	}
 	g := NewDialerGroup(option, "test-group", dialers, newEmptyAnnotations(len(dialers)),
 		DialerSelectionPolicy{
@@ -257,11 +260,11 @@ func TestDialerGroup_Select_Random(t *testing.T) {
 		CheckInterval:     15 * time.Second,
 	}
 	dialers := []*dialer.Dialer{
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
+		newDirectDialer(option),
+		newDirectDialer(option),
+		newDirectDialer(option),
+		newDirectDialer(option),
+		newDirectDialer(option),
 	}
 	g := NewDialerGroup(option, "test-group", dialers, newEmptyAnnotations(len(dialers)),
 		DialerSelectionPolicy{
@@ -341,11 +344,11 @@ func TestDialerGroup_SetAlive(t *testing.T) {
 		CheckInterval:     15 * time.Second,
 	}
 	dialers := []*dialer.Dialer{
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
+		newDirectDialer(option),
+		newDirectDialer(option),
+		newDirectDialer(option),
+		newDirectDialer(option),
+		newDirectDialer(option),
 	}
 	g := NewDialerGroup(option, "test-group", dialers, newEmptyAnnotations(len(dialers)),
 		DialerSelectionPolicy{
@@ -389,8 +392,8 @@ func TestDialerGroup_SetSelectionPolicy_FixedToRandomCreatesAliveState(t *testin
 		CheckTolerance:    0,
 	}
 	dialers := []*dialer.Dialer{
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
+		newDirectDialer(option),
+		newDirectDialer(option),
 	}
 	g := NewDialerGroup(option, "test-group", dialers, newEmptyAnnotations(len(dialers)),
 		DialerSelectionPolicy{
@@ -424,8 +427,8 @@ func TestDialerGroup_SetSelectionPolicy_FixedToRandomPreservesAliveState(t *test
 		CheckTolerance:    0,
 	}
 	dialers := []*dialer.Dialer{
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
+		newDirectDialer(option),
+		newDirectDialer(option),
 	}
 	g := NewDialerGroup(option, "test-group", dialers, newEmptyAnnotations(len(dialers)),
 		DialerSelectionPolicy{
@@ -465,8 +468,8 @@ func TestDialerGroup_SetSelectionPolicy_RecomputesMinLatencyOrdering(t *testing.
 		CheckTolerance:    0,
 	}
 	dialers := []*dialer.Dialer{
-		newDirectDialer(option, false),
-		newDirectDialer(option, false),
+		newDirectDialer(option),
+		newDirectDialer(option),
 	}
 	g := NewDialerGroup(option, "test-group", dialers, newEmptyAnnotations(len(dialers)),
 		DialerSelectionPolicy{
@@ -592,7 +595,7 @@ func newDataUdpGroup(t *testing.T, callback func(bool, *dialer.NetworkType, bool
 		CheckInterval:     15 * time.Second,
 		CheckTolerance:    0,
 	}
-	dialers := []*dialer.Dialer{newDirectDialer(option, false), newDirectDialer(option, false)}
+	dialers := []*dialer.Dialer{newDirectDialer(option), newDirectDialer(option)}
 	if seedDnsLatency {
 		// Control case: DNS-UDP probes succeeded at least once, so the
 		// data-UDP set borrows a latency and hasLatency becomes true.
@@ -821,7 +824,7 @@ func TestDialerGroup_Select_SingleDialerLenientFallsBackToFixed(t *testing.T) {
 		CheckInterval:     15 * time.Second,
 		CheckTolerance:    0,
 	}
-	dialers := []*dialer.Dialer{newDirectDialer(option, false)}
+	dialers := []*dialer.Dialer{newDirectDialer(option)}
 	g := NewDialerGroup(option, "single-node", dialers, newEmptyAnnotations(len(dialers)),
 		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinLastLatency},
 		func(alive bool, networkType *dialer.NetworkType, isInit bool) {})

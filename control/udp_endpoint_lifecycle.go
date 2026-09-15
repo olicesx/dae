@@ -312,8 +312,7 @@ func (ue *UdpEndpoint) isConnectionRefused(err error) bool {
 	if stderrors.Is(err, syscall.ECONNREFUSED) || stderrors.Is(err, syscall.EHOSTUNREACH) {
 		return true
 	}
-	var sysErr *os.SyscallError
-	if stderrors.As(err, &sysErr) {
+	if sysErr, ok := stderrors.AsType[*os.SyscallError](err); ok {
 		if stderrors.Is(sysErr.Err, syscall.ECONNREFUSED) || stderrors.Is(sysErr.Err, syscall.EHOSTUNREACH) {
 			return true
 		}

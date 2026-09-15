@@ -1357,8 +1357,7 @@ func (d *DoUDP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 				badConn = true
 				return nil, err
 			}
-			var netErr net.Error
-			if errors.As(err, &netErr) && netErr.Timeout() {
+			if netErr, ok := errors.AsType[net.Error](err); ok && netErr.Timeout() {
 				if d.profile.DiscardPooledConnOnTimeout {
 					udpPool.discard(conn)
 					badConn = true

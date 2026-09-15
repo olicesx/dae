@@ -44,13 +44,12 @@ func newPreferenceFilterController(t *testing.T, aaaa *dnsmessage.Msg) *DnsContr
 	return newCorpusControllerWithDefaultChooser(t, truncatedTestConfig())
 }
 
-func cacheAddressAnswer(t *testing.T, ctrl *DnsController, qname string, qtype uint16, answers []dnsmessage.RR) string {
+func cacheAddressAnswer(t *testing.T, ctrl *DnsController, qname string, qtype uint16, answers []dnsmessage.RR) {
 	t.Helper()
 	req := defaultUdpRequest()
 	baseKey := ctrl.cacheKey(qname, qtype)
 	cacheKey := ctrl.responseCacheKey(baseKey, req, consts.DnsRequestOutboundIndex_AsIs, nil)
 	installCorpusCache(t, ctrl, cacheKey, qname, qtype, answers, 300)
-	return baseKey
 }
 
 // TestIPVersionPreferFiltersNonPreferredQuery covers the documented behavior on

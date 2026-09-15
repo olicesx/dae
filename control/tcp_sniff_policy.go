@@ -304,8 +304,7 @@ func prefetchForTcpSniff(conn net.Conn, wait time.Duration, maxBytes int) (wrapp
 	if readErr == nil || errors.Is(readErr, io.EOF) {
 		return conn, nil, false, nil
 	}
-	var netErr net.Error
-	if errors.As(readErr, &netErr) && netErr.Timeout() {
+	if netErr, ok := errors.AsType[net.Error](readErr); ok && netErr.Timeout() {
 		return conn, nil, false, nil
 	}
 	return conn, nil, false, readErr

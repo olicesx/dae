@@ -182,7 +182,7 @@ func ResolveSubscription(log *logrus.Logger, client *http.Client, configDir stri
 		subscription = strings.Replace(subscription, "-file", "", 1)
 	default:
 	}
-	req, err = http.NewRequest("GET", subscription, nil)
+	req, err = http.NewRequest(http.MethodGet, subscription, nil)
 	if err != nil {
 		return "", nil, err
 	}

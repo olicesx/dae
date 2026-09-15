@@ -167,10 +167,8 @@ func TestUdpTaskPoolConcurrentSubmitAndClose(t *testing.T) {
 	var executed atomic.Int64
 	var wg sync.WaitGroup
 	start := make(chan struct{})
-	for p := range producers {
-		wg.Add(1)
-		go func(producer int) {
-			defer wg.Done()
+	for range producers {
+		wg.Go(func() {
 			<-start
 			for range perProducer {
 				if !pool.EmitTask(udpTaskPoolTestKey(), udpTaskFunc(func() {
@@ -179,7 +177,7 @@ func TestUdpTaskPoolConcurrentSubmitAndClose(t *testing.T) {
 					return
 				}
 			}
-		}(p)
+		})
 	}
 	close(start)
 	time.Sleep(5 * time.Millisecond)

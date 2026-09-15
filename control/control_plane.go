@@ -2527,8 +2527,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			}
 			lconn, err := tcpListener.Accept()
 			if err != nil {
-				var netErr net.Error
-				if stderrors.As(err, &netErr) && netErr.Timeout() {
+				if netErr, ok := stderrors.AsType[net.Error](err); ok && netErr.Timeout() {
 					return
 				}
 				if commonerrors.IsClosedConnection(err) || stderrors.Is(err, context.Canceled) {

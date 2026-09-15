@@ -14,7 +14,7 @@ import (
 // buildLargeDNSResponse builds a DNS response with many A records whose
 // packed size exceeds the classic 512-byte UDP limit (e.g. a CDN returning
 // 35 A records).
-func buildLargeDNSResponse(t *testing.T, count int) (*dnsmessage.Msg, []byte) {
+func buildLargeDNSResponse(t *testing.T, count int) []byte {
 	t.Helper()
 	msg := &dnsmessage.Msg{}
 	msg.SetQuestion("cdn.example.com.", dnsmessage.TypeA)
@@ -31,13 +31,13 @@ func buildLargeDNSResponse(t *testing.T, count int) (*dnsmessage.Msg, []byte) {
 	if err != nil {
 		t.Fatalf("Pack: %v", err)
 	}
-	return msg, data
+	return data
 }
 
 func TestTruncateDNSResponse(t *testing.T) {
 	// 35 A records exceed 512 bytes (the reported bug: CDN returns 35 A
 	// records, packed size > 512, client got "noerror, 0 answer, tc=0").
-	_, packed := buildLargeDNSResponse(t, 35)
+	packed := buildLargeDNSResponse(t, 35)
 	if len(packed) <= dnsDefaultUDPSize {
 		t.Fatalf("test fixture too small: packed = %d bytes, want > %d", len(packed), dnsDefaultUDPSize)
 	}
@@ -64,7 +64,7 @@ func TestTruncateDNSResponse(t *testing.T) {
 
 func TestTruncateDNSResponseSmall(t *testing.T) {
 	// Responses within the limit must pass through untouched.
-	_, packed := buildLargeDNSResponse(t, 2)
+	packed := buildLargeDNSResponse(t, 2)
 	truncated := truncateDNSResponse(packed, dnsDefaultUDPSize)
 	if len(truncated) != len(packed) {
 		t.Fatalf("small response was modified: %d -> %d bytes", len(packed), len(truncated))

@@ -90,11 +90,8 @@ func collectPrograms(t *testing.T) (obj *bpftestObjects, progset []programSet, e
 			Programs: ebpf.ProgramOptions{},
 		},
 	); err != nil {
-		var (
-			ve          *ebpf.VerifierError
-			verifierLog string
-		)
-		if errors.As(err, &ve) {
+		var verifierLog string
+		if ve, ok := errors.AsType[*ebpf.VerifierError](err); ok {
 			verifierLog = fmt.Sprintf("Verifier error: %+v\n", ve)
 		}
 

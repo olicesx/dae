@@ -46,7 +46,7 @@ func detectCgroupMemLimit() int64 {
 
 func detectCgroupMemLimitFrom(data []byte, root string) int64 {
 	var limit int64
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		// cgroup v2 unified hierarchy format: "0::/path"
 		if !strings.HasPrefix(line, "0::") {
 			continue

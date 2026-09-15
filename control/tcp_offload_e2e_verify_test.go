@@ -317,10 +317,7 @@ func runTCPOffloadSentAccountE2E(t *testing.T, address string, destination bool)
 	go func() {
 		remain := verifyStream
 		for remain > 0 {
-			n := len(chunk)
-			if remain < n {
-				n = remain
-			}
+			n := min(remain, len(chunk))
 			if _, err := client.Write(chunk[:n]); err != nil {
 				streamErr <- err
 				return

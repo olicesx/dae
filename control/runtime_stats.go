@@ -310,10 +310,7 @@ func bucketizeRuntimeSamples(samples []RuntimeTrafficSample, maxPoints int) []Ru
 	result := make([]RuntimeTrafficSample, 0, maxPoints)
 
 	for start := 0; start < len(samples); start += bucketSize {
-		end := start + bucketSize
-		if end > len(samples) {
-			end = len(samples)
-		}
+		end := min(start+bucketSize, len(samples))
 		bucket := samples[start:end]
 		last := bucket[len(bucket)-1]
 

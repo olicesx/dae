@@ -8,6 +8,7 @@ package control
 import (
 	stderrors "errors"
 	"fmt"
+	"maps"
 	"sort"
 	"sync"
 
@@ -705,9 +706,7 @@ func tcxPositionForPriority(group *tcHookGroup, priority uint16) tcxHookPosition
 
 func cloneTCHookSpecs(specs map[tcHookKey]tcHookSpec) map[tcHookKey]tcHookSpec {
 	cloned := make(map[tcHookKey]tcHookSpec, len(specs))
-	for key, spec := range specs {
-		cloned[key] = spec
-	}
+	maps.Copy(cloned, specs)
 	return cloned
 }
 

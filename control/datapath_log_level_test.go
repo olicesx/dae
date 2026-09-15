@@ -55,7 +55,7 @@ func fourWordIP(ip net.IP) [4]uint32 {
 	// words {0, 0, 0xFFFF0000, <addr LE-serialized into the low word>}.
 	ip4 := ip.To4()
 	var last uint32
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		last |= uint32(ip4[i]) << (8 * i)
 	}
 	return [4]uint32{0, 0, 0xFFFF0000, last}

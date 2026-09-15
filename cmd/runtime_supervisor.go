@@ -175,17 +175,16 @@ func (s *runtimeSupervisor) publishPrepared(candidate *runtimeGeneration) (*runt
 }
 
 // rollbackPrepared removes candidate without changing the active generation.
-// It returns false when another caller has already changed the candidate state.
-func (s *runtimeSupervisor) rollbackPrepared(candidate *runtimeGeneration) (*runtimeGeneration, bool) {
+// It is a no-op when another caller has already changed the candidate state.
+func (s *runtimeSupervisor) rollbackPrepared(candidate *runtimeGeneration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.prepared != candidate || candidate == nil {
-		return nil, false
+		return
 	}
 
 	s.prepared = nil
-	return candidate, true
 }
 
 // markRetirementComplete releases retiring only when completion belongs to the

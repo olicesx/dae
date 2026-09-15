@@ -57,7 +57,7 @@ func TestUnusableClientAddrIsPacedButStillAnswered(t *testing.T) {
 	h := &dnsHandler{log: logger}
 
 	const requests = 4
-	for i := 0; i < requests; i++ {
+	for i := range requests {
 		w := &addrLessResponseWriter{remote: badAddr{}}
 		h.answerUnusableClientAddr(w, newTestDNSQuery(), "split host and port", nil)
 		if len(w.writes) != 1 {

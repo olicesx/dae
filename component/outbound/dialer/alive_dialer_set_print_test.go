@@ -146,9 +146,7 @@ func TestLatencySnapshotIsByValue(t *testing.T) {
 
 	var wg sync.WaitGroup
 	done := make(chan struct{})
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for i := 0; ; i++ {
 			select {
 			case <-done:
@@ -162,7 +160,7 @@ func TestLatencySnapshotIsByValue(t *testing.T) {
 				set.SetSelectionPolicy(consts.DialerSelectionPolicy_MinMovingAverageLatencies)
 			}
 		}
-	}()
+	})
 
 	for i := range 200 {
 		// aliveEntries is appended to / swap-removed here, and the render runs

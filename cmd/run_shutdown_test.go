@@ -859,9 +859,9 @@ func TestDNSConfigFingerprintCoversAllDnsFields(t *testing.T) {
 		"MaxCacheSize":            {},
 	}
 
-	dnsType := reflect.TypeOf(config.Dns{})
-	for i := 0; i < dnsType.NumField(); i++ {
-		name := dnsType.Field(i).Name
+	dnsType := reflect.TypeFor[config.Dns]()
+	for field := range dnsType.Fields() {
+		name := field.Name
 		if _, isExcluded := excluded[name]; isExcluded {
 			continue
 		}
@@ -1157,7 +1157,7 @@ func TestReloadManagerStartControlPlaneRetirementCompletesAndCancelsOldContext(t
 }
 
 func TestReloadManagerRepeatedRetirementLifecycleReclaimsGeneration(t *testing.T) {
-	for iteration := 0; iteration < 64; iteration++ {
+	for iteration := range 64 {
 		manager := newReloadManager(make(chan reloadRequest, 1), make(chan struct{}, 1), make(chan os.Signal, 1))
 		manager.setPendingReloadMetadata(time.Now(), 0)
 

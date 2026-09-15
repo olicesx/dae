@@ -189,10 +189,7 @@ func NewTrie(keys []string, chars *ValidChars) (*Trie, error) {
 			continue
 		}
 		prev := keys[i-1]
-		minLen := len(prev)
-		if len(key) < minLen {
-			minLen = len(key)
-		}
+		minLen := min(len(key), len(prev))
 		lcp := 0
 		for lcp < minLen && prev[lcp] == key[lcp] {
 			lcp++

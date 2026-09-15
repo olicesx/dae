@@ -72,7 +72,7 @@ func (c *receiverConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHand
 }
 
 func (c *receiverConn) deliver(seq int) bool {
-	data := []byte(fmt.Sprintf("packet-%04d", seq))
+	data := fmt.Appendf(nil, "packet-%04d", seq)
 	packet := netproxy.NewReceivedPacket(data, receiverTestFrom(), nil, func() {})
 	c.mu.Lock()
 	handler := c.handler

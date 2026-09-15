@@ -1,5 +1,4 @@
 //go:build linux && dae_bpf_tests
-// +build linux,dae_bpf_tests
 
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
@@ -113,8 +112,8 @@ func collectPrograms(t *testing.T) (obj *bpftestObjects, progset []programSet, e
 	typeOfV := v.Type()
 	for i := 0; i < v.NumField(); i++ {
 		progname := typeOfV.Field(i).Name
-		if strings.HasPrefix(progname, "Testsetup") {
-			progid := strings.TrimPrefix(progname, "Testsetup")
+		if after, ok := strings.CutPrefix(progname, "Testsetup"); ok {
+			progid := after
 			progset = append(progset, programSet{
 				id:     progid,
 				pktgen: v.FieldByName("Testpktgen" + progid).Interface().(*ebpf.Program),
@@ -129,8 +128,8 @@ func collectPrograms(t *testing.T) (obj *bpftestObjects, progset []programSet, e
 func markAllOutboundsAlive(t *testing.T, obj *bpftestObjects) {
 	aliveVal := uint32(1)
 
-	for i := uint32(0); i < 256; i++ {
-		for j := uint32(0); j < 6; j++ {
+	for i := range uint32(256) {
+		for j := range uint32(6) {
 			ck := i*6 + j
 			if err := obj.OutboundConnectivityMap.Update(ck, aliveVal, ebpf.UpdateAny); err != nil {
 				t.Fatalf("failed to initialize outbound_connectivity_map[%d]: %v", ck, err)
@@ -166,7 +165,7 @@ func runProgramSetByID(t *testing.T, id string) {
 	}
 
 	zeroEntry := make([]byte, obj.RoutingMap.ValueSize())
-	for i := uint32(0); i < testMaxMatchSetLen; i++ {
+	for i := range uint32(testMaxMatchSetLen) {
 		if err = obj.RoutingMap.Update(i, zeroEntry, ebpf.UpdateAny); err != nil {
 			t.Fatalf("failed to clear routing_map[%d]: %v", i, err)
 		}
@@ -274,7 +273,7 @@ func TestBpfBugsVerification(t *testing.T) {
 		if zeroEntry == nil {
 			zeroEntry = make([]byte, obj.RoutingMap.ValueSize())
 		}
-		for i := uint32(0); i < testMaxMatchSetLen; i++ {
+		for i := range uint32(testMaxMatchSetLen) {
 			if err = obj.RoutingMap.Update(i, zeroEntry, ebpf.UpdateAny); err != nil {
 				t.Fatalf("failed to clear routing_map[%d]: %v", i, err)
 			}
@@ -386,7 +385,7 @@ func Test(t *testing.T) {
 		if zeroEntry == nil {
 			zeroEntry = make([]byte, obj.RoutingMap.ValueSize())
 		}
-		for i := uint32(0); i < testMaxMatchSetLen; i++ {
+		for i := range uint32(testMaxMatchSetLen) {
 			if err = obj.RoutingMap.Update(i, zeroEntry, ebpf.UpdateAny); err != nil {
 				t.Fatalf("failed to clear routing_map[%d]: %v", i, err)
 			}

@@ -606,10 +606,7 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	if ue.hasReply.Load() {
 		lastSend := ue.lastSendNano.Load()
 		lastReply := ue.lastReplyNano.Load()
-		last := lastSend
-		if lastReply > last {
-			last = lastReply
-		}
+		last := max(lastReply, lastSend)
 		if last != 0 {
 			staleTimeout := ue.sendStaleTimeout()
 			if now.UnixNano()-last >= int64(staleTimeout) {

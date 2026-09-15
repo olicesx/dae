@@ -124,10 +124,7 @@ func (tr *udpTaskQueueTrace) record(e udpTaskTraceEvent) {
 // snapshot returns the recorded events in ordinal order.
 func (tr *udpTaskQueueTrace) snapshot() []udpTaskTraceEvent {
 	written := tr.written.Load()
-	n := written
-	if n > udpTaskTraceCap {
-		n = udpTaskTraceCap
-	}
+	n := min(written, udpTaskTraceCap)
 	out := make([]udpTaskTraceEvent, 0, n)
 	start := written - n
 	for i := start; i < written; i++ {

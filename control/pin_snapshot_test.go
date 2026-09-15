@@ -161,14 +161,12 @@ func TestSnapshotPinnedUDPConcurrentSafe(t *testing.T) {
 
 	// Readers: snapshot while writers are mutating
 	for range readers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range iterations {
 				_ = mgr.snapshotPinnedUDP()
 				// Should never panic or race
 			}
-		}()
+		})
 	}
 
 	wg.Wait()
@@ -203,13 +201,11 @@ func TestSnapshotPinnedTCPConcurrentSafe(t *testing.T) {
 	}
 
 	for range readers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range iterations {
 				_ = mgr.snapshotPinnedTCP()
 			}
-		}()
+		})
 	}
 
 	wg.Wait()

@@ -30,12 +30,6 @@ const (
 	DaeVethTxQLen = 1000
 )
 
-// ptrToUint32 returns a pointer to the given uint32 value.
-// Used for netlink Rule.Mask field which requires *uint32.
-func ptrToUint32(v uint32) *uint32 {
-	return &v
-}
-
 var (
 	daeNetns     *DaeNetns
 	once         sync.Once
@@ -587,7 +581,7 @@ func (ns *DaeNetns) setupRoutingPolicy() (err error) {
 		Family:            unix.AF_INET,
 		Table:             table,
 		Mark:              consts.TproxyMark,
-		Mask:              ptrToUint32(consts.TproxyMark),
+		Mask:              new(consts.TproxyMark),
 	}, {
 		SuppressIfgroup:   -1,
 		SuppressPrefixlen: -1,
@@ -597,7 +591,7 @@ func (ns *DaeNetns) setupRoutingPolicy() (err error) {
 		Family:            unix.AF_INET6,
 		Table:             table,
 		Mark:              consts.TproxyMark,
-		Mask:              ptrToUint32(consts.TproxyMark),
+		Mask:              new(consts.TproxyMark),
 	}}
 
 	for _, rule := range rules {

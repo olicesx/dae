@@ -447,10 +447,7 @@ func (c *DnsController) bpfUpdateWorker() {
 			default:
 			}
 		}
-		delay := time.Until(due)
-		if delay < 0 {
-			delay = 0
-		}
+		delay := max(time.Until(due), 0)
 		retryTimer.Reset(delay)
 		retryTimerCh = retryTimer.C
 	}

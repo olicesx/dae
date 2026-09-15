@@ -79,10 +79,7 @@ func TestUdpTaskPoolOverflowOrderDiagnostic(t *testing.T) {
 	}
 	t.Logf("first ordering violation at execution %d: expected task %d, executed task %d",
 		firstBad, firstBad, execOrder[firstBad])
-	head := 40
-	if len(execOrder) < head {
-		head = len(execOrder)
-	}
+	head := min(len(execOrder), 40)
 	t.Logf("first %d executions: %v", head, execOrder[:head])
 	t.Logf("tier timeline:\n%s", trace.text(firstBad))
 	if path := os.Getenv("DAE_UDP_TASK_POOL_DIAG_DUMP"); path != "" {
@@ -120,10 +117,7 @@ func (tr *udpTaskQueueTrace) text(execIndex int) string {
 		if strings.HasPrefix(e.op, "pop-") && e.op != "pop-none" {
 			popSeen++
 			if popSeen == wantPop {
-				lo = i - 24
-				if lo < 0 {
-					lo = 0
-				}
+				lo = max(i-24, 0)
 				break
 			}
 		}

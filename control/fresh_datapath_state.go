@@ -8,6 +8,7 @@ package control
 import (
 	stderrors "errors"
 	"fmt"
+	"maps"
 
 	"github.com/cilium/ebpf"
 	"github.com/sirupsen/logrus"
@@ -50,9 +51,7 @@ func (s *FreshDatapathState) apply(options *ebpf.CollectionOptions, requestedCon
 		return 0, fmt.Errorf("apply fresh datapath state: invalid flow-state snapshot")
 	}
 	replacements := make(map[string]*ebpf.Map, len(options.MapReplacements)+3)
-	for name, replacement := range options.MapReplacements {
-		replacements[name] = replacement
-	}
+	maps.Copy(replacements, options.MapReplacements)
 	replacements["conn_state_map"] = s.connState
 	replacements["redirect_track"] = s.redirectTrack
 	replacements["cookie_pid_map"] = s.cookiePID

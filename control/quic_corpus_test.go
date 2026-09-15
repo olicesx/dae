@@ -56,7 +56,6 @@ func phase0QuicSniffingCorpusFixtures() []quicSniffingCorpusFixture {
 // dial target, and reuse that bound flow for later packets.
 func TestPhase0QuicSniffingCorpus_LegacyBaseline(t *testing.T) {
 	for _, fixture := range phase0QuicSniffingCorpusFixtures() {
-		fixture := fixture
 		t.Run(fixture.name, func(t *testing.T) {
 			replayQuicSniffingCorpusFixture(t, fixture)
 		})

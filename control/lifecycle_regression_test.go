@@ -195,7 +195,7 @@ func TestDnsForwarderCloseDoubleCheckProtocol(t *testing.T) {
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	const workers = 8
-	for w := 0; w < workers; w++ {
+	for w := range workers {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
@@ -444,11 +444,11 @@ func TestReleaseFlowSameTupleHammer(t *testing.T) {
 	binding.Egress.Dialer = d
 
 	var wg sync.WaitGroup
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			for round := 0; round < 50; round++ {
+			for round := range 50 {
 				flow, err := manager.adoptTCP(&memoryLayoutConn{id: uint64(id*1000 + round)}, nil, binding, rt, []bpfTuplesKey{key})
 				if err != nil {
 					t.Errorf("adopt round %d: %v", round, err)

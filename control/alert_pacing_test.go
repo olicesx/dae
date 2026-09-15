@@ -45,7 +45,7 @@ func (b *syncLogBuffer) String() string {
 
 func (b *syncLogBuffer) lines() []string {
 	var out []string
-	for _, line := range strings.Split(b.String(), "\n") {
+	for line := range strings.SplitSeq(b.String(), "\n") {
 		if strings.TrimSpace(line) != "" {
 			out = append(out, line)
 		}
@@ -128,7 +128,7 @@ func TestLogMapCapacityAlertPacesRepeatsAndCarriesTheCount(t *testing.T) {
 	logger, out := newLogCapture(logrus.WarnLevel)
 	c := &ControlPlane{log: logger}
 
-	for i := 0; i < 7; i++ {
+	for range 7 {
 		c.logMapCapacityAlert(&c.redirectTrackCapacityAlert, "cleanupRedirectTrackMap", 93.5, 4096)
 	}
 
@@ -196,7 +196,7 @@ func TestUdpIngressFailuresArePacedPerCondition(t *testing.T) {
 	dst := netip.MustParseAddrPort("198.51.100.7:443")
 	failure := stderrors.New("touch max retry limit")
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		c.logUdpRoutingTupleFailure(failure)
 		c.logUdpDNSRoutingTupleFailure(src, dst, failure)
 		c.logUdpHandlePktFailure(failure)

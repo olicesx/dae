@@ -1211,12 +1211,10 @@ func (c *DnsController) NormalizeAndCacheDnsResp_(msg *dnsmessage.Msg, responseC
 	// answers with TTL 0 asks for exactly that, and dae keeps its own freshness
 	// bookkeeping through the entry deadline and the stale window instead of
 	// treating the record as uncacheable.
-	ttl := minRealRecordTtl(msg)
-	// Clamp TTL to 1 year max to prevent integer overflow when casting to int
-	// on 32-bit platforms.
-	if ttl > dnsMaxCacheableTtl {
-		ttl = dnsMaxCacheableTtl
-	}
+	ttl := min(
+		// Clamp TTL to 1 year max to prevent integer overflow when casting to int
+		// on 32-bit platforms.
+		minRealRecordTtl(msg), dnsMaxCacheableTtl)
 
 	// Answers are forwarded with their real TTL, both on the first response and
 	// on a cache hit (where it is the remaining lifetime). dae used to rewrite

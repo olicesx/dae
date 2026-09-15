@@ -100,7 +100,7 @@ func TestAggregatorFlushOnFull(t *testing.T) {
 	ue := newBatchTestEndpoint(rec)
 	agg := newUDPWriteBatchAggregator(ue)
 
-	for i := 0; i < 33; i++ {
+	for i := range 33 {
 		if err := agg.Append([]byte{byte(i)}, "10.0.0.1:53"); err != nil {
 			t.Fatalf("Append #%d: %v", i, err)
 		}
@@ -171,8 +171,8 @@ func TestAggregatorBufferReuse(t *testing.T) {
 	for i := range payload {
 		payload[i] = byte(i)
 	}
-	for round := 0; round < 2; round++ {
-		for i := 0; i < 33; i++ {
+	for round := range 2 {
+		for i := range 33 {
 			if err := agg.Append(payload, "10.0.0.1:53"); err != nil {
 				t.Fatalf("round %d Append #%d: %v", round, i, err)
 			}
@@ -181,7 +181,7 @@ func TestAggregatorBufferReuse(t *testing.T) {
 	if rec.batchCount() < 2 {
 		t.Fatalf("expected 2 full flushes, got %d", rec.batchCount())
 	}
-	for round := 0; round < 2; round++ {
+	for round := range 2 {
 		b := rec.batch(round)
 		if len(b) != 32 {
 			t.Fatalf("round %d: expected 32 items, got %d", round, len(b))
@@ -244,7 +244,7 @@ func TestAggregatorErrorClassified(t *testing.T) {
 	ue := newBatchTestEndpoint(rec)
 	agg := newUDPWriteBatchAggregator(ue)
 
-	for i := 0; i < 33; i++ {
+	for i := range 33 {
 		if err := agg.Append([]byte{byte(i)}, "10.0.0.1:53"); err != nil {
 			t.Fatalf("Append #%d: %v", i, err)
 		}

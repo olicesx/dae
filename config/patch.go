@@ -85,8 +85,8 @@ func patchMustOutbound(params *Config) error {
 	if err != nil {
 		return err
 	}
-	if strings.HasPrefix(f.Name, "must_") {
-		f.Name = strings.TrimPrefix(f.Name, "must_")
+	if after, ok := strings.CutPrefix(f.Name, "must_"); ok {
+		f.Name = after
 		f.Params = append(f.Params, &config_parser.Param{
 			Val: "must",
 		})

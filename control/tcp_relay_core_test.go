@@ -1,3 +1,8 @@
+/*
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+ */
+
 package control
 
 import (
@@ -41,8 +46,7 @@ func TestRelayIdleWatchdogReclaimsIdleRelay(t *testing.T) {
 	rc.idleTimeout = 200 * time.Millisecond
 	rc.idleCheckPeriod = 50 * time.Millisecond
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	done := make(chan error, 1)
 	go func() { done <- rc.run(ctx) }()
@@ -115,8 +119,7 @@ func TestRelayIdleWatchdogCoexistsWithHalfClose(t *testing.T) {
 	rc.idleTimeout = 100 * time.Millisecond
 	rc.idleCheckPeriod = 20 * time.Millisecond
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	done := make(chan error, 1)
 	go func() { done <- rc.run(ctx) }()

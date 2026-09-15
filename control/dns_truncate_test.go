@@ -1,3 +1,8 @@
+/*
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+ */
+
 package control
 
 import (
@@ -15,7 +20,7 @@ func buildLargeDNSResponse(t *testing.T, count int) (*dnsmessage.Msg, []byte) {
 	msg.SetQuestion("cdn.example.com.", dnsmessage.TypeA)
 	msg.Response = true
 	msg.RecursionAvailable = true
-	for i := 0; i < count; i++ {
+	for range count {
 		rr, err := dnsmessage.NewRR("cdn.example.com. 300 IN A 203.0.113.1")
 		if err != nil {
 			t.Fatalf("NewRR: %v", err)

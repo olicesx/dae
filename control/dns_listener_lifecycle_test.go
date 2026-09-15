@@ -37,7 +37,7 @@ func TestDNSListenerStartReportsUDPBindFailure(t *testing.T) {
 }
 
 func TestDNSListenerImmediateStop(t *testing.T) {
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		listener, err := NewDNSListener(newDNSListenerTestLogger(), "127.0.0.1:0", nil)
 		if err != nil {
 			t.Fatalf("NewDNSListener iteration %d: %v", i, err)

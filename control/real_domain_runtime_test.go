@@ -1,3 +1,8 @@
+/*
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+ */
+
 package control
 
 import (
@@ -15,7 +20,7 @@ func TestRealDomainSetBoundedFIFO(t *testing.T) {
 	last := "last.example"
 	rt.muRealDomainSet.Lock()
 	rt.rememberRealDomain(first)
-	for i := 0; i < realDomainSetCapacity-1; i++ {
+	for i := range realDomainSetCapacity - 1 {
 		rt.rememberRealDomain("d" + strconv.Itoa(i) + ".test")
 	}
 	if len(rt.realDomainSet) != realDomainSetCapacity {

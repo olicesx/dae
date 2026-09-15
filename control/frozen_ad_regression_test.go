@@ -385,11 +385,11 @@ func TestHandleConnDoesNotDoubleCloseFailedAdoption(t *testing.T) {
 		t.Fatal("handleConn adoptTCPFlow call missing")
 	}
 	window := text[idx:]
-	end := strings.Index(window, "defer closeEstablishedTCPFlow")
-	if end < 0 {
+	before, _, ok := strings.Cut(window, "defer closeEstablishedTCPFlow")
+	if !ok {
 		t.Fatal("successful adoption ownership boundary missing")
 	}
-	if strings.Contains(window[:end], "rConn.Close()") {
+	if strings.Contains(before, "rConn.Close()") {
 		t.Fatal("handleConn closes egress already claimed by adopt failure ownership")
 	}
 }
@@ -462,11 +462,11 @@ func TestSkipTrueDoesNotReturnFromDNSFastPath(t *testing.T) {
 		t.Fatal("skip predicate call missing from udpIngressTask.Run")
 	}
 	window := text[idx:]
-	end := strings.Index(window, "if dnsMessage, _ := ChooseNatTimeout")
-	if end < 0 {
+	before, _, ok := strings.Cut(window, "if dnsMessage, _ := ChooseNatTimeout")
+	if !ok {
 		t.Fatal("DNS fast path after skip block is missing")
 	}
-	block := window[:end]
+	block := before
 	if strings.Contains(block, "return") {
 		t.Fatal("skip-true branch returns and drops TProxy-reached local DNS")
 	}

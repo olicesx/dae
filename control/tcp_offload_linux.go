@@ -462,7 +462,7 @@ func (s *tcpRelayOffloadSession) fuseStep(lastProgress *time.Time) (engage, lift
 // until both are empty (or a bounded number of iterations elapses). Returns
 // true when data is still pending so fuseStep can defer the lift.
 func (s *tcpRelayOffloadSession) drainResidual(lastProgress *time.Time) bool {
-	for i := 0; i < 64; i++ {
+	for range 64 {
 		lPending, err := tcpConnHasPendingReadData(s.left)
 		if err == nil && lPending {
 			_, _ = s.relayPassData(0, lastProgress)
@@ -592,10 +592,7 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 				return 0, 0, nil
 			}
 			if int(remaining.Milliseconds()) < waitMs {
-				waitMs = int(remaining.Milliseconds())
-				if waitMs < 1 {
-					waitMs = 1
-				}
+				waitMs = max(int(remaining.Milliseconds()), 1)
 			}
 		}
 
@@ -630,7 +627,7 @@ func (s *tcpRelayOffloadSession) Run(ctx context.Context) (leftRx, rightRx int64
 			continue
 		}
 
-		for i := 0; i < n; i++ {
+		for i := range n {
 			if events[i].Events&unix.EPOLLIN != 0 {
 				// SK_PASS fallback: the verdict program passes data through
 				// while the backlog fuse is engaged, so data sits in the
@@ -854,7 +851,7 @@ func tcpConnDrainKernelQueue(src, dst *net.TCPConn) (int, error) {
 		return 0, err
 	}
 	total := 0
-	for i := 0; i < tcpOffloadQueueDrainMaxIter; i++ {
+	for range tcpOffloadQueueDrainMaxIter {
 		pending, err := tcpConnPendingBytes(src)
 		if err != nil || pending <= 0 {
 			return total, err

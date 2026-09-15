@@ -25,8 +25,8 @@ func TestBpfStubMapParityWithKernelSource(t *testing.T) {
 	t.Parallel()
 
 	want := bpfMapNamesFromKernelSource(t)
-	assertBpfStubMapNames(t, "bpfMapSpecs", reflect.TypeOf(bpfMapSpecs{}), want)
-	assertBpfStubMapNames(t, "bpfMaps", reflect.TypeOf(bpfMaps{}), want)
+	assertBpfStubMapNames(t, "bpfMapSpecs", reflect.TypeFor[bpfMapSpecs](), want)
+	assertBpfStubMapNames(t, "bpfMaps", reflect.TypeFor[bpfMaps](), want)
 }
 
 func bpfMapNamesFromKernelSource(t *testing.T) []string {
@@ -48,8 +48,8 @@ func assertBpfStubMapNames(t *testing.T, typeName string, typ reflect.Type, want
 	t.Helper()
 
 	got := make([]string, 0, typ.NumField())
-	for i := 0; i < typ.NumField(); i++ {
-		if name := typ.Field(i).Tag.Get("ebpf"); name != "" {
+	for field := range typ.Fields() {
+		if name := field.Tag.Get("ebpf"); name != "" {
 			got = append(got, name)
 		}
 	}

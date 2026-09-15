@@ -1,3 +1,8 @@
+/*
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+ */
+
 package control
 
 import (
@@ -57,7 +62,7 @@ func TestParseDaeEventBothHostByteOrders(t *testing.T) {
 			copy(b[16:32], "native-order")
 			b[32] = 7
 			b[33] = unix.IPPROTO_TCP
-			for i := 0; i < 4; i++ {
+			for i := range 4 {
 				abi.putUint32(b[36+4*i:40+4*i], uint32(i+1))
 				abi.putUint32(b[52+4*i:56+4*i], uint32(i+11))
 			}
@@ -161,13 +166,13 @@ func TestRateLimitedActionConcurrent(t *testing.T) {
 	interval := 30 * time.Second
 	now := time.Now().UnixNano()
 	winners := make(chan bool, 64)
-	for i := 0; i < 64; i++ {
+	for range 64 {
 		go func() {
 			winners <- casRateLimited(&last, now, interval)
 		}()
 	}
 	passed := 0
-	for i := 0; i < 64; i++ {
+	for range 64 {
 		if <-winners {
 			passed++
 		}

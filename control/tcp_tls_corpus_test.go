@@ -81,7 +81,6 @@ func phase0TCPTLSCorpusFixtures() []phase0TCPTLSCorpusFixture {
 // proxy. Later policy or flow refactors must preserve this entire outcome.
 func TestPhase0TCPTLSCorpus_LegacyBaseline(t *testing.T) {
 	for _, fixture := range phase0TCPTLSCorpusFixtures() {
-		fixture := fixture
 		t.Run(fixture.name, func(t *testing.T) {
 			replayPhase0TCPTLSCorpusFixture(t, fixture)
 		})

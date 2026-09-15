@@ -1,3 +1,8 @@
+/*
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+ */
+
 package control
 
 import (
@@ -79,7 +84,7 @@ func parseDaeEventWithABI(abi bpfHostABI, b []byte) (e daeEvent) {
 	copy(e.Pname[:], b[16:32])
 	e.Outbound = b[32]
 	e.L4proto = b[33]
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		e.Sip[i] = abi.uint32(b[36+4*i : 40+4*i])
 		e.Dip[i] = abi.uint32(b[52+4*i : 56+4*i])
 	}

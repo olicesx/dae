@@ -166,13 +166,13 @@ func TestDirectDispatchSpawnSitePanicIsolation(t *testing.T) {
 		t.Fatal("bare `go task.Run()` spawn site must not come back")
 	}
 
-	loopStart := strings.Index(text, "processPacket := func(pktBuf pool.PB")
-	if loopStart < 0 {
+	before, _, ok := strings.Cut(text, "processPacket := func(pktBuf pool.PB")
+	if !ok {
 		t.Fatal("ingress read loop body not found in control_plane.go")
 	}
 	// The read-loop handler is the goroutine body directly preceding
 	// processPacket's definition.
-	handler := text[:loopStart]
+	handler := before
 	handler = handler[strings.LastIndex(handler, "go func() {"):]
 	if !strings.Contains(handler, "recover()") {
 		t.Fatal("ingress read loop has no panic isolation")

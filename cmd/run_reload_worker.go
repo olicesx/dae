@@ -489,7 +489,7 @@ func (w *reloadWorker) run() {
 		w.reloadManager.beginHandoff()
 		releaseReloadTransition()
 
-		w.reloadManager.refreshPprofServer(w.log, &w.pprofServer, newConf.Global.PprofPort)
+		w.reloadManager.refreshPprofServer(&w.pprofServer, newConf.Global.PprofPort)
 
 		notifyRunStateChange(w.runStateChanges)
 

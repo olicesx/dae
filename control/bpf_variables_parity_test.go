@@ -10,6 +10,7 @@ package control
 import (
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -76,13 +77,7 @@ func TestBpfVariablesParityWithKernelSource(t *testing.T) {
 	// kernel source must be covered by the Go injection list, otherwise it
 	// would silently keep its clang fallback value in production.
 	for name := range found {
-		listed := false
-		for _, want := range expectedInjectedVariables {
-			if name == want {
-				listed = true
-				break
-			}
-		}
+		listed := slices.Contains(expectedInjectedVariables, name)
 		if !listed {
 			t.Errorf("kernel source declares const-volatile variable %q but "+
 				"expectedInjectedVariables does not list it; it would keep its "+

@@ -29,7 +29,7 @@ func TestValidateUDPRawPayloadLength(t *testing.T) {
 
 // Locks ParsePortRange against a slice-out-of-bounds panic on short input.
 func TestParsePortRangeShortInput(t *testing.T) {
-	for n := 0; n < 4; n++ {
+	for n := range 4 {
 		buf := make([]byte, n)
 		start, end := ParsePortRange(buf) // must not panic
 		if start != 0 || end != 0 {

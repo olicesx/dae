@@ -246,7 +246,7 @@ func (c *ControlPlane) cleanupNegativeCaches(now time.Time) {
 	nowNano := now.UnixNano()
 
 	// 1. Cleanup real domain negative cache
-	c.realDomainNegSet.Range(func(key, value interface{}) bool {
+	c.realDomainNegSet.Range(func(key, value any) bool {
 		expiresAt, ok := value.(int64)
 		if !ok || nowNano >= expiresAt {
 			c.realDomainNegSet.Delete(key)

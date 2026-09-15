@@ -144,7 +144,7 @@ func clampWireRecordTtls(msg []byte, maxTtl uint32) []byte {
 	ar := int(binary.BigEndian.Uint16(out[10:12]))
 
 	off := 12
-	for i := 0; i < qd; i++ {
+	for range qd {
 		nameEnd := skipDnsWireName(out, off)
 		if nameEnd < 0 {
 			return nil
@@ -156,7 +156,7 @@ func clampWireRecordTtls(msg []byte, maxTtl uint32) []byte {
 	}
 
 	walkRRs := func(count int) bool {
-		for i := 0; i < count; i++ {
+		for range count {
 			nameEnd := skipDnsWireName(out, off)
 			if nameEnd < 0 {
 				return false

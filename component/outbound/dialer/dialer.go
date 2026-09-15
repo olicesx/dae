@@ -806,7 +806,7 @@ func (d *Dialer) cancelPendingRecoveryConfirmationByIndex(protoIdx int, proto co
 func (d *Dialer) calculateBackoffDurationLocked(level int, maxBackoff time.Duration) time.Duration {
 	// Calculate backoff: minBackoff * (2 ^ level)
 	duration := minRecoveryBackoff
-	for i := 0; i < level; i++ {
+	for range level {
 		duration *= time.Duration(backoffMultiplier)
 		if duration >= maxBackoff {
 			return maxBackoff

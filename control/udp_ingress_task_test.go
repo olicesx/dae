@@ -40,9 +40,9 @@ func TestUdpIngressTaskPoolConcurrent(t *testing.T) {
 	const workers = 8
 	const perWorker = 2000
 	done := make(chan error, workers)
-	for w := 0; w < workers; w++ {
+	for range workers {
 		go func() {
-			for i := 0; i < perWorker; i++ {
+			for range perWorker {
 				task := udpIngressTaskPool.Get().(*udpIngressTask)
 				task.c = nil
 				task.realDst = netip.MustParseAddrPort("192.0.2.1:40000")
@@ -51,7 +51,7 @@ func TestUdpIngressTaskPoolConcurrent(t *testing.T) {
 			done <- nil
 		}()
 	}
-	for w := 0; w < workers; w++ {
+	for range workers {
 		if err := <-done; err != nil {
 			t.Fatal(err)
 		}

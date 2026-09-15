@@ -83,7 +83,7 @@ func TestDnsCacheStoreFailureKeepsPerQueryDetailAtDebug(t *testing.T) {
 	c, out := newCacheStoreTestController(logrus.DebugLevel)
 	storeErr := stderrors.New("cache entry has no packable question")
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		c.noteDnsCacheStoreFailure("response writer", storeErr)
 	}
 

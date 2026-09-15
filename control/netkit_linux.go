@@ -96,11 +96,11 @@ var iproute2MinNetkitVersion = [2]int{6, 7}
 // is located by scanning rather than by trimming a fixed prefix.
 func parseIproute2Version(output string) (major, minor int, ok bool) {
 	marker := "iproute2-"
-	idx := strings.Index(output, marker)
-	if idx < 0 {
+	_, after, ok0 := strings.Cut(output, marker)
+	if !ok0 {
 		return 0, 0, false
 	}
-	rest := output[idx+len(marker):]
+	rest := after
 	// Skip any non-digit characters between the marker and the version
 	// (defensive against future output-format changes).
 	for len(rest) > 0 && (rest[0] < '0' || rest[0] > '9') {

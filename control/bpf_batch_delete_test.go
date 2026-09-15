@@ -21,7 +21,7 @@ func TestBatchDeleteIgnoringMissingResumesSuffix(t *testing.T) {
 	present := map[uint32]bool{1: true, 3: true}
 	var calls [][]uint32
 
-	deleted, err := batchDeleteIgnoringMissing(reflect.ValueOf(keys), func(raw interface{}) (int, error) {
+	deleted, err := batchDeleteIgnoringMissing(reflect.ValueOf(keys), func(raw any) (int, error) {
 		suffix := slices.Clone(raw.([]uint32))
 		calls = append(calls, suffix)
 		for i, key := range suffix {
@@ -73,7 +73,7 @@ func TestBpfMapBatchDeleteRealMapResumesAfterMissingKey(t *testing.T) {
 func TestBatchDeleteIgnoringMissingAllAbsent(t *testing.T) {
 	keys := []uint32{1, 2, 3}
 	calls := 0
-	deleted, err := batchDeleteIgnoringMissing(reflect.ValueOf(keys), func(raw interface{}) (int, error) {
+	deleted, err := batchDeleteIgnoringMissing(reflect.ValueOf(keys), func(raw any) (int, error) {
 		calls++
 		return 0, ebpf.ErrKeyNotExist
 	})
@@ -88,7 +88,7 @@ func TestBatchDeleteIgnoringMissingAllAbsent(t *testing.T) {
 func TestBatchDeleteIgnoringMissingPreservesPartialCountOnError(t *testing.T) {
 	keys := []uint32{1, 2, 3}
 	wantErr := stderrors.New("batch transport failed")
-	deleted, err := batchDeleteIgnoringMissing(reflect.ValueOf(keys), func(raw interface{}) (int, error) {
+	deleted, err := batchDeleteIgnoringMissing(reflect.ValueOf(keys), func(raw any) (int, error) {
 		return 1, wantErr
 	})
 	if deleted != 1 || !stderrors.Is(err, wantErr) {
@@ -98,7 +98,7 @@ func TestBatchDeleteIgnoringMissingPreservesPartialCountOnError(t *testing.T) {
 
 func TestBatchDeleteIgnoringMissingRejectsSilentPartialProgress(t *testing.T) {
 	keys := []uint32{1, 2, 3}
-	deleted, err := batchDeleteIgnoringMissing(reflect.ValueOf(keys), func(raw interface{}) (int, error) {
+	deleted, err := batchDeleteIgnoringMissing(reflect.ValueOf(keys), func(raw any) (int, error) {
 		return 0, nil
 	})
 	if deleted != 0 || err == nil {

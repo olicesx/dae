@@ -176,7 +176,7 @@ func loadBpf() (*ebpf.CollectionSpec, error) {
 	return nil, errBpfObjectsUnavailable
 }
 
-func loadBpfObjects(_ interface{}, _ *ebpf.CollectionOptions) error {
+func loadBpfObjects(_ any, _ *ebpf.CollectionOptions) error {
 	return errBpfObjectsUnavailable
 }
 
@@ -436,11 +436,11 @@ func BpfMapBatchDeleteAll[K any, V any](m *ebpf.Map) error {
 	return errBpfObjectsUnavailable
 }
 
-func BpfMapBatchDelete(m *ebpf.Map, keys interface{}) (n int, err error) {
+func BpfMapBatchDelete(m *ebpf.Map, keys any) (n int, err error) {
 	return 0, errBpfObjectsUnavailable
 }
 
-func BpfMapBatchUpdate(m *ebpf.Map, keys interface{}, values interface{}, opts *ebpf.BatchOptions) (n int, err error) {
+func BpfMapBatchUpdate(m *ebpf.Map, keys any, values any, opts *ebpf.BatchOptions) (n int, err error) {
 	return 0, errBpfObjectsUnavailable
 }
 

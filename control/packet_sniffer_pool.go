@@ -139,10 +139,7 @@ func (c *failedQuicDcidCache) targetShardEntriesCap(liveEntries int) int {
 	if c == nil || liveEntries <= 0 {
 		return 0
 	}
-	target := max(liveEntries, c.initialEntriesPerShard())
-	if target > c.maxEntriesPerShard {
-		target = c.maxEntriesPerShard
-	}
+	target := min(max(liveEntries, c.initialEntriesPerShard()), c.maxEntriesPerShard)
 	return target
 }
 
@@ -281,10 +278,7 @@ func (c *failedQuicDcidCache) MarkFailed(key PacketSnifferKey, reason quicDcidFa
 		if entry.backoffShift < failedQuicDcidMaxBackoffShift {
 			entry.backoffShift++
 		}
-		newExpiry := now.Add(failedQuicDcidSuppressionTtl(reason, entry.backoffShift)).UnixNano()
-		if newExpiry < entry.expiresAtUnixNano {
-			newExpiry = entry.expiresAtUnixNano
-		}
+		newExpiry := max(now.Add(failedQuicDcidSuppressionTtl(reason, entry.backoffShift)).UnixNano(), entry.expiresAtUnixNano)
 		entry.expiresAtUnixNano = newExpiry
 		shard.entries[key] = entry
 		return

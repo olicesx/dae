@@ -62,7 +62,7 @@ func FuzzRuntimeSupervisorOperations(f *testing.F) {
 				}
 			case 2:
 				if snapshot.prepared != nil {
-					_, _ = supervisor.rollbackPrepared(snapshot.prepared)
+					supervisor.rollbackPrepared(snapshot.prepared)
 				}
 			case 3:
 				if snapshot.retiring != nil {
@@ -76,7 +76,7 @@ func FuzzRuntimeSupervisorOperations(f *testing.F) {
 				_ = supervisor.shutdown()
 			case 6:
 				if len(candidates) > 0 {
-					_, _ = supervisor.rollbackPrepared(candidates[len(candidates)-1])
+					supervisor.rollbackPrepared(candidates[len(candidates)-1])
 				}
 			}
 			assertState()

@@ -96,14 +96,14 @@ func TestConcurrentAvailabilityNotifications(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 1000; i++ {
+		for range 1000 {
 			// Full traffic-success path (state flip + group notification).
 			d.ReportAvailableTraffic(typ)
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 1000; i++ {
+		for range 1000 {
 			d.ReportUnavailable(typ, errors.New("dial failed"))
 		}
 	}()

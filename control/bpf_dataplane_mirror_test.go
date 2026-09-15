@@ -1,5 +1,10 @@
 //go:build !dae_stub_ebpf
 
+/*
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+ */
+
 package control
 
 import (
@@ -11,15 +16,15 @@ func TestDataplaneProgramsAndMapsComplete(t *testing.T) {
 	assertDataplaneMirrorComplete(
 		t,
 		"program",
-		reflect.TypeOf(bpfPrograms{}),
-		reflect.TypeOf(bpfDataplanePrograms{}),
+		reflect.TypeFor[bpfPrograms](),
+		reflect.TypeFor[bpfDataplanePrograms](),
 		tcpRelayOffloadPrograms,
 	)
 	assertDataplaneMirrorComplete(
 		t,
 		"map",
-		reflect.TypeOf(bpfMaps{}),
-		reflect.TypeOf(bpfDataplaneMaps{}),
+		reflect.TypeFor[bpfMaps](),
+		reflect.TypeFor[bpfDataplaneMaps](),
 		tcpRelayOffloadMaps,
 	)
 }
@@ -36,8 +41,8 @@ func TestAssignDataplaneToBpfCopiesMandatoryObjects(t *testing.T) {
 }
 
 func populatePointerFields(value reflect.Value) {
-	for i := 0; i < value.NumField(); i++ {
-		value.Field(i).Set(reflect.New(value.Field(i).Type().Elem()))
+	for _, field := range value.Fields() {
+		field.Set(reflect.New(field.Type().Elem()))
 	}
 }
 
@@ -77,8 +82,8 @@ func assertDataplaneMirrorComplete(t *testing.T, objectKind string, generated, m
 
 func ebpfTaggedFields(typ reflect.Type) map[string]struct{} {
 	fields := make(map[string]struct{}, typ.NumField())
-	for i := 0; i < typ.NumField(); i++ {
-		if name := typ.Field(i).Tag.Get("ebpf"); name != "" {
+	for field := range typ.Fields() {
+		if name := field.Tag.Get("ebpf"); name != "" {
 			fields[name] = struct{}{}
 		}
 	}

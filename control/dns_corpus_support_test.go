@@ -132,7 +132,6 @@ func ReplayDns(t *testing.T, fixture DnsCorpusFixture) {
 	setScopedBestDialerChooser(ctrl, chooser)
 
 	for _, tc := range fixture.Cases {
-		tc := tc
 		t.Run(tc.Name, func(t *testing.T) {
 			if tc.PreState != nil {
 				tc.PreState(t, ctrl)

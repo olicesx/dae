@@ -24,7 +24,6 @@ import (
 // the remaining sub-corpora are tracked in progress.md.
 func TestPhase0DnsCorpus_LegacyBaseline(t *testing.T) {
 	for _, fixture := range DnsCorpusFixtures() {
-		fixture := fixture
 		t.Run(fixture.Name, func(t *testing.T) {
 			ReplayDns(t, fixture)
 		})

@@ -255,7 +255,7 @@ func TestHandlePkt_RepeatedSameIngressReusesSingleUdpEndpoint(t *testing.T) {
 	flowDecision := ClassifyUdpFlow(src, dst, payload)
 	key := flowDecision.FullConeNatEndpointKey()
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if err := cp.handlePktWithPrefetch(payload, src, dst, routingResult, flowDecision, nil, UdpEndpointKey{}, false); err != nil {
 			t.Fatalf("handlePkt call %d: %v", i+1, err)
 		}
@@ -467,9 +467,7 @@ func TestAnyfromPool_ConcurrentExistingSocketReusesCachedBind(t *testing.T) {
 	connCh := make(chan *Anyfrom, callers)
 	var wg sync.WaitGroup
 	for range callers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			conn, isNew, err := pool.getOrCreateWithMark(lAddr, 0)
 			if err != nil {
@@ -481,7 +479,7 @@ func TestAnyfromPool_ConcurrentExistingSocketReusesCachedBind(t *testing.T) {
 				return
 			}
 			connCh <- conn
-		}()
+		})
 	}
 
 	close(start)
@@ -521,9 +519,7 @@ func TestAnyfromPool_ConcurrentFailedBindEntrySuppressesRetryStorm(t *testing.T)
 	errCh := make(chan error, callers)
 	var wg sync.WaitGroup
 	for range callers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			<-start
 			conn, isNew, err := pool.getOrCreateWithMark(lAddr, 0)
 			if !stderrors.Is(err, ErrAnyfromBindFailed) {
@@ -537,7 +533,7 @@ func TestAnyfromPool_ConcurrentFailedBindEntrySuppressesRetryStorm(t *testing.T)
 			if isNew {
 				errCh <- fmt.Errorf("GetOrCreate reported isNew for failed bind hot path")
 			}
-		}()
+		})
 	}
 
 	close(start)

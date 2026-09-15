@@ -8,6 +8,7 @@ package outbound
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"sync"
@@ -127,9 +128,7 @@ func (s *DialerSet) logParseFailureSummary() {
 	batch := total - s.parseFailuresReported
 	s.parseFailuresReported = total
 	byTag := make(map[string]uint64, len(s.parseFailuresBy))
-	for tag, count := range s.parseFailuresBy {
-		byTag[tag] = count
-	}
+	maps.Copy(byTag, s.parseFailuresBy)
 	s.parseFailuresBy = nil
 	s.parseFailuresMu.Unlock()
 	if batch == 0 {

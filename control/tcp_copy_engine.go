@@ -13,6 +13,13 @@ import (
 	"github.com/daeuniverse/outbound/netproxy"
 )
 
+// relayCopyBufferSize must stay an integer multiple of the anytls
+// maxFramePayloadSize (32768 in the pinned outbound fork): a whole read
+// buffer handed to stream.Write then chunks into exactly N full frames.
+// A non-multiple (e.g. 64 KiB over a 65535-byte frame budget) degrades
+// every read into a full frame plus a one-byte tail frame. The fork's
+// TestRelayBufferAlignment locks the property on its side; if the pin
+// advances and that test breaks the build, retune this constant too.
 const relayCopyBufferSize = 32 << 10
 
 var relayCopyBufferPool = sync.Pool{

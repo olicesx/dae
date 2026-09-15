@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"testing"
 	"time"
 
@@ -382,4 +383,17 @@ func TestUDPIngressRejectsTruncatedControlMessage(t *testing.T) {
 			require.Nil(t, buf, "incomplete original-destination metadata must not reach forwarding")
 		})
 	}
+}
+
+// Listener.Close unblocks a parked UDP ingress read by installing an immediate
+// read deadline, so the resulting timeout ends the read loop cleanly. Treating
+// it as fatal aborted the retiring generation during a reload's listener
+// handoff; fd-exhaustion errors must keep their retry path instead.
+func TestIngressWakeTimeoutClassification(t *testing.T) {
+	wake := &net.OpError{Op: "read", Net: "udp", Err: os.ErrDeadlineExceeded}
+	require.True(t, ingressWakeTimeout(wake), "read-deadline expiry is the close wake-up")
+	require.True(t, ingressWakeTimeout(fmt.Errorf("wrap: %w", wake)), "the wake-up is wrapped by the batch reader")
+	require.False(t, ingressWakeTimeout(net.ErrClosed), "closed connections are handled separately")
+	require.False(t, ingressWakeTimeout(unix.EMFILE), "fd exhaustion must keep its retry path")
+	require.False(t, ingressWakeTimeout(nil))
 }

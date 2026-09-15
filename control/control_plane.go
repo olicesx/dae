@@ -2430,6 +2430,17 @@ func ingressResourceExhausted(err error) bool {
 		stderrors.Is(err, syscall.ENOBUFS)
 }
 
+// ingressWakeTimeout reports whether err is the read-deadline expiry that
+// Listener.Close installs through wakePacketConn to unblock a parked UDP
+// ingress read. A timeout therefore means the listener is being closed, which
+// is a clean stop; treating it as fatal let a reload's listener handoff abort
+// the retiring generation with "ingress loop terminated". The TCP accept loop
+// below already returns cleanly on the same signal.
+func ingressWakeTimeout(err error) bool {
+	netErr, ok := stderrors.AsType[net.Error](err)
+	return ok && netErr.Timeout()
+}
+
 // retryIngressAfterBackoff logs (rate-limited) and sleeps briefly so the
 // caller can retry a transient ingress error. It reports whether the caller
 // should keep looping; false means the plane is shutting down.
@@ -2679,7 +2690,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				// preserving one exclusive ingress buffer per packet.
 				n, err := batchReader.ReadBatch()
 				if err != nil {
-					if !commonerrors.IsClosedConnection(err) {
+					if !commonerrors.IsClosedConnection(err) && !ingressWakeTimeout(err) {
 						if ingressResourceExhausted(err) && c.retryIngressAfterBackoff("ReadBatchUDP", err) {
 							continue
 						}
@@ -2711,7 +2722,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 
 			pktBuf, src, oobn, err := singleReader.Read(oob[:])
 			if err != nil {
-				if !commonerrors.IsClosedConnection(err) {
+				if !commonerrors.IsClosedConnection(err) && !ingressWakeTimeout(err) {
 					if ingressResourceExhausted(err) && c.retryIngressAfterBackoff("ReadMsgUDPAddrPort", err) {
 						continue
 					}

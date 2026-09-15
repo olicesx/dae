@@ -126,4 +126,8 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260910
 // remote-FIN data preservation, gRPC zero-deadline clearing, and
 // chain-constructed dialer ownership. Includes cancellable dial queues,
 // immediate TUIC retirement signals, and explicit write-deadline behavior.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260912070929-ebd5cd55cbda
+// Now also: symmetric-direct WriteMsgUDP keeps OOB cmsgs (QUIC GSO),
+// bbr3 low-RTT pacing-cwnd deadlock broken with a CwndGain-scaled
+// pacing-support floor, STARTUP no longer aborts on background loss,
+// and hy2 defaults to bbr3 again.
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260915135305-a2498ce2f7b3

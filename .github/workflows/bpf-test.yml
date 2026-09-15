@@ -116,8 +116,14 @@ jobs:
             fi
 
             # Direction 2: every whitelisted case must actually pass.
+            # The compile step runs under sudo too: the earlier root-owned
+            # `make ebpf-test` creates root-owned directories inside the
+            # shared GOMODCACHE, so an unprivileged `go test -c` fails with
+            # "mkdir ... permission denied" whenever the dependency set needs
+            # a module directory the root run did not create. Keeping the
+            # whole direction root-side avoids the mixed-ownership cache.
             run_regex="^($(paste -sd'|' /tmp/datapath-whitelist.txt))$"
-            go test -c ./control -o /tmp/dae-control-datapath.test
+            sudo --preserve-env=PATH,HOME,GOCACHE,GOMODCACHE,GOPATH,GOFLAGS,GOEXPERIMENT,CGO_ENABLED go test -c ./control -o /tmp/dae-control-datapath.test
             sudo /tmp/dae-control-datapath.test -test.run "$run_regex" -test.count=1 -test.v | tee /tmp/datapath.log
             failed=0
             while IFS= read -r name; do

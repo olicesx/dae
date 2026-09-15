@@ -230,6 +230,12 @@ wait_for_reload_count() {
 }
 
 daemon_fd_count() {
+	if ! kill -0 "$daemon_pid" 2>/dev/null; then
+		echo "daemon (pid $daemon_pid) exited before an fd-count probe; daemon.log tail:" >&2
+		tail -n 40 "$tmp_dir/daemon.log" >&2 2>/dev/null || echo "(daemon log unreadable)" >&2
+		dmesg 2>/dev/null | tail -n 20 >&2 || true
+		return 1
+	fi
 	find "/proc/$daemon_pid/fd" -mindepth 1 -maxdepth 1 -type l | wc -l
 }
 

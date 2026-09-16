@@ -28,7 +28,7 @@ dae enp1s0：192.168.2.1 网关 192.168.2.2
 
 4.配置保留地址别名
 
-   > 在`防火墙：别名：别名`处添加别名\_\_private_network，选择 Network 类型，添加所有保留地址（或仅添加自己网络中使用到的保留地址），参考[保留 IP 地址](ttps://www.wikiwand.com/zh-hant/保留IP地址)。
+   > 在`防火墙：别名：别名`处添加别名\_\_private_network，选择 Network 类型，添加所有保留地址（或仅添加自己网络中使用到的保留地址），参考[保留 IP 地址](https://www.wikiwand.com/zh-hant/保留IP地址)。
 
 5.聚合以上别名
 

@@ -164,6 +164,19 @@ dns {
 }
 ```
 
+## 引导解析器（`global` 段）
+
+`global.bootstrap_resolver` 只覆盖在 dae 自身 DNS 路由可用之前必须成功的解析：
+解析 DNS 上游的主机名、以及 `dial_mode: real-domain` 的探测。不设置时 dae 依次回退到
+`119.29.29.29:53` 与 `223.5.5.5:53`；一旦设置就完全取代这两个默认值，只用所配置的解析器。
+中国大陆以外的机器通常应换成更近的解析器：
+
+```shell
+global {
+  bootstrap_resolver: '9.9.9.9:53'
+}
+```
+
 ## 模板
 
 ```shell

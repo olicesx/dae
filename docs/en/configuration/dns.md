@@ -166,6 +166,20 @@ dns {
 }
 ```
 
+## Bootstrap resolver (`global`)
+
+`global.bootstrap_resolver` covers only the lookups that must succeed before
+dae's own DNS routing exists: resolving DNS upstream hostnames and
+`dial_mode: real-domain` probes. Left unset, dae falls back to `119.29.29.29:53`
+and then `223.5.5.5:53`; setting the option replaces those defaults entirely and
+is used alone. A host outside mainland China usually wants a closer resolver:
+
+```shell
+global {
+  bootstrap_resolver: '9.9.9.9:53'
+}
+```
+
 ## Templates
 
 ```shell

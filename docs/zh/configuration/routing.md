@@ -108,3 +108,18 @@ ip(geoip:cn) -> direct
 domain(geosite:cn) -> direct
 fallback: my_group
 ```
+
+## 设备级域名白名单（自动 sniff-punt）
+
+```shell
+mac('aa:bb:cc:dd:ee:ff') && domain(geosite:docker, suffix:quay.io, geosite:github) -> my_group
+mac('aa:bb:cc:dd:ee:ff') -> direct
+```
+
+域名条件依赖「该设备的 DNS 经过 dae」才存在的信息。如果该设备使用加密 DNS
+（DoH/DoT），白名单会静默失效，它的全部流量都会落到 fallback。dae 能识别这种形态
+（单主机 `mac`/`sip` 选择器 + 正向 `domain` 条件 + 之后仅选择器的 `direct`/`block`
+fallback），并自动在 fallback 之前插入一条仅在内核态生效的 sniff-punt 规则：缺少域名
+信息的连接被送往用户态嗅探（TLS SNI / HTTP host / QUIC），再用嗅探到的域名在同一条
+规则集上重新匹配。该设备未被白名单命中的流量仍落到 fallback，经用户态转发。使用前提是
+嗅探已启用（`sniffing_timeout > 0`、`dial_mode != ip`）；用 `auto_sniff_punt: false` 关闭。

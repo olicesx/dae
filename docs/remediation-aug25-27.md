@@ -1,6 +1,6 @@
 # Remediation plan: dae + outbound (2026-08-25 .. 2026-08-27)
 
-Status: implemented in the local checkouts (`/root/outbound`, `/root/dae`). dae `go.mod` replace points at `/root/outbound` until a published pseudo-version exists.
+Status: closed. The remediation shipped: dae's `go.mod` replace now points at the published outbound pseudo-version (`v0.0.0-sticky-ip.0.20260915172050-1187d577a58e`, advanced by commit `c6183f42`), so the local `/root/outbound` checkout is no longer part of the build.
 Artifact revisions this plan is bound to:
 
 - dae: `kdae` `7cfeb91e398ad6e764ec0ea50252cf5370d400fe`

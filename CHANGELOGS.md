@@ -77,9 +77,14 @@ changed. Review them before upgrading:
   `223.5.5.5:53`. Users outside mainland China likely want to set
   `bootstrap_resolver` to a closer resolver.
 - `so_mark_from_dae` semantics: when the option is absent, dae now
-  auto-selects an internal fwmark for its own egress traffic instead of
-  leaving it unset. Setups whose policy routing matched on "no mark" must set
-  `so_mark_from_dae: 0` explicitly (an explicit `0` keeps the old behavior).
+  auto-selects an internal fwmark (`0x100`) for its own egress traffic instead
+  of leaving it unset, and warns about that implicit choice. An explicit `0`
+  does **not** restore the old "no mark" behavior: `0` still resolves to the
+  internal mark and only silences the warning, because that mark is what keeps
+  `wan_egress` from re-capturing the control plane's own UDP traffic
+  (`common/utils.go`, `config/desc.go`, `example.dae`). Setups whose policy
+  routing matched on "no mark" have to update that rule — match `0x100`, or set
+  `so_mark_from_dae` to a non-zero value of your own and match that.
 - New `disable_thp` option (default `false`) can opt the dae process out of
   transparent huge pages via `prctl(PR_SET_THP_DISABLE)`. The default leaves
   kernel memory policy untouched; enable it if you observe RSS inflation on
@@ -129,6 +134,30 @@ changed. Review them before upgrading:
   A successful upgrade delivers the complete answer where the client used to
   receive TC=1, so no configuration change is needed; the observable difference
   is that these answers now resolve on the first query.
+- `GOMAXPROCS` is no longer pinned to `1`. The runtime default applies, so the
+  datapath uses more than one `P` on a multi-core host. An explicit
+  `GOMAXPROCS` environment variable still wins, so pinning it back to `1`
+  restores the previous behavior.
+- QUIC congestion control default: following the outbound dependency advance, a
+  QUIC connection whose path rate is unknown now gets the `bbr3` controller
+  instead of the previous default. `cc_override` still selects a controller per
+  outbound, and an unknown value there is rejected instead of ignored.
+- New `disable_waiting_network` option. Startup waits for the network before
+  pulling subscriptions, and that wait is now bounded: after the timeout dae
+  warns and resolves subscriptions anyway, so a host that never sees a default
+  route still finishes starting. Setting the option to `true` skips the wait.
+- Unknown operands for `l4proto` and `ipversion` are now rejected — e.g.
+  `l4proto: unknown value "sctp"; supported values are tcp and udp` — instead of
+  being silently ignored. This is the same class of change as the
+  named-parameter rejection above: a rule that used to be read as something
+  other than what it says now fails at parse time.
+- `dae validate` also dry-runs the DNS request/response routing block. A typo
+  there used to exit 0 from `validate` while `dae run` refused to start; scripts
+  that treat a successful `validate` as proof that the config will run now see
+  such configs fail, which is the point.
+- `ipversion_prefer` is enforced on every delivery path, including the
+  cache-hit and background-refresh paths that could previously release an answer
+  from the non-preferred family while the preferred family had records.
 
 ### v2.0.0rc1 (Pre-release)
 

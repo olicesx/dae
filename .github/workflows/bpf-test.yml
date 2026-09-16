@@ -77,7 +77,7 @@ jobs:
           if [ "$VERSION" = 19 ]; then
             set -euo pipefail
             sudo --preserve-env=PATH,HOME,GOCACHE,GOMODCACHE,GOPATH,GOFLAGS,GOEXPERIMENT,CGO_ENABLED CLANG=clang-$VERSION make ebpf
-            # Whitelist of the test cases that must actually RUN from the three
+            # Whitelist of the test cases that must actually RUN from the
             # !dae_stub_ebpf test files. Before this step only one case
             # (TestTCHookSetKernelUpdateAndRollback) ran while eight real
             # datapath cases were merely compiled.
@@ -100,6 +100,9 @@ jobs:
               # production helper and its source contract; no BPF map needed).
               TestRemovedIncompatiblePinnedMapWarnsWithConsequence
               TestIncompatiblePinRemovalIsNotAnInfoStep
+              # Cgroup2 mount-point probe cache (concurrent consistency of the
+              # sync.OnceValues singleton; reads /proc/mounts, no BPF map needed).
+              TestDetectCgroupPathCaching
             )
             printf '%s\n' "${whitelist[@]}" | sort -u > /tmp/datapath-whitelist.txt
 

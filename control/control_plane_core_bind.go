@@ -302,12 +302,12 @@ func (c *controlPlaneCore) setupSkPidMonitor() error {
 	}
 	bpf := c.bpf.Load()
 	cgProgs := []cgProg{
-		{Prog: bpf.TproxyWanCgSockCreate, Attach: ebpf.AttachCGroupInetSockCreate},
-		{Prog: bpf.TproxyWanCgSockRelease, Attach: ebpf.AttachCgroupInetSockRelease},
-		{Prog: bpf.TproxyWanCgConnect4, Attach: ebpf.AttachCGroupInet4Connect},
-		{Prog: bpf.TproxyWanCgConnect6, Attach: ebpf.AttachCGroupInet6Connect},
-		{Prog: bpf.TproxyWanCgSendmsg4, Attach: ebpf.AttachCGroupUDP4Sendmsg},
-		{Prog: bpf.TproxyWanCgSendmsg6, Attach: ebpf.AttachCGroupUDP6Sendmsg},
+		{Name: "sock_create", Prog: bpf.TproxyWanCgSockCreate, Attach: ebpf.AttachCGroupInetSockCreate},
+		{Name: "sock_release", Prog: bpf.TproxyWanCgSockRelease, Attach: ebpf.AttachCgroupInetSockRelease},
+		{Name: "connect4", Prog: bpf.TproxyWanCgConnect4, Attach: ebpf.AttachCGroupInet4Connect},
+		{Name: "connect6", Prog: bpf.TproxyWanCgConnect6, Attach: ebpf.AttachCGroupInet6Connect},
+		{Name: "sendmsg4", Prog: bpf.TproxyWanCgSendmsg4, Attach: ebpf.AttachCGroupUDP4Sendmsg},
+		{Name: "sendmsg6", Prog: bpf.TproxyWanCgSendmsg6, Attach: ebpf.AttachCGroupUDP6Sendmsg},
 	}
 	attachedLinks := make([]cgroupAttachment, 0, len(cgProgs))
 	detachFuncs := make([]func() error, 0, len(cgProgs))
@@ -325,9 +325,10 @@ func (c *controlPlaneCore) setupSkPidMonitor() error {
 		}
 		attachedLinks = append(attachedLinks, attached)
 		attachedLink := attached
+		progName := prog.Name
 		detachFunc := func() error {
 			if err := attachedLink.Close(); err != nil {
-				return fmt.Errorf("inet6Bind.Close(): %w", err)
+				return fmt.Errorf("cgroup %s detach: %w", progName, err)
 			}
 			return nil
 		}

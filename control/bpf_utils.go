@@ -258,10 +258,16 @@ func batchDeleteIgnoringMissing(vKeys reflect.Value, deleteBatch func(keys any) 
 	return deleted, nil
 }
 
-// detectCgroupPath returns the first-found mount point of type cgroup2
-// and stores it in the cgroupPath global variable.
-// Copied from https://github.com/cilium/ebpf/blob/v0.10.0/examples/cgroup_skb/main.go
+var detectCgroupPathCached = sync.OnceValues(scanCgroupPath)
+
+// detectCgroupPath returns the first-found mount point of type cgroup2,
+// caching the result for the lifetime of the process to avoid repeatedly
+// scanning /proc/mounts on reloads or multiple setups.
 func detectCgroupPath() (string, error) {
+	return detectCgroupPathCached()
+}
+
+func scanCgroupPath() (string, error) {
 	f, err := os.Open("/proc/mounts")
 	if err != nil {
 		return "", err

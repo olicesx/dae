@@ -28,17 +28,19 @@ Download the sample config file:
 
 ```bash
 mkdir -p /etc/dae
-curl -L -o /etc/dae/config.dae https://github.com/daeuniverse/dae/raw/main/example.dae
+curl -L -o /etc/dae/config.dae https://github.com/olicesx/dae/raw/main/example.dae
 chmod 600 /etc/dae/config.dae
 ```
 
 ## Download pre-compiled binaries
 
-Releases are available in <https://github.com/daeuniverse/dae/releases>
+Upstream releases are available in <https://github.com/daeuniverse/dae/releases>.
+This fork publishes no GitHub Releases: its binaries are the artifacts of the
+`Build (Main)` workflow, and its source revisions are tagged `latest`.
 
 > **Note**: If you would like to get a taste of new features, there are nightly (latest) builds available. Most of the time, newly proposed changes will be included in `PRs` and will be exported as cross-platform executable binaries in builds (GitHub Action Workflow Build). Noted that newly introduced features are sometimes buggy, do it at your own risk. However, we still highly encourage you to check out our latest builds as it may help us further analyze features stability and resolve potential bugs accordingly.
 
-Nightly builds are available in <https://github.com/daeuniverse/dae/actions/workflows/build-nightly.yml>
+This fork's builds are available in <https://github.com/olicesx/dae/actions/workflows/build.yml>
 
 ```bash
 sudo chmod +x ./dae
@@ -54,7 +56,7 @@ dae version
 
 ```bash
 # download the sample systemd.service
-sudo curl -L -o /etc/systemd/system/dae.service https://github.com/daeuniverse/dae/raw/main/install/dae.service
+sudo curl -L -o /etc/systemd/system/dae.service https://github.com/olicesx/dae/raw/main/install/dae.service
 
 # reload and restart daemon to take effect
 sudo systemctl daemon-reload

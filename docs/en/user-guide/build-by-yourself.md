@@ -7,7 +7,7 @@
 ```shell
 clang >= 10
 llvm >= 10 (optional)
-golang >= 1.24
+golang >= 1.26
 make
 ```
 
@@ -78,7 +78,7 @@ popd
 Download the example config file:
 
 ```shell
-curl -L -o example.dae https://github.com/daeuniverse/dae/raw/main/example.dae
+curl -L -o example.dae https://github.com/olicesx/dae/raw/main/example.dae
 ```
 
 See [example.dae](https://github.com/olicesx/dae/blob/main/example.dae).

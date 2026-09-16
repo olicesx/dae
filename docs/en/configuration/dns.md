@@ -63,6 +63,13 @@ tcp+udp://<host>:<port>
 default port: 53
 ```
 
+A truncated answer (`TC=1`, RFC 1035 §4.2.1) is retried over TCP, as RFC 7766
+§5 requires: an `udp://` upstream retries that query over TCP, while a
+`tcp+udp://` upstream always did. The built-in `asis` destination is not
+retried — the answer the destination sent is passed to the client as it
+arrived, so the client decides whether to retry, exactly as it would without
+dae in the path. Every other scheme keeps its declared transport.
+
 ## Examples
 
 ```shell
@@ -112,6 +119,8 @@ dns {
         # Match rules from top to bottom.
         request {
             # Built-in outbounds in 'request': asis, reject.
+            # asis queries the server the request was addressed to, as the request arrived.
+            # Do not point other LAN devices at dae:53 (loop risk).
             # You can also use user-defined upstreams.
 
             # Available functions for ordinary DNS requests: qname, qtype.

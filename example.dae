@@ -118,6 +118,11 @@ global {
     # Default 30ms is suitable for most networks. Increase to 100-300ms for high-latency networks.
     sniffing_timeout: 30ms
 
+    # Inject kernel-space-only sniff-punt rules for device-scoped domain whitelists whose
+    # device uses its own DNS (so the domain conditions would otherwise never match).
+    # Requires sniffing to be enabled (sniffing_timeout > 0 and dial_mode != ip).
+    auto_sniff_punt: true
+
     # TLS implementation. tls is to use Go's crypto/tls. utls is to use uTLS, which can imitate browser's Client Hello.
     tls_implementation: tls
 

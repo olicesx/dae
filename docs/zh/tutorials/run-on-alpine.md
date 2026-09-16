@@ -49,7 +49,7 @@ vi /etc/init.d/sysfs
         fi
 ```
 
-请注意，脚本 `/etc/init.d/sysfs` 的格式必须正确，否则 `/etc/init.d/sysfs` 将被删除。
+请注意，脚本 `/etc/init.d/sysfs` 的格式必须正确，否则 `sysfs` 服务会启动失败。
 
 ## 安装 dae
 

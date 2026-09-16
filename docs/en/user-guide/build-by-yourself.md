@@ -81,7 +81,7 @@ Download the example config file:
 curl -L -o example.dae https://github.com/daeuniverse/dae/raw/main/example.dae
 ```
 
-See [example.dae](https://github.com/daeuniverse/dae/blob/main/example.dae).
+See [example.dae](https://github.com/olicesx/dae/blob/main/example.dae).
 
 After fine tuning, run dae:
 

@@ -32,7 +32,7 @@ make dae
 ```
 
 该分支把 `go.mod` 的 outbound 钉到 fork 的 `feat/bbr3-experimental`
-（`v0.0.0-sticky-ip.0.20260909101419-b2c4e6d561c6`）。若你的环境走代理拉不到该提交：
+（`v0.0.0-sticky-ip.0.20260909102757-319c8e694f48`；fork 在 2026-09 重写历史，旧 hash 已作废）。若你的环境走代理拉不到该提交：
 
 ```bash
 GOPROXY=direct GOPRIVATE='github.com/olicesx/*' go mod download github.com/olicesx/outbound

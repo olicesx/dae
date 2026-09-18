@@ -120,4 +120,4 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260910
 
 // Custom outbound fork: protocol lifecycle and framing hardening, cancellable
 // dial queues, UDP write-path cmsg preservation, and congestion-control fixes.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260915172050-1187d577a58e
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260917223728-6a44445c9106

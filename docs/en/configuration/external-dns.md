@@ -45,9 +45,18 @@ You should configure dae as follows:
 
 4. If you bind to WAN, make sure your `/etc/resolv.conf` does NOT use your local external DNS directly. For example, you can set it as `nameserver 119.29.29.29`, and then DNS traffic will be hijacked by dae when the packets are sent through NIC. Most of the time, `/etc/resolv.conf` will be modified back by your DNS service like dnsmasq after rebooting, which is hard to deal with. We recommended you to uninstall them or give `sudo chattr +i /etc/resolv.conf` if you encounter such situation.
 
-5. If you bind to LAN, make sure your DHCP server will distribute dae as the DNS server (DNS request should be forwarded by dae for domain based traffic split).
+5. If you bind to LAN, a UDP query from a LAN client to the dae host's own port
+   53 is routed like any other packet and then handed to the resolver configured
+   in the `dns` section, so dae sees the answer and its `domain()` rules match
+   that client's traffic too. Advertising the dae host as the DNS server in DHCP
+   therefore works. If you want the host's own resolver to answer those queries
+   instead of dae, express it as a routing rule, for example
+   `l4proto(udp) && dport(53) && dip(<address of the dae host>) -> must_direct`.
 
-6. If there is still a DNS issue and there are no warn/error logs, you have to change your listening port of external DNS (here is AdGuardHome) from 53 to non-53 port. See [#31](https://github.com/daeuniverse/dae/issues/31#issuecomment-1467358364).
+6. If DNS still fails without warning or error logs, move AdGuardHome off port
+   53. Another program on port 53 breaks interception on NICs that cannot
+   disable checksum verification; see
+   [#31](https://github.com/daeuniverse/dae/issues/31#issuecomment-1467358364).
 
 7. If you use PVE, refer to [#37](https://github.com/daeuniverse/dae/discussions/37).
 

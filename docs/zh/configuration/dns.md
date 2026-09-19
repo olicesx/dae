@@ -1,6 +1,6 @@
 # DNS
 
-dae 拦截目标端口为 53 的 UDP 流量并嗅探 DNS，以下为 DNS 配置的示例和模板。
+dae 会拦截所有经它路由或从本机发出、发往 53 端口的 UDP 和 TCP 流量，并嗅探 DNS。只有命中 `must_direct` 的流量不经过 dae；仅写 `direct` 仍会交给 DNS 模块处理。局域网客户端发往 dae 主机自身 socket（例如本机监听 53 端口的 dnsmasq）的查询和其它报文一样走路由，UDP 与 TCP 都会进入 DNS 模块。要把这类查询直接交给该 socket（dae 看不到应答），靠的是 `must_direct` 规则，例如 `l4proto(udp) && dport(53) && dip(<dae 主机地址>) -> must_direct`。只有经 loopback 接口的查询不会经过 dae 的任何 hook。以下为 DNS 配置的示例和模板。
 
 # Schema
 

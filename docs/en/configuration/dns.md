@@ -1,6 +1,6 @@
 # DNS
 
-dae will intercept all UDP traffic to port 53 and sniff DNS. Here gives some examples and templates for DNS configuration.
+dae intercepts all UDP and TCP traffic to port 53 that it routes or that leaves the host, and sniffs DNS. Only a rule that resolves to `must_direct` keeps port 53 traffic away from dae; `direct` alone still hands it to the DNS module. A query from a LAN client to a socket on the dae host itself, such as a local dnsmasq on port 53, is routed like any other and reaches the DNS module, UDP and TCP alike. What delivers such a query to that socket instead — with dae never seeing the answer — is a `must_direct` rule, for example `l4proto(udp) && dport(53) && dip(<address of the dae host>) -> must_direct`. Only queries over the loopback interface never pass a dae hook. This page gives examples and templates for DNS configuration.
 
 # Schema
 

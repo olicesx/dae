@@ -751,6 +751,12 @@ func (c *DnsController) resolveDNSUpstream(
 	if err != nil {
 		return nil, err
 	}
+	// DNSPod omits the question on some terminal errors. Inherit this request's
+	// question only for the shape questionlessTerminalReply allows, so the echo
+	// check below still rejects every reply that could carry another query's data.
+	if questionlessTerminalReply(respMsg) && reqQuestion.Name != "" {
+		respMsg.Question = []dnsmessage.Question{reqQuestion}
+	}
 	if reqQuestion.Name != "" && !questionEchoMatches(reqQuestion, respMsg) {
 		return nil, fmt.Errorf("upstream %v reply does not echo the request question (possible spoofing or upstream cross-talk); dropped", upstreamName)
 	}

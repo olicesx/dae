@@ -74,6 +74,33 @@ func questionEchoMatches(req dnsmessage.Question, resp *dnsmessage.Msg) bool {
 		dnsmessage.CanonicalName(req.Name) == dnsmessage.CanonicalName(rq.Name)
 }
 
+// questionlessTerminalReply reports whether an upstream response may inherit
+// the request question. DNSPod answers some Bonjour/DNS-SD NXDOMAINs with
+// QDCOUNT=0. That shape is not another query's answer only when it cannot
+// carry records: NXDOMAIN, REFUSED, or SERVFAIL, with empty answer and
+// authority sections. An EDNS OPT in the additional section is signaling, not
+// data, and is allowed. A positive answer, NODATA, an authority SOA, or any
+// other additional record must still echo the question (RFC 5452).
+func questionlessTerminalReply(resp *dnsmessage.Msg) bool {
+	if resp == nil || !resp.Response || len(resp.Question) != 0 {
+		return false
+	}
+	switch resp.Rcode {
+	case dnsmessage.RcodeNameError, dnsmessage.RcodeRefused, dnsmessage.RcodeServerFailure:
+	default:
+		return false
+	}
+	if len(resp.Answer) != 0 || len(resp.Ns) != 0 {
+		return false
+	}
+	for _, rr := range resp.Extra {
+		if _, ok := rr.(*dnsmessage.OPT); !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // truncateDNSMessage requires exclusive ownership of msg and its records.
 func truncateDNSMessage(msg *dnsmessage.Msg, limit int) {
 	msg.Truncate(limit)

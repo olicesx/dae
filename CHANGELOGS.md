@@ -159,6 +159,10 @@ changed. Review them before upgrading:
   cache-hit and background-refresh paths that could previously release an answer
   from the non-preferred family while the preferred family had records.
 
+#### Bug Fixes
+
+- fix(control): flush short TCP splice writes without corking
+
 ### v2.0.0rc1 (Pre-release)
 
 > Release date: 2026/04/23

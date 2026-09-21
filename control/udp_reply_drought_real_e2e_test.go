@@ -277,6 +277,15 @@ func newRealUdpE2EControlPlane(t *testing.T, d *componentdialer.Dialer) *Control
 func installTestDaeNetns(t *testing.T) {
 	t.Helper()
 	ns := newDaeNetnsWithCurrentHandles(t)
+	// The spoofed-reply path creates its client-facing socket through a real
+	// setns into the dae netns. Unprivileged runners (CI executes tests as a
+	// non-root user) get EPERM from setns even for the current namespace, and
+	// every e2e below would then fail with a five-second reply timeout instead
+	// of exercising the rebuild logic. Probe the exact prerequisite once and
+	// skip rather than fail when it is unavailable.
+	if err := ns.With(func() error { return nil }); err != nil {
+		t.Skipf("the real spoofed-reply datapath needs setns (CAP_SYS_ADMIN), which this environment denies: %v", err)
+	}
 	old := daeNetns
 	daeNetns = ns
 	t.Cleanup(func() { daeNetns = old })

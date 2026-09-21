@@ -510,6 +510,14 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 		ue.retire()
 		return true
 	}
+	if ue.peerNeedsDedicatedSession(realDst, time.Now()) {
+		// A peer whose mapping the far end has forgotten gets the same treatment
+		// on a retained session as on a current-epoch one: decline the shortcut
+		// so the normal path dials it its own session instead of writing into a
+		// hole. The retained session keeps serving its other peers until its
+		// epoch drains.
+		return false
+	}
 	if flowDecision.HasConfirmedQuicState() || ue.SniffedDomain != "" {
 		ue.UpdateNatTimeout(QuicNatTimeout)
 	}
@@ -687,6 +695,26 @@ func (c *ControlPlane) handlePktOwned(data []byte, src, realDst netip.AddrPort, 
 			ueKey = fallbackKey
 			ue, ueExists = DefaultUdpEndpointPool.Get(ueKey)
 		}
+	}
+	// A full-cone session can outlive the usefulness of one of its peers: the
+	// far end reaps that peer's forwarding mapping, its datagrams are dropped,
+	// and the session stays healthy for every other peer. The endpoint-level
+	// drought gate cannot fire there, because a live peer keeps the reply clock
+	// fresh, so the reaped peer would stay dead for the life of the session.
+	// Escalate that peer to its own symmetric session — the same evidence-based
+	// escalation already used for sniffed domains and confirmed QUIC flows —
+	// which hands it a fresh forwarding source port without touching the peers
+	// that are still working. This is deliberately the only place dae accepts
+	// two endpoints for one source address, and only after per-peer evidence.
+	// The retained-endpoint path above consults the same gate and declines its
+	// shortcut for a reaped peer, so a draining epoch recovers here too.
+	if ueExists && !forceSymmetricKey && ue != nil && !ueKey.Dst.IsValid() &&
+		ue.peerNeedsDedicatedSession(realDst, now) {
+		forceSymmetricKey = true
+		ueKey = flowDecision.SymmetricNatEndpointKeyWithScope(routeScope)
+		// A miss is expected right after the promotion: the dial path below
+		// creates the dedicated session under this key.
+		ue, ueExists = DefaultUdpEndpointPool.Get(ueKey)
 	}
 	if ueExists {
 		switch {

@@ -73,14 +73,14 @@ func TestPacketReceiverFailedRegistrationReadFromHandlerError(t *testing.T) {
 	}
 	var releasesMu sync.Mutex
 	releases := make(map[*byte]int)
-	oldPut := putUdpEndpointReplyData
-	putUdpEndpointReplyData = func(data pool.PB) {
+	var oldPut func(data pool.PB)
+	oldPut = setPutUdpEndpointReplyData(func(data pool.PB) {
 		releasesMu.Lock()
 		releases[&data[:cap(data)][0]]++
 		releasesMu.Unlock()
 		oldPut(data)
-	}
-	t.Cleanup(func() { putUdpEndpointReplyData = oldPut })
+	})
+	t.Cleanup(func() { setPutUdpEndpointReplyData(oldPut) })
 	var handled, drainReleases atomic.Int32
 	ue := &UdpEndpoint{
 		conn: conn,

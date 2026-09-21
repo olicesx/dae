@@ -73,21 +73,45 @@ type UdpEndpoint struct {
 	// Before this flips true, the endpoint is still probing and must not
 	// use the normal sliding NAT lifetime.
 	hasReply atomic.Bool
-	// lastSendNano records the last time the client successfully sent a
-	// packet through this endpoint, and lastReplyNano the last time the
-	// upstream replied. A session that was established (hasReply) but whose
-	// BOTH directions went silent for sendStaleTimeout() is presumed to be
-	// starting a new round after an inter-round pause: the remote (e.g. a
-	// game server) may have reaped the old session, so the old hy2
-	// forwarding source port is no longer recognized. Rebuilding the endpoint
-	// allocates a fresh hy2 session with a new forwarding port the peer treats
-	// as a new client. The check uses the newer of the two timestamps, so
-	// active gameplay — where the server keeps replying even if the client
-	// briefly pauses — never rebuilds mid-round. Sniffed QUIC/H3 flows use
-	// a longer window (udpEndpointQuicSendStaleTimeout) so video segment
-	// gaps do not look like a new round.
-	lastSendNano  atomic.Int64
-	lastReplyNano atomic.Int64
+	// lastReplyNano records the last upstream reply and writesSinceReply the
+	// number of client datagrams sent since then. Together they are the
+	// endpoint's only active session-recovery evidence: an established session
+	// whose peer stopped answering while the client kept transmitting has
+	// almost certainly been reaped upstream, so the next write rebuilds it and
+	// the flow gets a fresh forwarding source port (see
+	// udpEndpointReplyDroughtWindow). Silence in both directions is
+	// deliberately NOT a signal: it is indistinguishable from a healthy pause,
+	// and rebuilding on it would only move the source port that QUIC and
+	// WireGuard peers track.
+	lastReplyNano    atomic.Int64
+	writesSinceReply atomic.Int64
+	// recentWriteBucket is the absolute index of the current
+	// udpEndpointReplyDroughtProbeWindow and recentWriteBucketWrites counts the
+	// datagrams the transport accepted during it. Together they approximate a
+	// sliding window of recent client activity, which the reply-drought gate
+	// needs to see bursts that a lifetime average would dilute (see
+	// droughtSendRate).
+	recentWriteBucket       atomic.Int64
+	recentWriteBucketWrites atomic.Int64
+
+	// A full-cone (source-keyed) session serves several peers whose fates are
+	// independent, so liveness is tracked per peer once a second peer has
+	// replied (multiPeer). Until then the endpoint keeps no per-peer state and
+	// pays nothing for it; peers is guarded by peerMu.
+	multiPeer atomic.Bool
+	peerMu    sync.Mutex
+	peers     map[string]*udpEndpointPeerState
+
+	// replyCount is the number of upstream replies this session has produced,
+	// and droughtRebuildGeneration how many reply-drought rebuilds its pool key
+	// already went through before this session was created. Together they form
+	// the recovery budget: a session that already replaced one that died of a
+	// reply drought must prove two-way health before it may do the same, so a
+	// peer that answers once and then goes quiet cannot cause a rebuild every
+	// window.
+	replyCount               atomic.Int32
+	retiredByReplyDrought    atomic.Bool
+	droughtRebuildGeneration int
 	// hasSent indicates the endpoint has already forwarded at least one client
 	// packet successfully. Once a flow reaches this point, control-plane health
 	// probes should not tear it down proactively; only data-plane errors,
@@ -232,6 +256,27 @@ type udpEndpointDialerNetworkKey struct {
 }
 
 // UdpEndpointPool is a UDP connection pool.
+//
+// The drought rebuild ledger only exists to carry a generation across the
+// remove-and-redial gap of one pool key: the gate retires a session, the very
+// next datagram of that flow dials its replacement, and the replacement has to
+// know that the key already spent a rebuild. That gap is sub-second, so the
+// window is kept close to it: anything longer lets an unrelated flow that
+// happens to reuse the same local port inherit the spent budget and serve one
+// drought with fewer rebuilds than a fresh flow would get. Size is bounded the
+// same way, for the same reason.
+const (
+	udpEndpointDroughtSuccessorLimit = 256
+	udpEndpointDroughtSuccessorTTL   = time.Minute
+)
+
+// udpEndpointDroughtSuccessor records that a pool key's session was retired by
+// the reply-drought gate, and how many such rebuilds the key has accumulated.
+type udpEndpointDroughtSuccessor struct {
+	generation int
+	recordedAt time.Time
+}
+
 type UdpEndpointPool struct {
 	shards           [udpEndpointCreateShardCount]udpEndpointPoolShard
 	janitorOnce      sync.Once
@@ -241,6 +286,62 @@ type UdpEndpointPool struct {
 	dialerEpoch      sync.Map // map[udpEndpointDialerNetworkKey]*atomic.Uint64
 	transportIndex   sync.Map // map[<-chan struct{}]*udpEndpointTransportBucket
 	transportWatchMu sync.RWMutex
+
+	droughtSuccessorsMu sync.Mutex
+	droughtSuccessors   map[UdpEndpointKey]udpEndpointDroughtSuccessor
+}
+
+// rememberDroughtRebuild records that the key's session was retired by the
+// reply-drought gate, so the session created for that key next is a recovery
+// attempt rather than a fresh flow.
+func (p *UdpEndpointPool) rememberDroughtRebuild(key UdpEndpointKey, generation int) {
+	if p == nil || generation <= 0 {
+		return
+	}
+	now := time.Now()
+	p.droughtSuccessorsMu.Lock()
+	defer p.droughtSuccessorsMu.Unlock()
+	if p.droughtSuccessors == nil {
+		p.droughtSuccessors = make(map[UdpEndpointKey]udpEndpointDroughtSuccessor, 8)
+	}
+	if len(p.droughtSuccessors) >= udpEndpointDroughtSuccessorLimit {
+		for existing, entry := range p.droughtSuccessors {
+			if now.Sub(entry.recordedAt) >= udpEndpointDroughtSuccessorTTL {
+				delete(p.droughtSuccessors, existing)
+			}
+		}
+		// Still full of fresh entries: drop the oldest so the ledger stays
+		// bounded whatever the traffic does.
+		if len(p.droughtSuccessors) >= udpEndpointDroughtSuccessorLimit {
+			oldestKey, oldestAt := UdpEndpointKey{}, time.Time{}
+			for existing, entry := range p.droughtSuccessors {
+				if oldestAt.IsZero() || entry.recordedAt.Before(oldestAt) {
+					oldestKey, oldestAt = existing, entry.recordedAt
+				}
+			}
+			delete(p.droughtSuccessors, oldestKey)
+		}
+	}
+	p.droughtSuccessors[key] = udpEndpointDroughtSuccessor{generation: generation, recordedAt: now}
+}
+
+// droughtRebuildGeneration reports how many reply-drought rebuilds the key has
+// already been through, or zero for a key that never needed one.
+func (p *UdpEndpointPool) droughtRebuildGeneration(key UdpEndpointKey) int {
+	if p == nil {
+		return 0
+	}
+	p.droughtSuccessorsMu.Lock()
+	defer p.droughtSuccessorsMu.Unlock()
+	entry, ok := p.droughtSuccessors[key]
+	if !ok {
+		return 0
+	}
+	if time.Since(entry.recordedAt) >= udpEndpointDroughtSuccessorTTL {
+		delete(p.droughtSuccessors, key)
+		return 0
+	}
+	return entry.generation
 }
 
 // udpEndpointAdmissionGate keeps endpoint publication ordered with forced
@@ -574,6 +675,9 @@ func (p *UdpEndpointPool) Reset() {
 		p.dialerEpoch.Delete(key)
 		return true
 	})
+	p.droughtSuccessorsMu.Lock()
+	p.droughtSuccessors = nil
+	p.droughtSuccessorsMu.Unlock()
 	p.stopTransportWatchers()
 }
 
@@ -713,6 +817,9 @@ dialSuccess:
 		udpConnStateOwner: createOption.ConnStateOwner,
 		drainTracker:      createOption.DrainTracker,
 		lifecycleProfile:  newDataSessionLifecycleProfile(dialOption.Dialer),
+		// A key that already burned recovery attempts starts this session with
+		// the matching budget (see udpEndpointReplyDroughtMinHealthyReplies).
+		droughtRebuildGeneration: p.droughtRebuildGeneration(key),
 		endpointNetworkType: func() dialer.NetworkType {
 			if dialOption.NetworkType != nil {
 				return *dialOption.NetworkType

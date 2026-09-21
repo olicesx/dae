@@ -462,34 +462,75 @@ func (ue *UdpEndpoint) markRetiredFromReceiver() {
 // merely-full datagram queue must be absorbed as a dropped datagram instead.
 const udpEndpointWriteTimeout = 10 * time.Second
 
-// udpEndpointSendStaleTimeout is how long an established game-like endpoint
-// may go without traffic in either direction before the next write rebuilds
-// it. A pause this long means the client is starting a new round after an
-// inter-round silence (e.g. between two game matches). Proxy transports (hy2)
-// multiplex many UDP sessions over one QUIC connection and reuse a single
-// forwarding source port per session: when the remote peer reaped the session
-// during the pause, the old source port is no longer recognized and new-round
-// packets are silently ignored. Rebuilding the endpoint allocates a fresh hy2
-// session and therefore a fresh forwarding port, which the peer treats as a
-// new client. Active gameplay sends heartbeats every tens of milliseconds, so
-// 5s of client silence is a safe "new round" signal and never fires mid-round.
-const udpEndpointSendStaleTimeout = 5 * time.Second
+// udpEndpointReplyDroughtWindow is how long an established data-session
+// endpoint may go without any upstream reply — while the client keeps writing —
+// before the next write rebuilds the session. Silence alone carries no
+// information: a pause shorter than the transport's own session lifetime
+// (Hysteria2 recreates an idle session after its UDPIdleTimeout; dae expires
+// pooled endpoints on the NAT timeout) is indistinguishable from a healthy
+// flow, and rebuilding there only changes the forwarding source port that QUIC
+// and WireGuard peers track. What IS observable is the absence of replies
+// during sustained transmission: a live peer of any protocol answers, so a
+// reply drought identifies a session whose remote side no longer recognizes it
+// (a game server or conntrack entry that reaped the mapping). That makes this
+// the only session-recovery signal dae owns; recovering a long pause belongs to
+// the transport/server layer, not here.
+const udpEndpointReplyDroughtWindow = 30 * time.Second
 
-// udpEndpointQuicSendStaleTimeout is the equivalent silence window for
-// sniffed flows, whose inner protocol is QUIC (H3/DASH/HLS video, QUIC
-// games). The classification key is not the traffic genre but the inner-QUIC
-// break sensitivity: rebuilding the hy2 session changes the forwarding
-// source port, i.e. the inner connection's 4-tuple, so the QUIC peer treats
-// the flow as a new client and collapses cwnd. Video segment gaps of 6-15s
-// are normal, so the 5s game window would rebuild on every pause; 30s covers
-// those gaps while still catching a peer that actually reaped the session,
-// well under QuicNatTimeout. Known edges (accepted tradeoffs): a SNI-carrying
-// QUIC game gets the 30s window, delaying inter-round recovery by up to 30s;
-// a QUIC flow whose SNI sniff failed keeps the 5s window and can churn on
-// video pauses (unchanged pre-refactor behavior). Both are information-
-// theoretic limits: without application-layer visibility the flow genre is
-// not observable.
-const udpEndpointQuicSendStaleTimeout = 30 * time.Second
+// udpEndpointReplyDroughtProbeWindow is the width of the recent-activity
+// measurement that complements the lifetime average in droughtSendRate: the
+// gate also acts when the client sent at least
+// udpEndpointReplyDroughtMinRate*udpEndpointReplyDroughtProbeWindow datagrams
+// inside this window. A burst is what a low-average flow produces — a game that
+// syncs state every tens of seconds, or any flow resuming after a long pause —
+// and the lifetime average dilutes it below the threshold forever. The window
+// must stay long enough that a genuinely sparse keepalive cannot fake a rate
+// (5s at 2 pkt/s is 10 datagrams, while WireGuard's 25s keepalive puts at most
+// one datagram in it) and short enough that "the client is transmitting now" is
+// still true when the decision is made.
+const udpEndpointReplyDroughtProbeWindow = 5 * time.Second
+
+// udpEndpointReplyDroughtMinHealthyReplies is how many upstream replies a
+// session must have produced before it is allowed to retire itself for a reply
+// drought when its key already went through one. A key that never needed a
+// recovery is never held back: a mapping can be reaped while a session is still
+// young, and that first recovery is the whole point. The budget exists for the
+// replacement: without it, a peer that answers once and then goes quiet would
+// be rebuilt every window, re-keying the flow each time for a single reply of
+// benefit. Three replies is proof of a working two-way path, not a lucky one.
+//
+// The budget follows the key, not the flow, for as long as the pool's rebuild
+// ledger remembers it (see udpEndpointDroughtSuccessorTTL): a client that
+// restarts and reuses the same local port within that window inherits the
+// budget of the flow that had it before.
+const udpEndpointReplyDroughtMinHealthyReplies = 3
+
+// udpEndpointReplyDroughtMinRate is the client write rate, in packets per
+// second, required to act on a reply drought. Wall-clock silence alone must
+// never rebuild: WireGuard's one-way persistent keepalive (about one packet per
+// 25s) gets no replies while idle and would otherwise be rebuilt every window,
+// moving its source port for no reason. Requiring traffic separates a dead
+// session (games heartbeat at 10-120 Hz) from a quiet but healthy one. The rate
+// is measured two ways and the larger one decides (see droughtSendRate): the
+// lifetime average over the drought, which is what a steady flow produces, and
+// the datagrams observed in the most recent
+// udpEndpointReplyDroughtProbeWindow, which is what a burst produces. Without
+// the second measurement a flow whose average stays below the threshold — a
+// game syncing state every tens of seconds, or any flow resuming after a long
+// pause — would keep a dead session forever. A flow that genuinely stopped
+// writing reaches neither measurement, so the transport layer recovers it
+// instead. The rebuild is also self-limiting, because the replacement session
+// starts probing and cannot be rebuilt again until its peer replies at least
+// once, so a false positive costs one dial rather than a loop.
+//
+// These three constants (window, probe window, min rate) are a documented
+// choice inside the envelope of TestUdpEndpointDroughtThresholdEnvelope, not a
+// measured operating point: this tree has no field distribution of client
+// write rates. The judgment fails if real interactive flows cluster near
+// 2 packets/s over 30s; that is the only band in which retuning MinRate or
+// Window would change a decision. Interactive ≥5 pps vs sparse ≤0.2 pps is
+// invariant across the swept range and would not move.
+const udpEndpointReplyDroughtMinRate = 2
 
 // udpEndpointWriteToleratedError wraps a transient transport write error that
 // the endpoint absorbed without retiring. Callers must drop the datagram and
@@ -520,19 +561,122 @@ func (ue *UdpEndpoint) dialTargetForWrite(realDst netip.AddrPort) string {
 	return realDst.String()
 }
 
-// sendStaleTimeout is the bidirectional-silence window that triggers a
-// session rebuild on the next write. The key is the flow's inner-QUIC break
-// sensitivity: sniffed QUIC flows use the 30s window so video segment gaps
-// do not look like a new round, everything else keeps the 5s inter-round
-// signal even when the transport is QUIC-backed (hy2/tuic game tunnels).
-func (ue *UdpEndpoint) sendStaleTimeout() time.Duration {
+// rebuildsOnReplyDrought reports whether this endpoint's lifecycle profile
+// enables the reply-drought session rebuild. Endpoints created outside the pool
+// (tests, ad-hoc dials) carry no profile and fall back to the data-session
+// profile, matching newUdpSessionLifecycleContext.
+func (ue *UdpEndpoint) rebuildsOnReplyDrought() bool {
+	profile := ue.lifecycleProfile
+	if profile.Kind == 0 {
+		profile = newDataSessionLifecycleProfile(ue.Dialer)
+	}
+	return profile.RebuildOnReplyDrought
+}
+
+// maybeRebuildOnReplyDrought retires an established endpoint whose upstream
+// stopped replying while the client kept writing. It returns the same
+// ErrClosedConnection classification as a normal close, so the caller's retry
+// dials a fresh session — and therefore a fresh forwarding source port —
+// without penalizing the dialer. Probing endpoints (no reply evidence yet) and
+// transactional flows (DNS owns its own timeout/discard policy) are never
+// touched.
+func (ue *UdpEndpoint) maybeRebuildOnReplyDrought(now time.Time) error {
 	if ue == nil {
-		return udpEndpointSendStaleTimeout
+		return nil
 	}
-	if ue.SniffedDomain != "" {
-		return udpEndpointQuicSendStaleTimeout
+	lastReply := ue.lastReplyNano.Load()
+	if lastReply == 0 {
+		// Still probing: no reply has ever been observed, so no drought exists.
+		return nil
 	}
-	return udpEndpointSendStaleTimeout
+	drought := now.UnixNano() - lastReply
+	if drought < int64(udpEndpointReplyDroughtWindow) {
+		return nil
+	}
+	if !ue.rebuildsOnReplyDrought() {
+		return nil
+	}
+	if ue.droughtRebuildGeneration > 0 && ue.replyCount.Load() < udpEndpointReplyDroughtMinHealthyReplies {
+		// This session is already a recovery attempt and has not proven
+		// two-way health since: spend no more recovery budget on it.
+		return nil
+	}
+	writes := ue.writesSinceReply.Load()
+	if ue.droughtSendRate(writes, drought, now) < float64(udpEndpointReplyDroughtMinRate) {
+		// Too little traffic to call the session dead: a sparse one-way flow
+		// such as WireGuard's persistent keepalive must keep its source port.
+		return nil
+	}
+	ue.retiredByReplyDrought.Store(true)
+	if ue.poolRef != nil {
+		// Carry the recovery budget of this key forward before the endpoint is
+		// marked dead: a concurrent replacement could otherwise retire the
+		// stale entry, dial, and read the ledger in between, leaving the
+		// replacement with a fresh flow's budget.
+		ue.poolRef.rememberDroughtRebuild(ue.poolKey, ue.droughtRebuildGeneration+1)
+	}
+	ue.retire()
+	if ue.log != nil {
+		dialerName := ""
+		if ue.Dialer != nil {
+			if property := ue.Dialer.Property(); property != nil {
+				dialerName = property.Name
+			}
+		}
+		ue.log.WithFields(logrus.Fields{
+			"dialer":             dialerName,
+			"proxy_addr":         ue.DialTarget,
+			"drought":            time.Duration(drought).String(),
+			"writes_since_reply": writes,
+		}).Debug("[UdpEndpoint] Rebuilding UDP session after reply drought")
+	}
+	return fmt.Errorf("%w: no reply for %s while %d packets were sent, rebuilding session",
+		errors.ErrClosedConnection, time.Duration(drought), writes)
+}
+
+// droughtSendRate reports the client's transmission rate into a session whose
+// upstream stopped replying, in packets per second. It takes the larger of two
+// measurements because they cover different traffic shapes: the lifetime
+// average over the drought, which a steady flow produces and which keeps the
+// original recovery latency, and the datagrams counted in the current
+// udpEndpointReplyDroughtProbeWindow, which is where a burst shows up even when
+// the average stays below the threshold. The second measurement cannot be faked
+// by a sparse flow: a window that short holds at most a couple of its
+// datagrams. A bucket from an older window is ignored; otherwise a burst before
+// a reply could be mistaken for traffic after a long quiet pause.
+func (ue *UdpEndpoint) droughtSendRate(writes, droughtNano int64, now time.Time) float64 {
+	bucket := now.UnixNano() / int64(udpEndpointReplyDroughtProbeWindow)
+	recent := int64(0)
+	if ue.recentWriteBucket.Load() == bucket {
+		recent = ue.recentWriteBucketWrites.Load()
+	}
+	return droughtSendRateFrom(writes, droughtNano, recent)
+}
+
+// observeSendRate records transmitted datagrams for the recent-activity
+// measurement used by the reply-drought gate. It is called from the two
+// accounting sites that already own hasSent/writesSinceReply — the synchronous
+// write path and the batched flush reporter — so a healthy session pays two
+// uncontended atomics per datagram and the gate itself does no per-packet work
+// beyond reading them.
+//
+// The counter covers the current absolute probe window; datagrams are counted
+// only after the transport accepted them, so evidence is never fabricated from
+// a datagram that was merely queued. The bucket is published after its counter
+// is cleared, so a reader that observes the new bucket cannot pair it with the
+// previous bucket's count. Concurrent writers may still lose a count, which
+// under-counts the window and therefore delays a rebuild instead of causing a
+// spurious one.
+func (ue *UdpEndpoint) observeSendRate(now time.Time, datagrams int) {
+	if ue == nil || datagrams <= 0 {
+		return
+	}
+	bucket := now.UnixNano() / int64(udpEndpointReplyDroughtProbeWindow)
+	if ue.recentWriteBucket.Load() != bucket {
+		ue.recentWriteBucketWrites.Store(0)
+		ue.recentWriteBucket.Store(bucket)
+	}
+	ue.recentWriteBucketWrites.Add(int64(datagrams))
 }
 
 func (ue *UdpEndpoint) armWriteDeadline(now time.Time) {
@@ -584,38 +728,15 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 	// Refresh TTL on write to keep endpoint alive for active connections
 	ue.RefreshTtl()
 
-	// Single wall-clock sample shared by the stale-session check and the write
-	// deadline arming below; the post-write timestamp is sampled separately so
-	// lastSendNano reflects the actual send completion.
+	// Single wall-clock sample shared by the reply-drought check and the write
+	// deadline arming below.
 	now := time.Now()
 
-	// A session that was established (hasReply) but whose both directions
-	// went silent for the flow's stale timeout is presumed to be starting a
-	// new round after an inter-round pause. The remote (e.g. a game server)
-	// may have reaped the old session, so rebuilding the endpoint yields a
-	// fresh hy2 session with a new forwarding source port that the peer
-	// recognizes as a new client. Without this, dae keeps writing to the same
-	// hy2 session whose source port the peer no longer answers, and the next
-	// round never starts. The check uses the newer of the client-send and
-	// upstream-reply timestamps, so active gameplay — where the server keeps
-	// replying even if the client briefly pauses — never rebuilds mid-round.
-	// This runs before the write refreshes lastSendNano, firing only on the
-	// first packet after the silence. Sniffed QUIC/H3 flows use a longer
-	// window so DASH/HLS segment gaps do not look like a new round.
-	if ue.hasReply.Load() {
-		lastSend := ue.lastSendNano.Load()
-		lastReply := ue.lastReplyNano.Load()
-		last := max(lastReply, lastSend)
-		if last != 0 {
-			staleTimeout := ue.sendStaleTimeout()
-			if now.UnixNano()-last >= int64(staleTimeout) {
-				ue.retire()
-				// ErrClosedConnection is classified as a normal UDP endpoint
-				// closure, so the retry removes the stale endpoint and dials a
-				// fresh hy2 session without penalizing the underlying dialer.
-				return 0, fmt.Errorf("%w: both directions silent for %s, rebuilding session", errors.ErrClosedConnection, staleTimeout)
-			}
-		}
+	// Session recovery is evidence-based: only a reply drought during sustained
+	// transmission may rebuild an established session. Silence alone is not a
+	// signal (see udpEndpointReplyDroughtWindow).
+	if err := ue.maybeRebuildOnReplyDrought(now); err != nil {
+		return 0, err
 	}
 
 	ue.armWriteDeadline(now)
@@ -633,11 +754,11 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 			}
 			// Oversized datagram: fall through to the direct path.
 		} else {
-			// Do not refresh hasSent/lastSendNano here. Append only
-			// queues the datagram; flush() is the sole writer of
-			// those fields after WriteBatch actually succeeds. A
-			// premature stamp would hide a later failed flush from
-			// the bidirectional-silence rebuild check.
+			// Do not refresh hasSent/writesSinceReply here. Append only
+			// queues the datagram; reportFlushed is the sole writer of
+			// those fields after WriteBatch actually succeeds. A premature
+			// stamp would count a datagram the transport never accepted as
+			// evidence of client transmission.
 			return len(b), nil
 		}
 	}
@@ -660,7 +781,9 @@ func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
 		return n, fmt.Errorf("%w: udp endpoint wrote %d/%d bytes to %s", io.ErrShortWrite, n, len(b), addr)
 	}
 	ue.hasSent.Store(true)
-	ue.lastSendNano.Store(time.Now().UnixNano())
+	ue.writesSinceReply.Add(1)
+	ue.observeSendRate(now, 1)
+	ue.notePeerWrite(addr, now)
 	if ue.writeBatch != nil && ue.sentReporter != nil {
 		// A batched endpoint that reached this point sent the datagram
 		// synchronously (the batch rejected it as oversized, see Append), and
@@ -785,11 +908,17 @@ func (ue *UdpEndpoint) requiresInitialReplyGuard() bool {
 
 // markReplied promotes the endpoint from probing to established state.
 // Once a reply has been observed, the normal sliding NAT timeout applies.
-func (ue *UdpEndpoint) markReplied(nowNano int64) {
+func (ue *UdpEndpoint) markReplied(nowNano int64, from netip.AddrPort) {
 	if nowNano == 0 {
 		nowNano = time.Now().UnixNano()
 	}
 	ue.lastReplyNano.Store(nowNano)
+	// A reply is proof of life: the drought evidence starts over. The reply is
+	// also attributed to the peer it came from, which is what keeps a healthy
+	// peer from masking a reaped one on a shared full-cone session.
+	ue.writesSinceReply.Store(0)
+	ue.replyCount.Add(1)
+	ue.notePeerReply(from, nowNano)
 	if !ue.hasReply.Swap(true) {
 		ue.clearPendingReplyPeers()
 		ue.lastRefreshNano.Store(nowNano)

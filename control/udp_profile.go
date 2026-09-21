@@ -19,11 +19,18 @@ const (
 )
 
 type UdpLifecycleProfile struct {
-	Kind                       UdpLifecycleKind
-	HealthDomain               componentdialer.UdpHealthDomain
-	StickyAfterReply           bool
-	PromoteOnReply             bool
-	RetireOnNormalClose        bool
+	Kind                UdpLifecycleKind
+	HealthDomain        componentdialer.UdpHealthDomain
+	StickyAfterReply    bool
+	PromoteOnReply      bool
+	RetireOnNormalClose bool
+	// RebuildOnReplyDrought enables the reply-drought session rebuild for
+	// long-lived data sessions: an established session whose peer stopped
+	// answering while the client kept transmitting is presumed reaped and is
+	// rebuilt so the flow gets a fresh forwarding identity. Transactional flows
+	// (DNS) leave this off: each request owns its own timeout and pooled-conn
+	// discard policy, so a missing reply is already handled per transaction.
+	RebuildOnReplyDrought      bool
 	DiscardPooledConnOnTimeout bool
 	PooledConnIdleTTL          time.Duration
 }
@@ -44,10 +51,11 @@ func newDnsLifecycleProfile(d *componentdialer.Dialer) UdpLifecycleProfile {
 
 func newDataSessionLifecycleProfile(d *componentdialer.Dialer) UdpLifecycleProfile {
 	return UdpLifecycleProfile{
-		Kind:                UdpLifecycleKindDataSession,
-		HealthDomain:        componentdialer.UdpHealthDomainData,
-		StickyAfterReply:    true,
-		PromoteOnReply:      true,
-		RetireOnNormalClose: isProxyBackedDialer(d),
+		Kind:                  UdpLifecycleKindDataSession,
+		HealthDomain:          componentdialer.UdpHealthDomainData,
+		StickyAfterReply:      true,
+		PromoteOnReply:        true,
+		RetireOnNormalClose:   isProxyBackedDialer(d),
+		RebuildOnReplyDrought: true,
 	}
 }

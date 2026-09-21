@@ -270,7 +270,7 @@ func TestHandlePkt_EstablishedDomainlessEndpointSurvivesQuicInitialHeuristic(t *
 	if !ok || ue == nil {
 		t.Fatal("expected pooled endpoint after first packet")
 	}
-	ue.markReplied(0)
+	ue.markReplied(0, netip.AddrPort{})
 	if !ue.hasReply.Load() {
 		t.Fatal("expected endpoint to enter established state after upstream reply")
 	}
@@ -326,7 +326,7 @@ func TestHandlePkt_NonSniffPortBypassesInitialShapedPayload(t *testing.T) {
 	if !ok || ue == nil {
 		t.Fatal("expected full-cone endpoint before simulating established state")
 	}
-	ue.markReplied(0)
+	ue.markReplied(0, netip.AddrPort{})
 	if !ue.hasReply.Load() {
 		t.Fatal("expected full-cone endpoint to become established after reply promotion")
 	}

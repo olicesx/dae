@@ -224,9 +224,9 @@ func (ue *UdpEndpoint) handleReceivedPacket(packet *netproxy.ReceivedPacket) boo
 		return true
 	}
 	if lifecycle, ok := newUdpSessionLifecycleContext(ue, consts.IpVersionFromAddr(from.Addr())); ok {
-		lifecycle.handleReply(ue, time.Now().UnixNano())
+		lifecycle.handleReply(ue, time.Now().UnixNano(), from)
 	} else {
-		ue.markReplied(time.Now().UnixNano())
+		ue.markReplied(time.Now().UnixNano(), from)
 	}
 
 	if !ue.enqueueReceivedReply(packet.Data, from, packet.Release) {
@@ -285,9 +285,9 @@ func (ue *UdpEndpoint) startReadLoop() {
 			continue
 		}
 		if lifecycle, ok := newUdpSessionLifecycleContext(ue, consts.IpVersionFromAddr(from.Addr())); ok {
-			lifecycle.handleReply(ue, time.Now().UnixNano())
+			lifecycle.handleReply(ue, time.Now().UnixNano(), from)
 		} else {
-			ue.markReplied(time.Now().UnixNano())
+			ue.markReplied(time.Now().UnixNano(), from)
 		}
 		// Dispatch reply asynchronously by transferring ownership of the current
 		// read buffer to the sender goroutine. This removes one per-packet copy

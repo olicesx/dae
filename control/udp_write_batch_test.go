@@ -258,14 +258,15 @@ func TestAggregatorErrorClassified(t *testing.T) {
 }
 
 // TestWriteToBatchDoesNotStampSendUntilFlush: Append is not a send. WriteTo
-// on a batched endpoint must leave lastSendNano/hasSent alone until flush
-// actually succeeds; a failed flush must not pretend the datagram left.
+// on a batched endpoint must leave the reply-drought evidence
+// (writesSinceReply/hasSent) alone until flush actually succeeds; a failed
+// flush must not pretend the datagram left.
 func TestWriteToBatchDoesNotStampSendUntilFlush(t *testing.T) {
 	rec := &batchRecorder{err: errors.New("boom")}
 	ue := newBatchTestEndpoint(rec)
 	ue.writeBatch = newUDPWriteBatchAggregator(ue)
 
-	before := ue.lastSendNano.Load()
+	before := ue.writesSinceReply.Load()
 	n, err := ue.WriteTo([]byte("queued"), "10.0.0.1:53")
 	if err != nil {
 		t.Fatalf("WriteTo enqueue: %v", err)
@@ -276,21 +277,22 @@ func TestWriteToBatchDoesNotStampSendUntilFlush(t *testing.T) {
 	if ue.hasSent.Load() {
 		t.Fatal("hasSent must stay false until a successful flush")
 	}
-	if got := ue.lastSendNano.Load(); got != before {
-		t.Fatalf("lastSendNano advanced on enqueue: %d -> %d", before, got)
+	if got := ue.writesSinceReply.Load(); got != before {
+		t.Fatalf("writesSinceReply advanced on enqueue: %d -> %d", before, got)
 	}
 
 	ue.writeBatch.flush()
 	if ue.hasSent.Load() {
 		t.Fatal("failed flush must not set hasSent")
 	}
-	if got := ue.lastSendNano.Load(); got != before {
-		t.Fatalf("failed flush advanced lastSendNano: %d -> %d", before, got)
+	if got := ue.writesSinceReply.Load(); got != before {
+		t.Fatalf("failed flush advanced writesSinceReply: %d -> %d", before, got)
 	}
 }
 
 // TestWriteToBatchStampsSendAfterSuccessfulFlush: a full-batch WriteTo that
-// actually leaves the socket must refresh lastSendNano/hasSent via flush().
+// actually leaves the socket must count the datagrams via reportFlushed, so the
+// reply-drought check sees the client's true transmission rate.
 func TestWriteToBatchStampsSendAfterSuccessfulFlush(t *testing.T) {
 	rec := &batchRecorder{}
 	ue := newBatchTestEndpoint(rec)
@@ -314,8 +316,99 @@ func TestWriteToBatchStampsSendAfterSuccessfulFlush(t *testing.T) {
 	if !ue.hasSent.Load() {
 		t.Fatal("successful flush must set hasSent")
 	}
-	if ue.lastSendNano.Load() == 0 {
-		t.Fatal("successful flush must refresh lastSendNano")
+	if got := ue.writesSinceReply.Load(); got == 0 {
+		t.Fatal("successful flush must count the flushed datagrams")
+	}
+	// The same accounting feeds the recent-activity measurement, so a batched
+	// transport (Hysteria2/TUIC and friends) produces the burst evidence too: a
+	// batch is one instant, and its datagrams must land in the probe window.
+	if got := ue.recentWriteBucketWrites.Load(); got != ue.writesSinceReply.Load() {
+		t.Fatalf("recent window counted %d datagrams, want %d (the flushed batch)", got, ue.writesSinceReply.Load())
+	}
+	if ue.recentWriteBucket.Load() == 0 {
+		t.Fatal("a flushed batch must stamp the probe window it belongs to")
+	}
+}
+
+// A batched transport owns the only true "what left the socket" count, so the
+// per-peer attribution of a full-cone session has to happen in the flush loop,
+// not at enqueue time.
+func TestWriteToBatchAttributesAcceptedFlushPerPeer(t *testing.T) {
+	rec := &batchRecorder{}
+	ue := newBatchTestEndpoint(rec)
+	ue.writeBatch = newUDPWriteBatchAggregator(ue)
+	peerA := netip.MustParseAddrPort("10.0.0.1:53")
+	peerB := netip.MustParseAddrPort("10.0.0.2:53")
+	// Two peers replied once, which is what makes liveness per-peer here; the
+	// reaped peer's replies are already a drought old.
+	droughtAt := time.Now().Add(-udpEndpointReplyDroughtWindow - time.Second).UnixNano()
+	ue.notePeerReply(peerA, droughtAt)
+	ue.notePeerReply(peerB, droughtAt)
+	if !ue.multiPeer.Load() {
+		t.Fatal("two peers must enable per-peer bookkeeping")
+	}
+
+	// One flush window carries a burst to the reaped peer and a single datagram
+	// to the healthy one. The burst has to clear the rate threshold on its own
+	// (minRate over the probe window), which is the same evidence the unbatched
+	// path needs, and it is twice the threshold so that a probe-window rollover
+	// in the middle of the test cannot drop it back under it.
+	for range 2 * udpEndpointReplyDroughtMinRate * int(udpEndpointReplyDroughtProbeWindow.Seconds()) {
+		if _, err := ue.WriteTo([]byte("pkt"), peerB.String()); err != nil {
+			t.Fatalf("enqueue to the reaped peer: %v", err)
+		}
+	}
+	if _, err := ue.WriteTo([]byte("pkt"), peerA.String()); err != nil {
+		t.Fatalf("enqueue to the healthy peer: %v", err)
+	}
+	ue.writeBatch.flush()
+	if rec.batchCount() < 1 {
+		t.Fatal("expected a flush")
+	}
+	if !ue.peerNeedsDedicatedSession(peerB, time.Now()) {
+		t.Fatal("the flushed burst to the reaped peer must promote it")
+	}
+	if ue.peerNeedsDedicatedSession(peerA, time.Now()) {
+		t.Fatal("the single datagram to the healthy peer must not promote it")
+	}
+}
+
+// Only the accepted prefix of a flush may be attributed: a transport that
+// accepts part of a batch must not credit the peers whose datagrams never left
+// the socket. (The short write itself is reported and penalised by the existing
+// flush-failure policy, which is not this test's subject.)
+func TestWriteToBatchAttributesOnlyAcceptedPrefix(t *testing.T) {
+	rec := &batchRecorder{shortN: 12}
+	ue := newBatchTestEndpoint(rec)
+	ue.writeBatch = newUDPWriteBatchAggregator(ue)
+	peerA := netip.MustParseAddrPort("10.0.0.1:53")
+	peerB := netip.MustParseAddrPort("10.0.0.2:53")
+	droughtAt := time.Now().Add(-udpEndpointReplyDroughtWindow - time.Second).UnixNano()
+	ue.notePeerReply(peerA, droughtAt)
+	ue.notePeerReply(peerB, droughtAt)
+
+	// The transport accepts the first twelve items, which all go to peer B; the
+	// twelve queued for peer A are dropped by the short write.
+	for range 12 {
+		if _, err := ue.WriteTo([]byte("pkt"), peerB.String()); err != nil {
+			t.Fatalf("enqueue to the reaped peer: %v", err)
+		}
+	}
+	for range 12 {
+		if _, err := ue.WriteTo([]byte("pkt"), peerA.String()); err != nil {
+			t.Fatalf("enqueue to the healthy peer: %v", err)
+		}
+	}
+	ue.writeBatch.flush()
+	ue.peerMu.Lock()
+	gotB := ue.peers[peerB.String()].writesSinceReply
+	gotA := ue.peers[peerA.String()].writesSinceReply
+	ue.peerMu.Unlock()
+	if gotB != 12 {
+		t.Fatalf("accepted peer writes = %d, want the 12 accepted datagrams", gotB)
+	}
+	if gotA != 0 {
+		t.Fatalf("unaccepted peer writes = %d, want 0 (nothing for that peer left the socket)", gotA)
 	}
 }
 
@@ -351,8 +444,8 @@ func TestFallbackFlushStampsSendOnSuccess(t *testing.T) {
 	if !ue.hasSent.Load() {
 		t.Fatal("successful fallback flush must set hasSent")
 	}
-	if ue.lastSendNano.Load() == 0 {
-		t.Fatal("successful fallback flush must refresh lastSendNano")
+	if ue.writesSinceReply.Load() == 0 {
+		t.Fatal("successful fallback flush must count the flushed datagrams")
 	}
 }
 
@@ -370,13 +463,13 @@ func TestFallbackFlushDoesNotStampSendOnError(t *testing.T) {
 	if err := agg.Append([]byte("solo"), "10.0.0.1:53"); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
-	before := ue.lastSendNano.Load()
+	before := ue.writesSinceReply.Load()
 	agg.flush()
 	if ue.hasSent.Load() {
 		t.Fatal("failed fallback flush must not set hasSent")
 	}
-	if got := ue.lastSendNano.Load(); got != before {
-		t.Fatalf("failed fallback flush advanced lastSendNano: %d -> %d", before, got)
+	if got := ue.writesSinceReply.Load(); got != before {
+		t.Fatalf("failed fallback flush advanced writesSinceReply: %d -> %d", before, got)
 	}
 }
 
@@ -412,8 +505,8 @@ func TestFallbackFlushStampsSendOnPartialError(t *testing.T) {
 	if !ue.hasSent.Load() {
 		t.Fatal("partial-error fallback flush must set hasSent: one datagram left")
 	}
-	if ue.lastSendNano.Load() == 0 {
-		t.Fatal("partial-error fallback flush must refresh lastSendNano")
+	if ue.writesSinceReply.Load() == 0 {
+		t.Fatal("partial-error fallback flush must count the flushed datagrams")
 	}
 	if ue.dead.Load() {
 		t.Fatal("first partial-error fallback flush is tolerated and must not retire")
@@ -434,8 +527,8 @@ func TestShortWriteBatchStampsSendWhenSomeDatagramsLeft(t *testing.T) {
 	if !ue.hasSent.Load() {
 		t.Fatal("short WriteBatch with n>0 must set hasSent")
 	}
-	if ue.lastSendNano.Load() == 0 {
-		t.Fatal("short WriteBatch with n>0 must refresh lastSendNano")
+	if ue.writesSinceReply.Load() == 0 {
+		t.Fatal("short WriteBatch with n>0 must count the flushed datagrams")
 	}
 	if ue.dead.Load() {
 		t.Fatal("first short WriteBatch is classified as a tolerated write error")
@@ -449,19 +542,19 @@ func TestShortWriteBatchZeroDoesNotStampSend(t *testing.T) {
 	if err := agg.Append([]byte("solo"), "10.0.0.1:53"); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
-	before := ue.lastSendNano.Load()
+	before := ue.writesSinceReply.Load()
 	agg.flush()
 	if ue.hasSent.Load() {
 		t.Fatal("failed WriteBatch with n==0 must not set hasSent")
 	}
-	if got := ue.lastSendNano.Load(); got != before {
-		t.Fatalf("failed WriteBatch advanced lastSendNano: %d -> %d", before, got)
+	if got := ue.writesSinceReply.Load(); got != before {
+		t.Fatalf("failed WriteBatch advanced writesSinceReply: %d -> %d", before, got)
 	}
 }
 
 // TestShortWriteBatchWithErrorStampsSendWhenSomeDatagramsLeft: a batched
 // write that reports an error but still sent n>0 datagrams (the sendmmsg
-// partial-failure contract) must stamp hasSent/lastSendNano — some datagrams
+// partial-failure contract) must stamp hasSent/writesSinceReply — some datagrams
 // really left — and count the error toward the soft-error threshold.
 func TestShortWriteBatchWithErrorStampsSendWhenSomeDatagramsLeft(t *testing.T) {
 	rec := &batchRecorder{err: errors.New("boom"), shortN: 1}
@@ -477,8 +570,8 @@ func TestShortWriteBatchWithErrorStampsSendWhenSomeDatagramsLeft(t *testing.T) {
 	if !ue.hasSent.Load() {
 		t.Fatal("error WriteBatch with n>0 must set hasSent")
 	}
-	if ue.lastSendNano.Load() == 0 {
-		t.Fatal("error WriteBatch with n>0 must refresh lastSendNano")
+	if ue.writesSinceReply.Load() == 0 {
+		t.Fatal("error WriteBatch with n>0 must count the flushed datagrams")
 	}
 	if ue.dead.Load() {
 		t.Fatal("first partial-error WriteBatch is tolerated and must not retire")

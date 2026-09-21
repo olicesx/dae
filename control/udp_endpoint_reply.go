@@ -271,10 +271,40 @@ var udpEndpointReplyObjects = sync.Pool{
 	New: func() any { return new(udpEndpointReply) },
 }
 
-// putUdpEndpointReplyData is a package-local seam for tests that need to observe
-// reply-buffer release without changing the production hot path.
-var putUdpEndpointReplyData = func(data pool.PB) {
-	data.Put()
+// udpEndpointReplyDataSeam holds the package-local seam for tests that need to
+// observe reply-buffer release without changing the production hot path.
+//
+// The function is swapped at runtime while read loops and reply senders may
+// still be draining a previous test's buffers, so reads and writes are
+// synchronized: an unsynchronized function variable is a data race by
+// construction, and the release path runs from goroutines the test does not
+// join.
+var udpEndpointReplyDataSeam = struct {
+	mu sync.RWMutex
+	fn func(data pool.PB)
+}{fn: func(data pool.PB) { data.Put() }}
+
+// putUdpEndpointReplyData releases a reply buffer through the current seam.
+// Call sites keep calling the seam by name, which the source contract pins.
+func putUdpEndpointReplyData(data pool.PB) {
+	udpEndpointReplyDataSeam.mu.RLock()
+	fn := udpEndpointReplyDataSeam.fn
+	udpEndpointReplyDataSeam.mu.RUnlock()
+	fn(data)
+}
+
+// setPutUdpEndpointReplyData installs a test wrapper and returns the previous
+// one, so a test can restore it in Cleanup. A nil wrapper restores the
+// production release.
+func setPutUdpEndpointReplyData(fn func(data pool.PB)) func(data pool.PB) {
+	udpEndpointReplyDataSeam.mu.Lock()
+	defer udpEndpointReplyDataSeam.mu.Unlock()
+	old := udpEndpointReplyDataSeam.fn
+	if fn == nil {
+		fn = func(data pool.PB) { data.Put() }
+	}
+	udpEndpointReplyDataSeam.fn = fn
+	return old
 }
 
 func takeUdpEndpointReply(data pool.PB, from netip.AddrPort) *udpEndpointReply {

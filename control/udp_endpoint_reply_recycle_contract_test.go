@@ -27,16 +27,16 @@ func TestSenderStopRecycleDoesNotDoubleRelease(t *testing.T) {
 
 	var mu sync.Mutex
 	releases := make(map[*byte]int)
-	oldPut := putUdpEndpointReplyData
-	putUdpEndpointReplyData = func(data pool.PB) {
+	var oldPut func(data pool.PB)
+	oldPut = setPutUdpEndpointReplyData(func(data pool.PB) {
 		if len(data) > 0 {
 			mu.Lock()
 			releases[&data[0]]++
 			mu.Unlock()
 		}
 		oldPut(data)
-	}
-	t.Cleanup(func() { putUdpEndpointReplyData = oldPut })
+	})
+	t.Cleanup(func() { setPutUdpEndpointReplyData(oldPut) })
 
 	releaseCount := func() int {
 		mu.Lock()

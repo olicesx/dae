@@ -134,12 +134,12 @@ func (c udpLifecycleContext) shouldRetireOnNormalClose(err error) bool {
 	return errors.IsUDPEndpointNormalClose(err)
 }
 
-func (c udpLifecycleContext) handleReply(ue *UdpEndpoint, nowNano int64) {
+func (c udpLifecycleContext) handleReply(ue *UdpEndpoint, nowNano int64, from netip.AddrPort) {
 	if ue == nil {
 		return
 	}
 	if c.profile.PromoteOnReply {
-		ue.markReplied(nowNano)
+		ue.markReplied(nowNano, from)
 	}
 	if c.profile.StickyAfterReply {
 		c.reportTrafficSuccess()

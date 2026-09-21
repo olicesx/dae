@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	daeerrors "github.com/daeuniverse/dae/common/errors"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/olicesx/quic-go"
 )
@@ -18,6 +17,7 @@ import (
 // scriptable per test.
 type mockPacketConn struct {
 	writeToFn func(p []byte, addr string) (int, error)
+	closeFn   func() error
 }
 
 func (m *mockPacketConn) Read(b []byte) (int, error)  { return 0, io.EOF }
@@ -31,7 +31,12 @@ func (m *mockPacketConn) WriteTo(p []byte, addr string) (int, error) {
 	}
 	return len(p), nil
 }
-func (m *mockPacketConn) Close() error                       { return nil }
+func (m *mockPacketConn) Close() error {
+	if m.closeFn != nil {
+		return m.closeFn()
+	}
+	return nil
+}
 func (m *mockPacketConn) SetDeadline(t time.Time) error      { return nil }
 func (m *mockPacketConn) SetReadDeadline(t time.Time) error  { return nil }
 func (m *mockPacketConn) SetWriteDeadline(t time.Time) error { return nil }
@@ -177,35 +182,40 @@ func TestUdpEndpointWriteToRetiresOnClosedConn(t *testing.T) {
 	}
 }
 
-// A session that was established (hasReply) but whose client has been silent
-// for udpEndpointSendStaleTimeout must be rebuilt on the next write: the pause
-// means a new round is starting and the remote (e.g. a game server) may have
-// reaped the old session. Retiring now lets the next GetOrCreate dial a fresh
-// hy2 session with a new forwarding source port.
-func TestUdpEndpointWriteToRebuildsStaleSession(t *testing.T) {
+// An established session that goes quiet in both directions must NOT be
+// rebuilt, however long the pause: silence is not evidence of a dead session.
+// A remote that reaped the mapping is recovered by the transport's own session
+// recreation (long pause) or by the reply-drought check (sustained traffic),
+// while rebuilding on plain silence only moves the forwarding source port that
+// QUIC and WireGuard peers track.
+func TestUdpEndpointWriteToPreservesIdleSession(t *testing.T) {
 	mock := &mockPacketConn{}
 	ue := newTestEndpoint(mock)
 	ue.hasReply.Store(true)
-	ue.lastSendNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
-	ue.lastReplyNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
+	ue.lastReplyNano.Store(time.Now().Add(-10 * udpEndpointReplyDroughtWindow).UnixNano())
 
-	_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
-	if !stderrors.Is(err, daeerrors.ErrClosedConnection) {
-		t.Fatalf("expected ErrClosedConnection on stale session, got: %v", err)
+	n, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
+	if err != nil {
+		t.Fatalf("expected success after idle silence, got: %v", err)
 	}
-	if !ue.dead.Load() {
-		t.Fatal("endpoint must be retired when the client session is stale")
+	if n != len("hello world") {
+		t.Fatalf("expected %d bytes written, got %d", len("hello world"), n)
+	}
+	if ue.dead.Load() {
+		t.Fatal("idle silence must not retire the endpoint")
+	}
+	if got := ue.writesSinceReply.Load(); got != 1 {
+		t.Fatalf("writesSinceReply = %d, want 1 (one datagram counted)", got)
 	}
 }
 
-// An established session whose client sent recently must NOT be rebuilt: this
-// keeps normal gameplay (sub-second heartbeats) on the same hy2 session. After
-// a successful write the lastSendNano is refreshed.
+// An established session whose upstream is still replying must never be
+// rebuilt mid-round, and a successful write is what feeds the reply-drought
+// evidence.
 func TestUdpEndpointWriteToKeepsFreshSession(t *testing.T) {
 	mock := &mockPacketConn{}
 	ue := newTestEndpoint(mock)
 	ue.hasReply.Store(true)
-	ue.lastSendNano.Store(time.Now().UnixNano())
 	ue.lastReplyNano.Store(time.Now().UnixNano())
 
 	n, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
@@ -218,8 +228,8 @@ func TestUdpEndpointWriteToKeepsFreshSession(t *testing.T) {
 	if ue.dead.Load() {
 		t.Fatal("fresh session must not be retired")
 	}
-	if ue.lastSendNano.Load() < time.Now().Add(-time.Second).UnixNano() {
-		t.Fatal("lastSendNano must be refreshed after a successful write")
+	if got := ue.writesSinceReply.Load(); got != 1 {
+		t.Fatalf("writesSinceReply = %d, want 1 after a successful write", got)
 	}
 }
 
@@ -231,7 +241,6 @@ func TestUdpEndpointWriteToKeepsSessionWhileServerReplyFresh(t *testing.T) {
 	mock := &mockPacketConn{}
 	ue := newTestEndpoint(mock)
 	ue.hasReply.Store(true)
-	ue.lastSendNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
 	ue.lastReplyNano.Store(time.Now().UnixNano())
 
 	n, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
@@ -246,74 +255,17 @@ func TestUdpEndpointWriteToKeepsSessionWhileServerReplyFresh(t *testing.T) {
 	}
 }
 
-// Game UDP over a QUIC-backed transport (hy2/tuic, empty SniffedDomain)
-// still rebuilds after 5s of bidirectional silence: that is the inter-round
-// signal, independent of the transport.
-func TestUdpEndpointWriteToRebuildsGameSessionOnQuicTransport(t *testing.T) {
+// A probing endpoint (never replied) is never rebuilt by the reply-drought
+// check: without reply evidence there is no drought to reason about, however
+// much the client transmits. Reply evidence only starts to matter once the
+// session has been established.
+func TestUdpEndpointWriteToProbingNotRebuilt(t *testing.T) {
 	done := make(chan struct{})
 	mock := &deadlineRecordingPacketConn{transportDone: done}
 	ue := newTestEndpoint(mock)
-	ue.hasReply.Store(true)
-	ue.lastSendNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
-	ue.lastReplyNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
-
-	_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
-	if !stderrors.Is(err, daeerrors.ErrClosedConnection) {
-		t.Fatalf("expected ErrClosedConnection on stale game session, got: %v", err)
-	}
-	if !ue.dead.Load() {
-		t.Fatal("game UDP over hy2/tuic must still rebuild after 5s of silence")
-	}
-}
-
-// A sniffed long-lived session (H3/DASH/HLS video) silent for the game 5s
-// window must NOT be rebuilt: segment gaps of 6-15s are normal and would
-// otherwise look like a new round.
-func TestUdpEndpointWriteToKeepsSniffedSessionAcrossGameStaleWindow(t *testing.T) {
-	mock := &mockPacketConn{}
-	ue := newTestEndpoint(mock)
-	ue.SniffedDomain = "video.example.com"
-	ue.hasReply.Store(true)
-	ue.lastSendNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
-	ue.lastReplyNano.Store(time.Now().Add(-2 * udpEndpointSendStaleTimeout).UnixNano())
-
-	n, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
-	if err != nil {
-		t.Fatalf("expected success across the 5s game window on a sniffed session, got: %v", err)
-	}
-	if n != len("hello world") {
-		t.Fatalf("expected %d bytes written, got %d", len("hello world"), n)
-	}
-	if ue.dead.Load() {
-		t.Fatal("sniffed session must not rebuild after 5s of silence")
-	}
-}
-
-// Past the 30s QUIC/H3 window, a sniffed session is still rebuilt so a
-// peer that actually reaped the session gets a fresh forwarding port.
-func TestUdpEndpointWriteToRebuildsSniffedSessionAfterQuicStaleWindow(t *testing.T) {
-	mock := &mockPacketConn{}
-	ue := newTestEndpoint(mock)
-	ue.SniffedDomain = "video.example.com"
-	ue.hasReply.Store(true)
-	ue.lastSendNano.Store(time.Now().Add(-2 * udpEndpointQuicSendStaleTimeout).UnixNano())
-	ue.lastReplyNano.Store(time.Now().Add(-2 * udpEndpointQuicSendStaleTimeout).UnixNano())
-
-	_, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
-	if !stderrors.Is(err, daeerrors.ErrClosedConnection) {
-		t.Fatalf("expected ErrClosedConnection on QUIC-stale sniffed session, got: %v", err)
-	}
-	if !ue.dead.Load() {
-		t.Fatal("sniffed endpoint must be retired after the 30s silence window")
-	}
-}
-
-// A probing endpoint (never replied) is not subject to stale-session rebuild:
-// the reply guard is only meaningful once the session has been established.
-func TestUdpEndpointWriteToProbingNotRebuilt(t *testing.T) {
-	mock := &mockPacketConn{}
-	ue := newTestEndpoint(mock)
-	// hasReply stays false; lastSendNano is irrelevant.
+	// hasReply stays false and lastReplyNano stays unset, so the endpoint is
+	// still probing no matter how many datagrams it has forwarded.
+	ue.writesSinceReply.Store(1000)
 
 	n, err := ue.WriteTo([]byte("hello world"), "1.2.3.4:53")
 	if err != nil {

@@ -69,6 +69,10 @@ type udpWriteBatchAggregator struct {
 	// queued but not yet flushed. Health-invalidation must treat that as
 	// an in-flight first write, not an unused session.
 	unflushedFirst bool
+
+	// peerBatch tallies the accepted prefix of a flush per destination for a
+	// session that tracks peers. It is reused across flushes under mu.
+	peerBatch []udpEndpointPeerWrite
 }
 
 func newUDPWriteBatchAggregator(ue *UdpEndpoint) *udpWriteBatchAggregator {
@@ -200,6 +204,28 @@ func (a *udpWriteBatchAggregator) flush() {
 	for i := 0; i < n && i < len(items); i++ {
 		sentBytes += len(items[i].Data)
 	}
+	// Attribute the accepted prefix to the peers it went to, so a full-cone
+	// session can tell a reaped peer from a healthy one. The tally reuses its
+	// backing array and only runs for sessions that actually track peers, so a
+	// single-peer session pays one atomic load per flush.
+	if a.ue.multiPeer.Load() {
+		a.peerBatch = a.peerBatch[:0]
+		for i := 0; i < n && i < len(items); i++ {
+			addr := items[i].Addr
+			merged := false
+			for j := range a.peerBatch {
+				if a.peerBatch[j].addr == addr {
+					a.peerBatch[j].datagrams++
+					merged = true
+					break
+				}
+			}
+			if !merged {
+				a.peerBatch = append(a.peerBatch, udpEndpointPeerWrite{addr: addr, datagrams: 1})
+			}
+		}
+		a.ue.noteBatchPeerWrites(a.peerBatch, time.Now())
+	}
 	a.mu.Unlock()
 
 	a.reportFlushed(n, sentBytes)
@@ -222,7 +248,10 @@ func (a *udpWriteBatchAggregator) reportFlushed(datagrams, bytes int) {
 	}
 	if datagrams > 0 {
 		a.ue.hasSent.Store(true)
-		a.ue.lastSendNano.Store(time.Now().UnixNano())
+		a.ue.writesSinceReply.Add(int64(datagrams))
+		// One flush is one instant: the whole batch lands in the same probe
+		// window, which is what makes a burst visible to the drought gate.
+		a.ue.observeSendRate(time.Now(), datagrams)
 	}
 	if reporter := a.ue.sentReporter; reporter != nil && datagrams > 0 {
 		reporter(a.ue, datagrams, bytes)

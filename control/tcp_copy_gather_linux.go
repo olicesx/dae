@@ -158,6 +158,31 @@ func relayGatherWriteTo(dst netproxy.Conn, segs [][]byte) (written int, err erro
 		return 0, nil
 	}
 
+	if len(segments) == 1 {
+		return dst.Write(segments[0])
+	}
+
+	// For proxied connections (wrapped interfaces), coalesce multiple small segments
+	// (e.g. protocol handshake prefix + TLS Client Hello) into a single write buffer.
+	// This avoids multi-packet fragmentation and repeated AEAD crypto framing.
+	totalLen := 0
+	for _, seg := range segments {
+		totalLen += len(seg)
+	}
+
+	if totalLen <= relayCopyBufferSize {
+		bufPtr := relayCopyBufferPool.Get().(*[]byte)
+		coalesced := (*bufPtr)[:totalLen]
+		offset := 0
+		for _, seg := range segments {
+			copy(coalesced[offset:], seg)
+			offset += len(seg)
+		}
+		n, err := dst.Write(coalesced)
+		relayCopyBufferPool.Put(bufPtr)
+		return n, err
+	}
+
 	buffers := net.Buffers(segments)
 	n, err := buffers.WriteTo(dst)
 	return int(n), err

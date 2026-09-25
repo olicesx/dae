@@ -76,7 +76,6 @@ func relayCopyLoop(ctx context.Context, dst netproxy.Conn, src netproxy.Conn, bu
 
 		nr, er := src.Read(buf)
 		if nr > 0 {
-			onActive(int64(nr))
 			nw, ew := dst.Write(buf[:nr])
 			written += int64(nw)
 			if nw > 0 {
@@ -116,7 +115,6 @@ func relayCopyDirect(ctx context.Context, dst io.Writer, src io.Reader, buf []by
 		}
 		nr, er := src.Read(buf)
 		if nr > 0 {
-			onActive(int64(nr))
 			nw, ew := dst.Write(buf[:nr])
 			written += int64(nw)
 			if nw > 0 {

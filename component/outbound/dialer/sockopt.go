@@ -67,6 +67,17 @@ func TproxyControl(c syscall.RawConn) error {
 			sockOptErr = fmt.Errorf("error setting IP_RECVORIGDSTADDR socket option: %w", e4)
 			return
 		}
+
+		// Check socket type: apply TCP-specific options only on stream sockets.
+		if sockType, err := unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_TYPE); err == nil && sockType == unix.SOCK_STREAM {
+			// Clamp inbound TCP MSS to safe threshold (1380) on listener.
+			// Linux advertises this MSS in SYN-ACK so clients do not generate
+			// oversized segments that get dropped after proxy encapsulation.
+			_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_MAXSEG, 1380)
+
+			// Enable TCP Fast Open queue for inbound connections.
+			_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_FASTOPEN, 256)
+		}
 	})
 	if controlErr != nil {
 		return fmt.Errorf("error invoking socket control function: %w", controlErr)

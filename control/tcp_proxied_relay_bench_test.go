@@ -52,7 +52,7 @@ func BenchmarkProxiedTCPRelay(b *testing.B) {
 			if err != nil {
 				return
 			}
-			defer c.Close()
+			defer func() { _ = c.Close() }()
 			buf := make([]byte, 64<<10)
 			for {
 				_, rerr := c.Read(buf)
@@ -100,7 +100,7 @@ func BenchmarkProxiedGatherWrite(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		for {
@@ -146,7 +146,7 @@ func TestProxiedGatherWriteCoalescesToSingleWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		c, err := ln.Accept()
@@ -167,7 +167,7 @@ func TestProxiedGatherWriteCoalescesToSingleWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer raw.Close()
+	defer func() { _ = raw.Close() }()
 
 	proxyConn := &mockProxiedConn{Conn: raw}
 	n, err := relayGatherWriteTo(proxyConn, segs)

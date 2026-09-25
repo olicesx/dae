@@ -11,7 +11,7 @@ import (
 // trackingConn counts individual Write calls to verify packet coalescing
 type trackingConn struct {
 	net.Conn
-	writeCount atomic.Int64
+	writeCount   atomic.Int64
 	bytesWritten atomic.Int64
 }
 
@@ -37,7 +37,7 @@ func TestAB_GatherWriteCoalescing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		for {
@@ -63,7 +63,7 @@ func TestAB_GatherWriteCoalescing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rawOpt.Close()
+	defer func() { _ = rawOpt.Close() }()
 
 	trackedOpt := &trackingConn{Conn: rawOpt}
 	nOpt, err := relayGatherWriteTo(trackedOpt, segs)
@@ -87,7 +87,7 @@ func TestAB_GatherWriteCoalescing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rawLeg.Close()
+	defer func() { _ = rawLeg.Close() }()
 
 	trackedLeg := &trackingConn{Conn: rawLeg}
 	legacyBuffers := net.Buffers(segs)
@@ -130,7 +130,7 @@ func BenchmarkAB_ProxiedRelayThroughput(b *testing.B) {
 			if err != nil {
 				return
 			}
-			defer c.Close()
+			defer func() { _ = c.Close() }()
 			buf := make([]byte, 64<<10)
 			for {
 				_, rerr := c.Read(buf)

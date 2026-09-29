@@ -132,4 +132,10 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260910
 // and hy2 defaults to bbr3 again. TLS records are coalesced into one socket
 // write per burst across anytls and the shared tls/ws transports (-35% to
 // -52% write syscalls measured on trojan and trojan-wss relay paths).
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260925082016-04be789bbeeb
+// This pin adds the typed datagram-dropped read contract
+// (netproxy.ErrDatagramDropped unwrapping to io.ErrShortBuffer) across
+// the packet read paths, a reflection-driven wrapper capability parity
+// gate, and converts silently-truncating readers (trojanc/juicity/tuic)
+// to typed drops; dae classifies these as per-datagram events instead
+// of retiring forwarders or reporting dialers unavailable.
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260929232642-759b1253c584

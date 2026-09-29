@@ -85,7 +85,7 @@ type classRule struct {
 // explicit errors.As match can be added, but the sentinel match must stay
 // for wrapped legacy producers.
 var forwardErrorRules = []classRule{
-	{func(err error) bool { return IsCanceledOrClosed(err) }, ClassCallerAbort},
+	{IsCanceledOrClosed, ClassCallerAbort},
 	{func(err error) bool {
 		return errors.Is(err, io.ErrShortBuffer) ||
 			errors.Is(err, protocol.ErrDomainResolution)

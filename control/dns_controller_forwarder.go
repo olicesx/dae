@@ -180,14 +180,94 @@ func (c *DnsController) evictIdleDnsForwarders(now time.Time) {
 	})
 }
 
+// classifyDnsForwardError extends the shared classifier with the one
+// control-local error family: ErrDNSUDPConnPoolExhausted is local admission
+// backpressure that never touched the network.
+func classifyDnsForwardError(err error) commonerrors.ErrorClass {
+	if errors.Is(err, ErrDNSUDPConnPoolExhausted) {
+		return commonerrors.ClassTransportCongested
+	}
+	return commonerrors.ClassifyForwardError(err)
+}
+
+// dnsForwardFailurePolicy is the decision table for one classified DNS
+// forward failure: what it counts toward, whether it retires the cached
+// forwarder, how it is logged, and whether it reports dialer unavailability.
+type dnsForwardFailurePolicy struct {
+	countFailure bool
+	// retireForwarder is decided after counting, because the threshold rule
+	// reads the incremented consecutive-error counter.
+	retireForwarder   bool
+	silent            bool
+	logDropped        bool
+	reportUnavailable bool
+}
+
+// logLevel selects the severity for the failure log line.
+func (p dnsForwardFailurePolicy) logLevel() logrus.Level {
+	if p.logDropped {
+		return logrus.DebugLevel
+	}
+	return logrus.WarnLevel
+}
+
+// dnsForwardFailurePolicyFor is the single decision table for classified
+// forward failures. Soft classes never touch dialer health: a dropped
+// datagram says nothing about the node, and caller cancellation or local
+// backpressure never reached the network. Hard failures (and the soft-auth
+// family, which for a DNS upstream means a misconfigured node) count, log at
+// Warn, and report unavailability.
+func dnsForwardFailurePolicyFor(class commonerrors.ErrorClass) dnsForwardFailurePolicy {
+	switch class {
+	case commonerrors.ClassSuccess, commonerrors.ClassCallerAbort:
+		return dnsForwardFailurePolicy{silent: true}
+	case commonerrors.ClassTransportCongested:
+		// Local admission control (e.g. the UDP conn pool is exhausted).
+		return dnsForwardFailurePolicy{silent: true}
+	case commonerrors.ClassDatagramDropped:
+		// The transport drained one oversized or unattributable datagram
+		// and the session stays usable. Keep the cached forwarder and the
+		// dialer health untouched; a Debug line records the drop.
+		return dnsForwardFailurePolicy{logDropped: true}
+	default: // ClassSoftAuth, ClassHardFailure
+		return dnsForwardFailurePolicy{
+			countFailure:      true,
+			reportUnavailable: true,
+		}
+	}
+}
+
+// handleDnsForwardFailure applies the decision table to one ForwardDNS
+// error: classify once, then count, retire, log, and report according to the
+// policy. This replaces the three per-helper filter copies that used to
+// drift apart (the short-buffer misclassification that retired forwarders
+// and reported dialers unavailable was exactly that drift).
+func (c *DnsController) handleDnsForwardFailure(upstream *dns.Upstream, dialArg *dialArgument, key dnsForwarderKey, entry *cachedDnsForwarder, err error) {
+	if err == nil {
+		return
+	}
+	pol := dnsForwardFailurePolicyFor(classifyDnsForwardError(err))
+	if pol.countFailure && entry != nil {
+		entry.consecutiveErrors.Add(1)
+		pol.retireForwarder = c.shouldRetireCachedDnsForwarder(upstream, dialArg, entry, err)
+	}
+	if pol.retireForwarder {
+		c.retireCachedDnsForwarder(key, entry)
+	}
+	if !pol.silent {
+		c.logDnsForwardFailure(upstream, dialArg, err, pol.logLevel(), pol.logDropped)
+	}
+	if pol.reportUnavailable {
+		c.reportDnsForwardFailure(dialArg, err)
+	}
+}
+
 func (c *DnsController) reportDnsForwardFailure(dialArg *dialArgument, err error) {
 	if dialArg == nil || err == nil {
 		return
 	}
-	// Caller-driven cancellation should not mark a dialer as unavailable.
-	if commonerrors.IsCanceledOrClosed(err) || errors.Is(err, ErrDNSUDPConnPoolExhausted) {
-		return
-	}
+	// Classification happened in handleDnsForwardFailure; only hard failures
+	// and the soft-auth family reach here.
 	if lifecycle, ok := newDnsUdpLifecycleContext(dialArg, UdpLifecycleProfile{}); ok {
 		lifecycle.reportUnavailable(err)
 	}
@@ -197,11 +277,11 @@ func (c *DnsController) reportDnsForwardFailure(dialArg *dialArgument, err error
 	notifyProxyDialerHealthCheck(dialArg.bestDialer, dialArg.l4proto, err)
 }
 
-func (c *DnsController) logDnsForwardFailure(upstream *dns.Upstream, dialArg *dialArgument, err error) {
+func (c *DnsController) logDnsForwardFailure(upstream *dns.Upstream, dialArg *dialArgument, err error, level logrus.Level, dropped bool) {
 	if c == nil || c.log == nil || err == nil {
 		return
 	}
-	if commonerrors.IsCanceledOrClosed(err) || errors.Is(err, ErrDNSUDPConnPoolExhausted) {
+	if level == logrus.DebugLevel && !c.log.IsLevelEnabled(logrus.DebugLevel) {
 		return
 	}
 	fields := logrus.Fields{}
@@ -221,16 +301,23 @@ func (c *DnsController) logDnsForwardFailure(upstream *dns.Upstream, dialArg *di
 			fields["dialer"] = dialArg.bestDialer.Property().Name
 		}
 	}
-	c.log.WithError(err).WithFields(fields).Warn("DNS forward to upstream failed")
+	if dropped {
+		// Per-datagram event: the transport drained one datagram and the
+		// session stays usable. Warn here would be alert noise for a
+		// condition the next query recovers from by itself.
+		c.log.WithError(err).WithFields(fields).Debug("DNS forward dropped a datagram; session kept")
+		return
+	}
+	c.log.WithError(err).WithFields(fields).Log(level, "DNS forward to upstream failed")
 }
 
 func (c *DnsController) shouldRetireCachedDnsForwarder(upstream *dns.Upstream, dialArg *dialArgument, entry *cachedDnsForwarder, err error) bool {
 	if dialArg == nil || err == nil {
 		return false
 	}
-	if commonerrors.IsCanceledOrClosed(err) || errors.Is(err, ErrDNSUDPConnPoolExhausted) {
-		return false
-	}
+	// Callers reach here only for hard failures and the soft-auth family;
+	// caller aborts, local backpressure, and dropped datagrams are filtered
+	// upstream by dnsForwardFailurePolicyFor.
 	// UDP forwarders keep pooled sockets whose state can be poisoned by a single
 	// timeout or stale-response burst. Flush the whole cached forwarder so the
 	// next query starts from a clean socket pool.
@@ -388,12 +475,7 @@ func (c *DnsController) forwardWithDialArg(ctx context.Context, upstream *dns.Up
 			// client), but do NOT retire the forwarder, penalise the dialer
 			// or emit a misleading failure log.
 			if !errors.Is(err, ErrDNSTruncated) {
-				entry.consecutiveErrors.Add(1)
-				if c.shouldRetireCachedDnsForwarder(upstream, dialArg, entry, err) {
-					c.retireCachedDnsForwarder(key, entry)
-				}
-				c.logDnsForwardFailure(upstream, dialArg, err)
-				c.reportDnsForwardFailure(dialArg, err)
+				c.handleDnsForwardFailure(upstream, dialArg, key, entry, err)
 			}
 			return nil, err
 		}

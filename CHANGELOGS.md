@@ -161,6 +161,7 @@ changed. Review them before upgrading:
 
 #### Bug Fixes
 
+- fix(control): let `EINVAL` trigger the raw-UDP fallback and log `bind_addr` on write failure
 - fix(control): flush short TCP splice writes without corking
 - fix(control): gate the opt-in TCP sockmap offload on the transparent unwrap — the
   outbound pin advance made wrapped proxy legs peelable, which would have redirected

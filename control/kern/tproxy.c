@@ -60,7 +60,7 @@
 #define MAX_INTERFACE_NUM 256
 #ifndef MAX_MATCH_SET_LEN
 #define MAX_MATCH_SET_LEN \
-	(32 * 32) // Should be sync with common/consts/ebpf_sync_spec.json.
+	(32 * 32) // Keep in sync with MaxMatchSetLen in common/consts/ebpf.go.
 #endif
 #define ROUTING_EPOCH_SLOT_NUM 2
 #define ROUTING_EPOCH_SLOT_UNKNOWN 0
@@ -3948,6 +3948,19 @@ load_redirect_tuple(struct __sk_buff *skb,
  * applies (publish_redirect_track_for_packet compares ifindex / from_wan /
  * smac); the reply path has no forward ifindex to compare against, because
  * every reply arrives on the same dae0 ingress hook.
+ *
+ * Known limitation (audited 2026-10): in the production netns topology this
+ * match can never succeed. Replies leave the dae namespace through the
+ * dae0peer default route, so their L2 header always carries the veth pair's
+ * macs (h_source = dae0peer, h_dest = dae0), never the stored LAN/WAN
+ * publisher macs. The refresh below is therefore dead code in production and
+ * the binding's lease is sustained solely by the forward path refresh plus
+ * the userspace session pins. The unit test only passes because it crafts
+ * reply frames carrying the winner's macs by hand. Making the reply-side
+ * refresh work requires a session-identity channel the skb does not carry:
+ * every netns reply shares the veth macs, so matching on them would let a
+ * rejected competitor's replies refresh the winner's binding again (the
+ * P1-8 takeover freeze this test exists to prevent).
  *
  * An unreadable L2 header is reported as "not the publisher" on purpose: the
  * conservative failure of this test is to stop refreshing the entry, which

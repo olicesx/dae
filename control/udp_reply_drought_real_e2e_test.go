@@ -37,6 +37,14 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// e2eWaitBudget bounds every cross-goroutine wait in this file. The old 5s
+// budgets assumed an idle machine: under a fully loaded runner the echo
+// target's serve loop can be starved for seconds, and a reply legitimately
+// in flight misses the deadline (the datagrams themselves are not lost —
+// they arrive FIFO once scheduled). 30s keeps the assertions about the
+// rebuild machinery while removing the load sensitivity.
+const e2eWaitBudget = 30 * time.Second
+
 // ---- a UDP echo target that can forget the mappings it learned ----
 
 type targetObservation struct {
@@ -217,7 +225,15 @@ func newRealUdpE2E(t *testing.T, d *componentdialer.Dialer, dst netip.AddrPort) 
 		t.Fatalf("client socket: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Close() })
-	replies := make(chan udpWireReply, 64)
+	// The buffer must absorb a full retro-echo flood: under scheduler load the
+	// target's serve loop can read a whole silent phase only after
+	// setEcho(true), echoing every buffered probe ahead of the awaited reply.
+	// The old 64-slot channel with a non-blocking push silently dropped the
+	// tail of that flood — which is exactly where the awaited reply sits —
+	// and made the test report a reply loss the datapath never committed.
+	// The blocking push below lets the kernel socket buffer backpressure
+	// anything beyond this, which is lossless at these burst sizes.
+	replies := make(chan udpWireReply, 1024)
 	go func() {
 		buf := make([]byte, 65535)
 		for {
@@ -226,10 +242,7 @@ func newRealUdpE2E(t *testing.T, d *componentdialer.Dialer, dst netip.AddrPort) 
 				close(replies)
 				return
 			}
-			select {
-			case replies <- udpWireReply{payload: string(buf[:n]), from: from.AddrPort()}:
-			default:
-			}
+			replies <- udpWireReply{payload: string(buf[:n]), from: from.AddrPort()}
 		}
 	}()
 	src := client.LocalAddr().(*net.UDPAddr).AddrPort()
@@ -362,9 +375,9 @@ func (e *realUdpE2E) waitForReply(d time.Duration) *UdpEndpoint {
 func (e *realUdpE2E) establish(target *reapEchoTarget) (*UdpEndpoint, string) {
 	e.t.Helper()
 	e.mustSend("probe-0")
-	obs := target.waitFor(e.t, "probe-0", 5*time.Second)
-	e.waitForClientReply("probe-0", e.dst, 5*time.Second)
-	return e.waitForReply(5 * time.Second), strconv.Itoa(int(obs.from.Port()))
+	obs := target.waitFor(e.t, "probe-0", e2eWaitBudget)
+	e.waitForClientReply("probe-0", e.dst, e2eWaitBudget)
+	return e.waitForReply(e2eWaitBudget), strconv.Itoa(int(obs.from.Port()))
 }
 
 func TestE2ERealSocks5ReplyDroughtRebuildsAndRecovers(t *testing.T) {
@@ -423,7 +436,7 @@ func TestE2ERealSocks5ReplyDroughtRebuildsAndRecovers(t *testing.T) {
 	if ue2.hasReply.Load() {
 		t.Fatal("the replacement session must start probing (the anti-churn gate)")
 	}
-	obs := target.waitFor(t, "rebuild", 5*time.Second)
+	obs := target.waitFor(t, "rebuild", e2eWaitBudget)
 	if port2 := strconv.Itoa(int(obs.from.Port())); port2 == port1 {
 		t.Fatalf("the fresh session reused the reaped egress port %s", port1)
 	}
@@ -444,9 +457,9 @@ func TestE2ERealSocks5ReplyDroughtRebuildsAndRecovers(t *testing.T) {
 	// endpoint instead of triggering another rebuild.
 	target.setEcho(true)
 	e.mustSend("rebuild-recover")
-	target.waitFor(t, "rebuild-recover", 5*time.Second)
-	e.waitForClientReply("rebuild-recover", flowDstA, 5*time.Second)
-	if marked := e.waitForReply(5 * time.Second); marked != ue2 {
+	target.waitFor(t, "rebuild-recover", e2eWaitBudget)
+	e.waitForClientReply("rebuild-recover", flowDstA, e2eWaitBudget)
+	if marked := e.waitForReply(e2eWaitBudget); marked != ue2 {
 		t.Fatal("the recovery reply must mark the replacement session")
 	}
 }
@@ -467,7 +480,7 @@ func TestE2ERealSocks5ProbingEndpointNeverRebuilds(t *testing.T) {
 	if ue1 == nil {
 		t.Fatal("expected a pooled endpoint")
 	}
-	target.waitFor(t, "probe-0", 5*time.Second)
+	target.waitFor(t, "probe-0", e2eWaitBudget)
 	if ue1.hasReply.Load() {
 		t.Fatal("a silent far end must leave the endpoint probing")
 	}
@@ -479,9 +492,9 @@ func TestE2ERealSocks5ProbingEndpointNeverRebuilds(t *testing.T) {
 	// it on the same session.
 	target.setEcho(true)
 	e.mustSend("probe-alive")
-	target.waitFor(t, "probe-alive", 5*time.Second)
-	e.waitForClientReply("probe-alive", flowDstA, 5*time.Second)
-	if ue2 := e.waitForReply(5 * time.Second); ue2 != ue1 {
+	target.waitFor(t, "probe-alive", e2eWaitBudget)
+	e.waitForClientReply("probe-alive", flowDstA, e2eWaitBudget)
+	if ue2 := e.waitForReply(e2eWaitBudget); ue2 != ue1 {
 		t.Fatal("a real reply must mark the established endpoint, not replace it")
 	}
 }
@@ -507,8 +520,8 @@ func TestE2ERealSocks5LivePeerMasksReapedPeer(t *testing.T) {
 
 	ue1, portA := e.establish(targetA)
 	sendToB("peer-b-0")
-	targetB.waitFor(t, "peer-b-0", 5*time.Second)
-	e.waitForClientReply("peer-b-0", flowDstB, 5*time.Second)
+	targetB.waitFor(t, "peer-b-0", e2eWaitBudget)
+	e.waitForClientReply("peer-b-0", flowDstB, e2eWaitBudget)
 
 	// Peer A is reaped; peer B stays alive and keeps answering.
 	if reaped := targetA.reap(); !slices.Contains(reaped, portA) {
@@ -517,7 +530,7 @@ func TestE2ERealSocks5LivePeerMasksReapedPeer(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		e.mustSend("a-dead-" + strconv.Itoa(i))
 		sendToB("peer-b-" + strconv.Itoa(i+1))
-		targetB.waitFor(t, "peer-b-"+strconv.Itoa(i+1), 5*time.Second)
+		targetB.waitFor(t, "peer-b-"+strconv.Itoa(i+1), e2eWaitBudget)
 	}
 
 	if got := targetA.count("a-dead-0"); got != 0 {
@@ -615,8 +628,8 @@ func TestE2ERealSocks5BurstyFlowStillRecovers(t *testing.T) {
 	if !ue1.dead.Load() {
 		t.Fatal("the reaped endpoint must be retired")
 	}
-	obs := target.waitFor(t, "burst-recover", 5*time.Second)
-	e.waitForClientReply("burst-recover", flowDstA, 5*time.Second)
+	obs := target.waitFor(t, "burst-recover", e2eWaitBudget)
+	e.waitForClientReply("burst-recover", flowDstA, e2eWaitBudget)
 	if port2 := strconv.Itoa(int(obs.from.Port())); port2 == port1 {
 		t.Fatalf("the fresh session reused the reaped egress port %s", port1)
 	}
@@ -660,8 +673,8 @@ func TestE2ERealSocks5PeerPromotionWiring(t *testing.T) {
 	// liveness observable per peer.
 	ue1, portA := e.establish(targetA)
 	e.mustSendTo(flowDstB, flowB, "peer-b-0")
-	targetB.waitFor(t, "peer-b-0", 5*time.Second)
-	e.waitForClientReply("peer-b-0", flowDstB, 5*time.Second)
+	targetB.waitFor(t, "peer-b-0", e2eWaitBudget)
+	e.waitForClientReply("peer-b-0", flowDstB, e2eWaitBudget)
 	if n := DefaultUdpEndpointPool.Len(); n != 1 {
 		t.Fatalf("pool holds %d endpoints, want the one shared session", n)
 	}
@@ -683,8 +696,8 @@ func TestE2ERealSocks5PeerPromotionWiring(t *testing.T) {
 	// leaves through the dedicated session's own forwarding source port.
 	agePeerDrought(t, ue1, flowDstB, udpEndpointReplyDroughtWindow+time.Second)
 	e.mustSendTo(flowDstB, flowB, "b-recovered")
-	obsB := targetB.waitFor(t, "b-recovered", 5*time.Second)
-	e.waitForClientReply("b-recovered", flowDstB, 5*time.Second)
+	obsB := targetB.waitFor(t, "b-recovered", e2eWaitBudget)
+	e.waitForClientReply("b-recovered", flowDstB, e2eWaitBudget)
 	if portB := strconv.Itoa(int(obsB.from.Port())); portB == portA {
 		t.Fatalf("the reaped peer recovered on the reaped forwarding port %s", portA)
 	}
@@ -698,8 +711,8 @@ func TestE2ERealSocks5PeerPromotionWiring(t *testing.T) {
 		t.Fatal("the shared session must stay alive and unchanged for the healthy peer")
 	}
 	e.mustSend("a-after")
-	obsA := targetA.waitFor(t, "a-after", 5*time.Second)
-	e.waitForClientReply("a-after", flowDstA, 5*time.Second)
+	obsA := targetA.waitFor(t, "a-after", e2eWaitBudget)
+	e.waitForClientReply("a-after", flowDstA, e2eWaitBudget)
 	if port := strconv.Itoa(int(obsA.from.Port())); port != portA {
 		t.Fatalf("the healthy peer moved from port %s to %s: the shared session was disturbed", portA, port)
 	}
@@ -736,8 +749,8 @@ func TestE2ERealSocks5ReapedPeerPromotesWithoutDisturbingLivePeer(t *testing.T) 
 	// what makes per-peer liveness observable at all.
 	ue1, portA := e.establish(targetA)
 	e.mustSendTo(flowDstB, flowB, "peer-b-0")
-	obsB0 := targetB.waitFor(t, "peer-b-0", 5*time.Second)
-	e.waitForClientReply("peer-b-0", flowDstB, 5*time.Second)
+	obsB0 := targetB.waitFor(t, "peer-b-0", e2eWaitBudget)
+	e.waitForClientReply("peer-b-0", flowDstB, e2eWaitBudget)
 	if portB0 := strconv.Itoa(int(obsB0.from.Port())); portB0 != portA {
 		t.Fatalf("peer B sent from port %s, want the shared session port %s", portB0, portA)
 	}
@@ -758,11 +771,11 @@ func TestE2ERealSocks5ReapedPeerPromotesWithoutDisturbingLivePeer(t *testing.T) 
 		e.mustSendTo(flowDstB, flowB, "b-dead-"+strconv.Itoa(i))
 		lastA = "a-live-" + strconv.Itoa(i)
 		e.mustSend(lastA)
-		obs := targetA.waitFor(t, lastA, 5*time.Second)
+		obs := targetA.waitFor(t, lastA, e2eWaitBudget)
 		if port := strconv.Itoa(int(obs.from.Port())); port != portA {
 			t.Fatalf("the healthy peer moved from port %s to %s: the shared session was disturbed", portA, port)
 		}
-		e.waitForClientReply(lastA, flowDstA, 5*time.Second)
+		e.waitForClientReply(lastA, flowDstA, e2eWaitBudget)
 		time.Sleep(100 * time.Millisecond)
 	}
 	if e.endpoint() != ue1 || ue1.dead.Load() {
@@ -775,16 +788,16 @@ func TestE2ERealSocks5ReapedPeerPromotesWithoutDisturbingLivePeer(t *testing.T) 
 	// The reaped peer must have been moved to its own session, which means a new
 	// forwarding source port that its reaped mapping does not filter out.
 	e.mustSendTo(flowDstB, flowB, "b-recovered")
-	obsB1 := targetB.waitFor(t, "b-recovered", 5*time.Second)
-	e.waitForClientReply("b-recovered", flowDstB, 5*time.Second)
+	obsB1 := targetB.waitFor(t, "b-recovered", e2eWaitBudget)
+	e.waitForClientReply("b-recovered", flowDstB, e2eWaitBudget)
 	if portB1 := strconv.Itoa(int(obsB1.from.Port())); portB1 == portA {
 		t.Fatalf("the reaped peer recovered on the same forwarding port %s, which its reaped mapping drops", portA)
 	}
 
 	// And the healthy peer's traffic still uses the original session.
 	e.mustSend("a-after")
-	obsA := targetA.waitFor(t, "a-after", 5*time.Second)
-	e.waitForClientReply("a-after", flowDstA, 5*time.Second)
+	obsA := targetA.waitFor(t, "a-after", e2eWaitBudget)
+	e.waitForClientReply("a-after", flowDstA, e2eWaitBudget)
 	if port := strconv.Itoa(int(obsA.from.Port())); port != portA {
 		t.Fatalf("the healthy peer moved to port %s, want the untouched %s", port, portA)
 	}
@@ -939,12 +952,12 @@ func TestE2ERealSocks5UncompressedDroughtWindow(t *testing.T) {
 	// Recovery is real: the far end accepts the fresh session's egress port,
 	// the client sees the reply again, and the reply marks the new session.
 	e.mustSend("recovered")
-	obs := target.waitFor(t, "recovered", 5*time.Second)
-	e.waitForClientReply("recovered", flowDstA, 5*time.Second)
+	obs := target.waitFor(t, "recovered", e2eWaitBudget)
+	e.waitForClientReply("recovered", flowDstA, e2eWaitBudget)
 	if port2 := strconv.Itoa(int(obs.from.Port())); port2 == port1 {
 		t.Fatalf("the recovery session reused the reaped egress port %s", port1)
 	}
-	if marked := e.waitForReply(5 * time.Second); marked != ue2 {
+	if marked := e.waitForReply(e2eWaitBudget); marked != ue2 {
 		t.Fatal("the recovery reply must mark the replacement session")
 	}
 	if errs := writeErrs.Load(); errs != 0 {

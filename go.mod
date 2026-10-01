@@ -138,4 +138,8 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260910
 // gate, and converts silently-truncating readers (trojanc/juicity/tuic)
 // to typed drops; dae classifies these as per-datagram events instead
 // of retiring forwarders or reporting dialers unavailable.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20260929232642-759b1253c584
+// It also fixes the vision UDP buffer arithmetic: the frame-length check
+// cast len(p) to uint16, so a 65536-byte read buffer (dae's full-range DNS
+// forward buffer, and the pool's largest bucket) wrapped to 0 and dropped
+// every datagram on xudp XTLS/Vision nodes.
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261001024857-70dfd0b84a56

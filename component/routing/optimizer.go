@@ -351,6 +351,10 @@ func (o *DatReaderOptimizer) Optimize(rules []*config_parser.RoutingRule) ([]*co
 						params, loadErr = o.loadGeoIp("geoip", param.Val)
 					case "ext":
 						fields := strings.SplitN(param.Val, ":", 2)
+						if len(fields) != 2 {
+							loadErr = fmt.Errorf("malformed ext param %v in function %v: want \"file:tag\"", param.Val, f.Name)
+							break
+						}
 						switch f.Name {
 						case consts.Function_Domain, consts.Function_QName:
 							params, loadErr = o.loadGeoSite(fields[0], fields[1])

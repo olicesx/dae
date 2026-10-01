@@ -6,6 +6,7 @@
 package routing
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/daeuniverse/dae/common/consts"
@@ -143,5 +144,31 @@ func TestMergeAndSortRulesOptimizerDoesNotMergeInvertedSingletons(t *testing.T) 
 		if !r.AndFunctions[0].Not {
 			t.Fatalf("rule %d: expected Not=true preserved", i)
 		}
+	}
+}
+
+// TestDatReaderOptimizerRejectsExtParamWithoutColon pins that a malformed ext
+// value surfaces as a configuration error instead of an index-out-of-range
+// panic that kills dae validate / dae run at startup.
+func TestDatReaderOptimizerRejectsExtParamWithoutColon(t *testing.T) {
+	rules := []*config_parser.RoutingRule{
+		{
+			AndFunctions: []*config_parser.Function{
+				{
+					Name: consts.Function_Domain,
+					Params: []*config_parser.Param{
+						{Key: "ext", Val: "nocolonvalue"},
+					},
+				},
+			},
+			Outbound: config_parser.Function{Name: "out"},
+		},
+	}
+	_, err := (&DatReaderOptimizer{}).Optimize(rules)
+	if err == nil {
+		t.Fatal("expected a malformed-ext error, got nil")
+	}
+	if !strings.Contains(err.Error(), "malformed ext param") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

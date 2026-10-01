@@ -138,8 +138,14 @@ func sniffQuicBlock(s *Sniffer, cryptos []*quicutils.CryptoFrameOffset, buf []by
 	if err != nil {
 		return cryptos, nil, ErrNotApplicable
 	}
-	boundary = boundary - quicutils.MaxVarintLen64 + n      // Correct boundary.
-	boundary += int(tokenLength) + quicutils.MaxVarintLen64 // Next fields may have quic.MaxVarintLen64 bytes length
+	boundary = boundary - quicutils.MaxVarintLen64 + n // Correct boundary.
+	// tokenLength is attacker-controlled and can reach ~2^62. Compare in the
+	// uint64 domain: on a 32-bit build int(tokenLength) wraps negative, the
+	// len(buf) < boundary guard below passes, and the slice panics.
+	if uint64(len(buf)-boundary) < tokenLength+quicutils.MaxVarintLen64 {
+		return cryptos, nil, ErrNotApplicable
+	}
+	boundary += int(tokenLength) + quicutils.MaxVarintLen64 // Next fields may have quicutils.MaxVarintLen64 bytes length
 	if len(buf) < boundary {
 		return cryptos, nil, ErrNotApplicable
 	}
@@ -149,6 +155,10 @@ func sniffQuicBlock(s *Sniffer, cryptos []*quicutils.CryptoFrameOffset, buf []by
 		return cryptos, nil, ErrNotApplicable
 	}
 	boundary = boundary - quicutils.MaxVarintLen64 + n // Correct boundary.
+	// Same truncation hazard as tokenLength for the protected-payload length.
+	if uint64(len(buf)-boundary) < length {
+		return cryptos, nil, ErrNotApplicable
+	}
 	blockEnd := boundary + int(length)
 	if len(buf) < blockEnd {
 		return cryptos, nil, ErrNotApplicable

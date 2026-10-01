@@ -7,6 +7,7 @@ package sniffing
 
 import (
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -202,5 +203,35 @@ func TestIsLikelyQuicInitialPacket_HeaderValidation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestSniffQuicHugeTokenLengthIsRejectedNotPanics pins the length arithmetic
+// on the QUIC Initial token-length varint: the value is attacker-controlled
+// and can reach ~2^62, and on a 32-bit build int(tokenLength) wraps negative
+// so the old len(buf) < boundary guard passed and the following slice went
+// out of range. The bounds must be compared in the uint64 domain on every
+// arch and reject the packet as not applicable.
+func TestSniffQuicHugeTokenLengthIsRejectedNotPanics(t *testing.T) {
+	buf := []byte{
+		0xc0,                   // long header, Initial packet type
+		0x00, 0x00, 0x00, 0x01, // version 1
+		0x08,                   // DCID length
+		1, 2, 3, 4, 5, 6, 7, 8, // DCID
+		0x00,                                           // SCID length
+		0xc0, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, // token length = 2^31
+	}
+	sniffer := NewPacketSniffer(buf, 50*time.Millisecond)
+	_, err := sniffer.SniffQuic()
+	if !errors.Is(err, ErrNotApplicable) {
+		t.Fatalf("err = %v, want ErrNotApplicable for a huge token length", err)
+	}
+	// The same guard must also cover the protected-payload length varint.
+	buf2 := append([]byte{}, buf...)
+	buf2 = append(buf2, 0xc0, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00) // length = 2^31
+	sniffer = NewPacketSniffer(buf2, 50*time.Millisecond)
+	_, err = sniffer.SniffQuic()
+	if !errors.Is(err, ErrNotApplicable) {
+		t.Fatalf("err = %v, want ErrNotApplicable for a huge payload length", err)
 	}
 }

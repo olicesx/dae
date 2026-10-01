@@ -70,8 +70,13 @@ func TestDeleteNamedNetnsReportsUnmountAndRemoveFailures(t *testing.T) {
 	if err == nil {
 		t.Fatal("DeleteNamedNetns(blocked) = nil, want the removal failure")
 	}
-	if !strings.Contains(err.Error(), "invalid argument") {
-		t.Fatalf("error lacks the unmount EINVAL context: %v", err)
+	// The unmount errno on a non-mount path is environment-specific: EINVAL
+	// on most kernels, EPERM where unprivileged umount is denied outright
+	// (GitHub runners). What must hold is that the unmount context is
+	// carried next to the removal failure — that pairing is what tells a
+	// kernel-locked mount apart from a healthy cleanup later (issue #1109).
+	if !strings.Contains(err.Error(), "invalid argument") && !strings.Contains(err.Error(), "operation not permitted") {
+		t.Fatalf("error lacks the unmount context: %v", err)
 	}
 	if !strings.Contains(err.Error(), "directory not empty") {
 		t.Fatalf("error lacks the removal failure: %v", err)
@@ -79,8 +84,8 @@ func TestDeleteNamedNetnsReportsUnmountAndRemoveFailures(t *testing.T) {
 	if !strings.Contains(err.Error(), blocked) {
 		t.Fatalf("error lacks the entry path %s: %v", blocked, err)
 	}
-	if !stderrors.Is(err, unix.EINVAL) {
-		t.Fatalf("errors.Is(err, EINVAL) = false, want the unmount errno to stay matchable: %v", err)
+	if !stderrors.Is(err, unix.EINVAL) && !stderrors.Is(err, unix.EPERM) {
+		t.Fatalf("the unmount errno must stay matchable: %v", err)
 	}
 }
 

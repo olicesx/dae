@@ -607,14 +607,15 @@ func (ue *UdpEndpoint) maybeRebuildOnReplyDrought(now time.Time) error {
 		// such as WireGuard's persistent keepalive must keep its source port.
 		return nil
 	}
-	ue.retiredByReplyDrought.Store(true)
 	if ue.poolRef != nil {
-		// Carry the recovery budget of this key forward before the endpoint is
-		// marked dead: a concurrent replacement could otherwise retire the
-		// stale entry, dial, and read the ledger in between, leaving the
-		// replacement with a fresh flow's budget.
+		// Carry the recovery budget of this key forward before the retirement
+		// flag becomes visible: a concurrent replacement could otherwise see
+		// the flag, dial, and read the ledger in between, leaving the
+		// replacement with a fresh flow's budget. The flag is the publication
+		// point of the retirement, so the ledger write must land first.
 		ue.poolRef.rememberDroughtRebuild(ue.poolKey, ue.droughtRebuildGeneration+1)
 	}
+	ue.retiredByReplyDrought.Store(true)
 	ue.retire()
 	if ue.log != nil {
 		dialerName := ""

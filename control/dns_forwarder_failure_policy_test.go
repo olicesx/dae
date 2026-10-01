@@ -42,7 +42,7 @@ func TestDnsForwardFailurePolicyFor(t *testing.T) {
 		},
 		{
 			commonerrors.ClassDatagramDropped,
-			dnsForwardFailurePolicy{logDropped: true},
+			dnsForwardFailurePolicy{logDropped: true, countDropped: true},
 		},
 		{
 			commonerrors.ClassSoftAuth,
@@ -95,10 +95,13 @@ func TestHandleDnsForwardFailureDropKeepsForwarderAndDialer(t *testing.T) {
 
 	t.Run("dropped datagram", func(t *testing.T) {
 		key, entry := newEntry(t)
+		before := controller.dnsDroppedDatagrams.Load()
 		controller.handleDnsForwardFailure(nil, udpArg, key, entry,
 			fmt.Errorf("read udp: %w", io.ErrShortBuffer))
 		require.EqualValues(t, 0, entry.consecutiveErrors.Load(), "drop must not count as failure")
 		require.False(t, entry.retired.Load(), "drop must not retire the forwarder")
+		require.EqualValues(t, before+1, controller.dnsDroppedDatagrams.Load(),
+			"drop must feed the counter the janitor publishes")
 		_, stillCached := controller.dnsForwarderCache.Load(key)
 		require.True(t, stillCached, "drop must keep the cached forwarder")
 		require.Len(t, hook.Entries, 1)

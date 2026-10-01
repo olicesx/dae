@@ -195,6 +195,11 @@ func classifyDnsForwardError(err error) commonerrors.ErrorClass {
 // forwarder, how it is logged, and whether it reports dialer unavailability.
 type dnsForwardFailurePolicy struct {
 	countFailure bool
+	// countDropped marks a per-datagram drop: it feeds the drop counters that
+	// the janitor's interval summary publishes, and nothing else. It is kept
+	// separate from countFailure so a drop can never start counting toward
+	// retirement or dialer-unavailable reporting.
+	countDropped bool
 	// retireForwarder is decided after counting, because the threshold rule
 	// reads the incremented consecutive-error counter.
 	retireForwarder   bool
@@ -227,8 +232,10 @@ func dnsForwardFailurePolicyFor(class commonerrors.ErrorClass) dnsForwardFailure
 	case commonerrors.ClassDatagramDropped:
 		// The transport drained one oversized or unattributable datagram
 		// and the session stays usable. Keep the cached forwarder and the
-		// dialer health untouched; a Debug line records the drop.
-		return dnsForwardFailurePolicy{logDropped: true}
+		// dialer health untouched; a Debug line records the drop and the
+		// drop counters feed the janitor's interval summary, so a transport
+		// that drops systematically stays visible without a per-event warn.
+		return dnsForwardFailurePolicy{logDropped: true, countDropped: true}
 	default: // ClassSoftAuth, ClassHardFailure
 		return dnsForwardFailurePolicy{
 			countFailure:      true,
@@ -247,6 +254,9 @@ func (c *DnsController) handleDnsForwardFailure(upstream *dns.Upstream, dialArg 
 		return
 	}
 	pol := dnsForwardFailurePolicyFor(classifyDnsForwardError(err))
+	if pol.countDropped && c != nil {
+		c.dnsDroppedDatagrams.Add(1)
+	}
 	if pol.countFailure && entry != nil {
 		entry.consecutiveErrors.Add(1)
 		pol.retireForwarder = c.shouldRetireCachedDnsForwarder(upstream, dialArg, entry, err)

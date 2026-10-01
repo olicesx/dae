@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
+	commonerrors "github.com/daeuniverse/dae/common/errors"
 	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/daeuniverse/dae/component/dns"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
@@ -88,10 +89,20 @@ func (c *DnsController) forwardWithFallback(
 	// no longer turns into a client-visible failure. Every other scheme keeps
 	// its declared transport contract unchanged.
 	truncated := errors.Is(primaryErr, ErrDNSTruncated)
+	// A dropped datagram is the second form of "the UDP answer did not reach
+	// this client": the transport drained one datagram it could not deliver
+	// (typically the answer was larger than a protocol buffer), the session
+	// stays usable, and this query still has no answer. The retry is the same
+	// remedy the truncation signal gets, for the same reason: the alternative
+	// is a client-visible failure for an answer the upstream may well serve
+	// over TCP. The drop stays soft everywhere else (it never counts toward
+	// dialer health or forwarder retirement) - this only decides the transport
+	// for this one query.
+	dropped := classifyDnsForwardError(primaryErr) == commonerrors.ClassDatagramDropped
 	// An upstream may serve this query when it speaks both transports, or when
-	// the answer was truncated and the operator declared `udp://` (the caller
-	// then retries over TCP). Expressed as the positive predicate so the
-	// condition stays readable.
+	// the answer was truncated or dropped and the operator declared `udp://`
+	// (the caller then retries over TCP). Expressed as the positive predicate
+	// so the condition stays readable.
 	//
 	// An as-is destination is deliberately not in that second case even though
 	// the scheme resolveDNSUpstream synthesizes for it reads "udp". As-is means
@@ -105,7 +116,7 @@ func (c *DnsController) forwardWithFallback(
 	udpUpgradeable := upstream != nil && !isAsIs && upstream.Scheme == dns.UpstreamScheme_UDP
 	canServe := upstream != nil &&
 		(upstream.Scheme == dns.UpstreamScheme_TCP_UDP ||
-			(truncated && udpUpgradeable))
+			((truncated || dropped) && udpUpgradeable))
 	if !canServe || primaryDialArg.l4proto != consts.L4ProtoStr_UDP {
 		return nil, primaryDialArg, primaryErr
 	}
@@ -141,11 +152,15 @@ func (c *DnsController) forwardWithFallback(
 	if err != nil {
 		if truncated {
 			c.reportDnsTruncatedFallback(upstream, false, primaryErr, err)
+		} else if dropped {
+			c.countDroppedRetry(false)
 		}
 		return nil, fallbackDialArg, fmt.Errorf("udp forward failed: %w; tcp fallback failed: %w", primaryErr, err)
 	}
 	if truncated {
 		c.reportDnsTruncatedFallback(upstream, true, primaryErr, nil)
+	} else if dropped {
+		c.countDroppedRetry(true)
 	}
 
 	return respMsg, fallbackDialArg, nil
@@ -198,6 +213,22 @@ func (c *DnsController) reportDnsTruncatedFallback(upstream *dns.Upstream, upgra
 		"(primary error: %v)", primaryErr)
 }
 
+// countDroppedRetry records the outcome of a TCP retry that a dropped UDP
+// datagram triggered. Drops get no per-event warning of their own - they are
+// per-datagram events that the next query usually recovers from - so these
+// counters are what makes a systematic drop visible; the janitor's interval
+// summary (reportDnsDroppedDatagramSummary) publishes them.
+func (c *DnsController) countDroppedRetry(upgraded bool) {
+	if c == nil || c.dnsControllerStore == nil {
+		return
+	}
+	if upgraded {
+		c.dnsDroppedRetries.Add(1)
+		return
+	}
+	c.dnsDroppedRetryFailures.Add(1)
+}
+
 // reportDnsTruncationSummary publishes the RFC 7766 §5 upgrade counters to the
 // operator. The per-event warning above is rate-limited to one line per minute
 // and therefore cannot answer the two questions an operator actually has: are
@@ -241,6 +272,53 @@ func (c *DnsController) reportDnsTruncationSummary() {
 		return
 	}
 	c.log.WithFields(fields).Info("DNS truncation (TC=1) answers were upgraded to TCP")
+}
+
+// reportDnsDroppedDatagramSummary publishes the dropped-datagram counters to
+// the operator, following the same janitor pattern as
+// reportDnsTruncationSummary: one line per interval that saw activity as an
+// interval delta plus lifetime totals, silent on an idle interval. Drops are
+// deliberately quiet per event (a Debug line in handleDnsForwardFailure),
+// because a single drained datagram says nothing about the node - but a
+// transport that drops systematically is exactly the condition that used to be
+// invisible: the query fails, no dialer health flag moves, and nothing is
+// logged above Debug. The retry counters make the difference between "the
+// transport dropped one datagram and the next query answered" and "every drop
+// became a client-visible failure".
+func (c *DnsController) reportDnsDroppedDatagramSummary() {
+	if c == nil || c.dnsControllerStore == nil || c.log == nil {
+		return
+	}
+	drops := c.dnsDroppedDatagrams.Load()
+	retries := c.dnsDroppedRetries.Load()
+	failures := c.dnsDroppedRetryFailures.Load()
+
+	intervalDrops := drops - c.lastReportedDroppedDatagrams.Swap(drops)
+	intervalRetries := retries - c.lastReportedDroppedRetries.Swap(retries)
+	intervalFailures := failures - c.lastReportedDroppedFailures.Swap(failures)
+	if intervalDrops == 0 && intervalRetries == 0 && intervalFailures == 0 {
+		return
+	}
+
+	fields := logrus.Fields{
+		"drops_total":               drops,
+		"drop_retries_total":        retries,
+		"drop_retry_failures_total": failures,
+		"drops":                     intervalDrops,
+		"drop_retries":              intervalRetries,
+		"drop_retry_failures":       intervalFailures,
+	}
+	if intervalFailures > 0 {
+		c.log.WithFields(fields).Warn("DNS datagrams were dropped by the upstream transport and the TCP retry did not " +
+			"deliver an answer; those queries failed. Check whether the upstream transport can carry the answer size " +
+			"(protocol buffer limits) and whether the upstream serves TCP")
+		return
+	}
+	if intervalRetries > 0 {
+		c.log.WithFields(fields).Info("DNS datagrams were dropped by the upstream transport; the TCP retry answered them")
+		return
+	}
+	c.log.WithFields(fields).Info("DNS datagrams were dropped by the upstream transport")
 }
 
 func (c *DnsController) allowDnsTruncatedLog(now time.Time) bool {

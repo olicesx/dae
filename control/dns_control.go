@@ -184,6 +184,23 @@ type dnsControllerStore struct {
 	lastReportedTruncatedFailures  atomic.Uint64
 	lastReportedTruncatedReplies   atomic.Uint64
 
+	// Dropped-datagram bookkeeping. A drop is a per-datagram event that leaves
+	// the transport session usable, so it never touches dialer health; it is
+	// still the operator's only signal that a transport cannot carry the
+	// answer size at all (which is silent today unless the query also fails).
+	// dnsDroppedDatagrams counts drops seen by the forwarder path,
+	// dnsDroppedRetries counts the TCP retries those drops triggered, and
+	// dnsDroppedRetryFailures counts the retries that did not deliver an
+	// answer. The lastReported* copies follow the truncation counters' pattern
+	// above: written only by the DNS cache janitor, so the periodic summary can
+	// report an interval rate.
+	dnsDroppedDatagrams          atomic.Uint64
+	dnsDroppedRetries            atomic.Uint64
+	dnsDroppedRetryFailures      atomic.Uint64
+	lastReportedDroppedDatagrams atomic.Uint64
+	lastReportedDroppedRetries   atomic.Uint64
+	lastReportedDroppedFailures  atomic.Uint64
+
 	// handleGate accounts for request handlers that entered through the
 	// active-plane dispatch. The publication RWMutex used to be held across
 	// whole DNS queries, which let one slow upstream head-of-line block a

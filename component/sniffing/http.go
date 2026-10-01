@@ -43,7 +43,10 @@ func sniffHTTPHostHeader(data []byte) (string, error) {
 	if i := bytes.IndexByte(data, '\n'); i >= 0 {
 		start = i + 1
 	} else {
-		return "", ErrNotFound
+		// The method check has already validated this is HTTP, so a buffer
+		// without an LF is a request line split across reads, not a final
+		// verdict: ask for more data instead of giving up on the Host.
+		return "", ErrNeedMore
 	}
 	for start < len(data) {
 		// Split on LF. HTTP lines end with CRLF, and a single-byte search for

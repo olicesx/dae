@@ -3,7 +3,10 @@ package subscription
 import (
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/daeuniverse/outbound/dialer/shadowsocks"
@@ -98,5 +101,25 @@ func TestResolveSubscriptionAsSIP008_SS2022KeepsRawPSK(t *testing.T) {
 
 	if got, want := string(decoded), "2022-blake3-aes-256-gcm:"+password; got != want {
 		t.Fatalf("unexpected decoded userinfo: got %q want %q", got, want)
+	}
+}
+
+// TestResolveSubscriptionReportsOversizeDownload pins that a subscription
+// beyond the 10 MiB cap fails with an error naming the cap: the silent
+// truncation used to surface far away as "resolved to 0 nodes", which told
+// the user nothing about the cause.
+func TestResolveSubscriptionReportsOversizeDownload(t *testing.T) {
+	body := make([]byte, 10*1024*1024+16)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	_, _, err := ResolveSubscription(logrus.New(), srv.Client(), t.TempDir(), srv.URL)
+	if err == nil {
+		t.Fatal("expected an oversize error, got nil")
+	}
+	if !strings.Contains(err.Error(), "10 MiB download cap") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

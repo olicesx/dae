@@ -204,9 +204,16 @@ func ResolveSubscription(log *logrus.Logger, client *http.Client, configDir stri
 		return "", nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	b, err = io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024)) // 10MB max subscription size
+	// Read one byte past the cap so an oversized subscription is detectable:
+	// a silent truncation surfaces far away from here as an unparseable body
+	// or "resolved to 0 nodes", which tells the user nothing about the cause.
+	const maxSubscriptionBytes = 10 * 1024 * 1024 // 10MB max subscription size
+	b, err = io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionBytes+1))
 	if err != nil {
 		return "", nil, err
+	}
+	if len(b) > maxSubscriptionBytes {
+		return "", nil, fmt.Errorf("subscription %v exceeds the %d MiB download cap; split it or trim it", u.String(), maxSubscriptionBytes>>20)
 	}
 
 resolve:

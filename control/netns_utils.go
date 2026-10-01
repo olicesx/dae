@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -34,6 +35,19 @@ var (
 	daeNetns     *DaeNetns
 	once         sync.Once
 	setNetnsFunc = netns.Set
+	// The named-netns lifecycle below touches /run/netns, the kernel and the
+	// host links. These seams keep its tests hermetic: the real calls would
+	// create or destroy real namespaces, mount over /run/netns, or delete a
+	// live dae0 on a developer host, and the setupNetns fail-fast test must
+	// prove NewNamed stays unreached rather than observe a real one appear.
+	deleteNamedNetnsFunc = DeleteNamedNetns
+	newNamedNetnsFunc    = netns.NewNamed
+	deleteLinkFunc       = DeleteLink
+	unmountFunc          = unix.Unmount
+	mountFunc            = unix.Mount
+	// netnsNamedDir holds the named netns mount points; tests redirect it to a
+	// scratch directory.
+	netnsNamedDir = "/run/netns"
 )
 
 type DaeNetns struct {
@@ -150,14 +164,32 @@ func (ns *DaeNetns) Close() (err error) {
 	}
 
 	ns.mu.Lock()
-	defer ns.mu.Unlock()
+	// cleanupErr is reported after the deferred unlock: a slow log writer must
+	// not stall the other DaeNetns readers, which take this same mutex.
+	var cleanupErr error
+	log := ns.log
+	defer func() {
+		ns.mu.Unlock()
+		if cleanupErr == nil || log == nil {
+			return
+		}
+		// A mount point that survives this shutdown is the first occurrence
+		// of the stuck state (issue #1109). The next start recovers by
+		// covering the directory with a fresh tmpfs, or fail-fasts with the
+		// real errnos when the environment denies that mount; report it here
+		// while the cause is fresh, but do not fail the shutdown for it: the
+		// namespace dies with the process anyway, and the setup-failure and
+		// reload handoff callers must not treat a leftover mount as a
+		// lifecycle failure.
+		log.WithError(cleanupErr).Warnf("Failed to clean up named netns %s; the leftover mount point may block the next start", NsName)
+	}()
 
 	if !ns.handlesInitialized {
 		ns.setupDone.Store(false)
 		return nil
 	}
-	_ = DeleteNamedNetns(NsName)
-	_ = DeleteLink(HostVethName)
+	cleanupErr = deleteNamedNetnsFunc(NsName)
+	_ = deleteLinkFunc(HostVethName)
 
 	var errs []error
 	if ns.daeNs.IsOpen() {
@@ -389,7 +421,7 @@ func (ns *DaeNetns) tryCreateNetkit() (err error) {
 
 	// Delete existing link if present
 	ns.log.Debugf("Deleting existing link %s if present", HostVethName)
-	_ = DeleteLink(HostVethName)
+	_ = deleteLinkFunc(HostVethName)
 
 	// Try to create Netkit device
 	// Configure scrub=NONE to preserve skb->mark across the netkit boundary.
@@ -425,7 +457,7 @@ func (ns *DaeNetns) tryCreateNetkit() (err error) {
 
 	if err = requireNetkitL2WithMAC(ns.dae0, ns.dae0peer); err != nil {
 		ns.log.Warnf("Rejecting Netkit pair: %v", err)
-		_ = DeleteLink(HostVethName)
+		_ = deleteLinkFunc(HostVethName)
 		ns.dae0 = nil
 		ns.dae0peer = nil
 		return err
@@ -608,7 +640,7 @@ func (ns *DaeNetns) setupRoutingPolicy() (err error) {
 }
 func (ns *DaeNetns) setupVeth() (err error) {
 	// ip l a dae0 type veth peer name dae0peer
-	_ = DeleteLink(HostVethName)
+	_ = deleteLinkFunc(HostVethName)
 	if err = netlink.LinkAdd(&netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{
 			Name:   HostVethName,
@@ -632,10 +664,89 @@ func (ns *DaeNetns) setupVeth() (err error) {
 	return
 }
 
+// isKernelLockedMount reports the incident signature from issue #1109: every
+// umount(2) flag combination rejected with EINVAL and the removal refused
+// with EBUSY. That pair proves the path is a mount point the kernel will not
+// release (MNT_LOCKED): EINVAL alone also comes from non-mount entries, and
+// EBUSY alone is a transient state a retry clears.
+func isKernelLockedMount(err error) bool {
+	return stderrors.Is(err, unix.EINVAL) && stderrors.Is(err, unix.EBUSY)
+}
+
+// coverNamedNetnsDir recovers from a kernel-locked stale entry the only way
+// the kernel allows: hide it under a fresh tmpfs instead of trying to unmount
+// it (issue #1109 — MNT_LOCKED rejects every umount(2) flag, so no retry or
+// ordering can ever clear the mount). The cover is deliberate and persistent:
+// it must outlive this process, or the next start hits the same locked entry
+// again. Named netns owned by other tools in the same directory are hidden,
+// not destroyed; nothing in /run survives a reboot, so those names return
+// only when their owning tool recreates them. Mounting is the same class of
+// privileged system mutation dae already performs during setup (bpffs, the
+// named netns itself, sysctls).
+func (ns *DaeNetns) coverNamedNetnsDir() error {
+	if entries, err := os.ReadDir(netnsNamedDir); err == nil {
+		var hidden []string
+		for _, entry := range entries {
+			if entry.Name() != NsName {
+				hidden = append(hidden, entry.Name())
+			}
+		}
+		if len(hidden) > 0 && ns.log != nil {
+			ns.log.Warnf("Covering %s with a fresh tmpfs to recover from a kernel-locked mount point; hiding named netns %s until the next reboot", netnsNamedDir, strings.Join(hidden, ", "))
+		}
+	}
+	if err := mountFunc("tmpfs", netnsNamedDir, "tmpfs", 0, "mode=755"); err != nil {
+		return err
+	}
+	if ns.log != nil {
+		ns.log.Warnf("Covered %s with a fresh tmpfs to recover from a kernel-locked mount point (issue #1109); the stale entry stays hidden until the next reboot", netnsNamedDir)
+	}
+	return nil
+}
+
+// prepareNamedNetns makes netnsNamedDir ready for NewNamed(NsName): the
+// directory exists and no stale entry survives under that name. A stale entry
+// that cannot be deleted must not leak into NewNamed — with the entry still
+// present, its O_CREATE|O_EXCL can only report the misleading "file exists"
+// instead of the real cause (issue #1109).
+func (ns *DaeNetns) prepareNamedNetns() error {
+	if err := os.MkdirAll(netnsNamedDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create %s: %w", netnsNamedDir, err)
+	}
+	staleErr := deleteNamedNetnsFunc(NsName)
+	if staleErr == nil {
+		return nil
+	}
+	if !isKernelLockedMount(staleErr) {
+		// The tmpfs recovery belongs to the locked signature only. A
+		// transient EBUSY (another instance still shutting down) clears on a
+		// retry, and a stray non-mount entry fails its removal with
+		// ENOTEMPTY/EACCES — covering the directory would answer those with
+		// an action that hides /run/netns for no reason. Errnos are named
+		// symbolically because the message the operator's umount(1) prints is
+		// localised.
+		return fmt.Errorf("failed to clean up the stale named netns %s: %w", NsName, staleErr)
+	}
+	if coverErr := ns.coverNamedNetnsDir(); coverErr != nil {
+		return fmt.Errorf("failed to clean up the stale named netns %s: %w; automatic recovery by covering %s with a fresh tmpfs failed: %w; cover it manually (mount -t tmpfs -o mode=755 tmpfs %s) or reboot, then start dae again", NsName, staleErr, netnsNamedDir, coverErr, netnsNamedDir)
+	}
+	if err := deleteNamedNetnsFunc(NsName); err != nil {
+		// The cover already hid the locked entry, so this failure is about
+		// the covered directory, not the stale mount itself.
+		return fmt.Errorf("failed to clear the name %s after covering %s with a fresh tmpfs: %w", NsName, netnsNamedDir, err)
+	}
+	return nil
+}
+
 func (ns *DaeNetns) setupNetns() (err error) {
 	// ip netns a daens
-	_ = DeleteNamedNetns(NsName)
-	ns.daeNs, err = netns.NewNamed(NsName)
+	// prepareNamedNetns removes any stale entry, and when the kernel holds it
+	// locked it recovers by covering the directory with a fresh tmpfs; both
+	// outcomes are logged there.
+	if err = ns.prepareNamedNetns(); err != nil {
+		return err
+	}
+	ns.daeNs, err = newNamedNetnsFunc(NsName)
 	if err != nil {
 		return fmt.Errorf("failed to create netns: %w", err)
 	}
@@ -809,16 +920,51 @@ func (ns *DaeNetns) setupIPv6Datapath() (err error) {
 	return
 }
 
+// DeleteNamedNetns unmounts and removes the named netns mount point under
+// netnsNamedDir. A missing entry is success: both callers invoke the deletion
+// speculatively and nothing to delete is the normal no-stale-state case.
+//
+// A non-nil return for a valid single-component name means the entry survived:
+// only a failed removal produces one, so callers may rely on that to decide
+// that a following NewNamed cannot succeed either.
+//
+// A synchronous unmount is tried first; MNT_DETACH alone is lazy and may leave
+// the mount point behind (os.Remove then fails with EBUSY), which leaks the
+// entry and breaks a subsequent restart, so it is only a fallback. Some kernels
+// lock the mount (MNT_LOCKED, set when the entry is inherited across a user
+// namespace boundary, e.g. inside LXC containers) and reject every umount(2)
+// flag combination with EINVAL before MNT_DETACH is even considered; discarding
+// those errnos left only the EBUSY from os.Remove, which says nothing about why
+// the mount cannot be cleared (issue #1109).
 func DeleteNamedNetns(name string) error {
-	namedPath := path.Join("/run/netns", name)
-	// Try a synchronous unmount first; MNT_DETACH alone is lazy and may leave
-	// the mount point behind (os.Remove then fails with EBUSY), which leaks
-	// /run/netns/<name> and breaks a subsequent restart. Fall back to lazy
-	// unmount only if the synchronous one fails (e.g. device busy).
-	if err := unix.Unmount(namedPath, 0); err != nil {
-		_ = unix.Unmount(namedPath, unix.MNT_DETACH)
+	// The name reaches unmount(2) and unlink(2) as a path component; a
+	// traversal name would escape netnsNamedDir.
+	if name == "" || name != path.Base(name) || name == "." || name == ".." {
+		return fmt.Errorf("invalid named netns %q", name)
 	}
-	return os.Remove(namedPath)
+	namedPath := path.Join(netnsNamedDir, name)
+	syncErr := unmountFunc(namedPath, 0)
+	var lazyErr error
+	if syncErr != nil {
+		lazyErr = unmountFunc(namedPath, unix.MNT_DETACH)
+	}
+	removeErr := os.Remove(namedPath)
+	if removeErr == nil || stderrors.Is(removeErr, os.ErrNotExist) {
+		// The entry is gone; the unmount errors above are the normal
+		// EINVAL/ENOENT noise for a non-mount or already-missing entry.
+		return nil
+	}
+	// One line on purpose: errors.Join separates causes with a newline, which
+	// splits a daemon log entry in two. Multiple %w verbs keep every errno
+	// matchable with errors.Is while the message stays on one line.
+	switch {
+	case syncErr == nil:
+		return removeErr
+	case lazyErr != nil:
+		return fmt.Errorf("unmount %s: %w; lazy unmount: %w; %w", namedPath, syncErr, lazyErr, removeErr)
+	default:
+		return fmt.Errorf("unmount %s: %w; %w", namedPath, syncErr, removeErr)
+	}
 }
 
 func DeleteLink(name string) error {

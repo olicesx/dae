@@ -142,4 +142,8 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260910
 // cast len(p) to uint16, so a 65536-byte read buffer (dae's full-range DNS
 // forward buffer, and the pool's largest bucket) wrapped to 0 and dropped
 // every datagram on xudp XTLS/Vision nodes.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261001024857-70dfd0b84a56
+// The vmess packetaddr reader now reads straight into the caller's buffer
+// instead of a MaxUDPSize (2048) staging pool, so a reply larger than 2048
+// bytes is delivered rather than reported as a short-buffer drop; oversized
+// datagrams still surface the typed drop instead of being split.
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261001031400-c8e883c0007e

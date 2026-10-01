@@ -6,7 +6,6 @@
 package config
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -25,6 +24,16 @@ type Merger struct {
 	entry             string
 	entryDir          string
 	entryToSectionMap map[string]map[string][]*config_parser.Item
+	// visiting holds the files on the current DFS path; it detects real
+	// cycles without rejecting a shared file included by two siblings
+	// (a diamond), which entryToSectionMap alone used to misreport.
+	visiting map[string]bool
+	// path mirrors visiting in order so the cycle error names the real chain.
+	path []string
+	// merged marks files whose sections were already merged into a father;
+	// a shared file contributes its items exactly once, so a diamond does
+	// not duplicate them.
+	merged map[string]bool
 }
 
 func NewMerger(entry string) *Merger {
@@ -32,6 +41,8 @@ func NewMerger(entry string) *Merger {
 		entry:             entry,
 		entryDir:          filepath.Dir(entry),
 		entryToSectionMap: map[string]map[string][]*config_parser.Item{},
+		visiting:          map[string]bool{},
+		merged:            map[string]bool{},
 	}
 }
 
@@ -48,12 +59,10 @@ func (m *Merger) Merge() (sections []*config_parser.Section, entries []string, e
 }
 
 func (m *Merger) readEntry(entry string) (err error) {
-	// Check circular include.
-	_, exist := m.entryToSectionMap[entry]
-	if exist {
-		return ErrCircularInclude
+	// Already parsed on an earlier branch (e.g. a shared include): reuse it.
+	if _, exist := m.entryToSectionMap[entry]; exist {
+		return nil
 	}
-
 	// Check filename
 	if !strings.HasSuffix(entry, ".dae") {
 		return fmt.Errorf("invalid config filename %v: must has suffix .dae", entry)
@@ -120,13 +129,21 @@ func unsqueezeEntries(patternEntries []string) (unsqueezed []string, err error) 
 }
 
 func (m *Merger) dfsMerge(entry string, fatherEntry string) (err error) {
-	// Read entry and check circular include.
+	// A file already on the current DFS path is a real cycle. A file parsed
+	// on a sibling branch is not: readEntry turns it into a cache hit.
+	if m.visiting[entry] {
+		return fmt.Errorf("%w: %s", ErrCircularInclude, strings.Join(append(m.path, entry), " -> "))
+	}
+	// Read entry (parse or reuse the cached sections).
 	if err = m.readEntry(entry); err != nil {
-		if errors.Is(err, ErrCircularInclude) {
-			return fmt.Errorf("%w: %v -> %v -> ... -> %v", err, fatherEntry, entry, fatherEntry)
-		}
 		return err
 	}
+	m.visiting[entry] = true
+	m.path = append(m.path, entry)
+	defer func() {
+		delete(m.visiting, entry)
+		m.path = m.path[:len(m.path)-1]
+	}()
 	sectionMap := m.entryToSectionMap[entry]
 	// Extract childEntries.
 	includes := sectionMap["include"]
@@ -159,6 +176,13 @@ func (m *Merger) dfsMerge(entry string, fatherEntry string) (err error) {
 		// We are already on the top.
 		return nil
 	}
+	// A shared include contributes its items once, to the first father that
+	// reached it; re-merging into every father would duplicate the items all
+	// the way up to the entry.
+	if m.merged[entry] {
+		return nil
+	}
+	m.merged[entry] = true
 	fatherSectionMap := m.entryToSectionMap[fatherEntry]
 	for sec := range sectionMap {
 		items := m.mergeItems(fatherSectionMap[sec], sectionMap[sec])

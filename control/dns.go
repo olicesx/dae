@@ -22,6 +22,7 @@ import (
 
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/consts"
+	commonerrors "github.com/daeuniverse/dae/common/errors"
 	"github.com/daeuniverse/dae/common/netutils"
 	"github.com/daeuniverse/dae/component/dns"
 	"github.com/daeuniverse/dae/component/dnstransport"
@@ -473,6 +474,12 @@ func (d *DoQ) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, err
 	// According https://datatracker.ietf.org/doc/html/rfc9250#section-4.2.1
 	// msg id should set to 0 when transport over QUIC.
 	// thanks https://github.com/natesales/q/blob/1cb2639caf69bd0a9b46494a3c689130df8fb24a/transport/quic.go#L97
+	// The zero must exist on the wire only: this buffer belongs to the caller,
+	// and the response router reuses it for reroute fallbacks, whose later
+	// UDP hops would otherwise go out with a fixed transaction ID 0. Stash the
+	// original ID and restore it on every exit path.
+	originalQueryID := binary.BigEndian.Uint16(data[0:2])
+	defer binary.BigEndian.PutUint16(data[0:2], originalQueryID)
 	binary.BigEndian.PutUint16(data[0:2], 0)
 
 	// Write the complete query, then close the write side (FIN) before
@@ -1363,6 +1370,20 @@ func (d *DoUDP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 					badConn = true
 				}
 				return nil, err
+			}
+			if commonerrors.ClassifyForwardError(err) == commonerrors.ClassDatagramDropped {
+				// The transport consumed exactly one datagram (oversized for the
+				// read buffer, or a source it could not resolve in time) and the
+				// session stays usable: the fork's datagram-dropped contract
+				// forbids retiring the conn on it. Keep waiting for the response
+				// with the matching ID, bounded by the stale-response cap.
+				staleResponses++
+				if staleResponses > maxStaleResponses {
+					udpPool.discard(conn)
+					badConn = true
+					return nil, fmt.Errorf("too many dropped UDP DNS datagrams")
+				}
+				continue
 			}
 			udpPool.discard(conn)
 			badConn = true

@@ -135,6 +135,102 @@ func TestMeasuredDialerReplacesUnmeasuredIncumbentDespiteTolerance(t *testing.T)
 	}
 }
 
+// TestIncumbentLosingItsMeasurementIsReconciled pins the class bookkeeping for
+// an incumbent that is still alive but reports no measurement (for example a
+// health restore replaced the live latency ring). Its recorded class must drop
+// to unmeasured together with its entry, so a measured peer takes over instead
+// of the incumbent keeping a stale class and a stale latency.
+func TestIncumbentLosingItsMeasurementIsReconciled(t *testing.T) {
+	networkType := newTestNetworkType()
+	stale := newNamedTestDialer(t, "stale-incumbent")
+	measured := newNamedTestDialer(t, "measured-peer")
+
+	setMovingAverage := func(d *Dialer, v time.Duration) {
+		d.collectionFineMu.Lock()
+		d.mustGetCollection(networkType).MovingAverage = v
+		d.collectionFineMu.Unlock()
+	}
+	setMovingAverage(stale, 100*time.Millisecond)
+	setMovingAverage(measured, 500*time.Millisecond)
+
+	set := NewAliveDialerSet(
+		stale.Log,
+		"reconcile-group",
+		networkType,
+		0,
+		consts.DialerSelectionPolicy_MinMovingAverageLatencies,
+		[]*Dialer{stale, measured},
+		[]*Annotation{{}, {}},
+		func(bool) {},
+		true,
+	)
+	stale.RegisterAliveDialerSet(set)
+	measured.RegisterAliveDialerSet(set)
+	t.Cleanup(func() {
+		stale.UnregisterAliveDialerSet(set)
+		measured.UnregisterAliveDialerSet(set)
+	})
+
+	if got, _ := set.GetMinLatency(nil); got != stale {
+		t.Fatalf("initial best dialer is not the 100ms dialer; the fixture is wrong")
+	}
+
+	// The incumbent loses its measurement while staying alive.
+	setMovingAverage(stale, 0)
+	set.NotifyLatencyChange(stale, true)
+
+	if got, key := set.GetMinLatency(nil); got != measured {
+		t.Fatalf("best dialer is still the dialer without a measurement (key %v), want the "+
+			"measured peer: the incumbent's recorded class must follow its entry", key)
+	}
+}
+
+// TestHugeAddLatencyKeepsAliveDialerSelectable pins the fallback scan
+// semantics that the measurement-class change made explicit: the "time.Hour"
+// scan initializer is not a floor. Asking for the best dialer other than the
+// incumbent must still return a live dialer whose key is at or above one hour
+// (a large configured add_latency or an additive backoff penalty) instead of
+// reporting that no dialer is alive.
+func TestHugeAddLatencyKeepsAliveDialerSelectable(t *testing.T) {
+	networkType := newTestNetworkType()
+	incumbent := newNamedTestDialer(t, "huge-offset-incumbent")
+	far := newNamedTestDialer(t, "huge-offset-peer")
+
+	appendLatencyLocked(incumbent, networkType, 100*time.Millisecond)
+	appendLatencyLocked(far, networkType, 100*time.Millisecond)
+
+	set := NewAliveDialerSet(
+		incumbent.Log,
+		"huge-offset-group",
+		networkType,
+		0,
+		consts.DialerSelectionPolicy_MinLastLatency,
+		[]*Dialer{incumbent, far},
+		[]*Annotation{{}, {AddLatency: 2 * time.Hour}},
+		func(bool) {},
+		true,
+	)
+	incumbent.RegisterAliveDialerSet(set)
+	far.RegisterAliveDialerSet(set)
+	t.Cleanup(func() {
+		incumbent.UnregisterAliveDialerSet(set)
+		far.UnregisterAliveDialerSet(set)
+	})
+
+	if got, _ := set.GetMinLatency(nil); got != incumbent {
+		t.Fatalf("initial best dialer is not the 100ms dialer; the fixture is wrong")
+	}
+
+	// Excluding the incumbent forces the fallback scan instead of the cached
+	// incumbent lookup. The peer is alive, so it must be returned even though
+	// its key is above one hour.
+	got, key := set.GetMinLatency(incumbent)
+	if got != far {
+		t.Fatalf("best non-incumbent dialer = %v (key %v), want the alive peer even though its "+
+			"key is above one hour", got, key)
+	}
+}
+
 // TestAllUnmeasuredStillHonorsAddLatency guards the documented manual-weight
 // contract: for network types without an active latency probe (e.g. data-UDP
 // without a borrowed DNS latency) every dialer is unmeasured, so add_latency is

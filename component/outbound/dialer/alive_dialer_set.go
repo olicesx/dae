@@ -502,6 +502,15 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 			a.minLatency.dialer = dialer
 			a.minLatency.sortingLatency = sortingLatency
 			a.minLatency.hasLatency = hasLatency
+		} else if a.minLatency.dialer == dialer {
+			// The incumbent is still alive but reports no measurement now (for
+			// example a health restore replaced the live latency ring). Refresh
+			// its class and key, then re-scan: without this the recorded class
+			// would stay "measured" while the entry's is not, and the stale
+			// incumbent would keep winning against a measured dialer.
+			a.minLatency.sortingLatency = sortingLatency
+			a.minLatency.hasLatency = hasLatency
+			a.calcMinLatency()
 		}
 		if wasNoAliveDialer && a.minLatency.dialer != nil {
 			// Not alive -> alive: mirror the has-latency branch above so the

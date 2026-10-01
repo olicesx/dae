@@ -69,6 +69,16 @@ func TestNotifyLatencyDoesNotHoldWriteLockDuringFormatting(t *testing.T) {
 	d1 := newNamedTestDialer(t, "print-1")
 	d2 := newNamedTestDialer(t, "print-2")
 
+	// Seed both dialers before construction so the initial ranking is real
+	// (d1 100ms, d2 500ms) rather than an optimistic 0-latency key: a dialer
+	// without a measurement can no longer outrank a measured one.
+	d1.collectionFineMu.Lock()
+	d1.mustGetCollection(networkType).Latencies10.AppendLatency(100 * time.Millisecond)
+	d1.collectionFineMu.Unlock()
+	d2.collectionFineMu.Lock()
+	d2.mustGetCollection(networkType).Latencies10.AppendLatency(500 * time.Millisecond)
+	d2.collectionFineMu.Unlock()
+
 	set := NewAliveDialerSet(
 		d1.Log,
 		"print-group",
@@ -94,15 +104,13 @@ func TestNotifyLatencyDoesNotHoldWriteLockDuringFormatting(t *testing.T) {
 	// the level that actually reaches the renderer.
 	d1.Log.SetLevel(logrus.DebugLevel)
 
-	// The constructor already registered both dialers as alive with an
-	// optimistic 0-latency sort key. Giving d1 a real probe latency makes the
-	// group re-rank onto d2 (whose optimistic key is still smaller), which is
-	// the path that renders the listing.
-	d1.collectionFineMu.Lock()
-	d1.mustGetCollection(networkType).Latencies10.AppendLatency(100 * time.Millisecond)
-	d1.collectionFineMu.Unlock()
+	// A better real latency for d2 re-ranks the measured group, which is the
+	// path that renders the listing.
 	before := probe.countsRenders()
-	set.NotifyLatencyChange(d1, true)
+	d2.collectionFineMu.Lock()
+	d2.mustGetCollection(networkType).Latencies10.AppendLatency(50 * time.Millisecond)
+	d2.collectionFineMu.Unlock()
+	set.NotifyLatencyChange(d2, true)
 	if probe.countsRenders() == before {
 		t.Fatal("the latency listing was not rendered; the probe observed nothing")
 	}

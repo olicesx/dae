@@ -31,6 +31,13 @@ func TestBestDialerChangeLogsOneInfoLineAndTableAtDebug(t *testing.T) {
 	d1.Log = logger
 	d2.Log = logger
 
+	// Seed both dialers before construction: the constructor registers each
+	// dialer with the latency it already has, so the initial ranking is real
+	// and the test does not rely on the optimistic 0-latency key that an
+	// unmeasured dialer used to receive.
+	appendLatencyLocked(d1, networkType, 100*time.Millisecond)
+	appendLatencyLocked(d2, networkType, 500*time.Millisecond)
+
 	set := NewAliveDialerSet(
 		logger,
 		"q8-group",
@@ -49,12 +56,14 @@ func TestBestDialerChangeLogsOneInfoLineAndTableAtDebug(t *testing.T) {
 		d2.UnregisterAliveDialerSet(set)
 	})
 
-	// Both dialers are alive on an optimistic 0-latency key. A real probe
-	// latency for d1 re-ranks the group onto d2, which is the path under test.
-	appendLatencyLocked(d1, networkType, 100*time.Millisecond)
-
+	// Both dialers already carry a real latency when the set is built (d1
+	// 100ms, d2 500ms), so the first selection never depends on an optimistic
+	// 0-latency key: a dialer without a measurement can no longer outrank a
+	// measured one. A better real latency for d2 then re-ranks the group onto
+	// it, which is the path under test.
 	hook.Reset()
-	set.NotifyLatencyChange(d1, true)
+	appendLatencyLocked(d2, networkType, 50*time.Millisecond)
+	set.NotifyLatencyChange(d2, true)
 
 	infoLines := 0
 	debugTables := 0

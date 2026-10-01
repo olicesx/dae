@@ -24,6 +24,7 @@ const (
 
 type minLatency struct {
 	sortingLatency time.Duration
+	hasLatency     bool
 	dialer         *Dialer
 }
 
@@ -32,6 +33,7 @@ type minLatency struct {
 type aliveEntry struct {
 	dialer         *Dialer
 	sortingLatency time.Duration
+	hasLatency     bool
 }
 
 // AliveDialerSet assumes mapping between index and dialer MUST remain unchanged.
@@ -150,13 +152,17 @@ func (a *AliveDialerSet) GetMinLatency(excluded *Dialer) (d *Dialer, latency tim
 	// Using aliveEntries with direct field access avoids map lookups.
 	var nextBest *Dialer
 	var nextBestSortingLatency = time.Hour
+	var nextBestHasLatency bool
 	for i := range a.aliveEntries {
 		entry := &a.aliveEntries[i]
 		if entry.dialer == excluded {
 			continue
 		}
-		if entry.sortingLatency < nextBestSortingLatency {
+		if nextBest == nil ||
+			(entry.hasLatency && !nextBestHasLatency) ||
+			(entry.hasLatency == nextBestHasLatency && entry.sortingLatency < nextBestSortingLatency) {
 			nextBestSortingLatency = entry.sortingLatency
+			nextBestHasLatency = entry.hasLatency
 			nextBest = entry.dialer
 		}
 	}
@@ -332,6 +338,7 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 			a.aliveEntries = append(a.aliveEntries, aliveEntry{
 				dialer:         dialer,
 				sortingLatency: rawLatency + a.dialerToLatencyOffset[dialer],
+				hasLatency:     hasLatency,
 			})
 		}
 	} else {
@@ -367,6 +374,7 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 			if removedBestWithoutLatency {
 				a.minLatency.dialer = nil
 				a.minLatency.sortingLatency = time.Hour
+				a.minLatency.hasLatency = false
 				a.calcMinLatency()
 				if a.minLatency.dialer == nil {
 					a.mu.Unlock()
@@ -393,14 +401,15 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 		// If dialer is alive, update its sortingLatency in aliveEntries.
 		if index := a.dialerToIndex[dialer]; index >= 0 {
 			a.aliveEntries[index].sortingLatency = sortingLatency
+			a.aliveEntries[index].hasLatency = hasLatency
 		}
-		if alive &&
-			sortingLatency <= a.minLatency.sortingLatency &&
-			(a.minLatency.sortingLatency < a.tolerance || sortingLatency <= a.minLatency.sortingLatency-a.tolerance) {
+		if alive && a.takeOverMinLocked(hasLatency, sortingLatency) {
 			a.minLatency.sortingLatency = sortingLatency
+			a.minLatency.hasLatency = hasLatency
 			a.minLatency.dialer = dialer
 		} else if a.minLatency.dialer == dialer {
 			a.minLatency.sortingLatency = sortingLatency
+			a.minLatency.hasLatency = hasLatency
 			if !alive || sortingLatency > bakOldMinSortingLatency {
 				// Latency increases.
 				if !alive {
@@ -486,11 +495,13 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 		sortingLatency = rawLatency + a.dialerToLatencyOffset[dialer]
 		if index := a.dialerToIndex[dialer]; index >= 0 {
 			a.aliveEntries[index].sortingLatency = sortingLatency
+			a.aliveEntries[index].hasLatency = hasLatency
 		}
 		wasNoAliveDialer := a.minLatency.dialer == nil
-		if wasNoAliveDialer || sortingLatency < a.minLatency.sortingLatency {
+		if wasNoAliveDialer || (!a.minLatency.hasLatency && sortingLatency < a.minLatency.sortingLatency) {
 			a.minLatency.dialer = dialer
 			a.minLatency.sortingLatency = sortingLatency
+			a.minLatency.hasLatency = hasLatency
 		}
 		if wasNoAliveDialer && a.minLatency.dialer != nil {
 			// Not alive -> alive: mirror the has-latency branch above so the
@@ -512,22 +523,50 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 	}
 }
 
+// takeOverMinLocked reports whether a candidate latency reading should
+// displace the incumbent best. A live measurement always outranks the absence
+// of one, so an unmeasured dialer can never beat a measured dialer regardless
+// of add_latency; within the same class the historical rule applies.
+// Callers must hold a.mu.
+func (a *AliveDialerSet) takeOverMinLocked(candHas bool, candLat time.Duration) bool {
+	if a.minLatency.dialer == nil {
+		return true
+	}
+	if candHas != a.minLatency.hasLatency {
+		return candHas
+	}
+	if !candHas {
+		return candLat < a.minLatency.sortingLatency
+	}
+	return candLat <= a.minLatency.sortingLatency &&
+		(a.minLatency.sortingLatency < a.tolerance || candLat <= a.minLatency.sortingLatency-a.tolerance)
+}
+
 func (a *AliveDialerSet) calcMinLatency() {
 	var minLatency = time.Hour
+	var minHasLatency bool
 	var minDialer *Dialer
 	for i := range a.aliveEntries {
-		if a.aliveEntries[i].sortingLatency < minLatency {
-			minLatency = a.aliveEntries[i].sortingLatency
-			minDialer = a.aliveEntries[i].dialer
+		entry := &a.aliveEntries[i]
+		if minDialer == nil ||
+			(entry.hasLatency && !minHasLatency) ||
+			(entry.hasLatency == minHasLatency && entry.sortingLatency < minLatency) {
+			minLatency = entry.sortingLatency
+			minHasLatency = entry.hasLatency
+			minDialer = entry.dialer
 		}
 	}
 	if a.minLatency.dialer == nil {
 		a.minLatency.sortingLatency = minLatency
+		a.minLatency.hasLatency = minHasLatency
 		a.minLatency.dialer = minDialer
 	} else if minDialer != nil &&
-		minLatency <= a.minLatency.sortingLatency &&
-		(a.minLatency.sortingLatency < a.tolerance || minLatency <= a.minLatency.sortingLatency-a.tolerance) {
+		(minHasLatency && !a.minLatency.hasLatency ||
+			(minHasLatency == a.minLatency.hasLatency &&
+				minLatency <= a.minLatency.sortingLatency &&
+				(a.minLatency.sortingLatency < a.tolerance || minLatency <= a.minLatency.sortingLatency-a.tolerance))) {
 		a.minLatency.sortingLatency = minLatency
+		a.minLatency.hasLatency = minHasLatency
 		a.minLatency.dialer = minDialer
 	}
 }
@@ -547,6 +586,7 @@ func (a *AliveDialerSet) recomputeSelectionStateLocked() {
 	a.dialerToLatency = make(map[*Dialer]time.Duration, len(a.dialerToLatencyOffset))
 	a.minLatency = minLatency{
 		sortingLatency: time.Hour,
+		hasLatency:     false,
 	}
 
 	if !isMinLatencyPolicy(a.selectionPolicy) {
@@ -563,6 +603,7 @@ func (a *AliveDialerSet) recomputeSelectionStateLocked() {
 		// an active latency probe (e.g. data-UDP) the offset is the only
 		// ranking signal, so add_latency acts as a true manual weight.
 		entry.sortingLatency = rawLatency + a.dialerToLatencyOffset[entry.dialer]
+		entry.hasLatency = hasLatency
 	}
 
 	a.calcMinLatency()

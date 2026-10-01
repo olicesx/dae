@@ -237,12 +237,17 @@ func ensureBpfPinDir(pinPath string, log *logrus.Logger) error {
 	if err == nil || os.IsExist(err) {
 		return nil
 	}
-	wrapped := bpfPinDirError(pinPath, err, isBpfPinRootMounted())
+	wrapped := bpfPinDirError(pinPath, err, probeBpfPinRootMount())
 	if log != nil {
 		log.Warnln(wrapped)
 	}
 	return wrapped
 }
+
+// probeBpfPinRootMount is the test seam over the real /proc/mounts probe:
+// hermetic tests substitute it so the reported branch does not depend on
+// whether the host actually mounted bpffs at the pin root.
+var probeBpfPinRootMount = isBpfPinRootMounted
 
 // bpfPinDirError builds the message from the observed state of the pin root.
 // Only a missing mount makes the mount advice actionable; a permission or

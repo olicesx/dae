@@ -85,6 +85,12 @@ func TestEnsureBpfPinDirReportsRealFailure(t *testing.T) {
 	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
 		t.Fatalf("write blocker: %v", err)
 	}
+	// Force the mounted-pin-root branch so the test is hermetic: on a host
+	// without bpffs at /sys/fs/bpf the real probe would pick the mount-advice
+	// branch and the assertion below would fail for environmental reasons.
+	old := probeBpfPinRootMount
+	probeBpfPinRootMount = func() bool { return true }
+	t.Cleanup(func() { probeBpfPinRootMount = old })
 	err := ensureBpfPinDir(filepath.Join(blocker, consts.AppName), testLogger())
 	if err == nil {
 		t.Fatal("expected an error when a path component is a regular file")

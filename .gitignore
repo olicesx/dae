@@ -25,3 +25,5 @@ control.test
 prof/
 kix-discipline/
 api-divergences.png
+# eBPF audit tooling output (verifier logs, manifests)
+/build/

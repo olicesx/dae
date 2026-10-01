@@ -122,6 +122,97 @@ func startTCPDNSServer(t *testing.T, handler func(req *dnsmessage.Msg, conn net.
 	return netip.MustParseAddrPort(l.Addr().String())
 }
 
+// fakeDNSUDPConn is an in-process stand-in for a UDP upstream. Read copies at
+// most len(p) bytes of the prepared reply, which is what a datagram read does
+// when the caller's buffer is smaller than the datagram, so the production
+// resolver's read buffer becomes the only variable under test.
+type fakeDNSUDPConn struct {
+	query    []byte
+	response []byte
+	readLen  int
+}
+
+func (c *fakeDNSUDPConn) Write(p []byte) (int, error) {
+	c.query = append([]byte(nil), p...)
+	return len(p), nil
+}
+
+func (c *fakeDNSUDPConn) Read(p []byte) (int, error) {
+	if c.response == nil {
+		var req dnsmessage.Msg
+		if err := req.Unpack(c.query); err != nil {
+			return 0, err
+		}
+		resp := new(dnsmessage.Msg)
+		resp.SetReply(&req)
+		// Compression off: Pack rejects a message that would need more
+		// compression pointers than the format allows.
+		resp.Compress = false
+		for i := range 200 {
+			resp.Answer = append(resp.Answer, &dnsmessage.A{
+				Hdr: dnsmessage.RR_Header{
+					Name:   req.Question[0].Name,
+					Rrtype: dnsmessage.TypeA,
+					Class:  dnsmessage.ClassINET,
+					Ttl:    60,
+				},
+				A: net.ParseIP(fmt.Sprintf("10.0.%d.%d", i/250, i%250+1)).To4(),
+			})
+		}
+		out, err := resp.Pack()
+		if err != nil {
+			return 0, err
+		}
+		c.response = out
+	}
+	c.readLen = len(p)
+	return copy(p, c.response), nil
+}
+
+func (c *fakeDNSUDPConn) Close() error                     { return nil }
+func (c *fakeDNSUDPConn) SetDeadline(time.Time) error      { return nil }
+func (c *fakeDNSUDPConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *fakeDNSUDPConn) SetWriteDeadline(time.Time) error { return nil }
+
+var _ netproxy.Conn = (*fakeDNSUDPConn)(nil)
+
+func (c *fakeDNSUDPConn) dialer() fakeDNSUDPDialer { return fakeDNSUDPDialer{conn: c} }
+
+type fakeDNSUDPDialer struct{ conn *fakeDNSUDPConn }
+
+func (d fakeDNSUDPDialer) DialContext(context.Context, string, string) (netproxy.Conn, error) {
+	return d.conn, nil
+}
+
+// TestResolveNetipLargeUDPResponse pins the internal resolver's UDP read buffer
+// to the full legal DNS message range. This resolver builds its queries without
+// an EDNS0 OPT record, so a compliant upstream answers within 512 bytes or sets
+// TC; an oversized reply must still not be read short and then be misreported as
+// a decode failure. The reply here is several times larger than a
+// link-MTU-sized buffer could hold.
+func TestResolveNetipLargeUDPResponse(t *testing.T) {
+	conn := &fakeDNSUDPConn{}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// A loopback UDP fixture cannot carry this reply in every environment
+	// (some sandboxes do not deliver large loopback datagrams at all), so the
+	// upstream is modelled in-process.
+	addrs, err := ResolveNetip(ctx, conn.dialer(), netip.MustParseAddrPort("192.0.2.53:53"),
+		"example.com", dnsmessage.TypeA, "udp")
+	if err != nil {
+		t.Fatalf("ResolveNetip over UDP failed: %v", err)
+	}
+	if len(addrs) != 200 {
+		t.Fatalf("unexpected address count: got %d want 200", len(addrs))
+	}
+	if conn.readLen < len(conn.response) {
+		t.Fatalf("resolver read buffer = %d bytes, reply = %d: the buffer must cover the "+
+			"full legal DNS message", conn.readLen, len(conn.response))
+	}
+}
+
 func writeTCPDNSResponse(conn net.Conn, resp *dnsmessage.Msg, fragmented bool) error {
 	respBuf, err := resp.Pack()
 	if err != nil {

@@ -15,7 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pkg/fastrand"
 	"github.com/daeuniverse/outbound/pool"
@@ -271,7 +270,14 @@ func resolve(ctx context.Context, d netproxy.Dialer, dns netip.AddrPort, host st
 			return
 		}
 
-		buf := pool.GetFullCap(consts.EthernetMtu)
+		// Cover the full legal DNS message, not a link-MTU-sized guess. This
+		// resolver builds its queries without an EDNS0 OPT record, so a
+		// compliant server stays within 512 bytes or sets TC; the full-range
+		// buffer keeps a non-compliant or oversized answer from being read
+		// short and misreported as a decode failure. Callers that forward a
+		// client's advertised EDNS0 size must cover that size instead
+		// (control.dnsUdpMaxResponseSize).
+		buf := pool.GetFullCap(maxDNSMessageSize)
 		defer buf.Put()
 		n, err := ReadUDPConn(c, buf)
 		if err != nil {

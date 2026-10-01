@@ -146,4 +146,4 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260910
 // instead of a MaxUDPSize (2048) staging pool, so a reply larger than 2048
 // bytes is delivered rather than reported as a short-buffer drop; oversized
 // datagrams still surface the typed drop instead of being split.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261001031400-c8e883c0007e
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261001102423-4163e01a20a9

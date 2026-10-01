@@ -20,6 +20,33 @@ curl -L -o geosite.dat https://github.com/v2fly/domain-list-community/releases/l
 popd
 ```
 
+dae looks for `geoip.dat` and `geosite.dat` in the directory of the config file, then in the platform data directories (`/usr/local/share/dae`, `/usr/share/dae`, `$XDG_DATA_HOME/dae`, ...). To add another directory, set the `DAE_LOCATION_ASSET` environment variable to the directory that holds the `.dat` files:
+
+```bash
+DAE_LOCATION_ASSET=/usr/share/v2ray dae run -c /etc/dae/config.dae
+```
+
+`DAE_LOCATION_ASSET` is read from the environment of the `dae` process itself. A value you export in an interactive shell does **not** reach a daemon launched by systemd, and `sudo` resets the environment unless you pass `-E`. For a systemd service, put it in a drop-in:
+
+```bash
+sudo systemctl edit dae.service
+```
+
+```ini
+[Service]
+Environment=DAE_LOCATION_ASSET=/usr/share/v2ray
+```
+
+The shipped unit also reads the optional `/etc/dae/dae.env`, which is not part of the package, so an upgrade cannot overwrite it:
+
+```bash
+printf 'DAE_LOCATION_ASSET=/usr/share/v2ray\n' | sudo tee /etc/dae/dae.env
+sudo chmod 600 /etc/dae/dae.env
+sudo systemctl restart dae
+```
+
+When starting `dae` manually, `sudo -E dae run ...` preserves the variable; a bare `sudo dae run ...` does not. Running `dae run ...` without `sudo` as a non-root user also works: dae escalates through `sudo -E` itself and keeps the variable. The error reported when the file is not found names `DAE_LOCATION_ASSET` and whether the process saw it, so the lookup failure is self-explanatory.
+
 ### Configuration File
 
 > **Note**: The config file is recommended to save under `/etc/dae`

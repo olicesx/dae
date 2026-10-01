@@ -261,6 +261,11 @@ func (t *udpIngressTask) Run() {
 							"question": dnsMessage.Question,
 						}).Debug("DNS ingress fast path got truncated UDP response; returning TC=1 to client")
 					}
+					// The listener and TCP ingress paths count every TC=1
+					// answer for the janitor summary; the fast path handles
+					// most proxied UDP DNS, so skipping it here starved the
+					// truncated_to_client metric.
+					dnsController.noteDnsTruncatedReplyToClient()
 					if sendErr := dnsController.sendDnsTruncatedResponse_(dnsMessage, req, nil); sendErr != nil {
 						if handler.log.IsLevelEnabled(logrus.WarnLevel) && handler.allowDnsFastPathServfailLog(time.Now()) {
 							handler.log.WithError(stderrors.Join(e, sendErr)).WithFields(logrus.Fields{

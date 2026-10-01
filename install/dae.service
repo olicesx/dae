@@ -29,6 +29,16 @@ OOMScoreAdjust=-100
 # Environment=GOMAXPROCS=4
 # Environment=GOGC=100
 
+# Extra directory to search for geoip.dat/geosite.dat. dae reads this from its
+# own environment, so exporting it in a shell does not reach this unit; set it
+# here (or in a drop-in) instead.
+# Environment=DAE_LOCATION_ASSET=/usr/share/v2ray
+
+# Optional environment overrides (for example DAE_LOCATION_ASSET). This file is
+# not shipped in the package, so an upgrade cannot clobber it the way it can
+# clobber an edited copy of this unit. The leading "-" makes it optional.
+EnvironmentFile=-/etc/dae/dae.env
+
 # Startup and reload commands
 # `validate` runs the same rule pipeline as `run` (alias resolution, geosite/
 # geoip expansion, rule lowering) but touches no BPF and performs no network

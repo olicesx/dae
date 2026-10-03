@@ -478,6 +478,9 @@ func (d *DoQ) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, err
 	// and the response router reuses it for reroute fallbacks, whose later
 	// UDP hops would otherwise go out with a fixed transaction ID 0. Stash the
 	// original ID and restore it on every exit path.
+	if len(data) < 2 {
+		return nil, fmt.Errorf("doq forward: query too short to carry a DNS transaction ID (%d bytes)", len(data))
+	}
 	originalQueryID := binary.BigEndian.Uint16(data[0:2])
 	defer binary.BigEndian.PutUint16(data[0:2], originalQueryID)
 	binary.BigEndian.PutUint16(data[0:2], 0)
@@ -1356,6 +1359,29 @@ func (d *DoUDP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 	for {
 		n, from, err := netutils.ReadUDPConnFrom(conn, respBuf)
 		if err != nil {
+			// Classify the drop family first: half of it (the
+			// ErrDomainResolution leg) wraps a *net.DNSError timeout, so the
+			// timeout branches below would otherwise steal it and discard the
+			// conn the datagram-dropped contract explicitly keeps usable.
+			if commonerrors.ClassifyForwardError(err) == commonerrors.ClassDatagramDropped {
+				// The transport consumed exactly one datagram (oversized for the
+				// read buffer, or a source it could not resolve in time) and the
+				// session stays usable: the fork's datagram-dropped contract
+				// forbids retiring the conn on it. Keep waiting for the response
+				// with the matching ID, bounded by the stale-response cap.
+				staleResponses++
+				if staleResponses > maxStaleResponses {
+					// The cap bounds the wait, not a verdict on the conn's
+					// health. The composed error keeps the drop cause so the
+					// forwarder policy still treats the cap as a per-datagram
+					// event (no retire, no dialer report) and the UDP upgrade
+					// path still retries the query over TCP.
+					udpPool.discard(conn)
+					badConn = true
+					return nil, fmt.Errorf("too many dropped UDP DNS datagrams: %w", err)
+				}
+				continue
+			}
 			// Direct UDP sockets can usually survive a single DNS timeout, but a
 			// proxy-backed UDP timeout often means the relay-side session has gone
 			// stale. Reusing that socket causes timeout loops and stale-response churn.
@@ -1370,20 +1396,6 @@ func (d *DoUDP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 					badConn = true
 				}
 				return nil, err
-			}
-			if commonerrors.ClassifyForwardError(err) == commonerrors.ClassDatagramDropped {
-				// The transport consumed exactly one datagram (oversized for the
-				// read buffer, or a source it could not resolve in time) and the
-				// session stays usable: the fork's datagram-dropped contract
-				// forbids retiring the conn on it. Keep waiting for the response
-				// with the matching ID, bounded by the stale-response cap.
-				staleResponses++
-				if staleResponses > maxStaleResponses {
-					udpPool.discard(conn)
-					badConn = true
-					return nil, fmt.Errorf("too many dropped UDP DNS datagrams")
-				}
-				continue
 			}
 			udpPool.discard(conn)
 			badConn = true

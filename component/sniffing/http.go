@@ -36,7 +36,16 @@ func isValidHttpMethod(method []byte) bool {
 	return false
 }
 
+// sniffHTTPMaxBufferedSize bounds how many LF-free header bytes the sniffer
+// accumulates before giving up. The absolute sniffing deadline already bounds
+// the wait in time; this bounds it in space, mirroring how the TLS record
+// format structurally bounds the TLS path.
+const sniffHTTPMaxBufferedSize = 64 << 10
+
 func sniffHTTPHostHeader(data []byte) (string, error) {
+	if len(data) > sniffHTTPMaxBufferedSize {
+		return "", ErrNotFound
+	}
 	// The first line is the request line ("METHOD SP target SP version"); it is
 	// never a Host header, so jump past it to avoid a wasted scan per request.
 	start := 0
@@ -48,6 +57,7 @@ func sniffHTTPHostHeader(data []byte) (string, error) {
 		// verdict: ask for more data instead of giving up on the Host.
 		return "", ErrNeedMore
 	}
+	headersComplete := false
 	for start < len(data) {
 		// Split on LF. HTTP lines end with CRLF, and a single-byte search for
 		// '\n' is markedly cheaper than a two-byte search for "\r\n"; the
@@ -63,12 +73,16 @@ func sniffHTTPHostHeader(data []byte) (string, error) {
 			}
 			start = lineEnd + 1
 		} else {
-			line = data[start:]
-			start = len(data)
+			// The read boundary fell inside a header line (a split Host value
+			// would otherwise be accepted truncated) and further headers,
+			// Host included, may still arrive: incomplete headers are never a
+			// final verdict.
+			return "", ErrNeedMore
 		}
 
 		// Empty line marks end-of-headers.
 		if len(line) == 0 {
+			headersComplete = true
 			break
 		}
 		key, value, found := bytes.Cut(line, httpHeaderSep)
@@ -83,6 +97,13 @@ func sniffHTTPHostHeader(data []byte) (string, error) {
 			}
 			return host, nil
 		}
+	}
+	if !headersComplete {
+		// Every received line was complete but the end-of-headers blank line
+		// has not arrived: the client may still send a Host (or more headers)
+		// in the next read. A legal request always terminates its header block,
+		// so only malformed traffic waits for the sniffing deadline here.
+		return "", ErrNeedMore
 	}
 	return "", ErrNotFound
 }

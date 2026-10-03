@@ -234,6 +234,12 @@ func newRealUdpE2E(t *testing.T, d *componentdialer.Dialer, dst netip.AddrPort) 
 	// The blocking push below lets the kernel socket buffer backpressure
 	// anything beyond this, which is lossless at these burst sizes.
 	replies := make(chan udpWireReply, 1024)
+	// A failed test stops reading replies, and closing the socket only
+	// unblocks the read — not a push blocked on a full channel. done lets the
+	// goroutine exit either way; its cleanup runs before client.Close (LIFO),
+	// so both a blocked push and a blocked read are released.
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
 	go func() {
 		buf := make([]byte, 65535)
 		for {
@@ -242,7 +248,11 @@ func newRealUdpE2E(t *testing.T, d *componentdialer.Dialer, dst netip.AddrPort) 
 				close(replies)
 				return
 			}
-			replies <- udpWireReply{payload: string(buf[:n]), from: from.AddrPort()}
+			select {
+			case replies <- udpWireReply{payload: string(buf[:n]), from: from.AddrPort()}:
+			case <-done:
+				return
+			}
 		}
 	}()
 	src := client.LocalAddr().(*net.UDPAddr).AddrPort()

@@ -59,6 +59,11 @@ type udpEndpointPeerWrite struct {
 // which has to match the address the client wrote to. Transports that rewrite
 // one but not the other therefore never promote anyone: the failure direction
 // is "no promotion", never "promote the wrong peer".
+// A peer is identified by the string form of its address because the write
+// side already carries that string (it is the transport's WriteTo target),
+// so the map lookup costs nothing extra there; keying by netip.AddrPort
+// instead would force a ParseAddrPort on every write to save one String on
+// every reply.
 func (ue *UdpEndpoint) notePeerReply(from netip.AddrPort, nowNano int64) {
 	if ue == nil || !from.IsValid() || ue.poolKey.Dst.IsValid() {
 		// Symmetric sessions have exactly one peer by construction, and an
@@ -96,7 +101,11 @@ func (ue *UdpEndpoint) notePeerReply(from netip.AddrPort, nowNano int64) {
 // never answered would invent evidence, and the promotion gate requires a peer
 // that was established at least once.
 func (ue *UdpEndpoint) notePeerWrite(addr string, now time.Time) {
-	if ue == nil || addr == "" {
+	// The same fast path as the batch twin: symmetric endpoints have no peers
+	// by construction, and a full-cone endpoint that never saw a second peer
+	// reply has no state any gate reads (peerNeedsDedicatedSession requires
+	// multiPeer), so neither pays the lock.
+	if ue == nil || addr == "" || ue.poolKey.Dst.IsValid() || !ue.multiPeer.Load() {
 		return
 	}
 	ue.peerMu.Lock()

@@ -536,9 +536,14 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 			c.log.WithFields(logrus.Fields{
 				"from": src.String(),
 				"to":   realDst.String(),
-			}).WithError(err).Debug("Retired process-owned UDP endpoint after write failure")
+			}).WithError(err).Debug("Retired process-owned UDP endpoint after write failure; redialing on the current path")
 		}
-		return true
+		// Decline the shortcut instead of consuming the datagram: the
+		// current-epoch path treats the same failure (a reply-drought rebuild
+		// classifies as a normal close) as remove-and-redial and delivers the
+		// triggering datagram on the fresh session. A draining old epoch
+		// should not lose one datagram per drought event.
+		return false
 	}
 	// The retained endpoint still belongs to this plane's connection, so
 	// meter it through the plane-bound recorder like every other egress

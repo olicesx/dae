@@ -37,6 +37,10 @@ func dnsUDPResponseSizeLimit(req *dnsmessage.Msg) int {
 type dnsUDPResponseWriter struct {
 	dnsmessage.ResponseWriter
 	limit int
+	// noteTruncated, when set, records that this datagram left with TC=1 so
+	// the truncation summary counts every delivery path. The constructor
+	// wires it to the controller's counter.
+	noteTruncated func()
 }
 
 func (w *dnsUDPResponseWriter) WriteMsg(msg *dnsmessage.Msg) error {
@@ -45,6 +49,9 @@ func (w *dnsUDPResponseWriter) WriteMsg(msg *dnsmessage.Msg) error {
 		// payloads must stay intact for clients that retry over TCP.
 		msg = msg.Copy()
 		truncateDNSMessage(msg, w.limit)
+		if w.noteTruncated != nil {
+			w.noteTruncated()
+		}
 	}
 	return w.ResponseWriter.WriteMsg(msg)
 }

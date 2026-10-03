@@ -351,7 +351,11 @@ func (c *DnsController) Handle_(ctx context.Context, dnsMessage *dnsmessage.Msg,
 func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
 	c.requireStore()
 	if responseWriter != nil && !dnsResponseWriterUsesTCP(responseWriter) {
-		responseWriter = &dnsUDPResponseWriter{ResponseWriter: responseWriter, limit: dnsUDPResponseSizeLimit(dnsMessage)}
+		responseWriter = &dnsUDPResponseWriter{
+			ResponseWriter: responseWriter,
+			limit:          dnsUDPResponseSizeLimit(dnsMessage),
+			noteTruncated:  c.noteDnsTruncatedReplyToClient,
+		}
 	}
 	var upstreamIndex consts.DnsRequestOutboundIndex
 	var upstream *dns.Upstream

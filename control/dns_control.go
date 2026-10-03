@@ -188,7 +188,10 @@ type dnsControllerStore struct {
 	// the transport session usable, so it never touches dialer health; it is
 	// still the operator's only signal that a transport cannot carry the
 	// answer size at all (which is silent today unless the query also fails).
-	// dnsDroppedDatagrams counts drops seen by the forwarder path,
+	// dnsDroppedDatagrams counts the queries whose forward ENDED in a
+	// drop-classified failure (the drop surfaced to the controller); a drop
+	// that the DoUDP wait loop absorbed under its stale cap while the matching
+	// reply still arrived is recovered traffic and deliberately not counted.
 	// dnsDroppedRetries counts the TCP retries those drops triggered, and
 	// dnsDroppedRetryFailures counts the retries that did not deliver an
 	// answer. The lastReported* copies follow the truncation counters' pattern

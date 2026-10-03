@@ -83,3 +83,58 @@ func TestMergerRejectsRealCircularInclude(t *testing.T) {
 		msg = msg[idx:]
 	}
 }
+
+// TestMergerRejectsSelfIncludeCycle pins the shortest real cycle: a file
+// including itself. The error must name the actual 2-element cycle
+// (main -> main) instead of stopping at a bare ErrCircularInclude.
+func TestMergerRejectsSelfIncludeCycle(t *testing.T) {
+	dir := t.TempDir()
+	main := writeMergeFile(t, dir, "main.dae", "include {\n  main.dae\n}\n")
+
+	_, _, err := NewMerger(main).Merge()
+	if !errors.Is(err, ErrCircularInclude) {
+		t.Fatalf("err = %v, want ErrCircularInclude", err)
+	}
+	// The chain must name both hops of the cycle in order: main -> main.
+	msg := err.Error()
+	for _, frag := range []string{main + " -> ", main} {
+		idx := strings.Index(msg, frag)
+		if idx < 0 {
+			t.Fatalf("cycle error should name the 2-element chain, missing %q: %v", frag, msg)
+		}
+		msg = msg[idx:]
+	}
+}
+
+// TestMergerRejectsCycleBehindDiamondInclude pins that a cycle hidden behind a
+// diamond is still rejected: the entry fans out to a and b, both include the
+// shared file s, and s loops back to a. Only the visiting set (not the merged
+// marker) detects it, and the DFS error aborts Merge before any section is
+// produced, so nothing from the shared file is merged anywhere.
+func TestMergerRejectsCycleBehindDiamondInclude(t *testing.T) {
+	dir := t.TempDir()
+	a := writeMergeFile(t, dir, "a.dae", "include {\n  s.dae\n}\nrouting {\n  domain(a.example) -> proxy\n}\n")
+	writeMergeFile(t, dir, "b.dae", "include {\n  s.dae\n}\nrouting {\n  domain(b.example) -> proxy\n}\n")
+	s := writeMergeFile(t, dir, "s.dae", "include {\n  a.dae\n}\nrouting {\n  domain(shared.example) -> direct\n}\n")
+	main := writeMergeFile(t, dir, "main.dae", "include {\n  a.dae\n  b.dae\n}\n")
+
+	sections, entries, err := NewMerger(main).Merge()
+	if !errors.Is(err, ErrCircularInclude) {
+		t.Fatalf("err = %v, want ErrCircularInclude", err)
+	}
+	// The chain must name the real path in order: main -> a -> s -> a. The
+	// first branch (a) is explored before b, and s loops back into it.
+	msg := err.Error()
+	for _, frag := range []string{main + " -> ", a + " -> ", s + " -> ", a} {
+		idx := strings.Index(msg, frag)
+		if idx < 0 {
+			t.Fatalf("cycle error should name the chain, missing %q: %v", frag, msg)
+		}
+		msg = msg[idx:]
+	}
+	// The error precedes any merge output: nothing, in particular nothing from
+	// the shared file, may be merged anywhere.
+	if sections != nil || entries != nil {
+		t.Fatalf("cycle must abort before producing merge output, got sections=%v entries=%v", sections, entries)
+	}
+}

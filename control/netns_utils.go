@@ -31,6 +31,13 @@ const (
 	DaeVethTxQLen = 1000
 )
 
+// The test seam variables declared in this block (setNetnsFunc, the named
+// netns/link/mount functions, and netnsNamedDir) are swapped by tests without
+// any synchronization, so they rely on an unstated invariant: tests that swap
+// them, or that exercise the DaeNetns lifecycle driving them, must run
+// sequentially. Never add t.Parallel() to such a test; a parallel neighbor
+// swapping or reading the same seam would race on it. Production code never
+// writes these after package init.
 var (
 	daeNetns     *DaeNetns
 	once         sync.Once

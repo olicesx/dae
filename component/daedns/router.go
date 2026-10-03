@@ -776,6 +776,13 @@ type ipLookupLeg struct {
 	lookup func(context.Context) ([]net.IPAddr, error)
 }
 
+// ipLookupLegTimeout bounds how long one leg of the race may run, so a
+// silently-dropping resolver cannot keep its leg alive until the caller's
+// context ends (the UDP resend loop re-sends forever). It reuses the shared
+// lookup budget (lookupSharedTimeout in client.go) and stays a variable only
+// so tests can shorten the wait.
+var ipLookupLegTimeout = lookupSharedTimeout
+
 // lookupNodeIPAddr resolves a node address that no node or subscription rule
 // selected an upstream for. The generation's direct DNS view and the configured
 // bootstrap resolvers are raced because either leg can be unreachable: a host
@@ -808,11 +815,14 @@ func (r *Router) lookupNodeIPAddr(ctx context.Context, network, host string) ([]
 }
 
 // raceIPAddrLookups returns the first usable answer among the legs and cancels
-// the rest. Every leg is canceled and awaited before the call returns, so no
-// leg keeps a lookup alive after the caller stops waiting, as long as the dialer
-// behind it honours context cancellation. When no leg produces an address, the
-// failures are joined in leg order, so the message and the diagnosis it carries
-// do not depend on which resolver answered first.
+// the rest. Each leg runs under its own deadline, so a blackholed resolver ends
+// its leg on time even when the caller set no deadline; the deadline derives
+// from the race's parent context, so a parent cancel or an earlier parent
+// deadline still wins. Every leg is canceled and awaited before the call
+// returns, so no leg keeps a lookup alive after the caller stops waiting, as
+// long as the dialer behind it honours context cancellation. When no leg
+// produces an address, the failures are joined in leg order, so the message and
+// the diagnosis it carries do not depend on which resolver answered first.
 func raceIPAddrLookups(ctx context.Context, host string, legs []ipLookupLeg) ([]net.IPAddr, string, error) {
 	raceCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -830,7 +840,17 @@ func raceIPAddrLookups(ctx context.Context, host string, legs []ipLookupLeg) ([]
 		wg.Add(1)
 		go func(i int, leg ipLookupLeg) {
 			defer wg.Done()
-			addrs, err := leg.lookup(raceCtx)
+			// Bound this leg by the shared lookup budget, derived from the
+			// race's parent context so the parent still decides first.
+			legCtx, cancelLeg := context.WithTimeout(raceCtx, ipLookupLegTimeout)
+			defer cancelLeg()
+			addrs, err := leg.lookup(legCtx)
+			if err != nil && raceCtx.Err() == nil && errors.Is(legCtx.Err(), context.DeadlineExceeded) {
+				// This leg's own bound fired while the caller still waits.
+				// Name the leg so a joined pair of timeouts says which
+				// resolver blackholed.
+				err = fmt.Errorf("%s leg timed out after %v: %w", leg.name, ipLookupLegTimeout, err)
+			}
 			results <- lookupResult{leg: i, addrs: addrs, err: err}
 		}(i, leg)
 	}

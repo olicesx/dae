@@ -192,12 +192,15 @@ global {
 
 A node address that no `node`/`sub` rule in `dns.routing` selects an upstream
 for is resolved through the system resolver and through the bootstrap resolvers
-at the same time, and the first answer wins. The system view is the server in
-`/etc/resolv.conf`, or `global.fallback_resolver` when that file names only
-loopback servers; its query leaves directly, without dae DNS routing. Racing the
-two keeps one blocked resolver from stopping every node: an unusable system
-resolver still reaches the bootstrap resolvers, and blocked bootstrap resolvers
-still resolve through the system view. Because the first answer wins, a host
+at the same time, and the first answer wins. The system view is the first
+non-loopback server in `/etc/resolv.conf`, or `global.fallback_resolver` when
+that file is missing, unreadable, or supplies no non-loopback server; its query
+leaves directly, without dae DNS routing. Racing the two keeps one blocked
+resolver from stopping every node: an unusable system resolver still reaches the
+bootstrap resolvers, and blocked bootstrap resolvers still resolve through the
+system view. Each leg of the race stops after 10 seconds, so a resolver that
+silently drops queries cannot hold node dialing open; an answer that arrives
+sooner still wins immediately. Because the first answer wins, a host
 resolver that filters or rewrites the node's name decides the address; when the
 two views must not be interchangeable, route that node's hostname in
 `dns.routing.node` to a specific upstream and dae uses it instead.
@@ -205,9 +208,11 @@ two views must not be interchangeable, route that node's hostname in
 Two consequences deserve spelling out. A node's hostname now also reaches the
 system resolver even when `global.bootstrap_resolver` is explicitly pinned, so
 an operator who must keep proxy hostnames off the host resolver has to route
-them in `dns.routing.node`. And subscription hosts fetched at startup are still
-resolved through the bootstrap resolvers only: no runtime generation exists yet
-at that point, so the race described above starts with the first generation.
+them in `dns.routing.node`. And subscription hosts fetched at startup that no
+`dns.routing.sub` rule routes are still resolved through the bootstrap resolvers
+only: a matching `sub` rule still selects its upstream on the startup router,
+and no runtime generation exists yet at that point, so the race described above
+starts with the first generation.
 
 ## Templates
 

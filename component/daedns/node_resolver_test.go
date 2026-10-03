@@ -12,12 +12,15 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/daeuniverse/dae/common/netutils"
+	componentdns "github.com/daeuniverse/dae/component/dns"
 	"github.com/daeuniverse/outbound/netproxy"
 	dnsmessage "github.com/miekg/dns"
 )
@@ -160,6 +163,7 @@ func testRouter(dialer netproxy.Dialer, systemDNS SystemDNSProvider, bootstrap .
 		directDialer: dialer,
 		systemDNS:    systemDNS,
 		bootstrapDns: bootstrap,
+		lookupCalls:  make(map[string]*lookupCall),
 	}
 }
 
@@ -286,6 +290,10 @@ func TestLookupNodeIPAddrReportsUnusableSystemView(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "system DNS resolver is not configured") {
 		t.Fatalf("missing system-view diagnosis in %q", err.Error())
+	}
+	// The joined error must still unwrap to the system leg's sentinel.
+	if !errors.Is(err, errNoSystemDNS) {
+		t.Fatalf("got %v, want the system leg's errNoSystemDNS sentinel", err)
 	}
 }
 
@@ -433,6 +441,148 @@ func TestLookupNodeIPAddrPropagatesCallerCancel(t *testing.T) {
 	}
 }
 
+// TestRaceIPAddrLookupsCancelMidRace pins the mid-race cancellation contract:
+// canceling the parent context while both legs are in flight makes the call
+// return promptly with context.Canceled and leaves no leg goroutine running.
+func TestRaceIPAddrLookupsCancelMidRace(t *testing.T) {
+	type legProbe struct {
+		started chan struct{}
+		done    chan struct{}
+	}
+	probes := make([]*legProbe, 0, 2)
+	legs := make([]ipLookupLeg, 0, 2)
+	for _, name := range []string{"system", "bootstrap"} {
+		probe := &legProbe{started: make(chan struct{}), done: make(chan struct{})}
+		probes = append(probes, probe)
+		legs = append(legs, ipLookupLeg{name: name, lookup: func(ctx context.Context) ([]net.IPAddr, error) {
+			close(probe.started)
+			defer close(probe.done)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	returned := make(chan error, 1)
+	go func() {
+		_, _, err := raceIPAddrLookups(ctx, "node.test", legs)
+		returned <- err
+	}()
+
+	// Wait until both legs are inside the race before canceling.
+	for i, probe := range probes {
+		select {
+		case <-probe.started:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("leg %d never started", i)
+		}
+	}
+	cancel()
+
+	select {
+	case err := <-returned:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want context.Canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the race did not return promptly after the parent canceled")
+	}
+	for i, probe := range probes {
+		select {
+		case <-probe.done:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("leg %d goroutine kept running after the parent canceled", i)
+		}
+	}
+}
+
+// TestLookupNodeIPAddrBoundsBlackholedLegs pins the per-leg deadline: a
+// deadline-less caller and two silently-dropping resolvers still end on time,
+// the joined failure names which leg timed out in leg order, and both legs'
+// connections are released.
+func TestLookupNodeIPAddrBoundsBlackholedLegs(t *testing.T) {
+	systemAddr := netip.MustParseAddrPort("192.0.2.53:53")
+	bootstrapAddr := netip.MustParseAddrPort("198.51.100.53:53")
+
+	dialer := newScriptedDialer()
+	dialer.hang[systemAddr.String()] = true
+	dialer.hang[bootstrapAddr.String()] = true
+
+	orig := ipLookupLegTimeout
+	ipLookupLegTimeout = 200 * time.Millisecond
+	defer func() { ipLookupLegTimeout = orig }()
+
+	router := testRouter(dialer, stubSystemDNS{addr: systemAddr}, bootstrapAddr)
+	returned := make(chan error, 1)
+	go func() {
+		_, err := router.lookupNodeIPAddr(context.Background(), "tcp4", "node.test")
+		returned <- err
+	}()
+
+	var err error
+	select {
+	case err = <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the blackholed legs were not bounded by the per-leg timeout")
+	}
+	if err == nil {
+		t.Fatal("expected an error when both legs time out")
+	}
+	systemText := "system leg timed out after"
+	bootstrapText := "bootstrap leg timed out after"
+	if !strings.Contains(err.Error(), systemText) || !strings.Contains(err.Error(), bootstrapText) {
+		t.Fatalf("both leg timeouts must be named, got %q", err.Error())
+	}
+	if strings.Index(err.Error(), systemText) > strings.Index(err.Error(), bootstrapText) {
+		t.Fatalf("leg order must be stable (system before bootstrap), got %q", err.Error())
+	}
+
+	closed := make(map[string]bool)
+	deadline := time.After(3 * time.Second)
+	for len(closed) < 2 {
+		select {
+		case addr := <-dialer.hungClose:
+			closed[addr] = true
+		case <-deadline:
+			t.Fatalf("only %v were closed after the legs timed out", closed)
+		}
+	}
+}
+
+// TestLookupNodeIPAddrParentDeadlineStillWins pins that the per-leg bound never
+// masks the caller's own deadline: an earlier parent deadline returns
+// context.DeadlineExceeded without the per-leg timeout text.
+func TestLookupNodeIPAddrParentDeadlineStillWins(t *testing.T) {
+	systemAddr := netip.MustParseAddrPort("192.0.2.53:53")
+	bootstrapAddr := netip.MustParseAddrPort("198.51.100.53:53")
+
+	dialer := newScriptedDialer()
+	dialer.hang[systemAddr.String()] = true
+	dialer.hang[bootstrapAddr.String()] = true
+
+	router := testRouter(dialer, stubSystemDNS{addr: systemAddr}, bootstrapAddr)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	returned := make(chan error, 1)
+	go func() {
+		_, err := router.lookupNodeIPAddr(ctx, "tcp4", "node.test")
+		returned <- err
+	}()
+
+	select {
+	case err := <-returned:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("got %v, want context.DeadlineExceeded", err)
+		}
+		if strings.Contains(err.Error(), "leg timed out") {
+			t.Fatalf("the per-leg bound must not mask the parent deadline, got %q", err.Error())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the race ignored the parent deadline")
+	}
+}
+
 // TestIpAddrsFromIp46SelectsTheRequestedFamily pins the extracted projection,
 // including the dual-stack default branch that the resolver race relies on.
 func TestIpAddrsFromIp46SelectsTheRequestedFamily(t *testing.T) {
@@ -523,5 +673,73 @@ func TestResolvingDialerKeepsUpstreamErrors(t *testing.T) {
 	}
 	if opened := dialer.openedAddrs(); len(opened) != 0 {
 		t.Fatalf("the node lookup must not run after an upstream error, dialed %v", opened)
+	}
+}
+
+// controlUpstreamResolver builds a named upstream the control path can select,
+// so a test can drive how that upstream's lookup terminates.
+func controlUpstreamResolver(raw *url.URL, finish func(*url.URL, *componentdns.Upstream) error) *componentdns.UpstreamResolver {
+	return &componentdns.UpstreamResolver{
+		Raw:                raw,
+		Network:            "udp",
+		FinishInitCallback: finish,
+	}
+}
+
+// TestResolvingDialerControlUpstreamPassthroughFallsBackToNodeLookup pins the
+// passthrough branch of the control lookup: when the selected control upstream
+// resolves to a passthrough action, the node lookup race answers instead of the
+// lookup failing outright.
+func TestResolvingDialerControlUpstreamPassthroughFallsBackToNodeLookup(t *testing.T) {
+	systemAddr := netip.MustParseAddrPort("192.0.2.53:53")
+	bootstrapAddr := netip.MustParseAddrPort("198.51.100.53:53")
+	want := netip.MustParseAddr("203.0.113.31")
+
+	dialer := newScriptedDialer()
+	dialer.answers[systemAddr.String()] = want
+	dialer.fail[bootstrapAddr.String()] = true
+
+	router := testRouter(dialer, stubSystemDNS{addr: systemAddr}, bootstrapAddr)
+	router.upstreams = map[string]*componentdns.UpstreamResolver{
+		"passe": controlUpstreamResolver(&url.URL{Scheme: "udp", Host: "192.0.2.54:53"},
+			func(*url.URL, *componentdns.Upstream) error { return errPassthroughToBaseResolver }),
+	}
+	resolver := newResolvingDialer(dialer, router, "passe", "passe", "node.test")
+
+	addrs, err := resolver.lookupIPAddr(context.Background(), "tcp4", "node.test")
+	if err != nil {
+		t.Fatalf("lookupIPAddr: %v", err)
+	}
+	mustAddrs(t, addrs, want)
+}
+
+// TestResolvingDialerControlUpstreamEmptyAnswerFallsBackToNodeLookup pins the
+// empty-answer branch of the control lookup: a control upstream that answers
+// with no records defers to the node lookup race instead of returning nothing.
+func TestResolvingDialerControlUpstreamEmptyAnswerFallsBackToNodeLookup(t *testing.T) {
+	systemAddr := netip.MustParseAddrPort("192.0.2.53:53")
+	bootstrapAddr := netip.MustParseAddrPort("198.51.100.53:53")
+	controlAddr := netip.MustParseAddrPort("192.0.2.54:53")
+	want := netip.MustParseAddr("203.0.113.32")
+
+	dialer := newScriptedDialer()
+	dialer.answers[systemAddr.String()] = want
+	dialer.fail[bootstrapAddr.String()] = true
+	// The control upstream stays unanswered on purpose: its scripted reply
+	// carries zero records, so the control lookup returns no address.
+
+	router := testRouter(dialer, stubSystemDNS{addr: systemAddr}, bootstrapAddr)
+	router.upstreams = map[string]*componentdns.UpstreamResolver{
+		"empty": controlUpstreamResolver(&url.URL{Scheme: "udp", Host: controlAddr.String()}, nil),
+	}
+	resolver := newResolvingDialer(dialer, router, "empty", "empty", "node.test")
+
+	addrs, err := resolver.lookupIPAddr(context.Background(), "tcp4", "node.test")
+	if err != nil {
+		t.Fatalf("lookupIPAddr: %v", err)
+	}
+	mustAddrs(t, addrs, want)
+	if opened := dialer.openedAddrs(); !slices.Contains(opened, controlAddr.String()) {
+		t.Fatalf("the control upstream was never queried, dialed %v", opened)
 	}
 }

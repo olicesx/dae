@@ -36,16 +36,24 @@ func isValidHttpMethod(method []byte) bool {
 	return false
 }
 
-// sniffHTTPMaxBufferedSize bounds how many LF-free header bytes the sniffer
-// accumulates before giving up. The absolute sniffing deadline already bounds
-// the wait in time; this bounds it in space, mirroring how the TLS record
-// format structurally bounds the TLS path.
+// sniffHTTPMaxBufferedSize bounds how far the sniffer keeps accumulating an
+// unfinished header block before giving up. The absolute sniffing deadline
+// already bounds the wait in time; this bounds it in space, mirroring how the
+// TLS record format structurally bounds the TLS path. The check runs only
+// where accumulation would continue — a buffer that already carries a
+// parseable Host is searched no matter its size.
 const sniffHTTPMaxBufferedSize = 64 << 10
 
-func sniffHTTPHostHeader(data []byte) (string, error) {
+// needMoreOrCap asks for more data, unless the unfinished header block is
+// already past the buffered-size cap and the sniff must give up instead.
+func needMoreOrCap(data []byte) (string, error) {
 	if len(data) > sniffHTTPMaxBufferedSize {
 		return "", ErrNotFound
 	}
+	return "", ErrNeedMore
+}
+
+func sniffHTTPHostHeader(data []byte) (string, error) {
 	// The first line is the request line ("METHOD SP target SP version"); it is
 	// never a Host header, so jump past it to avoid a wasted scan per request.
 	start := 0
@@ -55,7 +63,7 @@ func sniffHTTPHostHeader(data []byte) (string, error) {
 		// The method check has already validated this is HTTP, so a buffer
 		// without an LF is a request line split across reads, not a final
 		// verdict: ask for more data instead of giving up on the Host.
-		return "", ErrNeedMore
+		return needMoreOrCap(data)
 	}
 	headersComplete := false
 	for start < len(data) {
@@ -77,7 +85,7 @@ func sniffHTTPHostHeader(data []byte) (string, error) {
 			// would otherwise be accepted truncated) and further headers,
 			// Host included, may still arrive: incomplete headers are never a
 			// final verdict.
-			return "", ErrNeedMore
+			return needMoreOrCap(data)
 		}
 
 		// Empty line marks end-of-headers.
@@ -103,7 +111,7 @@ func sniffHTTPHostHeader(data []byte) (string, error) {
 		// has not arrived: the client may still send a Host (or more headers)
 		// in the next read. A legal request always terminates its header block,
 		// so only malformed traffic waits for the sniffing deadline here.
-		return "", ErrNeedMore
+		return needMoreOrCap(data)
 	}
 	return "", ErrNotFound
 }

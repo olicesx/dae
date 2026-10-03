@@ -185,11 +185,15 @@ func (c *ControlPlane) tryOffloadTCPRelay(ctx context.Context, left, right netpr
 func newTCPRelayOffloadSession(log *logrus.Logger, fastSock, pauseMap, sentMap *ebpf.Map, left, right netproxy.Conn, leftRecord, rightRecord func(int64)) (*tcpRelayOffloadSession, error) {
 	// Callers must flush the userspace prefix via tcpOffloadFlushLeftPrefix
 	// before this call; only the kernel receive queue matters for TIOCINQ.
-	leftTCP, ok := unwrapRelayTCPConn(left)
+	// Kernel redirect moves bytes, so the gate must use the data-movement
+	// unwrap: a peeling unwrap would resolve the fork's protocol conns (which
+	// expose UnderlyingConn for observational probes) down to the raw socket
+	// below TLS/framing and redirect plaintext around the transform.
+	leftTCP, ok := unwrapRelayTransparentTCPConn(left)
 	if !ok {
 		return nil, fmt.Errorf("%w: left connection cannot be unwrapped to *net.TCPConn", errTCPRelayOffloadUnavailable)
 	}
-	rightTCP, ok := unwrapRelayTCPConn(right)
+	rightTCP, ok := unwrapRelayTransparentTCPConn(right)
 	if !ok {
 		return nil, fmt.Errorf("%w: right connection cannot be unwrapped to *net.TCPConn", errTCPRelayOffloadUnavailable)
 	}

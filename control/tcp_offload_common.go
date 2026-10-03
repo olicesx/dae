@@ -10,12 +10,15 @@ import (
 )
 
 // canResolveTCPRelayOffloadConn reports whether the connection is
-// offload-capable (both ends resolve to concrete TCP sockets), so link logs
-// can annotate offload outcome and skip reasons.
+// offload-capable (both ends resolve to concrete TCP sockets through
+// transparent wrappers only), so link logs can annotate offload outcome and
+// skip reasons. It must use the same data-movement unwrap as the offload gate
+// itself; a peeling predicate would annotate wrapped legs as capable while the
+// session gate refuses them.
 func canResolveTCPRelayOffloadConn(conn netproxy.Conn) bool {
 	if conn == nil {
 		return false
 	}
-	_, ok := unwrapRelayTCPConn(conn)
+	_, ok := unwrapRelayTransparentTCPConn(conn)
 	return ok
 }

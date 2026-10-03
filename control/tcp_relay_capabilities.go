@@ -48,6 +48,41 @@ var (
 	_ relayPrefixSource       = (*prefixedConn)(nil)
 )
 
+// unwrapRelayTransparentTCPConn resolves conn to a TCP socket only when
+// every wrapper in between passes bytes through unmodified. Conns that
+// transform the byte stream (protocol framing, TLS encryption, QUIC
+// streams, read buffering) advertise themselves through the fork's
+// capability interfaces; once any transforming layer is seen the chain is
+// not splice- or writev-safe and the walk reports failure. Callers that
+// only observe socket state (pending-byte probes, socket options) use
+// unwrapRelayTCPConn instead: peeling through a transforming conn is safe
+// for observation and unsafe for data movement.
+func unwrapRelayTransparentTCPConn(conn any) (*net.TCPConn, bool) {
+	for range relayConnChainMaxDepth {
+		if conn == nil {
+			return nil, false
+		}
+		switch c := conn.(type) {
+		case *net.TCPConn:
+			return c, true
+		case *prefixedConn:
+			conn = c.Conn
+		case *sniffing.ConnSniffer:
+			if tcpConn, ok := c.UnwrapTCPConn(); ok {
+				return tcpConn, true
+			}
+			conn = c.Conn
+		case netproxy.ReadBufferer, netproxy.IntrinsicConnProvider:
+			return nil, false
+		case netproxy.UnderlyingConnProvider:
+			conn = c.UnderlyingConn()
+		default:
+			return nil, false
+		}
+	}
+	return nil, false
+}
+
 const relayConnChainMaxDepth = 8
 
 // unwrapRelayTCPConn resolves transparent wrappers down to a concrete TCP

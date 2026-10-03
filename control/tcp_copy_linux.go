@@ -55,8 +55,8 @@ func relayFastCopy(ctx context.Context, dst netproxy.Conn, src netproxy.Conn, re
 	// sets SetReadDeadline(past) on both connections, which causes io.Copy to
 	// return with a timeout error, unblocking the pending direction immediately.
 
-	dstTCP, dstOk := unwrapRelayTCPConn(dst)
-	srcTCP, srcOk := unwrapRelayTCPConn(src)
+	dstTCP, dstOk := unwrapRelayTransparentTCPConn(dst)
+	srcTCP, srcOk := unwrapRelayTransparentTCPConn(src)
 
 	// Fast path: both sides are plain TCP connections
 	if dstOk && srcOk {
@@ -344,6 +344,6 @@ func shouldUseRelayFastPath(dst netproxy.Conn, src netproxy.Conn) bool {
 }
 
 func isRelayFastPathWhitelistedConn(c netproxy.Conn) bool {
-	_, ok := unwrapRelayTCPConn(c)
+	_, ok := unwrapRelayTransparentTCPConn(c)
 	return ok
 }

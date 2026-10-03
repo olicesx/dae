@@ -424,7 +424,7 @@ func closeWriteRelayConn(conn netproxy.Conn) {
 	if conn == nil {
 		return
 	}
-	if tcp, ok := unwrapRelayTCPConn(conn); ok {
+	if tcp, ok := unwrapRelayTransparentTCPConn(conn); ok {
 		_ = tcp.CloseWrite()
 		return
 	}
@@ -692,8 +692,8 @@ func (c *bufioConn) CopyRelayRemainder(ctx context.Context, dst io.Writer, buf [
 	// TCP sockets, allowing the normal splice-based fast path to continue.
 	if c.reader.Buffered() == 0 {
 		if dstConn, ok := dst.(netproxy.Conn); ok {
-			if dstTCP, ok := unwrapRelayTCPConn(dstConn); ok {
-				if srcTCP, ok := unwrapRelayTCPConn(c.Conn); ok {
+			if dstTCP, ok := unwrapRelayTransparentTCPConn(dstConn); ok {
+				if srcTCP, ok := unwrapRelayTransparentTCPConn(c.Conn); ok {
 					return relaySpliceCopyExact(ctx, dstTCP, srcTCP, record, onActive)
 				}
 			}

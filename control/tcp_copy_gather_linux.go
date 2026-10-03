@@ -145,7 +145,7 @@ func relayGatherWriteTCPConn(conn netproxy.Conn) (*net.TCPConn, bool) {
 }
 
 func relayGatherWriteTo(dst netproxy.Conn, segs [][]byte) (written int, err error) {
-	if dstTCP, ok := relayGatherWriteTCPConn(dst); ok {
+	if dstTCP, ok := unwrapRelayTransparentTCPConn(dst); ok {
 		rawConn, err := dstTCP.SyscallConn()
 		if err != nil {
 			return 0, err

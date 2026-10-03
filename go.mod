@@ -115,7 +115,7 @@ require (
 // control, and explicit-transport address behavior. Performance and security
 // claims are enforced in the fork's own unit/race gates; no GC behavior is
 // inferred from pool implementation choice here.
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260910141758-62d80bbebb5b
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20261003000424-f64271925d81
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
@@ -146,4 +146,5 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260910
 // instead of a MaxUDPSize (2048) staging pool, so a reply larger than 2048
 // bytes is delivered rather than reported as a short-buffer drop; oversized
 // datagrams still surface the typed drop instead of being split.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261001102423-4163e01a20a9
+
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-20261003001843-fae1e14b4f48

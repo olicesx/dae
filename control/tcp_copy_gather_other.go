@@ -11,3 +11,7 @@ import (
 func tryRelayGatherWrite(_ context.Context, _ netproxy.Conn, _ netproxy.Conn, _ func(int64)) (written int64, err error, ok bool) {
 	return 0, nil, false
 }
+
+func relaySteadyGatherCopy(_ context.Context, _ netproxy.Conn, _ netproxy.Conn, _ func(int64), _ func(int64)) (written int64, err error, ok bool) {
+	return 0, nil, false
+}

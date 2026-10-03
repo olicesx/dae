@@ -55,13 +55,26 @@ func TestClassifyForwardError(t *testing.T) {
 	}
 }
 
-// TestErrorClassOrderLock asserts the rule order that makes classification
-// deterministic: caller abort outranks everything (a cancellation wrapping a
-// datagram drop is still caller-driven), and the drop family outranks the
-// soft-auth string matchers.
+// TestErrorClassOrderLock pins the rule order through classification itself:
+// an error matching two rules must resolve to the earlier one. The const
+// order carries no behavior, so asserting iota values would be tautological.
 func TestErrorClassOrderLock(t *testing.T) {
-	if ClassCallerAbort >= ClassDatagramDropped || ClassDatagramDropped >= ClassSoftAuth {
-		t.Fatalf("unexpected class ordering: abort=%d dropped=%d softauth=%d",
-			ClassCallerAbort, ClassDatagramDropped, ClassSoftAuth)
+	// A cancellation wrapping a datagram drop is still caller-driven.
+	canceledDrop := fmt.Errorf("read canceled: %w", context.Canceled)
+	canceledDrop = fmt.Errorf("%w: %w", canceledDrop, io.ErrShortBuffer)
+	if !IsCanceledOrClosed(canceledDrop) {
+		t.Fatal("fixture sanity: canceledDrop must match the abort rule")
+	}
+	if got := ClassifyForwardError(canceledDrop); got != ClassCallerAbort {
+		t.Fatalf("a cancellation wrapping a drop classified %v, want ClassCallerAbort (abort outranks drop)", got)
+	}
+
+	// A drop whose message also matches the soft-auth family stays a drop.
+	dropWithAuthText := fmt.Errorf("read: cipher: message authentication failed: %w", io.ErrShortBuffer)
+	if !IsAuthError(dropWithAuthText) {
+		t.Fatal("fixture sanity: dropWithAuthText must match the soft-auth rule")
+	}
+	if got := ClassifyForwardError(dropWithAuthText); got != ClassDatagramDropped {
+		t.Fatalf("a drop carrying auth text classified %v, want ClassDatagramDropped (drop outranks soft-auth)", got)
 	}
 }

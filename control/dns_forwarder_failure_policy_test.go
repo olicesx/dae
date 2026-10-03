@@ -9,11 +9,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
 	commonerrors "github.com/daeuniverse/dae/common/errors"
+	componentdialer "github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/require"
@@ -91,10 +93,41 @@ func TestHandleDnsForwardFailureDropKeepsForwarderAndDialer(t *testing.T) {
 		controller.dnsForwarderCache.Store(key, entry)
 		return key, entry
 	}
-	udpArg := &dialArgument{l4proto: consts.L4ProtoStr_UDP, ipversion: consts.IpVersionStr_4}
+	// The dialer half of the contract needs an observable dialer: a forced
+	// unavailability report lands on the dialer's own logger ("Connectivity
+	// Check Failed"), so the fixture dialer is built on the same hooked
+	// logger and both rows assert the drop never reaches it while the hard
+	// failure does.
+	newDialArg := func(t *testing.T) *dialArgument {
+		t.Helper()
+		d := componentdialer.NewDialerContext(t.Context(),
+			&scriptedDialer{},
+			&componentdialer.GlobalOption{
+				Log:           logger,
+				CheckInterval: time.Second,
+			},
+			componentdialer.InstanceOption{DisableCheck: true},
+			&componentdialer.Property{},
+		)
+		return &dialArgument{
+			l4proto:    consts.L4ProtoStr_UDP,
+			ipversion:  consts.IpVersionStr_4,
+			bestDialer: d,
+		}
+	}
+	countMessage := func(substr string) int {
+		n := 0
+		for _, e := range hook.AllEntries() {
+			if strings.Contains(e.Message, substr) {
+				n++
+			}
+		}
+		return n
+	}
 
 	t.Run("dropped datagram", func(t *testing.T) {
 		key, entry := newEntry(t)
+		udpArg := newDialArg(t)
 		before := controller.dnsDroppedDatagrams.Load()
 		controller.handleDnsForwardFailure(nil, udpArg, key, entry,
 			fmt.Errorf("read udp: %w", io.ErrShortBuffer))
@@ -104,37 +137,50 @@ func TestHandleDnsForwardFailureDropKeepsForwarderAndDialer(t *testing.T) {
 			"drop must feed the counter the janitor publishes")
 		_, stillCached := controller.dnsForwarderCache.Load(key)
 		require.True(t, stillCached, "drop must keep the cached forwarder")
-		require.Len(t, hook.Entries, 1)
+		require.Equal(t, 1, countMessage("dropped a datagram"))
 		require.Equal(t, logrus.DebugLevel, hook.LastEntry().Level)
-		require.Contains(t, hook.LastEntry().Message, "dropped a datagram")
+		require.Zero(t, countMessage("Connectivity Check Failed"),
+			"a drop must never report the dialer unavailable")
 		hook.Reset()
 	})
 
 	t.Run("caller abort is silent", func(t *testing.T) {
 		key, entry := newEntry(t)
-		controller.handleDnsForwardFailure(nil, udpArg, key, entry, context.Canceled)
+		controller.handleDnsForwardFailure(nil, newDialArg(t), key, entry, context.Canceled)
 		require.EqualValues(t, 0, entry.consecutiveErrors.Load())
 		require.False(t, entry.retired.Load())
-		require.Empty(t, hook.Entries, "cancellation must not log")
+		require.Zero(t, countMessage("DNS forward to upstream failed"), "cancellation must not log")
+		require.Zero(t, countMessage("Connectivity Check Failed"))
+		hook.Reset()
 	})
 
 	t.Run("local backpressure is silent", func(t *testing.T) {
 		key, entry := newEntry(t)
-		controller.handleDnsForwardFailure(nil, udpArg, key, entry,
+		controller.handleDnsForwardFailure(nil, newDialArg(t), key, entry,
 			fmt.Errorf("pool: %w", ErrDNSUDPConnPoolExhausted))
 		require.EqualValues(t, 0, entry.consecutiveErrors.Load())
-		require.Empty(t, hook.Entries)
+		require.Zero(t, countMessage("DNS forward to upstream failed"))
+		require.Zero(t, countMessage("Connectivity Check Failed"))
+		hook.Reset()
 	})
 
-	t.Run("hard failure counts, retires, warns", func(t *testing.T) {
+	t.Run("hard failure counts, retires, warns, reports the dialer", func(t *testing.T) {
 		key, entry := newEntry(t)
-		controller.handleDnsForwardFailure(nil, udpArg, key, entry, io.ErrUnexpectedEOF)
+		hardArg := newDialArg(t)
+		controller.handleDnsForwardFailure(nil, hardArg, key, entry, io.ErrUnexpectedEOF)
 		require.EqualValues(t, 1, entry.consecutiveErrors.Load())
 		require.True(t, entry.retired.Load(), "UDP hard failure must retire the forwarder")
 		_, stillCached := controller.dnsForwarderCache.Load(key)
 		require.False(t, stillCached)
-		require.Len(t, hook.Entries, 1)
-		require.Equal(t, logrus.WarnLevel, hook.LastEntry().Level)
-		require.Contains(t, hook.LastEntry().Message, "DNS forward to upstream failed")
+		require.Equal(t, 1, countMessage("DNS forward to upstream failed"))
+		for _, e := range hook.AllEntries() {
+			if strings.Contains(e.Message, "DNS forward to upstream failed") {
+				require.Equal(t, logrus.WarnLevel, e.Level)
+			}
+		}
+		// The dialer half of the contract: the hard failure's report lands on
+		// the dialer as a forced-unavailable connectivity-check failure — the
+		// exact event the drop row above proves never fires for a drop.
+		require.Equal(t, 1, countMessage("Connectivity Check Failed"))
 	})
 }

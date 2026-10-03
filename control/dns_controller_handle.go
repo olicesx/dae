@@ -471,7 +471,12 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 		// of an unsendable datagram; every other UDP send path already does.
 		// truncateDNSResponse unpacks into a fresh message, so the shared
 		// singleflight result is never mutated.
-		data = truncateDNSResponse(data, dnsUDPResponseSizeLimit(dnsMessage))
+		if clientLimit := dnsUDPResponseSizeLimit(dnsMessage); len(data) > clientLimit {
+			// The datagram leaves with TC=1 set: count it in the truncation
+			// summary like every other delivery path.
+			c.noteDnsTruncatedReplyToClient()
+			data = truncateDNSResponse(data, clientLimit)
+		}
 		if req == nil || req.lConn == nil {
 			return fmt.Errorf("dns request connection is nil for singleflight response")
 		}

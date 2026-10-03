@@ -258,13 +258,35 @@ func batchDeleteIgnoringMissing(vKeys reflect.Value, deleteBatch func(keys any) 
 	return deleted, nil
 }
 
-var detectCgroupPathCached = sync.OnceValues(scanCgroupPath)
+// detectCgroupPathMu guards the success-only probe cache below. A failure is
+// never cached: a transient scan failure (EMFILE, or a container that mounts
+// cgroup2 slightly after dae starts) must recover at the next reload instead
+// of freezing "cgroup2 is not enabled" for the life of the process.
+var (
+	detectCgroupPathMu    sync.Mutex
+	detectCgroupPathValue string
+	detectCgroupPathFound bool
+
+	// scanCgroupPathFn is the test seam over the real /proc/mounts scan.
+	scanCgroupPathFn = scanCgroupPath
+)
 
 // detectCgroupPath returns the first-found mount point of type cgroup2,
-// caching the result for the lifetime of the process to avoid repeatedly
-// scanning /proc/mounts on reloads or multiple setups.
+// caching a successful result for the lifetime of the process to avoid
+// repeatedly scanning /proc/mounts on reloads or multiple setups. A failed
+// scan is retried on the next call.
 func detectCgroupPath() (string, error) {
-	return detectCgroupPathCached()
+	detectCgroupPathMu.Lock()
+	defer detectCgroupPathMu.Unlock()
+	if detectCgroupPathFound {
+		return detectCgroupPathValue, nil
+	}
+	path, err := scanCgroupPathFn()
+	if err != nil {
+		return "", err
+	}
+	detectCgroupPathValue, detectCgroupPathFound = path, true
+	return path, nil
 }
 
 func scanCgroupPath() (string, error) {

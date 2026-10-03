@@ -149,7 +149,9 @@ func TestMergeAndSortRulesOptimizerDoesNotMergeInvertedSingletons(t *testing.T) 
 
 // TestDatReaderOptimizerRejectsExtParamWithoutColon pins that a malformed ext
 // value surfaces as a configuration error instead of an index-out-of-range
-// panic that kills dae validate / dae run at startup.
+// panic that kills dae validate / dae run at startup. The error must name the
+// rule's outbound and render the rule itself, so the operator can find the
+// offending line in the config.
 func TestDatReaderOptimizerRejectsExtParamWithoutColon(t *testing.T) {
 	rules := []*config_parser.RoutingRule{
 		{
@@ -161,7 +163,7 @@ func TestDatReaderOptimizerRejectsExtParamWithoutColon(t *testing.T) {
 					},
 				},
 			},
-			Outbound: config_parser.Function{Name: "out"},
+			Outbound: config_parser.Function{Name: "myproxy"},
 		},
 	}
 	_, err := (&DatReaderOptimizer{}).Optimize(rules)
@@ -170,5 +172,10 @@ func TestDatReaderOptimizerRejectsExtParamWithoutColon(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "malformed ext param") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, want := range []string{"myproxy", "domain", "nocolonvalue"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("malformed-ext error lacks rule context %q: %v", want, err)
+		}
 	}
 }

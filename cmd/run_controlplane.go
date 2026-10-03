@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
@@ -161,6 +162,38 @@ func configureGcMemoryLimit(log *logrus.Logger) {
 	}
 }
 
+// subscriptionResult is one subscription fetch outcome. The fetching goroutine
+// writes it into the slot of its config position and the slice is read only
+// after all fetches complete, so the arrival order never becomes observable.
+type subscriptionResult struct {
+	tag     string
+	nodes   []string
+	err     error
+	sub     config.KeyableString
+	elapsed time.Duration
+}
+
+// mergeSubscriptionResults folds fetch results into tagToNodeList and reports
+// whether any subscription failed to resolve. Results are processed in
+// subscription config order (the slice is indexed by config position, not
+// arrival order), so two subscription entries that share one tag always yield
+// the same within-tag node order across reloads; the parallel fetch order must
+// not move what fixed(0) selects between generations.
+func mergeSubscriptionResults(log *logrus.Logger, tagToNodeList map[string][]string, results []subscriptionResult) (resolvingFailed bool) {
+	for _, result := range results {
+		if result.err != nil {
+			log.Warnf(`failed to resolve subscription "%v" after %v: %v`, result.sub, result.elapsed, result.err)
+			resolvingFailed = true
+		} else {
+			log.Infof(`subscription "%v" resolved %d node(s) in %v`, result.tag, len(result.nodes), result.elapsed)
+		}
+		if len(result.nodes) > 0 {
+			tagToNodeList[result.tag] = append(tagToNodeList[result.tag], result.nodes...)
+		}
+	}
+	return resolvingFailed
+}
+
 func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {
 	// Deep copy to prevent modification.
 	conf = deepcopy.Copy(conf).(*config.Config)
@@ -254,13 +287,6 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	}
 	// Parallelize subscription resolution to improve startup performance.
 	// Use a semaphore to limit concurrency and avoid overwhelming the network.
-	type subscriptionResult struct {
-		tag     string
-		nodes   []string
-		err     error
-		sub     config.KeyableString
-		elapsed time.Duration
-	}
 	numSubscriptions := len(conf.Subscription)
 	if numSubscriptions > 0 {
 		// Reset to cover only the fetch itself; the network-wait phase above is
@@ -270,10 +296,16 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 		// Limit concurrency to 4 subscriptions at a time to avoid overwhelming network
 		maxConcurrency := min(numSubscriptions, 4)
 		sem := make(chan struct{}, maxConcurrency)
-		results := make(chan subscriptionResult, numSubscriptions)
+		// Each fetching goroutine writes only its own slot (its config
+		// position), and the slice is read after fetchWG.Wait, so every result
+		// is visible regardless of the completion order.
+		results := make([]subscriptionResult, numSubscriptions)
+		var fetchWG sync.WaitGroup
 
-		for _, sub := range conf.Subscription {
-			go func(s config.KeyableString) {
+		for i, sub := range conf.Subscription {
+			fetchWG.Add(1)
+			go func(idx int, s config.KeyableString) {
+				defer fetchWG.Done()
 				sem <- struct{}{}        // Acquire semaphore
 				defer func() { <-sem }() // Release semaphore
 
@@ -282,7 +314,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 				if daeDNSRouter != nil {
 					wrappedDialer, wrapErr := daeDNSRouter.WrapSubscriptionDialer(subDialer, string(s))
 					if wrapErr != nil {
-						results <- subscriptionResult{
+						results[idx] = subscriptionResult{
 							err: wrapErr,
 							sub: s,
 						}
@@ -292,30 +324,24 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 				}
 				client := newHTTPClientForDialer(subDialer, 30*time.Second, conf.Global.SoMarkFromDae, conf.Global.Mptcp)
 				tag, nodes, err := subscription.ResolveSubscription(log, &client, filepath.Dir(cfgFile), string(s))
-				results <- subscriptionResult{
+				results[idx] = subscriptionResult{
 					tag:     tag,
 					nodes:   nodes,
 					err:     err,
 					sub:     s,
 					elapsed: time.Since(subStart),
 				}
-			}(sub)
+			}(i, sub)
 		}
 
-		// Collect results
-		for range numSubscriptions {
-			result := <-results
-			if result.err != nil {
-				log.Warnf(`failed to resolve subscription "%v" after %v: %v`, result.sub, result.elapsed, result.err)
-				resolvingfailed = true
-			} else {
-				log.Infof(`subscription "%v" resolved %d node(s) in %v`, result.tag, len(result.nodes), result.elapsed)
-			}
-			if len(result.nodes) > 0 {
-				tagToNodeList[result.tag] = append(tagToNodeList[result.tag], result.nodes...)
-			}
+		fetchWG.Wait()
+		// Merge in subscription config order, not goroutine-arrival order: two
+		// subscription entries sharing one tag must produce the same
+		// within-tag node order on every reload, or what fixed(0) selects
+		// moves between generations.
+		if mergeSubscriptionResults(log, tagToNodeList, results) {
+			resolvingfailed = true
 		}
-		close(results)
 		log.Infof("Subscriptions fetched in %v", time.Since(stageStart))
 	}
 

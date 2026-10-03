@@ -149,26 +149,24 @@ func (a *AliveDialerSet) GetMinLatency(excluded *Dialer) (d *Dialer, latency tim
 	}
 
 	// Find the best non-excluded dialer.
-	// Using aliveEntries with direct field access avoids map lookups.
+	// Using aliveEntries with direct field access avoids map lookups, and the
+	// shared comparator keeps this scan's two-tier order identical to every
+	// other selection site.
 	var nextBest *Dialer
-	var nextBestSortingLatency = time.Hour
-	var nextBestHasLatency bool
+	nextBestEntry := aliveEntry{sortingLatency: time.Hour}
 	for i := range a.aliveEntries {
-		entry := &a.aliveEntries[i]
+		entry := a.aliveEntries[i]
 		if entry.dialer == excluded {
 			continue
 		}
-		if nextBest == nil ||
-			(entry.hasLatency && !nextBestHasLatency) ||
-			(entry.hasLatency == nextBestHasLatency && entry.sortingLatency < nextBestSortingLatency) {
-			nextBestSortingLatency = entry.sortingLatency
-			nextBestHasLatency = entry.hasLatency
+		if nextBest == nil || aliveEntryLess(entry, nextBestEntry) {
+			nextBestEntry = entry
 			nextBest = entry.dialer
 		}
 	}
 
 	if nextBest != nil {
-		return nextBest, nextBestSortingLatency
+		return nextBest, nextBestEntry.sortingLatency
 	}
 
 	// No dialer available
@@ -185,6 +183,13 @@ type latencySnapshotEntry struct {
 	tag     string
 	latency time.Duration
 	offset  time.Duration
+	// hasLatency and sortingLatency carry the measurement class and the
+	// selection key so the render can order rows with the very comparator the
+	// selection uses. They duplicate the display numbers above on purpose
+	// instead of embedding aliveEntry, whose dialer pointer must not leak out
+	// of the lock.
+	hasLatency     bool
+	sortingLatency time.Duration
 }
 
 // latencySnapshot is the lock-free rendering input for printLatenciesOutOfLock.
@@ -210,13 +215,14 @@ func (a *AliveDialerSet) snapshotLatenciesLocked() (latencySnapshot, bool) {
 	}
 	for i := range a.aliveEntries {
 		d := a.aliveEntries[i].dialer
-		latency, ok := a.dialerToLatency[d]
-		if !ok {
-			continue
-		}
 		entry := latencySnapshotEntry{
-			latency: latency,
-			offset:  a.dialerToLatencyOffset[d],
+			// dialerToLatency only carries measured dialers; an unmeasured one
+			// shows no raw latency and only its offset-derived key, which is
+			// exactly the state the class column must make visible.
+			latency:        a.dialerToLatency[d],
+			offset:         a.dialerToLatencyOffset[d],
+			hasLatency:     a.aliveEntries[i].hasLatency,
+			sortingLatency: a.aliveEntries[i].sortingLatency,
 		}
 		if d != nil && d.property != nil {
 			entry.name = d.property.Name
@@ -237,16 +243,25 @@ func (a *AliveDialerSet) snapshotLatenciesLocked() (latencySnapshot, bool) {
 // dialers it is N lines per best-dialer change, which is exactly the kind of
 // detail log_level=debug exists for. It is not removed, because the ordering
 // behind a selection decision is what an operator needs when they disagree
-// with the choice.
+// with the choice. Rows are ordered by the shared selection comparator
+// (measurement class first, then key) and carry their class, so a mixed-class
+// group shows why a measured dialer outranks a lower raw key.
 func (a *AliveDialerSet) printLatenciesOutOfLock(snap latencySnapshot) {
 	alive := snap.entries
+	sortKey := func(e latencySnapshotEntry) aliveEntry {
+		return aliveEntry{sortingLatency: e.sortingLatency, hasLatency: e.hasLatency}
+	}
 	sort.SliceStable(alive, func(i, j int) bool {
-		return alive[i].latency+alive[i].offset < alive[j].latency+alive[j].offset
+		return aliveEntryLess(sortKey(alive[i]), sortKey(alive[j]))
 	})
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "Group '%v' [%v]:\n", snap.group, snap.network)
 	for i, dl := range alive {
-		fmt.Fprintf(&builder, "%4d. [%v] %v: %v\n", i+1, dl.tag, dl.name, latencyString(dl.latency, dl.offset))
+		class := "measured"
+		if !dl.hasLatency {
+			class = "unmeasured"
+		}
+		fmt.Fprintf(&builder, "%4d. %-10s [%v] %v: %v\n", i+1, class, dl.tag, dl.name, latencyString(dl.latency, dl.offset))
 	}
 	a.log.Debugln(strings.TrimSuffix(builder.String(), "\n"))
 }
@@ -394,6 +409,7 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 	if hasLatency {
 		bakOldBestDialer := a.minLatency.dialer
 		bakOldMinSortingLatency := a.minLatency.sortingLatency
+		bakOldMinHasLatency := a.minLatency.hasLatency
 		// Calc minLatency.
 		a.dialerToLatency[dialer] = rawLatency
 		// Update sorting latency in aliveEntries for GetMinLatency hot path optimization.
@@ -447,6 +463,12 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 					reason := "best latency"
 					if bakOldBestDialer == nil {
 						reason = "no dialer was alive"
+					} else if bakOldMinHasLatency != a.minLatency.hasLatency {
+						// The selection crossed the measured/unmeasured class
+						// boundary (a measurement arrived on the new best, or
+						// disappeared from the old one). That is a correction
+						// of the class bookkeeping, not a latency improvement.
+						reason = "class correction"
 					}
 					fields := logrus.Fields{
 						string(a.selectionPolicy): latencyString(newBestLatency, newBestOffset),
@@ -457,7 +479,11 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 						"group":                   a.dialerGroupName,
 						"network":                 a.CheckTyp.String(),
 					}
-					if bakOldBestDialer != nil {
+					if bakOldBestDialer != nil && bakOldMinHasLatency && a.minLatency.hasLatency {
+						// The delta is only meaningful between two real
+						// measurements: against an unmeasured side's key it is
+						// a delta against a phantom weight and reads like a
+						// regression (see the class-correction reason above).
 						delta := newBestLatency + newBestOffset - bakOldMinSortingLatency
 						fields["latency_delta_ms"] = delta.Milliseconds()
 					}
@@ -498,7 +524,7 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 			a.aliveEntries[index].hasLatency = hasLatency
 		}
 		wasNoAliveDialer := a.minLatency.dialer == nil
-		if wasNoAliveDialer || (!a.minLatency.hasLatency && sortingLatency < a.minLatency.sortingLatency) {
+		if a.takeOverMinLocked(hasLatency, sortingLatency) {
 			a.minLatency.dialer = dialer
 			a.minLatency.sortingLatency = sortingLatency
 			a.minLatency.hasLatency = hasLatency
@@ -532,50 +558,72 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 	}
 }
 
+// aliveEntryLess reports whether cand ranks strictly below cur in the group's
+// selection order: a dialer with a live measurement always outranks one
+// without, and within a class the sorting key (raw latency plus the add_latency
+// offset) decides. Scans use it to find the group's true minimum; it never
+// applies check_tolerance.
+func aliveEntryLess(cand, cur aliveEntry) bool {
+	if cand.hasLatency != cur.hasLatency {
+		return cand.hasLatency
+	}
+	return cand.sortingLatency < cur.sortingLatency
+}
+
+// takeOverLocked reports whether a candidate should displace the incumbent
+// best. The class tier and the unmeasured comparison are delegated to
+// aliveEntryLess so the takeover rule cannot drift from the scan order.
+// check_tolerance hysteresis applies only between two MEASURED dialers, where
+// it damps probe jitter; two unmeasured dialers compare their configured keys
+// plainly (no tolerance), because add_latency is an exact weight rather than a
+// jittery measurement, and hysteresis there would reject a strictly better
+// configured peer — the asymmetry the incumbent-refresh path used to expose
+// when calcMinLatency applied tolerance but a direct notification did not.
+// Callers must hold a.mu.
+func (a *AliveDialerSet) takeOverLocked(cand, cur aliveEntry) bool {
+	if cand.hasLatency != cur.hasLatency || !cand.hasLatency {
+		return aliveEntryLess(cand, cur)
+	}
+	return cand.sortingLatency <= cur.sortingLatency &&
+		(cur.sortingLatency < a.tolerance || cand.sortingLatency <= cur.sortingLatency-a.tolerance)
+}
+
 // takeOverMinLocked reports whether a candidate latency reading should
-// displace the incumbent best. A live measurement always outranks the absence
-// of one, so an unmeasured dialer can never beat a measured dialer regardless
-// of add_latency; within the same class the historical rule applies.
+// displace the incumbent best, under the shared two-tier order of
+// aliveEntryLess and takeOverLocked. A live measurement always outranks the
+// absence of one, so an unmeasured dialer can never beat a measured dialer
+// regardless of add_latency; within the same class the historical rule applies.
 // Callers must hold a.mu.
 func (a *AliveDialerSet) takeOverMinLocked(candHas bool, candLat time.Duration) bool {
 	if a.minLatency.dialer == nil {
 		return true
 	}
-	if candHas != a.minLatency.hasLatency {
-		return candHas
-	}
-	if !candHas {
-		return candLat < a.minLatency.sortingLatency
-	}
-	return candLat <= a.minLatency.sortingLatency &&
-		(a.minLatency.sortingLatency < a.tolerance || candLat <= a.minLatency.sortingLatency-a.tolerance)
+	return a.takeOverLocked(
+		aliveEntry{sortingLatency: candLat, hasLatency: candHas},
+		aliveEntry{sortingLatency: a.minLatency.sortingLatency, hasLatency: a.minLatency.hasLatency},
+	)
 }
 
 func (a *AliveDialerSet) calcMinLatency() {
-	var minLatency = time.Hour
-	var minHasLatency bool
+	minEntry := aliveEntry{sortingLatency: time.Hour}
 	var minDialer *Dialer
 	for i := range a.aliveEntries {
-		entry := &a.aliveEntries[i]
-		if minDialer == nil ||
-			(entry.hasLatency && !minHasLatency) ||
-			(entry.hasLatency == minHasLatency && entry.sortingLatency < minLatency) {
-			minLatency = entry.sortingLatency
-			minHasLatency = entry.hasLatency
+		entry := a.aliveEntries[i]
+		if minDialer == nil || aliveEntryLess(entry, minEntry) {
+			minEntry = entry
 			minDialer = entry.dialer
 		}
 	}
 	if a.minLatency.dialer == nil {
-		a.minLatency.sortingLatency = minLatency
-		a.minLatency.hasLatency = minHasLatency
+		a.minLatency.sortingLatency = minEntry.sortingLatency
+		a.minLatency.hasLatency = minEntry.hasLatency
 		a.minLatency.dialer = minDialer
-	} else if minDialer != nil &&
-		(minHasLatency && !a.minLatency.hasLatency ||
-			(minHasLatency == a.minLatency.hasLatency &&
-				minLatency <= a.minLatency.sortingLatency &&
-				(a.minLatency.sortingLatency < a.tolerance || minLatency <= a.minLatency.sortingLatency-a.tolerance))) {
-		a.minLatency.sortingLatency = minLatency
-		a.minLatency.hasLatency = minHasLatency
+	} else if minDialer != nil && a.takeOverLocked(
+		minEntry,
+		aliveEntry{sortingLatency: a.minLatency.sortingLatency, hasLatency: a.minLatency.hasLatency},
+	) {
+		a.minLatency.sortingLatency = minEntry.sortingLatency
+		a.minLatency.hasLatency = minEntry.hasLatency
 		a.minLatency.dialer = minDialer
 	}
 }

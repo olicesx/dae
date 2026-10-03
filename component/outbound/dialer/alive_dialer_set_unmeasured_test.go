@@ -185,6 +185,69 @@ func TestIncumbentLosingItsMeasurementIsReconciled(t *testing.T) {
 	}
 }
 
+// TestUnmeasuredPeerTakesOverIncumbentWithoutTolerance pins the F1 symmetry:
+// between two UNMEASURED dialers check_tolerance must not apply. The
+// incumbent-refresh path (an incumbent that loses its measurement while staying
+// alive) used to run the tolerance clause in calcMinLatency's takeover arm, so a
+// better-keyed unmeasured peer within tolerance of the refreshed incumbent was
+// rejected, while the very same peer notifying directly took over with a plain
+// key comparison. add_latency is an exact weight, not a jittery measurement, so
+// there is nothing to damp inside the unmeasured class.
+func TestUnmeasuredPeerTakesOverIncumbentWithoutTolerance(t *testing.T) {
+	networkType := newTestNetworkType()
+	incumbent := newNamedTestDialer(t, "tolerance-incumbent")
+	peer := newNamedTestDialer(t, "tolerance-peer")
+
+	setMovingAverage := func(d *Dialer, v time.Duration) {
+		d.collectionFineMu.Lock()
+		d.mustGetCollection(networkType).MovingAverage = v
+		d.collectionFineMu.Unlock()
+	}
+	// The incumbent starts measured (100ms + a 200ms offset = key 300ms), so it
+	// wins construction-time selection against the unmeasured peer (key 150ms).
+	// When the incumbent then loses its measurement, its key refreshes to the
+	// offset-only 200ms: still worse than the peer's 150ms, but by less than the
+	// 100ms check_tolerance configured below.
+	setMovingAverage(incumbent, 100*time.Millisecond)
+
+	set := NewAliveDialerSet(
+		incumbent.Log,
+		"unmeasured-tolerance-group",
+		networkType,
+		100*time.Millisecond, // check_tolerance: large enough to swallow the gap
+		consts.DialerSelectionPolicy_MinMovingAverageLatencies,
+		[]*Dialer{incumbent, peer},
+		[]*Annotation{
+			{AddLatency: 200 * time.Millisecond},
+			{AddLatency: 150 * time.Millisecond},
+		},
+		func(bool) {},
+		true,
+	)
+	incumbent.RegisterAliveDialerSet(set)
+	peer.RegisterAliveDialerSet(set)
+	t.Cleanup(func() {
+		incumbent.UnregisterAliveDialerSet(set)
+		peer.UnregisterAliveDialerSet(set)
+	})
+
+	if got, _ := set.GetMinLatency(nil); got != incumbent {
+		t.Fatal("initial best dialer is not the measured incumbent; the fixture is wrong")
+	}
+
+	// The incumbent loses its measurement while staying alive (the 6837be5c
+	// incumbent-refresh path): both dialers are now unmeasured and the peer's
+	// key (150ms) is strictly better than the refreshed incumbent's (200ms).
+	setMovingAverage(incumbent, 0)
+	set.NotifyLatencyChange(incumbent, true)
+
+	if got, key := set.GetMinLatency(nil); got != peer {
+		t.Fatalf("best dialer is still the refreshed incumbent (key %v), want the "+
+			"better-keyed unmeasured peer: check_tolerance must not apply inside "+
+			"the unmeasured class", key)
+	}
+}
+
 // TestHugeAddLatencyKeepsAliveDialerSelectable pins the fallback scan
 // semantics that the measurement-class change made explicit: the "time.Hour"
 // scan initializer is not a floor. Asking for the best dialer other than the

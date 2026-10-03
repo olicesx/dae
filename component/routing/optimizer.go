@@ -352,7 +352,12 @@ func (o *DatReaderOptimizer) Optimize(rules []*config_parser.RoutingRule) ([]*co
 					case "ext":
 						fields := strings.SplitN(param.Val, ":", 2)
 						if len(fields) != 2 {
-							loadErr = fmt.Errorf("malformed ext param %v in function %v: want \"file:tag\"", param.Val, f.Name)
+							// Name the rule and its outbound so the operator can
+							// find the offending line; f.Params is only replaced
+							// after the param loop finishes, so the rule still
+							// renders exactly as configured here.
+							loadErr = fmt.Errorf("malformed ext param %v in function %v of routing rule %v -> %v: want \"file:tag\"",
+								param.Val, f.Name, r.String(false, false, false), r.Outbound.Name)
 							break
 						}
 						switch f.Name {

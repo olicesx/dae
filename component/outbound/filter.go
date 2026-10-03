@@ -79,14 +79,12 @@ func (s *DialerSet) AllDialers() []*dialer.Dialer {
 	return append([]*dialer.Dialer(nil), s.dialers...)
 }
 
-// noteParseFailure records one dropped node. The first dropped node of the
-// build warns with the concrete parse error; the rest are folded into a single
-// aggregate line, because a subscription refresh can invalidate hundreds of
-// nodes at once and one warning per node would both flood the log and hide the
-// total, which is the number that matters.
 // sortedSubscriptionTags returns the tag map's keys in a stable order so the
 // dialer list (and therefore what fixed(N) selects) is reproducible across
-// builds and reloads despite Go's randomized map iteration.
+// builds and reloads despite Go's randomized map iteration. The resulting total
+// order is: inline-config nodes first (the empty tag sorts before any
+// subscription tag), then subscription tags alphabetically, and within a tag
+// shared by several subscriptions the subscription config order.
 func sortedSubscriptionTags(tagToNodeList map[string][]string) []string {
 	tags := make([]string, 0, len(tagToNodeList))
 	for tag := range tagToNodeList {
@@ -96,6 +94,11 @@ func sortedSubscriptionTags(tagToNodeList map[string][]string) []string {
 	return tags
 }
 
+// noteParseFailure records one dropped node. The first dropped node of the
+// build warns with the concrete parse error; the rest are folded into a single
+// aggregate line, because a subscription refresh can invalidate hundreds of
+// nodes at once and one warning per node would both flood the log and hide the
+// total, which is the number that matters.
 func (s *DialerSet) noteParseFailure(subscriptionTag string, err error) {
 	if s == nil {
 		return

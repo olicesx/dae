@@ -13,6 +13,7 @@ import (
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus/hooks/test"
 )
 
 // lockProbeWriter fails the test when the latency listing is rendered while
@@ -118,6 +119,80 @@ func TestNotifyLatencyDoesNotHoldWriteLockDuringFormatting(t *testing.T) {
 	_, locked := probe.counts()
 	if len(locked) > 0 {
 		t.Fatalf("latency listing was rendered while the set write lock was held:\n%s", locked[0])
+	}
+}
+
+// TestLatencyTableShowsClassTiers pins the mixed-class render: the debug table
+// is ordered by the selection comparator (measurement class first, then key)
+// and carries each row's class, so an operator reading why a measured dialer
+// was selected over a lower offset-only key sees the class tier spelled out.
+// Sorting by the raw key alone used to rank the unmeasured row first.
+func TestLatencyTableShowsClassTiers(t *testing.T) {
+	networkType := newTestNetworkType()
+	measured := newNamedTestDialer(t, "m-node")
+	unmeasured := newNamedTestDialer(t, "u-node")
+
+	logger, hook := test.NewNullLogger()
+	logger.SetLevel(logrus.DebugLevel)
+	measured.Log = logger
+	unmeasured.Log = logger
+
+	appendLatencyLocked(measured, networkType, 500*time.Millisecond)
+
+	set := NewAliveDialerSet(
+		logger,
+		"tier-group",
+		networkType,
+		0,
+		consts.DialerSelectionPolicy_MinLastLatency,
+		[]*Dialer{measured, unmeasured},
+		[]*Annotation{{}, {AddLatency: -100 * time.Millisecond}},
+		func(bool) {},
+		true,
+	)
+	measured.RegisterAliveDialerSet(set)
+	unmeasured.RegisterAliveDialerSet(set)
+	t.Cleanup(func() {
+		measured.UnregisterAliveDialerSet(set)
+		unmeasured.UnregisterAliveDialerSet(set)
+	})
+
+	snap, ok := set.snapshotLatenciesLocked()
+	if !ok {
+		t.Fatal("latency snapshot was not built at debug level")
+	}
+	set.printLatenciesOutOfLock(snap)
+
+	var table string
+	for _, entry := range hook.AllEntries() {
+		if strings.Contains(entry.Message, "Group 'tier-group'") {
+			table = entry.Message
+		}
+	}
+	if table == "" {
+		t.Fatal("latency table was not rendered")
+	}
+	var measuredRow, unmeasuredRow = -1, -1
+	for i, line := range strings.Split(table, "\n") {
+		switch {
+		case strings.Contains(line, "m-node"):
+			measuredRow = i
+			if !strings.Contains(line, "measured") {
+				t.Fatalf("measured row lacks its class: %v", line)
+			}
+		case strings.Contains(line, "u-node"):
+			unmeasuredRow = i
+			if !strings.Contains(line, "unmeasured") {
+				t.Fatalf("unmeasured row lacks its class: %v", line)
+			}
+		}
+	}
+	if measuredRow < 0 || unmeasuredRow < 0 {
+		t.Fatalf("table is missing a row (measured=%d unmeasured=%d):\n%v", measuredRow, unmeasuredRow, table)
+	}
+	if measuredRow > unmeasuredRow {
+		t.Fatalf("table ranks the unmeasured row above the measured one despite the "+
+			"class tier:\n%v", table)
 	}
 }
 

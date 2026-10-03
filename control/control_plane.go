@@ -614,6 +614,7 @@ func NewControlPlaneWithContextOptions(
 	option.DaeDNS, err = daedns.NewWithOption(log, global, dnsConfig, &daedns.NewOption{
 		LocationFinder: locationFinder,
 		DirectDialer:   directDialer,
+		SystemDNS:      systemDNSResolver,
 	})
 	if err != nil {
 		return nil, err

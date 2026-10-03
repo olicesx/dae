@@ -195,6 +195,11 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 	directDialers := direct.NewDirectDialers(conf.Global.FallbackResolver)
 	systemDNSResolver := netutils.NewSystemDNSResolver(netip.MustParseAddrPort(conf.Global.FallbackResolver))
 	locationFinder := assets.NewLocationFinder(externGeoDataDirs)
+	// The startup router resolves subscription hosts before the runtime
+	// generations exist. It stays bootstrap-only on purpose: the
+	// configured bootstrap resolvers are what an operator pins for a
+	// subscription host, so NewOption.SystemDNS is deliberately left unset and
+	// this router does not silently fall back to the host resolver instead.
 	daeDNSRouter, err := daedns.NewWithOption(log, &conf.Global, &conf.Dns, &daedns.NewOption{
 		LocationFinder: locationFinder,
 		DirectDialer:   directDialers.Symmetric,

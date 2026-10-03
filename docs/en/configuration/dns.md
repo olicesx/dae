@@ -177,9 +177,10 @@ dns {
 
 ## Bootstrap resolver (`global`)
 
-`global.bootstrap_resolver` covers only the lookups that must succeed before
-dae's own DNS routing exists: resolving DNS upstream hostnames and
-`dial_mode: real-domain` probes. Left unset, dae falls back to `119.29.29.29:53`
+`global.bootstrap_resolver` covers the lookups that must succeed before dae's
+own DNS routing can serve them: resolving DNS upstream hostnames,
+`dial_mode: real-domain` probes, and node addresses that no `node`/`sub` rule
+routes (see below). Left unset, dae falls back to `119.29.29.29:53`
 and then `223.5.5.5:53`; setting the option replaces those defaults entirely and
 is used alone. A host outside mainland China usually wants a closer resolver:
 
@@ -188,6 +189,25 @@ global {
   bootstrap_resolver: '9.9.9.9:53'
 }
 ```
+
+A node address that no `node`/`sub` rule in `dns.routing` selects an upstream
+for is resolved through the system resolver and through the bootstrap resolvers
+at the same time, and the first answer wins. The system view is the server in
+`/etc/resolv.conf`, or `global.fallback_resolver` when that file names only
+loopback servers; its query leaves directly, without dae DNS routing. Racing the
+two keeps one blocked resolver from stopping every node: an unusable system
+resolver still reaches the bootstrap resolvers, and blocked bootstrap resolvers
+still resolve through the system view. Because the first answer wins, a host
+resolver that filters or rewrites the node's name decides the address; when the
+two views must not be interchangeable, route that node's hostname in
+`dns.routing.node` to a specific upstream and dae uses it instead.
+
+Two consequences deserve spelling out. A node's hostname now also reaches the
+system resolver even when `global.bootstrap_resolver` is explicitly pinned, so
+an operator who must keep proxy hostnames off the host resolver has to route
+them in `dns.routing.node`. And subscription hosts fetched at startup are still
+resolved through the bootstrap resolvers only: no runtime generation exists yet
+at that point, so the race described above starts with the first generation.
 
 ## Templates
 

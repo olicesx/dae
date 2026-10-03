@@ -57,6 +57,17 @@ var (
 // only observe socket state (pending-byte probes, socket options) use
 // unwrapRelayTCPConn instead: peeling through a transforming conn is safe
 // for observation and unsafe for data movement.
+//
+// The refusal set is a cross-repository contract, safety by enumeration: a
+// fork wrapper that transforms bytes MUST advertise ReadBufferer or
+// IntrinsicConnProvider — one that only implements UnderlyingConnProvider
+// peels straight through here. Two known types do exactly that today and
+// are safe only situationally: the fork's bufferred_conn.BufferedConn
+// (unreachable from dae — every dialer returns a protocol conn above it)
+// and dae's own bufioConn (safe only because the offload gate flushes its
+// buffered prefix before unwrapping; see tcpOffloadFlushLeftPrefix). A new
+// fork wrapper in that shape reopens the offload hole silently; extend the
+// fork's wrapper-parity gates to enforce the advertisement when adding one.
 func unwrapRelayTransparentTCPConn(conn any) (*net.TCPConn, bool) {
 	for range relayConnChainMaxDepth {
 		if conn == nil {

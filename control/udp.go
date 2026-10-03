@@ -508,7 +508,10 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 	}
 	if !c.checkUdpEndpointHealth(ue, true) {
 		ue.retire()
-		return true
+		// Same treatment as the write-failure retirement below: retire, then
+		// decline the shortcut so the triggering datagram is delivered on a
+		// fresh session instead of dying with the drained one.
+		return false
 	}
 	if ue.peerNeedsDedicatedSession(realDst, time.Now()) {
 		// A peer whose mapping the far end has forgotten gets the same treatment

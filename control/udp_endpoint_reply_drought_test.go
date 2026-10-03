@@ -312,3 +312,46 @@ func TestHandlePkt_ReplyDroughtRedialsFreshEndpoint(t *testing.T) {
 		t.Fatalf("replacement droughtRebuildGeneration = %d, want 1 (the rebuild must be carried across remove-and-redial)", got)
 	}
 }
+
+// A flow whose healthy reply cadence is slower than the drought window must
+// not be rebuilt on every quiet gap: once the session has bridged a 60s
+// interval between two replies, the drought threshold rises to
+// window+observed gap, so a 35s silence that would otherwise start a
+// deterministic rebuild loop (one rebuild per few reply periods, forever)
+// keeps the session. Only a silence longer than anything the flow survived
+// while healthy still rebuilds.
+func TestUdpEndpointDroughtLearnsObservedReplyCadence(t *testing.T) {
+	ue, _ := establishedWithDrought(t, 35*time.Second, 300)
+	ue.maxReplyGapNano.Store(60 * time.Second.Nanoseconds())
+
+	if _, err := ue.WriteTo([]byte("telemetry"), "1.2.3.4:9"); err != nil {
+		t.Fatalf("a silence inside the learned cadence must not rebuild: %v", err)
+	}
+	if ue.dead.Load() {
+		t.Fatal("a silence shorter than the flow's own observed reply gap is not drought")
+	}
+
+	ue2, _ := establishedWithDrought(t, udpEndpointReplyDroughtWindow+61*time.Second, 300)
+	ue2.maxReplyGapNano.Store(60 * time.Second.Nanoseconds())
+	if _, err := ue2.WriteTo([]byte("telemetry"), "1.2.3.4:9"); !stderrors.Is(err, daeerrors.ErrClosedConnection) {
+		t.Fatalf("expected ErrClosedConnection once the silence exceeds window+observed gap, got %v", err)
+	}
+}
+
+// markReplied must record the inter-reply interval it observes, monotonically.
+func TestMarkRepliedRecordsReplyGap(t *testing.T) {
+	ue, _ := establishedWithDrought(t, time.Second, 0)
+	now := time.Now().UnixNano()
+	ue.lastReplyNano.Store(now - 42*time.Second.Nanoseconds())
+	ue.markReplied(now, netip.AddrPort{})
+	if got := ue.maxReplyGapNano.Load(); got < 42*time.Second.Nanoseconds() {
+		t.Fatalf("maxReplyGapNano = %d, want >= 42s", got)
+	}
+
+	// A shorter later gap must not lower the learned cadence.
+	ue.lastReplyNano.Store(now - 5*time.Second.Nanoseconds())
+	ue.markReplied(now, netip.AddrPort{})
+	if got := ue.maxReplyGapNano.Load(); got < 42*time.Second.Nanoseconds() {
+		t.Fatalf("maxReplyGapNano = %d, must not decrease", got)
+	}
+}

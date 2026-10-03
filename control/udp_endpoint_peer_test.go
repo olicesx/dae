@@ -347,9 +347,20 @@ func TestUdpEndpointDroughtRebuildBudget(t *testing.T) {
 		}
 		ue, _ := establishedWithDrought(t, udpEndpointReplyDroughtWindow+time.Second, 300)
 		ue.droughtRebuildGeneration = 1
-		for range udpEndpointReplyDroughtMinHealthyReplies - 1 {
-			ue.markReplied(time.Now().UnixNano(), netip.AddrPort{})
+		// tightReplies lands n replies close together: markReplied records
+		// the interval since the previous reply and the drought gate treats a
+		// gap the flow itself bridged while healthy as learned cadence. A
+		// proof built on the backdated reply timestamp of agedEvidence would
+		// teach a 31s cadence and — correctly, see
+		// TestUdpEndpointDroughtLearnsObservedReplyCadence — raise the rebuild
+		// threshold above this fixture's drought.
+		tightReplies := func(n int) {
+			ue.lastReplyNano.Store(time.Now().UnixNano())
+			for range n {
+				ue.markReplied(time.Now().UnixNano(), netip.AddrPort{})
+			}
 		}
+		tightReplies(udpEndpointReplyDroughtMinHealthyReplies - 1)
 		agedEvidence(ue)
 		if err := write(t, ue); err != nil {
 			t.Fatalf("a replacement with too few replies must not rebuild again: %v", err)
@@ -358,9 +369,7 @@ func TestUdpEndpointDroughtRebuildBudget(t *testing.T) {
 			t.Fatal("the recovery budget must keep the session")
 		}
 		// Once the session proves two-way health, the gate may act again.
-		for range udpEndpointReplyDroughtMinHealthyReplies {
-			ue.markReplied(time.Now().UnixNano(), netip.AddrPort{})
-		}
+		tightReplies(udpEndpointReplyDroughtMinHealthyReplies)
 		agedEvidence(ue)
 		if err := write(t, ue); err == nil {
 			t.Fatal("a replacement that proved two-way health must be allowed to recover")

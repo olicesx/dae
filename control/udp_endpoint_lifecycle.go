@@ -593,6 +593,15 @@ func (ue *UdpEndpoint) maybeRebuildOnReplyDrought(now time.Time) error {
 	if drought < int64(udpEndpointReplyDroughtWindow) {
 		return nil
 	}
+	// Raise the threshold by the longest silence this session has already
+	// bridged while healthy: a flow whose reply cadence is naturally slower
+	// than the window (a slow-ack telemetry flow) would otherwise be rebuilt
+	// on every quiet gap — deterministically, because the gate fires before
+	// the next reply can land. After the cadence is learned, only a silence
+	// longer than anything the flow has survived counts as drought.
+	if gapFloor := int64(udpEndpointReplyDroughtWindow) + ue.maxReplyGapNano.Load(); drought < gapFloor {
+		return nil
+	}
 	if !ue.rebuildsOnReplyDrought() {
 		return nil
 	}
@@ -628,6 +637,7 @@ func (ue *UdpEndpoint) maybeRebuildOnReplyDrought(now time.Time) error {
 			"dialer":             dialerName,
 			"proxy_addr":         ue.DialTarget,
 			"drought":            time.Duration(drought).String(),
+			"drought_floor":      time.Duration(int64(udpEndpointReplyDroughtWindow) + ue.maxReplyGapNano.Load()).String(),
 			"writes_since_reply": writes,
 		}).Debug("[UdpEndpoint] Rebuilding UDP session after reply drought")
 	}
@@ -912,6 +922,18 @@ func (ue *UdpEndpoint) requiresInitialReplyGuard() bool {
 func (ue *UdpEndpoint) markReplied(nowNano int64, from netip.AddrPort) {
 	if nowNano == 0 {
 		nowNano = time.Now().UnixNano()
+	}
+	if prev := ue.lastReplyNano.Load(); prev != 0 && nowNano > prev {
+		// Record the observed inter-reply interval before the fresh timestamp
+		// lands: the drought gate treats a gap the flow itself has already
+		// bridged while healthy as normal cadence, not as evidence of death.
+		gap := nowNano - prev
+		for {
+			old := ue.maxReplyGapNano.Load()
+			if gap <= old || ue.maxReplyGapNano.CompareAndSwap(old, gap) {
+				break
+			}
+		}
 	}
 	ue.lastReplyNano.Store(nowNano)
 	// A reply is proof of life: the drought evidence starts over. The reply is

@@ -109,9 +109,23 @@ type UdpEndpoint struct {
 	// reply drought must prove two-way health before it may do the same, so a
 	// peer that answers once and then goes quiet cannot cause a rebuild every
 	// window.
-	replyCount               atomic.Int32
+	replyCount atomic.Int32
+	// retiredByReplyDrought is a test seam, not a production signal: nothing
+	// in the datapath reads it. The retirement's real publication is
+	// dead.Store(true) plus selfRemoveFromPool inside retire(); this flag
+	// exists so the ordering contract — the drought-rebuild ledger must be
+	// written before the retirement becomes observable — can be pinned by
+	// TestUdpEndpointDroughtBudgetIsRecordedBeforeRetirement sampling it.
 	retiredByReplyDrought    atomic.Bool
 	droughtRebuildGeneration int
+	// maxReplyGapNano is the largest interval this session has ever observed
+	// between two upstream replies. The drought gate raises its silence
+	// threshold to window+maxReplyGapNano: a flow that has already proven it
+	// answers slower than the window is not in drought during a gap shorter
+	// than its own observed cadence, so a legitimately slow-ack flow is not
+	// rebuilt every few reply periods forever. Maintained as a CAS-max; a
+	// clock that jumps backwards yields a negative gap which is ignored.
+	maxReplyGapNano atomic.Int64
 	// hasSent indicates the endpoint has already forwarded at least one client
 	// packet successfully. Once a flow reaches this point, control-plane health
 	// probes should not tear it down proactively; only data-plane errors,

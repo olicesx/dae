@@ -14,12 +14,13 @@ import (
 )
 
 var (
+	// relayWritevFunc is the test seam over unix.Writev: the partial-write
+	// advancement and EAGAIN re-entry of relayWritevAll are pinned by tests
+	// that script its results.
 	relayWritevFunc = unix.Writev
 )
 
 const relayGatherInlineSegmentCap = 8
-
-var relayGatherWriteEnabled = true
 
 func relayTakeSourceSegments(src netproxy.Conn, scratch *[relayGatherInlineSegmentCap][]byte) [][]byte {
 	if segmentSource, ok := src.(relaySegmentSource); ok {
@@ -74,9 +75,6 @@ func relayBuildWriteSegments(prefixSegs [][]byte, body []byte, scratch *[relayGa
 func tryRelayGatherWrite(ctx context.Context, dst netproxy.Conn, src netproxy.Conn, record func(int64), onActive func(int64)) (written int64, err error, ok bool) {
 	record = normalizeTrafficRecord(record)
 	onActive = normalizeTrafficRecord(onActive)
-	if !relayGatherWriteEnabled {
-		return 0, nil, false
-	}
 	var sourceSegScratch [relayGatherInlineSegmentCap][]byte
 	segments := relayTakeSourceSegments(src, &sourceSegScratch)
 	if len(segments) == 0 {
@@ -86,34 +84,52 @@ func tryRelayGatherWrite(ctx context.Context, dst netproxy.Conn, src netproxy.Co
 	buf := *bufPtr
 	defer relayCopyBufferPool.Put(bufPtr)
 
+	prefixLen := 0
+	for _, seg := range segments {
+		prefixLen += len(seg)
+	}
+
 	var (
 		body    []byte
 		readErr error
 	)
-
-	if srcTCP, ok := relayGatherWriteTCPConn(src); ok {
-		pending, err := tcpConnHasPendingReadData(srcTCP)
-		if err != nil {
-			return 0, err, true
-		}
-		if pending {
-			nr, er := src.Read(buf)
-			if nr > 0 {
-				body = buf[:nr]
-			}
-			readErr = er
-		}
-	}
-
 	var writeSegScratch [relayGatherInlineSegmentCap + 1][]byte
-	writeSegs := relayBuildWriteSegments(segments, body, &writeSegScratch)
+	var writeSegs [][]byte
+	if prefixLen < len(buf) {
+		// The taken segments alias the source's bufio/sniffer buffer and are
+		// only valid until the next read of src, so the probe read below must
+		// never leave them live: copy them into the pooled buffer first and
+		// hand the write one contiguous prefix+body slice.
+		off := 0
+		for _, seg := range segments {
+			off += copy(buf[off:], seg)
+		}
+		if srcTCP, ok := relayGatherWriteTCPConn(src); ok {
+			pending, perr := tcpConnHasPendingReadData(srcTCP)
+			if perr != nil {
+				return 0, perr, true
+			}
+			if pending {
+				nr, er := src.Read(buf[off:])
+				if nr > 0 {
+					body = buf[off : off+nr]
+				}
+				readErr = er
+			}
+		}
+		writeSegScratch[0] = buf[:len(body)+off]
+		writeSegs = writeSegScratch[:1]
+	} else {
+		// A prefix too large for the pooled buffer is written as-is and the
+		// probe read is skipped this round: reading src now would invalidate
+		// the aliased segments. The steady loop picks the rest up next.
+		writeSegs = relayBuildWriteSegments(segments, nil, &writeSegScratch)
+	}
 
 	nw, err := relayGatherWriteTo(dst, writeSegs)
 	written += int64(nw)
 	if nw > 0 {
 		onActive(int64(nw))
-	}
-	if nw > 0 {
 		record(int64(nw))
 	}
 	if err != nil {
@@ -162,9 +178,13 @@ func relayGatherWriteTo(dst netproxy.Conn, segs [][]byte) (written int, err erro
 		return dst.Write(segments[0])
 	}
 
-	// For proxied connections (wrapped interfaces), coalesce multiple small segments
-	// (e.g. protocol handshake prefix + TLS Client Hello) into a single write buffer.
-	// This avoids multi-packet fragmentation and repeated AEAD crypto framing.
+	// For proxied connections (wrapped interfaces), coalesce multiple segments
+	// into a single write buffer: this avoids multi-packet fragmentation and
+	// repeated AEAD crypto framing. Only batches up to relayCopyBufferSize
+	// (32 KiB) coalesce here; a larger batch (the steady loop gathers up to
+	// 128 KiB) falls through to net.Buffers.WriteTo, which writes per segment —
+	// functionally fine, and the fork's FlushConn re-coalesces at the TLS
+	// layer, but it is not the single-write shape the small case gets.
 	totalLen := 0
 	for _, seg := range segments {
 		totalLen += len(seg)

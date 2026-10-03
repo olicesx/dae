@@ -166,23 +166,41 @@ func relaySteadyGatherCopy(ctx context.Context, dst netproxy.Conn, src netproxy.
 			// bounds. The probe observes socket state only; when it reports
 			// no pending bytes (or the source does not unwrap to a TCP
 			// socket) the batch ends and flushes without waiting.
+			innerErr := error(nil)
 			for total < relayGatherMaxBytes && len(segs) < relayGatherMaxSegments {
 				if !relayGatherSourceHasMoreBuffered(src) {
 					break
 				}
 				pBufPtr := relayCopyBufferPool.Get().(*[]byte)
-				pn, _ := src.Read(*pBufPtr)
+				pn, per := src.Read(*pBufPtr)
 				if pn > 0 {
 					segs = append(segs, gatherSeg{bufPtr: pBufPtr, view: (*pBufPtr)[:pn]})
 					total += pn
 					onActive(int64(pn))
+					if per != nil {
+						// Keep the data (a read may deliver bytes and its
+						// terminal error together) and stop batching; the
+						// error is reported after the flush instead of
+						// relying on the next outer read to surface it.
+						innerErr = per
+						break
+					}
 					continue
 				}
 				relayCopyBufferPool.Put(pBufPtr)
+				if per != nil && innerErr == nil {
+					innerErr = per
+				}
 				break
 			}
 			if ferr := flush(); ferr != nil {
 				return written, ferr, true
+			}
+			if innerErr != nil {
+				if innerErr == io.EOF {
+					return written, nil, true
+				}
+				return written, innerErr, true
 			}
 		} else {
 			relayCopyBufferPool.Put(bufPtr)

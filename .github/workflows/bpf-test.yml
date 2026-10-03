@@ -100,9 +100,12 @@ jobs:
               # production helper and its source contract; no BPF map needed).
               TestRemovedIncompatiblePinnedMapWarnsWithConsequence
               TestIncompatiblePinRemovalIsNotAnInfoStep
-              # Cgroup2 mount-point probe cache (concurrent consistency of the
-              # sync.OnceValues singleton; reads /proc/mounts, no BPF map needed).
-              TestDetectCgroupPathCaching
+              # Cgroup2 mount-point probe cache (success-only caching and the
+              # retry-after-failure contract through the scan seam; no BPF map
+              # needed).
+              TestDetectCgroupPathCachesSuccessOnly
+              TestDetectCgroupPathRetriesAfterFailure
+              TestDetectCgroupPathConcurrentCallersShareOneScan
             )
             printf '%s\n' "${whitelist[@]}" | sort -u > /tmp/datapath-whitelist.txt
 

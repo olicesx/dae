@@ -162,6 +162,23 @@ changed. Review them before upgrading:
 #### Bug Fixes
 
 - fix(control): flush short TCP splice writes without corking
+- fix(control): gate the opt-in TCP sockmap offload on the transparent unwrap — the
+  outbound pin advance made wrapped proxy legs peelable, which would have redirected
+  client plaintext around TLS/framing when `DAE_ALLOW_TCP_SOCKMAP=1` is set
+- fix(control): learn a flow's observed reply cadence before calling a reply drought,
+  so a slow-ack flow is no longer rebuilt once per few reply periods
+- fix(dns): a datagram drop whose cause is a resolver timeout keeps waiting for the
+  reply instead of discarding the pooled connection, and the stale-drop cap keeps the
+  drop classification so it neither retires the forwarder nor skips the TCP retry
+- fix(sniffing): an HTTP Host is accepted only from a terminated header line, so a
+  Host value split across reads no longer routes by a truncated domain; QUIC CRYPTO
+  frame lengths and offsets are bounds-checked in the uint64 domain on every arch
+- fix(control): a transient cgroup2 probe failure is retried on the next reload
+  instead of disabling pname routing until restart
+- fix(outbound): dialer ranking applies `check_tolerance` only between two measured
+  dialers and reports class corrections in the selection log
+- fix(daedns): each leg of the node-address resolution race is bounded by the shared
+  10s lookup timeout, so a blackholed resolver cannot hang a node dial
 
 ### v2.0.0rc1 (Pre-release)
 

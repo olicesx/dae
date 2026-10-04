@@ -1410,8 +1410,8 @@ func TestWaitForControlPlaneDrainReturnsTimeout(t *testing.T) {
 }
 
 // retirementBehaviorPlane extends fakeRetirementControlPlane with abort
-// tracking to prove the three-way retirement precedence rule:
-// abort → !overlap → drain.
+// tracking to prove the two-stage retirement precedence rule:
+// abort → drain.
 type retirementBehaviorPlane struct {
 	*fakeRetirementControlPlane
 	abortCalled         atomic.Bool

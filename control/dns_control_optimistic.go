@@ -32,9 +32,9 @@ func (c *DnsController) backgroundRefresh(cacheKey string, dnsMessage *dnsmessag
 	}
 	ctx, cancel := c.newWorkContext(5 * time.Second)
 	defer cancel()
-	// Always clear the refreshing flag. Do not look the entry up through
-	// LookupDnsRespCache: that helper evicts expired-but-stale entries, which
-	// would turn a refresh miss into a hard failure for every later query.
+	// Always clear the refreshing flag, and only through this non-evicting
+	// Load: evicting an entry that is still being served would turn a refresh
+	// miss into a hard failure for every later query.
 	defer func() {
 		if cacheKey == "" {
 			return

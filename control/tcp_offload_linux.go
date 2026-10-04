@@ -374,9 +374,9 @@ func (s *tcpRelayOffloadSession) reportOffloadMapFailure(op string, err error) {
 // already pushed into the peers' send paths, tracked by the skb_send_sock
 // kprobe and by the userspace fallback), engages the pause when the backlog
 // exceeds tcpOffloadMaxPeerBacklog, and lifts it once the backlog drains.
-// Returns (engage, lift, err): engage demands the fds be dropped from epoll
-// while the kernel drains already-redirected skbs; lift demands they be
-// re-added.
+// Returns (engage, lift): engage demands the fds be dropped from epoll while
+// the kernel drains already-redirected skbs; lift demands they be re-added. A
+// transient tcp_info read failure skips this round instead of surfacing one.
 func (s *tcpRelayOffloadSession) fuseStep(lastProgress *time.Time) (engage, lift bool) {
 	lrx, err := tcpConnRxBytes(s.left)
 	if err != nil {

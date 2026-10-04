@@ -164,8 +164,8 @@ type SessionManager struct {
 	tcpCount atomic.Int64
 	udpCount atomic.Int64
 
-	// generationsMu only guards the small epoch-count table plus flows whose
-	// PolicyEpoch migrates mid-reload. The per-packet data plane never takes it.
+	// generationsMu only guards the small epoch-count table and the lifecycle
+	// transactions that update it. The per-packet data plane never takes it.
 	generationsMu sync.Mutex
 	generations   map[routing.PolicyEpoch]*sessionGenerationState
 

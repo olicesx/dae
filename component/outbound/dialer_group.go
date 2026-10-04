@@ -318,21 +318,20 @@ func (g *DialerGroup) logNoAlive(
 	}).Warn("no alive dialer for selection (rate-limited)")
 }
 
-// Select is a backward-compatible wrapper for SelectWithExclusion.
+// Select is a backward-compatible wrapper for SelectWithExclusionResult.
 func (g *DialerGroup) Select(networkType *dialer.NetworkType, strictIpVersion bool) (d *dialer.Dialer, latency time.Duration, err error) {
 	d, latency, _, err = g.SelectWithExclusionResult(networkType, strictIpVersion, nil)
 	return d, latency, err
 }
 
-// SelectWithExclusion selects a dialer from group according to selectionPolicy.
+// SelectWithExclusionResult selects a dialer from group according to
+// selectionPolicy and returns it together with the health domain actually used
+// to admit it: the requested network type for ordinary selections, and DNS-UDP
+// or TCP for data-UDP recovery.
 // The 'excluded' parameter specifies a dialer to avoid during selection (for
 // failover scenarios). Note that Fixed policy ignores 'excluded' because user
 // configuration takes precedence over automatic exclusion.
 // If 'strictIpVersion' is false and no alive dialer, it will fallback to another ipversion.
-
-// SelectWithExclusionResult returns the chosen dialer together with the health
-// domain actually used to admit that dialer. For ordinary selections this is
-// the requested network type; for data-UDP recovery it may be DNS-UDP or TCP.
 func (g *DialerGroup) SelectWithExclusionResult(networkType *dialer.NetworkType, strictIpVersion bool, excluded *dialer.Dialer) (d *dialer.Dialer, latency time.Duration, selectedNetworkType *dialer.NetworkType, err error) {
 	state := g.currentSelectionState()
 	policy := state.policy

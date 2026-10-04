@@ -203,7 +203,7 @@ go build ./... && go vet ./...
 go build -tags trace ./... && go vet -tags trace ./...
 go vet -tags dae_bpf_tests ./control/kern/tests/...
 golangci-lint run --build-tags dae_stub_ebpf ./...   # 0 issues (CI gate)
-golangci-lint run ./...                              # 2 pre-existing SA1019, see below
+golangci-lint run ./...                              # 2 SA1019 at the time, see below (fixed in b1771731)
 go test -tags dae_stub_ebpf -count=1 ./...           # green
 go test -race -tags dae_stub_ebpf -timeout 30m ./control/... ./component/... ./cmd/...
 make ebpf-test                                       # green
@@ -217,9 +217,12 @@ npm run check-broken-link
 datapath suite passes, and the stubbed `dae_stub_ebpf` run is not treated as
 evidence for it.
 
-The two `golangci-lint run ./...` findings are pre-existing and unrelated to this
-pass: `control/bpf_utils.go:138,152` reference
-`consts.UserspaceBatchUpdateFeatureVersion`, which carries a `Deprecated` marker
-(Ftrace does not support ARM64). CI lints only the `dae_stub_ebpf` build, under
-which `control/bpf_utils.go` is not compiled, so the finding is not currently
-gated. Resolving it means changing the feature-gating logic, not the constant.
+The two `golangci-lint run ./...` findings this pass recorded were **not**
+pre-existing: `061095d6` deleted `consts.FtraceFeatureVersion` but left its
+`// Deprecated: Ftrace does not support arm64 yet (Linux 6.2).` doc comment
+behind, so the marker came to sit on `consts.UserspaceBatchUpdateFeatureVersion`
+(`control/bpf_utils.go:138,152`). CI lints only the `dae_stub_ebpf` build, under
+which `control/bpf_utils.go` is not compiled, so nothing gated it and the
+regression read as legacy debt. `b1771731` removed the orphaned comment, and
+`golangci-lint run --default=none --enable=staticcheck ./...` is clean on the
+real build again.

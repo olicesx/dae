@@ -199,7 +199,6 @@ func (s *ConnSniffer) ReadFrom(r io.Reader) (int64, error) {
 // copyDirect copies from src to dst using the provided buf without delegating
 // to io.WriterTo or io.ReaderFrom interfaces. This prevents stdlib wrappers
 // (e.g. net.TCPConn.ReadFrom) from silently heap-allocating their own buffers.
-// record, when non-nil, observes every successfully written chunk.
 func copyDirect(dst io.Writer, src io.Reader, buf []byte) (written int64, err error) {
 	for {
 		nr, er := src.Read(buf)

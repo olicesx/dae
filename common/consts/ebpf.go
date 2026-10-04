@@ -81,8 +81,7 @@ func (v IpVersionType) ToIpVersionStr() IpVersionStr {
 }
 
 var (
-	BasicFeatureVersion = internal.Version{5, 2, 0}
-	// Deprecated: Ftrace does not support arm64 yet (Linux 6.2).
+	BasicFeatureVersion                       = internal.Version{5, 2, 0}
 	UserspaceBatchUpdateFeatureVersion        = internal.Version{5, 6, 0}
 	SkAssignFeatureVersion                    = internal.Version{5, 7, 0}
 	ChecksumFeatureVersion                    = internal.Version{5, 8, 0}

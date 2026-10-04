@@ -119,26 +119,6 @@ func (c *controlPlaneCore) RetainUdpConnStateTuples(keys []bpfTuplesKey) {
 	}
 }
 
-func (c *controlPlaneCore) TransferRetainedUdpConnStateTuplesFrom(previous udpConnStateOwner, keys []bpfTuplesKey) {
-	if c == nil || previous == nil || previous == c || len(keys) == 0 {
-		return
-	}
-
-	previousCore, ok := previous.(*controlPlaneCore)
-	if !ok || previousCore == nil {
-		return
-	}
-
-	currentTracker := c.getUdpConnStateTracker()
-	previousTracker := previousCore.getUdpConnStateTracker()
-	if currentTracker == nil || previousTracker == nil || currentTracker == previousTracker {
-		return
-	}
-
-	currentTracker.Retain(keys)
-	previousTracker.Forget(keys)
-}
-
 func (c *controlPlaneCore) ReleaseUdpConnStateTuples(keys []bpfTuplesKey) error {
 	if c == nil || len(keys) == 0 {
 		return nil

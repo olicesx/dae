@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/daeuniverse/dae/component/sniffing/internal/quicutils"
 	"github.com/sirupsen/logrus"
 )
 
@@ -68,5 +69,23 @@ func TestSniffer_SniffTls_AcceptsLegacyMinorVersions(t *testing.T) {
 	}
 	if d != "odin.game.daum.net" {
 		t.Fatalf("domain = %q, want %q", d, "odin.game.daum.net")
+	}
+}
+
+// TestSniffTlsServerNameExtensionTooShort pins the bounds guard on the
+// server_name extension: an extension shorter than its own SNI-list length
+// field must be rejected before that field is read. With a zero-length
+// extension at the very end of the buffer, the read used to slice two bytes
+// past the locator (BuiltinBytesLocator slices raw, so this was a panic — a
+// crafted ClientHello could crash the sniffer, not just be refused).
+func TestSniffTlsServerNameExtensionTooShort(t *testing.T) {
+	// Extensions block: server_name (type 0) with extLength 0, plus one
+	// uncovered trailing byte so the parser loop actually reads the
+	// extension header. The buffer ends exactly at the block.
+	buf := []byte{0x00, 0x00, 0x00, 0x00, 0xff}
+	locator := quicutils.BuiltinBytesLocator(buf)
+	_, err := findSniExtension(locator, 0, len(buf))
+	if err == nil {
+		t.Fatal("a server_name extension shorter than its SNI-list length field must be rejected")
 	}
 }

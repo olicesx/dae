@@ -111,9 +111,10 @@ func sniffQuicBlock(s *Sniffer, cryptos []*quicutils.CryptoFrameOffset, buf []by
 	// Long header: 4 bits masked
 	// High 4 bits are not protected, so we can access QuicFlag_HeaderForm and QuicFlag_LongPacketType without decryption.
 	protectedFlag := buf[0]
-	// 0b11 covers HeaderForm + Reserved so an unexpected high nibble shape
-	// bails early; only bit0 currently matters for this check.
-	if ((protectedFlag >> QuicFlag_HeaderForm) & 0b11) != QuicFlag_HeaderForm_LongHeader {
+	// Only bit 7 (HeaderForm) can be examined: after >>7 the value is a
+	// single bit, so masking more bits would be a no-op and would not
+	// validate the Reserved bits (5-6) at all.
+	if ((protectedFlag >> QuicFlag_HeaderForm) & 0b1) != QuicFlag_HeaderForm_LongHeader {
 		return cryptos, nil, ErrNotApplicable
 	}
 	if ((protectedFlag >> QuicFlag_LongPacketType) & 0b11) != QuicFlag_LongPacketType_Initial {

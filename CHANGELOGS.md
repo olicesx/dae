@@ -179,6 +179,26 @@ changed. Review them before upgrading:
   dialers and reports class corrections in the selection log
 - fix(daedns): each leg of the node-address resolution race is bounded by the shared
   10s lookup timeout, so a blackholed resolver cannot hang a node dial
+- fix(control): `SetSendRedirects`/`CheckSendRedirects` now write and verify
+  `conf/all/send_redirects` too — the kernel ORs it with the per-interface node,
+  so a "0" written only to `conf/<lan>` was inert while `conf/all` kept the
+  default 1 and the LAN still got ICMP redirects around dae (#1125)
+- fix(kern): a LAN UDP packet is passed to a local service only when the matched
+  socket is bound to the packet's exact destination address; a wildcard-bound
+  socket no longer swallows traffic addressed elsewhere, and port 53 never
+  bypasses routing (#1110)
+- fix(daedns): the bootstrap resolver and the system resolver are dialed
+  family-agnostically — the dial family follows the fixed resolver address, so a
+  v6-origin flow no longer fails with "no suitable address found" and disables
+  that resolution leg (#1130, plus the same fix on kdae's system-DNS leg)
+- fix(config): the digit-prefix error hint now tells the user to quote the whole
+  `name: value` entry (a quoted name alone cannot parse), and `dae validate`
+  dry-runs `dns.fixed_domain_ttl` parsing (#1124)
+- fix(config): `Marshaller.Bytes` is restored for embedding callers such as
+  dae-wing (#1117)
+- feat: log timestamps use `2006-01-02 15:04:05` with forced formatting (#1010)
+- chore(ebpf): the tproxy.c CO-RE comment no longer misattributes relocation
+  failure to GCC 15 DTE; the real cause is pahole mis-parsing DWARF5 (#1056)
 
 ### v2.0.0rc1 (Pre-release)
 

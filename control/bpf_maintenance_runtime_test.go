@@ -249,3 +249,56 @@ func TestStopBpfMaintenanceRuntimeJoinsActors(t *testing.T) {
 		t.Fatal("stopped runtime remained registered")
 	}
 }
+
+// TestBpfMaintenanceIdempotentReactivationRollbackKeepsTarget pins the
+// ownership rule of the idempotent (early-path) re-activation: a binding that
+// finds the active slot already at its target transitioned nothing, so its
+// rollback must not restore the stale predecessor an earlier activation left
+// in b.previous (or the nil zero value), and its deactivate must not clear a
+// slot it does not own.
+func TestBpfMaintenanceIdempotentReactivationRollbackKeepsTarget(t *testing.T) {
+	resetBpfMaintenanceRegistryForTest(t)
+	defer resetBpfMaintenanceRegistryForTest(t)
+
+	bpf := &bpfObjects{}
+	oldPlane := &ControlPlane{}
+	newPlane := &ControlPlane{}
+	oldBinding := bindBpfMaintenanceRuntime(bpf, oldPlane)
+	newBinding := bindBpfMaintenanceRuntime(bpf, newPlane)
+
+	// A real transition leaves a genuine predecessor on newBinding.
+	if err := oldBinding.activate(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := newBinding.activate(oldPlane); err != nil {
+		t.Fatal(err)
+	}
+	newBinding.deactivate()
+	oldBinding.deactivate()
+	if err := oldBinding.activate(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second binding to the same plane performs the transition; newBinding
+	// then re-activates through the idempotent early path.
+	twin := bindBpfMaintenanceRuntime(bpf, newPlane)
+	if err := twin.activate(oldPlane); err != nil {
+		t.Fatal(err)
+	}
+	if err := newBinding.activate(oldPlane); err != nil {
+		t.Fatal(err)
+	}
+
+	// Rollback of the idempotent activation owns nothing to restore.
+	if err := newBinding.rollback(); err != nil {
+		t.Fatalf("rollback of an idempotent re-activation: %v", err)
+	}
+	if got := newBinding.runtime.active.Load(); got != newPlane {
+		t.Fatalf("idempotent re-activation rollback restored a stale target: got %p want %p", got, newPlane)
+	}
+	// Neither may its deactivation clear the twin's slot.
+	newBinding.deactivate()
+	if got := newBinding.runtime.active.Load(); got != newPlane {
+		t.Fatalf("idempotent re-activation deactivate cleared a slot it did not own: got %p want %p", got, newPlane)
+	}
+}

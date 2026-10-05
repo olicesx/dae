@@ -19,6 +19,13 @@ type bpfMaintenanceBinding struct {
 	target    *ControlPlane
 	previous  atomic.Pointer[ControlPlane]
 	activated atomic.Bool
+
+	// ownsActive marks that this binding's activation performed the
+	// active-slot transition itself. An idempotent re-activation that found
+	// the slot already at target must neither roll back nor deactivate that
+	// slot: it never owned it, and the stored previous (or its nil zero
+	// value) belongs to a different, possibly ancient activation.
+	ownsActive atomic.Bool
 }
 
 // bpfMaintenanceRuntime owns the one ringbuf reader for one BPF object set.
@@ -221,6 +228,11 @@ func (b *bpfMaintenanceBinding) activate(previous *ControlPlane) error {
 		return nil
 	}
 	if b.runtime.active.Load() == b.target {
+		// Idempotent re-activation: the active slot already holds the
+		// target, set by an earlier activation of this or another binding.
+		// This activation did not transition the slot, so it owns nothing
+		// to roll back to or deactivate later.
+		b.ownsActive.Store(false)
 		b.activated.Store(true)
 		if b.runtime.cleanup != nil {
 			b.runtime.cleanup.active.CompareAndSwap(nil, b.runtime)
@@ -232,6 +244,7 @@ func (b *bpfMaintenanceBinding) activate(previous *ControlPlane) error {
 		return fmt.Errorf("BPF maintenance target changed during activation")
 	}
 	b.previous.Store(previous)
+	b.ownsActive.Store(true)
 	b.activated.Store(true)
 	if b.runtime.cleanup != nil {
 		b.runtime.cleanup.active.CompareAndSwap(nil, b.runtime)
@@ -245,11 +258,22 @@ func (b *bpfMaintenanceBinding) deactivate() {
 		return
 	}
 	b.activated.Store(false)
+	if !b.ownsActive.CompareAndSwap(true, false) {
+		// Never owned the active slot (idempotent re-activation): leave the
+		// slot to whoever set it.
+		return
+	}
 	b.runtime.active.CompareAndSwap(b.target, nil)
 }
 
 func (b *bpfMaintenanceBinding) rollback() error {
 	if b == nil || b.runtime == nil || !b.activated.CompareAndSwap(true, false) {
+		return nil
+	}
+	if !b.ownsActive.CompareAndSwap(true, false) {
+		// Idempotent re-activation: nothing was transitioned, so there is
+		// nothing to restore. Restoring b.previous would corrupt the slot
+		// with the pre-state of an earlier, unrelated activation.
 		return nil
 	}
 	previous := b.previous.Load()

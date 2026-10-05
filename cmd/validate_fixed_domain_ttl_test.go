@@ -42,6 +42,12 @@ routing {
 		"empty ttl":       `'123.example.com:'`,
 		"missing colon":   `'123.example.com'`,
 		"non-numeric ttl": `'123.example.com: abc'`,
+		"zero ttl":        `'123.example.com: 0'`,
+		"negative ttl":    `'123.example.com: -5'`,
+		// time.Duration(ttl) * time.Second overflows past MaxInt32 seconds
+		// on 64-bit builds: the fixed deadline lands in the past and the
+		// entry silently never caches.
+		"overflowing ttl": `'123.example.com: 9223372036854'`,
 	}
 	for name, entry := range bad {
 		t.Run(name, func(t *testing.T) {

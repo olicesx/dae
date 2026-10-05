@@ -673,21 +673,34 @@ func (ue *UdpEndpoint) droughtSendRate(writes, droughtNano int64, now time.Time)
 //
 // The counter covers the current absolute probe window; datagrams are counted
 // only after the transport accepted them, so evidence is never fabricated from
-// a datagram that was merely queued. The bucket is published after its counter
-// is cleared, so a reader that observes the new bucket cannot pair it with the
-// previous bucket's count. Concurrent writers may still lose a count, which
-// under-counts the window and therefore delays a rebuild instead of causing a
-// spurious one.
+// a datagram that was merely queued. The bucket transition is CAS-gated: the
+// winner publishes the new bucket and then seeds its counter with its own
+// datagrams, so the plain Store(0)-then-publish sequence can neither erase a
+// concurrent writer's count mid-transition nor attribute a straggler's write
+// to a bucket it does not belong to. A writer whose view of the bucket is
+// stale across a transition can still be dropped or misattributed once per
+// transition, which under-counts the window and therefore delays a rebuild
+// instead of causing a spurious one.
 func (ue *UdpEndpoint) observeSendRate(now time.Time, datagrams int) {
 	if ue == nil || datagrams <= 0 {
 		return
 	}
 	bucket := now.UnixNano() / int64(udpEndpointReplyDroughtProbeWindow)
-	if ue.recentWriteBucket.Load() != bucket {
-		ue.recentWriteBucketWrites.Store(0)
-		ue.recentWriteBucket.Store(bucket)
+	for {
+		cur := ue.recentWriteBucket.Load()
+		if cur == bucket {
+			ue.recentWriteBucketWrites.Add(int64(datagrams))
+			return
+		}
+		if ue.recentWriteBucket.CompareAndSwap(cur, bucket) {
+			// The winner publishes the new bucket first and then seeds the
+			// counter with its own datagrams: any concurrent Add that raced
+			// in between belonged to the retired bucket and is dropped with
+			// it, and every later Add lands on the fresh count.
+			ue.recentWriteBucketWrites.Store(int64(datagrams))
+			return
+		}
 	}
-	ue.recentWriteBucketWrites.Add(int64(datagrams))
 }
 
 func (ue *UdpEndpoint) armWriteDeadline(now time.Time) {

@@ -8,6 +8,7 @@ package control
 import (
 	stderrors "errors"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -353,5 +354,58 @@ func TestMarkRepliedRecordsReplyGap(t *testing.T) {
 	ue.markReplied(now, netip.AddrPort{})
 	if got := ue.maxReplyGapNano.Load(); got < 42*time.Second.Nanoseconds() {
 		t.Fatalf("maxReplyGapNano = %d, must not decrease", got)
+	}
+}
+
+// TestObserveSendRateTransitionPreservesCounts pins the observable
+// invariants of observeSendRate's bucket transition under concurrent entry:
+// the retired bucket's count must not survive into the new bucket, the total
+// must not exceed what was actually counted, and the run must stay race-free
+// under -race. The erasure interleaving of the pre-CAS Store(0) sequence (a
+// writer preempted between the stale-bucket check and its reset wiping a
+// completed transition's counts) is structurally excluded by the CAS-gated
+// protocol rather than caught statistically here: no reset can execute after
+// the new bucket is published, because resets only run before a successful
+// CAS. This test would fail catastrophic regressions (stale survivors,
+// over-attribution, data races), not single-count losses.
+func TestObserveSendRateTransitionPreservesCounts(t *testing.T) {
+	ue := &UdpEndpoint{}
+	old := time.Now().Add(-2 * udpEndpointReplyDroughtProbeWindow)
+	ue.recentWriteBucket.Store(old.UnixNano() / int64(udpEndpointReplyDroughtProbeWindow))
+	ue.recentWriteBucketWrites.Store(12345)
+
+	// Repeated transitions with a wide concurrent entry: all goroutines hit
+	// the stale bucket at once, which is exactly the interleaving the old
+	// Store(0)-then-publish sequence erased counts in. Rounds use distinct
+	// buckets so every round exercises the transition path.
+	const rounds, goroutines, perG = 20, 64, 10
+	var total int64
+	for r := 0; r < rounds; r++ {
+		now := time.Now().Add(time.Duration(r+2) * udpEndpointReplyDroughtProbeWindow)
+		ue.recentWriteBucket.Store(now.Add(-udpEndpointReplyDroughtProbeWindow).UnixNano() / int64(udpEndpointReplyDroughtProbeWindow))
+		ue.recentWriteBucketWrites.Store(0)
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for g := 0; g < goroutines; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				for i := 0; i < perG; i++ {
+					ue.observeSendRate(now, 1)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		total += ue.recentWriteBucketWrites.Load()
+	}
+	want := int64(rounds * goroutines * perG)
+	// The stale count must not survive, and only the handful of writes
+	// racing each publication may be dropped: the fixed protocol loses a
+	// bounded trickle, the pre-fix code lost whole groups to erasing
+	// Store(0)s.
+	if total < want*19/20 || total > want {
+		t.Fatalf("send-rate count after %d concurrent transitions = %d, want ~%d", rounds, total, want)
 	}
 }

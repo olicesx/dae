@@ -773,7 +773,15 @@ func (r *Router) lookupSystemIPAddr(ctx context.Context, network, host string) (
 	if !resolver.IsValid() {
 		return nil, errNoSystemDNS
 	}
-	dnsNetwork := common.MagicNetworkWithIPVersion("udp", r.soMark, r.mptcp, requestedIPVersion(network))
+	// The system resolver is a fixed address read from /etc/resolv.conf (or
+	// the configured fallback), so the family used to dial it follows from
+	// that address, exactly like the bootstrap resolver: inheriting the
+	// family requested by the caller would make a v6-origin flow dial a v4
+	// resolver literal over "udp6", fail with "no suitable address found",
+	// and take the whole system-DNS leg of the node-address race down. The
+	// requested family is still honoured when filtering the answers in
+	// ipAddrsFromIp46.
+	dnsNetwork := common.MagicNetwork("udp", r.soMark, r.mptcp)
 	ip46, err4, err6 := netutils.ResolveIp46(ctx, r.directDialer, resolver, host, dnsNetwork, false)
 	return ipAddrsFromIp46(ip46, err4, err6, network, fmt.Sprintf("system resolver %v returned no usable address for %q", resolver, host))
 }

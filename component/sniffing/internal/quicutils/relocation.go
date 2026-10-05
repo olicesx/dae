@@ -29,7 +29,11 @@ const (
 // packet: Initial datagrams cannot exceed 64 KiB, so the ClientHello's crypto
 // stream stays below this bound. Offsets at or above it are attacker garbage
 // and must be rejected before any int conversion (the varint can reach ~2^62,
-// which wraps on 32-bit builds).
+// which wraps on 32-bit builds). A legitimate ClientHello can approach the
+// bound (ECH plus post-quantum key shares); refusing it is deliberate and
+// fail-closed: sniffQuicBlock maps the parse error to ErrNotApplicable, so the
+// flow is routed without a sniffed domain rather than sniffed from
+// attacker-shaped bytes.
 const quicMaxInitialCryptoOffset = 1 << 16
 
 type CryptoFrameOffset struct {

@@ -213,9 +213,13 @@ wait_for_reload_count() {
 	local log_file=$1
 	local expected=$2
 	local attempt finished retired
+	# The daemon logs reload progress as "[Reload] Finished". The prefixed
+	# formatter (pkg/logger, ForceFormatting) turns a leading bracketed
+	# component into "Reload: Finished", so accept both renderings instead of
+	# coupling this wait to the formatter's output style.
 	for attempt in {1..45}; do
-		finished=$(grep -F -c "[Reload] Finished" "$log_file" || true)
-		retired=$(grep -F -c "[Reload] Retired old control plane" "$log_file" || true)
+		finished=$(grep -E -c '(\[Reload\]|Reload:) Finished' "$log_file" || true)
+		retired=$(grep -E -c '(\[Reload\]|Reload:) Retired old control plane' "$log_file" || true)
 		if [ "$finished" -ge "$expected" ] && [ "$retired" -ge "$expected" ]; then
 			return 0
 		fi

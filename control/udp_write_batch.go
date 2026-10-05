@@ -234,6 +234,12 @@ func (a *udpWriteBatchAggregator) flush() {
 		return
 	}
 	if n < len(items) {
+		// Retire the unsent suffix instead of re-queueing it: a batch is one
+		// sendmmsg window, so a retry would duplicate the accepted prefix and
+		// reorder datagrams, while the UDP applications above retransmit on
+		// their own. The shortfall still reaches the health plane as
+		// io.ErrShortWrite, so a transport that keeps short-writing stays
+		// visible instead of being silently forgiven.
 		a.reportFlushFailure(fmt.Errorf("%w: batched write sent %d/%d datagrams", io.ErrShortWrite, n, len(items)))
 	}
 }

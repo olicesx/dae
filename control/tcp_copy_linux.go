@@ -7,6 +7,7 @@ import (
 	stderrors "errors"
 	"io"
 	"net"
+	"os"
 	"syscall"
 	"time"
 
@@ -284,7 +285,10 @@ func spliceSocketToPipe(rawConn syscall.RawConn, pipeW int, maxBytes int) (int, 
 			if stderrors.Is(err, syscall.EAGAIN) || stderrors.Is(err, syscall.EWOULDBLOCK) {
 				return false
 			}
-			spliceErr = err
+			// Name the failing operation so classifiers and logs see
+			// "splice: broken pipe" instead of a bare errno, matching the
+			// shape the standard library's splice path already produces.
+			spliceErr = os.NewSyscallError("splice", err)
 			return true
 		}
 	})
@@ -321,7 +325,7 @@ func splicePipeToSocket(rawConn syscall.RawConn, pipeR int, maxBytes int) (int, 
 			if stderrors.Is(err, syscall.EAGAIN) || stderrors.Is(err, syscall.EWOULDBLOCK) {
 				return false
 			}
-			spliceErr = err
+			spliceErr = os.NewSyscallError("splice", err)
 			return true
 		}
 	})

@@ -64,6 +64,40 @@ func TestIsCanceledOrClosed_OperationCanceledString(t *testing.T) {
 	}
 }
 
+// TestIsIgnorableTCPRelayError_SpliceErrnoForms locks the errno identity rule
+// for relay-close classification. The raw splice loop returns bare
+// syscall.Errno (no *os.SyscallError wrapper), which an errors.As-only probe
+// misses; every producer shape must classify by identity instead.
+func TestIsIgnorableTCPRelayError_SpliceErrnoForms(t *testing.T) {
+	ignorable := []error{
+		syscall.EPIPE,
+		syscall.ECONNRESET,
+		os.NewSyscallError("splice", syscall.EPIPE),
+		&net.OpError{Op: "splice", Net: "tcp", Err: os.NewSyscallError("splice", syscall.EPIPE)},
+		fmt.Errorf("handleTCP relay error: %w", syscall.EPIPE),
+	}
+	for _, err := range ignorable {
+		if !IsIgnorableTCPRelayError(err) {
+			t.Fatalf("expected %v to be ignorable for TCP relay", err)
+		}
+		if !IsIgnorableConnectionError(err) {
+			t.Fatalf("expected %v to be ignorable for connection handling", err)
+		}
+	}
+
+	// A refused target stays visible: unlike EPIPE it names an actionable
+	// condition, and the string layer never matched it either.
+	visible := []error{
+		syscall.ECONNREFUSED,
+		os.NewSyscallError("splice", syscall.ECONNREFUSED),
+	}
+	for _, err := range visible {
+		if IsIgnorableTCPRelayError(err) {
+			t.Fatalf("expected %v to stay visible for TCP relay", err)
+		}
+	}
+}
+
 func TestTypedQUICStreamErrorCodeZeroIsNormalClose(t *testing.T) {
 	err := &quic.StreamError{StreamID: 1, ErrorCode: 0, Remote: true}
 	if !IsIgnorableTCPRelayError(err) {

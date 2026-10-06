@@ -171,16 +171,16 @@ func IsIgnorableConnectionError(err error) bool {
 		return true
 	}
 
-	// Check for syscall errors
-	var sysErr *os.SyscallError
-	if errors.As(err, &sysErr) {
-		if errors.Is(sysErr.Err, syscall.EPIPE) ||
-			errors.Is(sysErr.Err, syscall.ECONNRESET) ||
-			errors.Is(sysErr.Err, syscall.ETIMEDOUT) ||
-			errors.Is(sysErr.Err, syscall.ECONNREFUSED) ||
-			errors.Is(sysErr.Err, syscall.EADDRNOTAVAIL) {
-			return true
-		}
+	// Check errno-family errors by identity. Bare syscall.Errno reaches the
+	// classifiers from raw-syscall paths without an *os.SyscallError wrapper,
+	// so an errors.As-only probe misses it; the errors.Is chain check matches
+	// the bare errno and every wrapped form.
+	if errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ETIMEDOUT) ||
+		errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.EADDRNOTAVAIL) {
+		return true
 	}
 
 	// Slow path: single string allocation for pattern matching
@@ -200,12 +200,12 @@ func IsIgnorableTCPRelayError(err error) bool {
 		return true
 	}
 
-	// Fast path: check wrapped syscall errors
-	var sysErr *os.SyscallError
-	if errors.As(err, &sysErr) {
-		if errors.Is(sysErr.Err, syscall.EPIPE) || errors.Is(sysErr.Err, syscall.ECONNRESET) {
-			return true
-		}
+	// Fast path: EPIPE/ECONNRESET by identity, bare or wrapped. The relay
+	// splice loop surfaces raw syscall.Errno from unix.Splice(2) without an
+	// *os.SyscallError wrapper; errors.Is matches that bare errno and every
+	// wrapped form in one check.
+	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+		return true
 	}
 
 	// Check for network timeout errors (type assertion fast path first)

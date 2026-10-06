@@ -147,4 +147,4 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20261005
 // bytes is delivered rather than reported as a short-buffer drop; oversized
 // datagrams still surface the typed drop instead of being split.
 
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261005062231-f109ab8f1ebe
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261006063155-df4dc6411686

@@ -120,8 +120,10 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to build DNS response routing: %w", err)
 	}
-	if len(dns.Upstream) == 0 {
-		// Immediately ready.
+	if len(dns.Upstream) == 0 && opt.UpstreamReadyCallback != nil {
+		// Immediately ready. The callback is optional, and it may block until
+		// the caller finishes constructing the control plane, so it keeps
+		// running in its own goroutine.
 		go func() { _ = opt.UpstreamReadyCallback(nil) }()
 	}
 	return s, nil

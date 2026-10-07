@@ -96,7 +96,11 @@ func (a *udpWriteBatchAggregator) Append(data []byte, addr string) error {
 			a.mu.Unlock()
 			return net.ErrClosed
 		}
-		if len(a.items) >= udpWriteBatchMaxItems || (a.used+len(data) > len(a.buf) && len(a.buf) > 0) {
+		// Flush-on-overflow only when there is something to flush: after the
+		// flush empties the batch, a datagram that still cannot fit alone
+		// must fall through to the oversized rejection below instead of
+		// re-entering this branch forever (items>0 implies buf is allocated).
+		if len(a.items) >= udpWriteBatchMaxItems || (len(a.items) > 0 && a.used+len(data) > len(a.buf)) {
 			a.mu.Unlock()
 			a.flush()
 			continue

@@ -221,6 +221,44 @@ func TestAggregatorOversized(t *testing.T) {
 	}
 }
 
+// TestAggregatorOversizedAfterUse: a datagram larger than the whole backing
+// buffer arriving after the buffer already holds pending items must fall back
+// with errUDPWriteBatchOversized instead of livelocking flush-retry (the old
+// overflow branch kept re-triggering on the emptied batch forever).
+func TestAggregatorOversizedAfterUse(t *testing.T) {
+	rec := &batchRecorder{}
+	ue := newBatchTestEndpoint(rec)
+	agg := newUDPWriteBatchAggregator(ue)
+
+	if err := agg.Append([]byte("pending"), "10.0.0.1:53"); err != nil {
+		t.Fatalf("Append pending: %v", err)
+	}
+	type appendResult struct {
+		err error
+	}
+	res := make(chan appendResult, 1)
+	big := make([]byte, udpWriteBatchMaxItems*udpWriteBatchItemSize+1)
+	go func() {
+		res <- appendResult{agg.Append(big, "10.0.0.1:53")}
+	}()
+	select {
+	case r := <-res:
+		if !errors.Is(r.err, errUDPWriteBatchOversized) {
+			t.Fatalf("expected errUDPWriteBatchOversized, got %v", r.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Append livelocked: oversized datagram after prior use never returned")
+	}
+	// The earlier pending item must survive the overflow flush and land intact.
+	deadline := time.Now().Add(2 * time.Second)
+	for rec.batchCount() < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if rec.batchCount() != 1 || len(rec.batch(0)) != 1 || string(rec.batch(0)[0].Data) != "pending" {
+		t.Fatal("pending item lost across the oversized fallback")
+	}
+}
+
 // TestAggregatorClosed: appends after Close fail with net.ErrClosed; pending
 // items are flushed on Close.
 func TestAggregatorClosed(t *testing.T) {

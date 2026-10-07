@@ -130,6 +130,58 @@ func stripCKernelComments(src string) string {
 	return lineCommentPattern.ReplaceAllString(src, "")
 }
 
+// stripGoComments removes // and /* */ comments so a declaration scan cannot be
+// satisfied by the type quoted inside a comment; string, rune and raw-string
+// literals are copied verbatim so a comment marker inside one cannot truncate
+// the rest of the file.
+func stripGoComments(src string) string {
+	var b strings.Builder
+	b.Grow(len(src))
+	for i := 0; i < len(src); {
+		switch {
+		case strings.HasPrefix(src[i:], "//"):
+			if j := strings.IndexByte(src[i:], '\n'); j >= 0 {
+				i += j
+			} else {
+				i = len(src)
+			}
+		case strings.HasPrefix(src[i:], "/*"):
+			j := strings.Index(src[i+2:], "*/")
+			if j < 0 {
+				i = len(src)
+			} else {
+				b.WriteByte('\n')
+				i += j + 4
+			}
+		case src[i] == '"' || src[i] == '\'' || src[i] == '`':
+			quote := src[i]
+			b.WriteByte(quote)
+			i++
+			for i < len(src) {
+				if src[i] == '\\' && quote != '`' {
+					b.WriteByte(src[i])
+					i++
+					if i == len(src) {
+						break
+					}
+					b.WriteByte(src[i])
+					i++
+					continue
+				}
+				b.WriteByte(src[i])
+				i++
+				if src[i-1] == quote {
+					break
+				}
+			}
+		default:
+			b.WriteByte(src[i])
+			i++
+		}
+	}
+	return b.String()
+}
+
 var (
 	blockCommentPattern = regexp.MustCompile(`(?s)/\*.*?\*/`)
 	lineCommentPattern  = regexp.MustCompile(`//[^\n]*`)
@@ -397,10 +449,13 @@ func TestRedirectTrackCapacityParityWithKernelSource(t *testing.T) {
 // build cannot compile is covered by TestRoutingResultMirrorSourcesAgree.
 func TestRoutingResultLayoutParityWithKernelSource(t *testing.T) {
 	kernelSource := stripCKernelComments(tproxySource)
-	m := routingResultStructPattern.FindStringSubmatch(kernelSource)
-	if m == nil {
-		t.Fatal("struct routing_result not found in kern/tproxy.c")
+	// Fail closed on ambiguity: a second definition (a disabled block, a quoted
+	// declaration) must not be able to stand in for the one that compiles.
+	declarations := routingResultStructPattern.FindAllStringSubmatch(kernelSource, -1)
+	if len(declarations) != 1 {
+		t.Fatalf("kern/tproxy.c contains %d definitions of struct routing_result, want exactly 1; the gate must not guess which one compiles", len(declarations))
 	}
+	m := declarations[0]
 	// A struct-level attribute changes the layout of every field at once, so
 	// the field-by-field comparison below could not notice it.
 	trailer := routingResultTrailerPattern.FindStringSubmatch(kernelSource)
@@ -536,10 +591,14 @@ func TestRoutingResultLayoutParityWithKernelSource(t *testing.T) {
 // bpf_utils.go keeps the stub unit-test gate green while the binary that ships
 // decodes the kernel struct with different field types or offsets.
 func TestRoutingResultMirrorSourcesAgree(t *testing.T) {
-	m := goRoutingResultStructPattern.FindStringSubmatch(bpfUtilsSource)
-	if m == nil {
-		t.Fatal("type bpfRoutingResult struct not found in control/bpf_utils.go")
+	// The declaration must be read out of code, not out of prose: a doc comment
+	// quoting the type (or a second definition) would otherwise decide what the
+	// gate compares, and the shipped mirror could drift behind it.
+	declarations := goRoutingResultStructPattern.FindAllStringSubmatch(stripGoComments(bpfUtilsSource), -1)
+	if len(declarations) != 1 {
+		t.Fatalf("control/bpf_utils.go contains %d definitions of type bpfRoutingResult struct, want exactly 1; the gate must not guess which one ships", len(declarations))
 	}
+	m := declarations[0]
 
 	var want []string
 	for _, line := range strings.Split(m[1], "\n") {

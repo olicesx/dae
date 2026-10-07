@@ -7,7 +7,6 @@ package control
 
 import (
 	"fmt"
-	"net"
 	"net/netip"
 
 	"github.com/daeuniverse/dae/common/consts"
@@ -152,11 +151,7 @@ func (m *RoutingMatcher) newFacts(
 	processName [16]uint8,
 	dscp uint8,
 	mac [16]uint8,
-) (routingMatcherFacts, error) {
-	if len(sourceAddr) != net.IPv6len || len(destAddr) != net.IPv6len || len(mac) != net.IPv6len {
-		return routingMatcherFacts{}, fmt.Errorf("bad address length")
-	}
-
+) routingMatcherFacts {
 	facts := routingMatcherFacts{
 		sourceAddr: sourceAddr,
 		destAddr:   destAddr,
@@ -183,7 +178,7 @@ func (m *RoutingMatcher) newFacts(
 	if m.needs.domainBitmap && domain != "" {
 		facts.domainBitmap = m.domainMatcher.MatchDomainBitmap(domain)
 	}
-	return facts, nil
+	return facts
 }
 
 // matchCompiledMatch evaluates one positive compiled match operation. Callers
@@ -246,7 +241,7 @@ func (m *RoutingMatcher) Match(
 	dscp uint8,
 	mac [16]uint8,
 ) (outboundIndex consts.OutboundIndex, mark uint32, must bool, err error) {
-	facts, err := m.newFacts(
+	facts := m.newFacts(
 		sourceAddr,
 		destAddr,
 		sourcePort,
@@ -258,9 +253,6 @@ func (m *RoutingMatcher) Match(
 		dscp,
 		mac,
 	)
-	if err != nil {
-		return 0, 0, false, err
-	}
 
 	matches := m.compiledMatches
 	if len(matches) == 0 {

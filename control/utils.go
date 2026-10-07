@@ -8,9 +8,9 @@ package control
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/hex"
 	stderrors "errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"os"
 	"syscall"
@@ -86,32 +86,7 @@ func (c *controlPlaneCore) retrieveEmbeddedRoutingResult(tuples *bpfTuplesKey, l
 	var routingResult bpfRoutingResult
 
 	switch l4proto {
-	case unix.IPPROTO_TCP:
-		if bpf.ConnStateMap == nil {
-			return nil, ebpf.ErrKeyNotExist
-		}
-		var connState bpfConnState
-		if err := bpf.ConnStateMap.Lookup(tuples, &connState); err != nil {
-			if stderrors.Is(err, ebpf.ErrKeyNotExist) {
-				return nil, ebpf.ErrKeyNotExist
-			}
-			return nil, fmt.Errorf("reading conn_state_map: %w", err)
-		}
-		if connState.Meta.Data.HasRouting == 0 {
-			return nil, ebpf.ErrKeyNotExist
-		}
-		routingResult = routingResultFromConnState(
-			connState.Meta.Data.Mark,
-			connState.Meta.Data.Must,
-			connState.Meta.Data.Outbound,
-			connState.Mac,
-			connState.Meta.Data.Dscp,
-			connState.Pname,
-			connState.Pid,
-			connState.RoutingEpochSlot,
-			connState.DatapathGeneration,
-		)
-	case unix.IPPROTO_UDP:
+	case unix.IPPROTO_TCP, unix.IPPROTO_UDP:
 		if bpf.ConnStateMap == nil {
 			return nil, ebpf.ErrKeyNotExist
 		}
@@ -402,15 +377,8 @@ func ProcessName2String(pname []uint8) string {
 	return string(bytes.TrimRight(pname, string([]byte{0})))
 }
 
+// Mac2String formats a MAC address as colon-separated lowercase hex. Callers
+// always pass 6-byte addresses, so net.HardwareAddr's formatting applies.
 func Mac2String(mac []uint8) string {
-	ori := []byte(hex.EncodeToString(mac))
-	// Insert ":".
-	b := make([]byte, len(ori)/2*3-1)
-	for i, j := 0, 0; i < len(ori); i, j = i+2, j+3 {
-		copy(b[j:j+2], ori[i:i+2])
-		if j+2 < len(b) {
-			b[j+2] = ':'
-		}
-	}
-	return string(b)
+	return net.HardwareAddr(mac).String()
 }

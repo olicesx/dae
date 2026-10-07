@@ -7,23 +7,12 @@ package sniffing
 
 import (
 	"errors"
-	"io"
 	"net"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
 )
-
-const relayBufSize = 32 << 10 // 32 KB, matches control.relayCopyBufferSize
-
-var relayBufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, relayBufSize)
-		return &b
-	},
-}
 
 type ConnSniffer struct {
 	// log defaults to the standard logger; callers owning a configured
@@ -53,19 +42,6 @@ func (s *ConnSniffer) UnderlyingConn() net.Conn { return s.Conn }
 
 func (s *ConnSniffer) Read(p []byte) (n int, err error) {
 	return s.Sniffer.Read(p)
-}
-
-// CopyRelayRemainder streams the rest of the connection to dst by reading the
-// underlying conn directly, skipping the Sniffer.
-//
-// It deliberately does NOT match control's relayContinuationSource signature,
-// so control's gather-write path keeps falling back to relayCopyLoop, which
-// reads through Sniffer.Read. Do not "align" it: reading s.Conn directly loses
-// Sniffer state (buffered bytes and dataError) that Read still owns, and doing
-// so breaks proxied TCP. Only bufioConn and prefixedConn, whose prefixes are
-// fully drained before the continuation runs, may implement that interface.
-func (s *ConnSniffer) CopyRelayRemainder(dst io.Writer, buf []byte) (int64, error) {
-	return copyDirect(dst, s.Conn, buf)
 }
 
 func (s *ConnSniffer) TakeRelaySegments() [][]byte {
@@ -120,105 +96,6 @@ func (s *ConnSniffer) Close() (err error) {
 		return errors.New(strings.Join(errs, "; "))
 	}
 	return nil
-}
-
-// WriteTo implements io.WriterTo.
-//
-// Called by io.Copy when ConnSniffer is the source (client → server direction).
-// Flushes the sniff buffer (TLS ClientHello etc.) then forwards the remainder
-// of the stream via a plain io.Copy.
-//
-// Data flow: ConnSniffer (client) → remote proxy/server
-func (s *ConnSniffer) WriteTo(w io.Writer) (n int64, err error) {
-	// Flush buffered sniff data (e.g. TLS ClientHello already read).
-	if s.Sniffer != nil {
-		s.readMu.Lock()
-		if s.buf.Len() > 0 {
-			n, err = s.buf.WriteTo(w)
-			s.readMu.Unlock()
-			if err != nil {
-				return n, err
-			}
-		} else {
-			s.readMu.Unlock()
-		}
-	}
-
-	// Fast path: if w is a plain TCP connection, use io.Copy to enable splice.
-	// This bypasses io.CopyBuffer and uses the kernel's splice(2) for zero-copy forwarding.
-	if tcpConn, ok := s.getUnderlyingTCPConn(w); ok {
-		copied, err := io.Copy(tcpConn, s.Conn)
-		return n + copied, err
-	}
-
-	// Fallback: use buffered copy for non-TCP or wrapped connections.
-	bufPtr := relayBufPool.Get().(*[]byte)
-	buf := *bufPtr
-	defer relayBufPool.Put(bufPtr)
-	copied, err := io.CopyBuffer(w, s.Conn, buf)
-	return n + copied, err
-}
-
-// getUnderlyingTCPConn returns the underlying *net.TCPConn if available.
-// This enables splice(2) zero-copy forwarding after sniffing is complete.
-func (s *ConnSniffer) getUnderlyingTCPConn(w io.Writer) (*net.TCPConn, bool) {
-	// Fast path: check if w is already a *net.TCPConn
-	if tcpConn, ok := w.(*net.TCPConn); ok {
-		return tcpConn, true
-	}
-	// Indirect path: check if w implements UnderlyingConnProvider
-	type underlyingConnProvider interface {
-		UnwrapTCPConn() (*net.TCPConn, bool)
-	}
-	if ucp, ok := w.(underlyingConnProvider); ok {
-		return ucp.UnwrapTCPConn()
-	}
-	return nil, false
-}
-
-// ReadFrom implements io.ReaderFrom.
-//
-// Called by io.Copy when ConnSniffer is the destination (server → client
-// direction).  Bypasses the read buffer and writes directly to the underlying
-// connection.
-//
-// We intentionally avoid io.Copy(s.Conn, r) here: net.TCPConn implements
-// io.ReaderFrom, and its ReadFrom calls genericReadFrom which internally does
-// io.Copy with a nil buf → make([]byte, 32768) heap allocation per connection.
-// copyDirect uses an explicit caller-provided buffer and skips both WriterTo and ReaderFrom
-// interface delegation, preventing that hidden allocation.
-//
-// Data flow: remote proxy/server → ConnSniffer (client)
-func (s *ConnSniffer) ReadFrom(r io.Reader) (int64, error) {
-	bufPtr := relayBufPool.Get().(*[]byte)
-	buf := *bufPtr
-	defer relayBufPool.Put(bufPtr)
-	return copyDirect(s.Conn, r, buf)
-}
-
-// copyDirect copies from src to dst using the provided buf without delegating
-// to io.WriterTo or io.ReaderFrom interfaces. This prevents stdlib wrappers
-// (e.g. net.TCPConn.ReadFrom) from silently heap-allocating their own buffers.
-func copyDirect(dst io.Writer, src io.Reader, buf []byte) (written int64, err error) {
-	for {
-		nr, er := src.Read(buf)
-		if nr > 0 {
-			nw, ew := dst.Write(buf[:nr])
-			written += int64(nw)
-			if ew != nil {
-				return written, ew
-			}
-			if nw < nr {
-				return written, io.ErrShortWrite
-			}
-		}
-		if er != nil {
-			if er != io.EOF {
-				err = er
-			}
-			return
-		}
-	}
 }
 
 // UnwrapTCPConn returns the underlying *net.TCPConn if available.

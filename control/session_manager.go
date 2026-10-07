@@ -418,31 +418,6 @@ func (f *FlowRuntime) Context() context.Context {
 	return f.ctx
 }
 
-// Ingress returns the accepted transparent connection.
-func (f *FlowRuntime) Ingress() net.Conn {
-	if f == nil {
-		return nil
-	}
-	return f.ingress
-}
-
-// Egress returns the concrete outbound connection selected at establishment.
-// It is nil for locally terminated flows such as transparent DNS-over-TCP.
-func (f *FlowRuntime) Egress() netproxy.Conn {
-	if f == nil {
-		return nil
-	}
-	return f.egress
-}
-
-// Binding returns the immutable route and concrete egress decision.
-func (f *FlowRuntime) Binding() TcpFlowBinding {
-	if f == nil {
-		return TcpFlowBinding{}
-	}
-	return f.binding
-}
-
 func (m *SessionManager) adoptTCP(
 	ingress net.Conn,
 	egress netproxy.Conn,

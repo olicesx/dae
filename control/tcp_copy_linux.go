@@ -39,13 +39,9 @@ func relayFastCopy(ctx context.Context, dst netproxy.Conn, src netproxy.Conn, re
 	// Bypass outer wrapper interfaces (*ConnSniffer, *prefixedConn) and operate
 	// on the raw socket pair directly: io.Copy on two *net.TCPConn invokes
 	// (*net.TCPConn).WriteTo → (*net.TCPConn).ReadFrom → splice(2) on Linux,
-	// eliminating userspace memcopy.
-	//
-	// Without this unwrap:
-	//   • l2r, src=*ConnSniffer(prefixedConn): ConnSniffer.WriteTo → inner
-	//     dst.ReadFrom(*prefixedConn) → genericReadFrom → alloc 32 KiB per conn
-	//   • l2r, src=*prefixedConn: dst.ReadFrom(*prefixedConn) → same 32 KiB alloc
-	//   • r2l, dst=*ConnSniffer: ConnSniffer.ReadFrom → copyDirect → no splice
+	// eliminating userspace memcopy. Wrapped legs never reach this function
+	// (shouldUseRelayFastPath gates them out) and take the steady/slow relay
+	// paths in relayCopyEngine instead.
 	//
 	// Safety: tryRelayGatherWrite has already drained any userspace prefix via
 	// TakeRelayPrefix/TakeRelaySegments before this function is called, so the
@@ -58,61 +54,45 @@ func relayFastCopy(ctx context.Context, dst netproxy.Conn, src netproxy.Conn, re
 
 	dstTCP, dstOk := unwrapRelayTransparentTCPConn(dst)
 	srcTCP, srcOk := unwrapRelayTransparentTCPConn(src)
-
-	// Fast path: both sides are plain TCP connections
-	if dstOk && srcOk {
-		// Propagate context deadline to TCP connections if present.
-		// relayCore.run ensures ctx is never nil.
-		if ctx != nil {
-			if deadline, ok := ctx.Deadline(); ok {
-				// Check if already canceled (only when we have a deadline)
-				select {
-				case <-ctx.Done():
-					return 0, ctx.Err()
-				default:
-				}
-				// Set deadline on both connections.
-				// Ignore errors: connections may be closed by forceClose concurrently.
-				_ = srcTCP.SetReadDeadline(deadline)
-				_ = dstTCP.SetWriteDeadline(deadline)
-				defer func() {
-					// Clear deadline on exit. Ignore errors for same reason.
-					_ = srcTCP.SetReadDeadline(time.Time{})
-					_ = dstTCP.SetWriteDeadline(time.Time{})
-				}()
-			}
-		}
-		// Direct splice remains enabled. When runtime accounting is requested,
-		// use an explicit splice loop so we can account exact bytes written while
-		// staying in the kernel zero-copy path. relayCore.forceClose() will
-		// unblock blocked splice calls via SetReadDeadline(past).
-		// The bare io.Copy shortcut is legal only when neither record nor
-		// onActive is set: io.Copy cannot refresh lastActiveNano, and the
-		// idle watchdog is armed unconditionally by relayCore.run.
-		if record == nil && onActive == nil {
-			return io.Copy(dstTCP, srcTCP)
-		}
-		return relaySpliceCopyExact(ctx, dstTCP, srcTCP, record, onActive)
+	if !dstOk || !srcOk {
+		// Unreachable through relayCopyEngine: shouldUseRelayFastPath gates
+		// entry with the same pure unwrap. Fail loudly rather than silently
+		// degrading if a future caller skips the gate.
+		return 0, stderrors.New("relay fast path: both conns must unwrap to transparent TCP sockets")
 	}
 
-	// Fallback: use WriterTo if available, or buffered copy
-	if dstOk {
-		if _, ok := src.(io.WriterTo); ok {
-			if record == nil && onActive == nil {
-				return io.Copy(dstTCP, src)
+	// Propagate context deadline to TCP connections if present.
+	// relayCore.run ensures ctx is never nil.
+	if ctx != nil {
+		if deadline, ok := ctx.Deadline(); ok {
+			// Check if already canceled (only when we have a deadline)
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			default:
 			}
-			bufPtr := relayCopyBufferPool.Get().(*[]byte)
-			buf := *bufPtr
-			defer relayCopyBufferPool.Put(bufPtr)
-			return relayCopyLoop(ctx, dst, src, buf, record, onActive)
+			// Set deadline on both connections.
+			// Ignore errors: connections may be closed by forceClose concurrently.
+			_ = srcTCP.SetReadDeadline(deadline)
+			_ = dstTCP.SetWriteDeadline(deadline)
+			defer func() {
+				// Clear deadline on exit. Ignore errors for same reason.
+				_ = srcTCP.SetReadDeadline(time.Time{})
+				_ = dstTCP.SetWriteDeadline(time.Time{})
+			}()
 		}
 	}
-
-	// Slow path: buffered copy (e.g., when wrapper doesn't support fast path)
-	bufPtr := relayCopyBufferPool.Get().(*[]byte)
-	buf := *bufPtr
-	defer relayCopyBufferPool.Put(bufPtr)
-	return relayCopyLoop(ctx, dst, src, buf, record, onActive)
+	// Direct splice remains enabled. When runtime accounting is requested,
+	// use an explicit splice loop so we can account exact bytes written while
+	// staying in the kernel zero-copy path. relayCore.forceClose() will
+	// unblock blocked splice calls via SetReadDeadline(past).
+	// The bare io.Copy shortcut is legal only when neither record nor
+	// onActive is set: io.Copy cannot refresh lastActiveNano, and the
+	// idle watchdog is armed unconditionally by relayCore.run.
+	if record == nil && onActive == nil {
+		return io.Copy(dstTCP, srcTCP)
+	}
+	return relaySpliceCopyExact(ctx, dstTCP, srcTCP, record, onActive)
 }
 
 func relaySpliceCopyExact(ctx context.Context, dst, src *net.TCPConn, record func(int64), onActive func(int64)) (int64, error) {

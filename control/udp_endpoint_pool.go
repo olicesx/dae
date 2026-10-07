@@ -750,9 +750,10 @@ func (p *UdpEndpointPool) Get(key UdpEndpointKey) (udpEndpoint *UdpEndpoint, ok 
 	return ue, ok
 }
 
-// createEndpointLocked dials and registers a new UdpEndpoint under the caller's shard lock.
-// The caller MUST hold the shard mutex for key before calling this function.
-func (p *UdpEndpointPool) createEndpointLocked(key UdpEndpointKey, createOption *UdpEndpointOptions) (*UdpEndpoint, error) {
+// createEndpointUnderCreateMu dials and registers a new UdpEndpoint. The
+// caller MUST hold shard.createMu for key; the function takes the shard mutex
+// itself when touching the shared pool map.
+func (p *UdpEndpointPool) createEndpointUnderCreateMu(key UdpEndpointKey, createOption *UdpEndpointOptions) (*UdpEndpoint, error) {
 	if createOption == nil {
 		createOption = &UdpEndpointOptions{}
 	}
@@ -776,7 +777,7 @@ func (p *UdpEndpointPool) createEndpointLocked(key UdpEndpointKey, createOption 
 	dialOption, err := createOption.GetDialOption(ctx)
 	if err != nil {
 		if shouldCacheUdpEndpointCreateFailure(err) {
-			p.cacheFailureLocked(key, createOption.Log)
+			p.cacheCreateFailure(key, createOption.Log)
 		}
 		return nil, err
 	}
@@ -806,7 +807,7 @@ func (p *UdpEndpointPool) createEndpointLocked(key UdpEndpointKey, createOption 
 			}
 		}
 		if shouldCacheUdpEndpointCreateFailure(err) {
-			p.cacheFailureLocked(key, createOption.Log)
+			p.cacheCreateFailure(key, createOption.Log)
 		}
 		return nil, err
 	}
@@ -935,7 +936,10 @@ func shouldCacheUdpEndpointCreateFailure(err error) bool {
 	return true
 }
 
-func (p *UdpEndpointPool) cacheFailureLocked(key UdpEndpointKey, log *logrus.Logger) {
+// cacheCreateFailure installs a short-lived failed-endpoint placeholder for
+// key so repeated dials of a dead target fail fast. It acquires the shard
+// mutex itself.
+func (p *UdpEndpointPool) cacheCreateFailure(key UdpEndpointKey, log *logrus.Logger) {
 	failedUe := &UdpEndpoint{
 		log:     log,
 		poolRef: p,
@@ -1047,7 +1051,7 @@ func (p *UdpEndpointPool) GetOrCreate(key UdpEndpointKey, createOption *UdpEndpo
 	shard.mu.Unlock()
 
 	// Create a new endpoint under the creation lock.
-	newUe, createErr := p.createEndpointLocked(key, createOption)
+	newUe, createErr := p.createEndpointUnderCreateMu(key, createOption)
 	shard.createMu.Unlock()
 	createMuLocked = false
 

@@ -36,7 +36,7 @@ type relayPrefixSource interface {
 //
 // sniffing.ConnSniffer is intentionally absent from relayContinuationSource:
 // its remainder must be read through Sniffer.Read, so it stays on
-// relayCopyLoop. See ConnSniffer.CopyRelayRemainder.
+// relayCopyLoop.
 var (
 	_ relaySegmentSource      = (*sniffing.ConnSniffer)(nil)
 	_ relayPrefixSource       = (*sniffing.ConnSniffer)(nil)

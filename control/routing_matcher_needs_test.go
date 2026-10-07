@@ -31,16 +31,13 @@ func TestRoutingMatcherNeedsGatesFactBuilds(t *testing.T) {
 	}
 
 	m := &RoutingMatcher{needs: needs}
-	facts, err := m.newFacts(
+	facts := m.newFacts(
 		srcAddr16(t, "10.0.0.1"),
 		dstAddr16(t, "8.8.8.8"),
 		1234, 443,
 		consts.IpVersion_4, consts.L4ProtoStr_TCP.ToL4ProtoType(),
 		"", [16]uint8{}, 0, [16]uint8{},
 	)
-	if err != nil {
-		t.Fatalf("newFacts: %v", err)
-	}
 	if facts.ipSetBin == "" || facts.sourceIPSetBin == "" {
 		t.Fatal("required ip bins were not built")
 	}
@@ -54,11 +51,8 @@ func TestRoutingMatcherNeedsGatesFactBuilds(t *testing.T) {
 // gated matcher reports no error evaluating such a rule with empty bins.
 func TestMatchCompiledMatchWithGatedEmptyBins(t *testing.T) {
 	m := &RoutingMatcher{}
-	facts, err := m.newFacts(srcAddr16(t, "10.0.0.1"), dstAddr16(t, "8.8.8.8"), 1234, 80,
+	facts := m.newFacts(srcAddr16(t, "10.0.0.1"), dstAddr16(t, "8.8.8.8"), 1234, 80,
 		consts.IpVersion_4, consts.L4ProtoStr_TCP.ToL4ProtoType(), "", [16]uint8{}, 0, [16]uint8{})
-	if err != nil {
-		t.Fatalf("newFacts: %v", err)
-	}
 	ok, err := m.matchCompiledMatch(0, compiledRoutingMatch{
 		matchType: consts.MatchType_Port, portStart: 80, portEnd: 80,
 	}, &facts)

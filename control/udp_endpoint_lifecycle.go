@@ -545,10 +545,6 @@ func isUdpEndpointWriteTolerated(err error) bool {
 	return stderrors.As(err, &tolerated)
 }
 
-// armWriteDeadline keeps a write deadline of [T/2, T] ahead of every write
-// while re-arming at most once per T/2 window. Transports that do not support
-// write deadlines return an error, which is deliberately ignored: they simply
-// keep their previous unbounded behaviour.
 // dialTargetForWrite returns the string form of the datagram's upstream
 // destination for WriteTo. Symmetric endpoints (non-zero Dst in the pool
 // key) have a fixed dial target stored once at creation, so the per-packet
@@ -703,6 +699,10 @@ func (ue *UdpEndpoint) observeSendRate(now time.Time, datagrams int) {
 	}
 }
 
+// armWriteDeadline keeps a write deadline of [T/2, T] ahead of every write
+// while re-arming at most once per T/2 window. Transports that do not support
+// write deadlines return an error, which is deliberately ignored: they simply
+// keep their previous unbounded behaviour.
 func (ue *UdpEndpoint) armWriteDeadline(now time.Time) {
 	// Transports that declare a session-closing write deadline via the
 	// netproxy.WriteDeadlineBehavior contract (TUIC/Hysteria2: their

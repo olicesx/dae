@@ -119,47 +119,33 @@ func cidrToBpfLpmKey(prefix netip.Prefix) _bpfLpmKey {
 }
 
 var (
-	CheckBatchUpdateFeatureOnce sync.Once
-	SimulateBatchUpdate         bool
-	SimulateBatchUpdateLpmTrie  bool
+	checkBatchUpdateFeatureOnce sync.Once
+	simulateBatchUpdate         bool
+	simulateBatchUpdateLpmTrie  bool
 
-	CheckBatchDeleteFeatureOnce sync.Once
-	SimulateBatchDelete         bool
+	checkBatchDeleteFeatureOnce sync.Once
+	simulateBatchDelete         bool
 )
 
-func initBatchDeleteFeatureFlags() {
-	CheckBatchDeleteFeatureOnce.Do(func() {
-		version, e := internal.KernelVersion()
-		if e != nil {
-			SimulateBatchDelete = true
-			return
-		}
-		// BatchDelete requires kernel 5.6+ for BPF_MAP_TYPE_BATCH operations.
-		if version.Less(consts.UserspaceBatchUpdateFeatureVersion) {
-			SimulateBatchDelete = true
-		}
-	})
-}
-
 func BpfMapBatchUpdate(m *ebpf.Map, keys any, values any, opts *ebpf.BatchOptions) (n int, err error) {
-	CheckBatchUpdateFeatureOnce.Do(func() {
+	checkBatchUpdateFeatureOnce.Do(func() {
 		version, e := internal.KernelVersion()
 		if e != nil {
-			SimulateBatchUpdate = true
-			SimulateBatchUpdateLpmTrie = true
+			simulateBatchUpdate = true
+			simulateBatchUpdateLpmTrie = true
 			return
 		}
 		if version.Less(consts.UserspaceBatchUpdateFeatureVersion) {
-			SimulateBatchUpdate = true
+			simulateBatchUpdate = true
 		}
 		if version.Less(consts.UserspaceBatchUpdateLpmTrieFeatureVersion) {
-			SimulateBatchUpdateLpmTrie = true
+			simulateBatchUpdateLpmTrie = true
 		}
 	})
 
-	simulate := SimulateBatchUpdate
+	simulate := simulateBatchUpdate
 	if m.Type() == ebpf.LPMTrie {
-		simulate = SimulateBatchUpdateLpmTrie
+		simulate = simulateBatchUpdateLpmTrie
 	}
 
 	if !simulate {
@@ -196,14 +182,24 @@ func BpfMapBatchUpdate(m *ebpf.Map, keys any, values any, opts *ebpf.BatchOption
 // missing key, so ENOENT must resume at the following key instead of being
 // treated as success for the unprocessed suffix.
 func BpfMapBatchDelete(m *ebpf.Map, keys any) (n int, err error) {
-	initBatchDeleteFeatureFlags()
+	checkBatchDeleteFeatureOnce.Do(func() {
+		version, e := internal.KernelVersion()
+		if e != nil {
+			simulateBatchDelete = true
+			return
+		}
+		// BatchDelete requires kernel 5.6+ for BPF_MAP_TYPE_BATCH operations.
+		if version.Less(consts.UserspaceBatchUpdateFeatureVersion) {
+			simulateBatchDelete = true
+		}
+	})
 
 	vKeys := reflect.ValueOf(keys)
 	if vKeys.Kind() != reflect.Slice {
 		return 0, fmt.Errorf("keys must be slice")
 	}
 
-	if !SimulateBatchDelete {
+	if !simulateBatchDelete {
 		n, err = batchDeleteIgnoringMissing(vKeys, func(suffix any) (int, error) {
 			return m.BatchDelete(suffix, &ebpf.BatchOptions{})
 		})

@@ -437,43 +437,56 @@ func (b *RoutingMatcherBuilder) addSourceMac(f *config_parser.Function, macAddrs
 	return nil
 }
 
-func (b *RoutingMatcherBuilder) addIp(f *config_parser.Function, values []netip.Prefix, outbound *routing.Outbound) (err error) {
-	values = canonicalizePrefixes(values)
-	// Deduplication: check if we've seen this IP set before with collision detection
+// lpmTrieIndexFor returns the simulated LPM trie index for the given
+// canonicalized prefix set, inserting a new trie when the set has not been
+// seen before. On a hash collision with a different prefix set it appends a
+// fresh trie but leaves the existing dedup entry in place: overwriting it
+// would silently redirect a previously registered colliding set to the new
+// trie.
+func (b *RoutingMatcherBuilder) lpmTrieIndexFor(values []netip.Prefix) uint32 {
 	hash := hashLpmSet(values)
-	var lpmTrieIndex uint32
 	if entry, exists := b.lpmDedup[hash]; exists {
-		// Verify it's not a hash collision
+		// Verify it's not a hash collision.
 		if prefixesEqual(entry.prefixes, values) {
-			lpmTrieIndex = entry.index
-		} else {
-			// Hash collision detected - use a new entry
-			lpmTrieIndex = uint32(len(b.simulatedLpmTries))
-			b.simulatedLpmTries = append(b.simulatedLpmTries, values)
-			b.lpmDedup[hash] = lpmDedupEntry{index: lpmTrieIndex, prefixes: values}
+			return entry.index
 		}
-	} else {
-		lpmTrieIndex = uint32(len(b.simulatedLpmTries))
+		// Hash collision detected - use a new entry.
+		index := uint32(len(b.simulatedLpmTries))
 		b.simulatedLpmTries = append(b.simulatedLpmTries, values)
-		b.lpmDedup[hash] = lpmDedupEntry{index: lpmTrieIndex, prefixes: values}
+		return index
 	}
+	index := uint32(len(b.simulatedLpmTries))
+	b.simulatedLpmTries = append(b.simulatedLpmTries, values)
+	b.lpmDedup[hash] = lpmDedupEntry{index: index, prefixes: values}
+	return index
+}
+
+// addIpRule emits one IP-prefix match rule of the given match type, sharing
+// the LPM trie dedup insertion between destination and source IP rules.
+func (b *RoutingMatcherBuilder) addIpRule(f *config_parser.Function, values []netip.Prefix, outbound *routing.Outbound, matchType consts.MatchType) (err error) {
+	values = canonicalizePrefixes(values)
+	lpmTrieIndex := b.lpmTrieIndexFor(values)
 	outboundId, err := b.outboundToId(outbound.Name)
 	if err != nil {
 		return err
 	}
 	set := bpfMatchSet{
 		Value:    [16]byte{},
-		Type:     uint8(consts.MatchType_IpSet),
+		Type:     uint8(matchType),
 		Not:      bpfBool(f.Not),
 		Outbound: outboundId,
 		Mark:     outbound.Mark,
 		Must:     bpfBool(outbound.Must),
 	}
 	nativeBpfABI.putUint32(set.Value[:], lpmTrieIndex)
-	compiled := newCompiledRoutingBase(consts.MatchType_IpSet, f.Not, outboundId, outbound.Mark, outbound.Must)
+	compiled := newCompiledRoutingBase(matchType, f.Not, outboundId, outbound.Mark, outbound.Must)
 	compiled.lpmIndex = lpmTrieIndex
 	b.appendRule(set, compiled)
 	return nil
+}
+
+func (b *RoutingMatcherBuilder) addIp(f *config_parser.Function, values []netip.Prefix, outbound *routing.Outbound) (err error) {
+	return b.addIpRule(f, values, outbound, consts.MatchType_IpSet)
 }
 
 func (b *RoutingMatcherBuilder) addPort(f *config_parser.Function, values [][2]uint16, outbound *routing.Outbound) (err error) {
@@ -506,42 +519,7 @@ func (b *RoutingMatcherBuilder) addPort(f *config_parser.Function, values [][2]u
 }
 
 func (b *RoutingMatcherBuilder) addSourceIp(f *config_parser.Function, values []netip.Prefix, outbound *routing.Outbound) (err error) {
-	values = canonicalizePrefixes(values)
-	// Deduplication: check if we've seen this IP set before with collision detection
-	hash := hashLpmSet(values)
-	var lpmTrieIndex uint32
-	if entry, exists := b.lpmDedup[hash]; exists {
-		// Verify it's not a hash collision
-		if prefixesEqual(entry.prefixes, values) {
-			lpmTrieIndex = entry.index
-		} else {
-			// Hash collision detected - use a new entry
-			lpmTrieIndex = uint32(len(b.simulatedLpmTries))
-			b.simulatedLpmTries = append(b.simulatedLpmTries, values)
-			b.lpmDedup[hash] = lpmDedupEntry{index: lpmTrieIndex, prefixes: values}
-		}
-	} else {
-		lpmTrieIndex = uint32(len(b.simulatedLpmTries))
-		b.simulatedLpmTries = append(b.simulatedLpmTries, values)
-		b.lpmDedup[hash] = lpmDedupEntry{index: lpmTrieIndex, prefixes: values}
-	}
-	outboundId, err := b.outboundToId(outbound.Name)
-	if err != nil {
-		return err
-	}
-	set := bpfMatchSet{
-		Value:    [16]byte{},
-		Type:     uint8(consts.MatchType_SourceIpSet),
-		Not:      bpfBool(f.Not),
-		Outbound: outboundId,
-		Mark:     outbound.Mark,
-		Must:     bpfBool(outbound.Must),
-	}
-	nativeBpfABI.putUint32(set.Value[:], lpmTrieIndex)
-	compiled := newCompiledRoutingBase(consts.MatchType_SourceIpSet, f.Not, outboundId, outbound.Mark, outbound.Must)
-	compiled.lpmIndex = lpmTrieIndex
-	b.appendRule(set, compiled)
-	return nil
+	return b.addIpRule(f, values, outbound, consts.MatchType_SourceIpSet)
 }
 
 func (b *RoutingMatcherBuilder) addSourcePort(f *config_parser.Function, values [][2]uint16, outbound *routing.Outbound) (err error) {

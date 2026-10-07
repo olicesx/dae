@@ -74,7 +74,7 @@ func ResolveSubscriptionAsSIP008(log *logrus.Logger, b []byte) (nodes []string, 
 	var sip sip008
 	err = json.Unmarshal(b, &sip)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unmarshal json to sip008")
+		return nil, fmt.Errorf("failed to unmarshal json to sip008: %w", err)
 	}
 	if sip.Version != 1 || sip.Servers == nil {
 		return nil, fmt.Errorf("does not seems like a standard sip008 subscription")

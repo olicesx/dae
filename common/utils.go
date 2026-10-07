@@ -242,22 +242,6 @@ func EnsureFileInSubDir(filePath string, dir string) (err error) {
 	return nil
 }
 
-func MapKeys(m any) (keys []string, err error) {
-	v := reflect.ValueOf(m)
-	if v.Kind() != reflect.Map {
-		return nil, fmt.Errorf("MapKeys requires map[string]*")
-	}
-	if v.Type().Key().Kind() != reflect.String {
-		return nil, fmt.Errorf("MapKeys requires map[string]*")
-	}
-	_keys := v.MapKeys()
-	keys = make([]string, 0, len(_keys))
-	for _, k := range _keys {
-		keys = append(keys, k.String())
-	}
-	return keys, nil
-}
-
 // GetTagFromLinkLikePlaintext re-exports from outbound/common to eliminate duplication.
 var GetTagFromLinkLikePlaintext = obcommon.GetTagFromLinkLikePlaintext
 

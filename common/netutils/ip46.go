@@ -20,11 +20,21 @@ type Ip46 struct {
 	Ip6 netip.Addr
 }
 
+// CtxKey is the context key type shared by netutils helpers and their
+// callers. context.Value compares key types as well as key values, so both
+// the writer and the reader must use this type; a plain string key never
+// matches a CtxKey key.
+type CtxKey string
+
+// CtxKeyLogger carries the *logrus.Logger that netutils resolution helpers
+// attach their per-family diagnostics to.
+const CtxKeyLogger CtxKey = "logger"
+
 func ResolveIp46(ctx context.Context, dialer netproxy.Dialer, dns netip.AddrPort, host string, network string, race bool) (ipv46 *Ip46, err4, err6 error) {
 	ipv46 = &Ip46{}
 
 	var log *logrus.Logger
-	if _log := ctx.Value("logger"); _log != nil {
+	if _log := ctx.Value(CtxKeyLogger); _log != nil {
 		var ok bool
 		log, ok = _log.(*logrus.Logger)
 		if !ok {

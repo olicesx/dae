@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"syscall"
 
 	"github.com/olicesx/quic-go"
@@ -72,7 +73,7 @@ func IsClosedConnection(err error) bool {
 	}
 
 	// Check by error message for backward compatibility
-	return Contains(err.Error(), "use of closed network connection")
+	return strings.Contains(err.Error(), "use of closed network connection")
 }
 
 // IsCanceledOrClosed reports whether err came from request cancellation or a
@@ -89,7 +90,7 @@ func IsCanceledOrClosed(err error) bool {
 		return true
 	}
 	errStr := err.Error()
-	return Contains(errStr, "context canceled") || Contains(errStr, "operation was canceled")
+	return strings.Contains(errStr, "context canceled") || strings.Contains(errStr, "operation was canceled")
 }
 
 // IsNetworkUnreachable checks if the error is due to network unreachability.
@@ -116,7 +117,7 @@ func IsNetworkUnreachable(err error) bool {
 	}
 
 	// Check by error message for backward compatibility
-	return HasSuffix(err.Error(), "network is unreachable")
+	return strings.HasSuffix(err.Error(), "network is unreachable")
 }
 
 // IsAddressNotSuitable checks if the error is due to address unsuitability.
@@ -136,8 +137,8 @@ func IsAddressNotSuitable(err error) bool {
 
 	// Check by error message for backward compatibility
 	errStr := err.Error()
-	return HasSuffix(errStr, "no suitable address found") ||
-		HasSuffix(errStr, "non-IPv4 address")
+	return strings.HasSuffix(errStr, "no suitable address found") ||
+		strings.HasSuffix(errStr, "non-IPv4 address")
 }
 
 // IsIgnorableConnectionError checks if the error is an ignorable connection error
@@ -276,7 +277,7 @@ func IsUDPEndpointNormalClose(err error) bool {
 	}
 
 	// Check for closed connection (string-based for backward compatibility)
-	if Contains(errStr, "use of closed network connection") {
+	if strings.Contains(errStr, "use of closed network connection") {
 		return true
 	}
 
@@ -305,7 +306,7 @@ var replayFamilyErrorSubstrings = [...]string{"replay attack", "timestamp expire
 // import ahead of.
 func isReplayFamilyErrorString(errStr string) bool {
 	for _, pattern := range replayFamilyErrorSubstrings {
-		if Contains(errStr, pattern) {
+		if strings.Contains(errStr, pattern) {
 			return true
 		}
 	}
@@ -327,7 +328,7 @@ func IsAuthError(err error) bool {
 	if err == nil {
 		return false
 	}
-	return Contains(err.Error(), "cipher: message authentication failed")
+	return strings.Contains(err.Error(), "cipher: message authentication failed")
 }
 
 // ignorableErrorPatterns is a pre-allocated slice of error patterns to avoid
@@ -349,7 +350,7 @@ var ignorableErrorPatterns = []string{
 // Uses a pre-allocated slice to avoid heap allocations on the hot path.
 func ContainsIgnorableErrorPattern(s string) bool {
 	for _, p := range ignorableErrorPatterns {
-		if Contains(s, p) {
+		if strings.Contains(s, p) {
 			return true
 		}
 	}
@@ -357,9 +358,9 @@ func ContainsIgnorableErrorPattern(s string) bool {
 }
 
 func isNormalWebSocketCloseErrorString(s string) bool {
-	return Contains(s, "websocket: close 1000 (normal)") ||
-		Contains(s, "websocket: close 1001 (going away)") ||
-		Contains(s, "websocket: close sent")
+	return strings.Contains(s, "websocket: close 1000 (normal)") ||
+		strings.Contains(s, "websocket: close 1001 (going away)") ||
+		strings.Contains(s, "websocket: close sent")
 }
 
 // ============================================================================
@@ -376,7 +377,7 @@ func IsBTFNotFoundError(err error) bool {
 		return true
 	}
 
-	return Contains(err.Error(), "no BTF found for kernel version")
+	return strings.Contains(err.Error(), "no BTF found for kernel version")
 }
 
 // IsUnknownBPFFuncError checks if the error indicates an unknown BPF function.
@@ -391,10 +392,10 @@ func IsUnknownBPFFuncError(err error) (funcName string, ok bool) {
 	}
 
 	errStr := err.Error()
-	if Contains(errStr, "unknown func bpf_trace_printk") {
+	if strings.Contains(errStr, "unknown func bpf_trace_printk") {
 		return "bpf_trace_printk", true
 	}
-	if Contains(errStr, "unknown func bpf_probe_read") {
+	if strings.Contains(errStr, "unknown func bpf_probe_read") {
 		return "bpf_probe_read", true
 	}
 	return "", false
@@ -432,32 +433,3 @@ func WrapBPFError(err error) error {
 // ============================================================================
 // String Utilities
 // ============================================================================
-
-// These utilities avoid importing the strings package to reduce binary size
-// and improve performance for hot paths.
-
-// Contains reports whether substr is within s.
-func Contains(s, substr string) bool {
-	return len(s) >= len(substr) && indexOf(s, substr) >= 0
-}
-
-// HasSuffix reports whether s ends with suffix.
-func HasSuffix(s, suffix string) bool {
-	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
-}
-
-func indexOf(s, substr string) int {
-	n := len(substr)
-	if n == 0 {
-		return 0
-	}
-	if n > len(s) {
-		return -1
-	}
-	for i := 0; i <= len(s)-n; i++ {
-		if s[i:i+n] == substr {
-			return i
-		}
-	}
-	return -1
-}

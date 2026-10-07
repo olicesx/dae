@@ -8,7 +8,6 @@ package assets
 import (
 	"errors"
 	"fmt"
-	"github.com/daeuniverse/dae/common/consts"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -18,6 +17,8 @@ import (
 	"time"
 
 	"github.com/adrg/xdg"
+	"github.com/daeuniverse/dae/common"
+	"github.com/daeuniverse/dae/common/consts"
 	"github.com/sirupsen/logrus"
 )
 
@@ -110,9 +111,8 @@ func (c *LocationFinder) GetLocationAsset(log *logrus.Logger, filename string) (
 		searchPath := filepath.Join(searchDir, filename)
 		// Reject lexical ".." traversal. Symlink resolution remains governed
 		// by the trust assigned to configured asset directories.
-		if rel, relErr := filepath.Rel(searchDir, searchPath); relErr != nil ||
-			rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return "", fmt.Errorf("asset filename escapes search directory: %v", filename)
+		if err = common.EnsureFileInSubDir(searchPath, searchDir); err != nil {
+			return "", fmt.Errorf("asset filename escapes search directory: %v: %w", filename, err)
 		}
 		if _, err = os.Stat(searchPath); err != nil {
 			if errors.Is(err, fs.ErrNotExist) {

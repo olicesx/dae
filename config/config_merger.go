@@ -51,9 +51,9 @@ func (m *Merger) Merge() (sections []*config_parser.Section, entries []string, e
 	if err != nil {
 		return nil, nil, err
 	}
-	entries, err = common.MapKeys(m.entryToSectionMap)
-	if err != nil {
-		return nil, nil, err
+	entries = make([]string, 0, len(m.entryToSectionMap))
+	for entry := range m.entryToSectionMap {
+		entries = append(entries, entry)
 	}
 	return m.convertMapToSections(m.entryToSectionMap[m.entry]), entries, nil
 }

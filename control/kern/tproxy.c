@@ -3300,10 +3300,10 @@ tproxy_wan_ingress_role(struct __sk_buff *skb, __u32 link_h_len,
 
 		copy_reversed_tuples(&pkt->tuples.five, &reversed_tuples_key);
 		/* Observability only: an unsolicited WAN-ingress UDP flow would
-		 * otherwise create conn_state from the outside (262144 entries
-		 * over a 300s TTL is only ~874 new flows per second). Rejecting
-		 * it would also drop the is_wan_ingress_direction marker that the
-		 * wan_egress pass-through depends on (host-terminated UDP
+		 * otherwise create conn_state from the outside (MAX_CONN_STATE_NUM
+		 * entries over a 300s TTL is only ~218 new flows per second).
+		 * Rejecting it would also drop the is_wan_ingress_direction marker
+		 * that the wan_egress pass-through depends on (host-terminated UDP
 		 * services), so this is counted, not enforced. See fix-plan.md
 		 * decision A20. */
 		mark_udp_seen_with_status(&reversed_tuples_key, true,

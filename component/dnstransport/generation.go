@@ -48,12 +48,32 @@ func ReleaseHTTPClientGeneration(mu *sync.Mutex, g *HTTPClientGeneration, forget
 		closeNow = true
 	}
 	mu.Unlock()
-	if closeNow {
-		g.Close()
-		mu.Lock()
-		if g.Retired && g.Active == 0 {
-			forget()
-		}
-		mu.Unlock()
+	FinishRetiredHTTPClient(mu, g, closeNow, forget)
+}
+
+// RetireHTTPClientLocked marks a generation retired after its owner swapped
+// in a successor. The caller must hold the owner's mu; the return reports
+// whether the generation has already drained and can be closed immediately.
+func RetireHTTPClientLocked(g *HTTPClientGeneration) bool {
+	if g == nil {
+		return false
 	}
+	g.Retired = true
+	return g.Active == 0
+}
+
+// FinishRetiredHTTPClient closes a drained retired generation and removes it
+// from the owner's tracking set: the close runs outside mu so transport
+// teardown never happens under the owner's lock, and the forget is re-checked
+// under mu in case an acquire raced the drain window.
+func FinishRetiredHTTPClient(mu *sync.Mutex, g *HTTPClientGeneration, closeNow bool, forget func()) {
+	if g == nil || !closeNow {
+		return
+	}
+	g.Close()
+	mu.Lock()
+	if g.Retired && g.Active == 0 {
+		forget()
+	}
+	mu.Unlock()
 }

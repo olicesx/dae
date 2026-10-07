@@ -306,21 +306,11 @@ func (r *Router) replaceHTTPClient(previous *dnstransport.HTTPClientGeneration, 
 	next.Active = 1
 	r.httpClients[key] = next
 	r.httpClientGenerations[next] = struct{}{}
-	if previous != nil {
-		previous.Retired = true
-		if previous.Active == 0 {
-			closePrevious = true
-		}
-	}
+	closePrevious = dnstransport.RetireHTTPClientLocked(previous)
 	r.httpClientMu.Unlock()
-	if closePrevious {
-		previous.Close()
-		r.httpClientMu.Lock()
-		if previous.Retired && previous.Active == 0 {
-			delete(r.httpClientGenerations, previous)
-		}
-		r.httpClientMu.Unlock()
-	}
+	dnstransport.FinishRetiredHTTPClient(&r.httpClientMu, previous, closePrevious, func() {
+		delete(r.httpClientGenerations, previous)
+	})
 	return next
 }
 

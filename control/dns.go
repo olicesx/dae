@@ -343,21 +343,11 @@ func (d *DoH) replaceClient(previous *dnstransport.HTTPClientGeneration) *dnstra
 	next.Active = 1
 	d.client = next
 	d.clientGenerations[next] = struct{}{}
-	if previous != nil {
-		previous.Retired = true
-		if previous.Active == 0 {
-			closePrevious = true
-		}
-	}
+	closePrevious = dnstransport.RetireHTTPClientLocked(previous)
 	d.mu.Unlock()
-	if closePrevious {
-		previous.Close()
-		d.mu.Lock()
-		if previous.Retired && previous.Active == 0 {
-			delete(d.clientGenerations, previous)
-		}
-		d.mu.Unlock()
-	}
+	dnstransport.FinishRetiredHTTPClient(&d.mu, previous, closePrevious, func() {
+		delete(d.clientGenerations, previous)
+	})
 	return next
 }
 

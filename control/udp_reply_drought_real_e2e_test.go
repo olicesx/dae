@@ -214,6 +214,13 @@ type realUdpE2E struct {
 
 func newRealUdpE2E(t *testing.T, d *componentdialer.Dialer, dst netip.AddrPort) *realUdpE2E {
 	t.Helper()
+	// The reply-drought accounting this suite asserts (writesSinceReply,
+	// hasSent, send-rate evidence) is defined on the unbatched write path,
+	// where WriteTo stamps it synchronously. The default-on batch aggregator
+	// defers that stamping to flush time — behavior covered separately in
+	// udp_write_batch_test.go — so pin the opt-out here and keep these E2E
+	// tests on the synchronous semantics they were written against.
+	t.Setenv(udpWriteBatchOptOutEnv, "1")
 	oldPool := DefaultUdpEndpointPool
 	DefaultUdpEndpointPool = NewUdpEndpointPool()
 	t.Cleanup(func() {

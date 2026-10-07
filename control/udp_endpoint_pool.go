@@ -861,7 +861,13 @@ dialSuccess:
 			}
 		}(),
 	}
-	if udpWriteBatchOptedIn() {
+	// Install the write aggregator only on transports that implement
+	// netproxy.PacketBatchWriter. Dial success is the one moment the concrete
+	// transport type is known (ue.conn is never reassigned after this), so
+	// this dial-time assertion is what scopes batching; the type re-check in
+	// flush() is a defensive fallback only. Batching is on by default;
+	// DAE_DISABLE_UDP_WRITE_BATCH=1 opts the deployment out entirely.
+	if udpWriteBatchEnabled() {
 		if _, ok := packetConn.(netproxy.PacketBatchWriter); ok {
 			ue.writeBatch = newUDPWriteBatchAggregator(ue)
 			ue.sentReporter = createOption.SentReporter

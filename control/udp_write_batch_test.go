@@ -18,23 +18,26 @@ import (
 	"github.com/daeuniverse/outbound/netproxy"
 )
 
-// batchRecorder implements PacketConn + PacketBatchWriter and records every
-// batch (with deep-copied payloads so reuse of the aggregator buffer is safe).
-func TestUDPWriteBatchRequiresExplicitOptIn(t *testing.T) {
-	t.Setenv(udpWriteBatchOptInEnv, "")
-	if udpWriteBatchOptedIn() {
-		t.Fatal("batching enabled without explicit opt-in")
+// TestUDPWriteBatchDisabledByEnv: batching is on by default and only the exact
+// value DAE_DISABLE_UDP_WRITE_BATCH=1 turns it off; an ambiguous value keeps
+// the default rather than silently unbatching.
+func TestUDPWriteBatchDisabledByEnv(t *testing.T) {
+	t.Setenv(udpWriteBatchOptOutEnv, "")
+	if !udpWriteBatchEnabled() {
+		t.Fatal("batching must be enabled by default")
 	}
-	t.Setenv(udpWriteBatchOptInEnv, "1")
-	if !udpWriteBatchOptedIn() {
-		t.Fatal("batching disabled with explicit opt-in")
+	t.Setenv(udpWriteBatchOptOutEnv, "1")
+	if udpWriteBatchEnabled() {
+		t.Fatal("batching must be disabled by the opt-out env")
 	}
-	t.Setenv(udpWriteBatchOptInEnv, "true")
-	if udpWriteBatchOptedIn() {
-		t.Fatal("ambiguous opt-in value enabled batching")
+	t.Setenv(udpWriteBatchOptOutEnv, "true")
+	if !udpWriteBatchEnabled() {
+		t.Fatal("ambiguous opt-out value must not disable batching")
 	}
 }
 
+// batchRecorder implements PacketConn + PacketBatchWriter and records every
+// batch (with deep-copied payloads so reuse of the aggregator buffer is safe).
 type batchRecorder struct {
 	mu      sync.Mutex
 	batches [][]netproxy.BatchItem

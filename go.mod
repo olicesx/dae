@@ -173,4 +173,4 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20261007
 // connection with an auth error - and the reference client discards the same
 // Close error.
 
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261007133803-7f00c68f2b95
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261007144729-aa7bb5f96deb

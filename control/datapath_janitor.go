@@ -421,6 +421,8 @@ type connStateJanitorScratch struct {
 	// pinnedTCP/pinnedUDP hold the pin-set snapshots filled once per scan
 	// cycle by SessionManager.snapshotPinned*Into; the janitor is the only
 	// consumer, so the maps are cleared and refilled instead of reallocated.
+	// The per-cycle saving scales with the live pin count (the buckets stay
+	// allocated by clear()), not with the map capacity.
 	pinnedTCP map[bpfTuplesKey]struct{}
 	pinnedUDP map[bpfTuplesKey]struct{}
 

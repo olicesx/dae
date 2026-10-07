@@ -448,9 +448,10 @@ func NewUdpEndpointPool() *UdpEndpointPool {
 	}
 	// Shard maps are created lazily on first insert: most shards stay empty
 	// on small deployments, and eagerly preallocating a 16-slot map for all
-	// udpEndpointCreateShardCount shards costs ~1 MiB of resident heap that
-	// scales with the shard count instead of the endpoint count. Reads,
-	// len(), and range over a nil map are well-defined no-ops.
+	// udpEndpointCreateShardCount shards costs ~3.5 MiB of resident heap
+	// (measured: 1024 shards x ~3.5 KiB for the 96-byte key) that scales with
+	// the shard count instead of the endpoint count. Reads, len(), and range
+	// over a nil map are well-defined no-ops.
 	p.startJanitor()
 	return p
 }

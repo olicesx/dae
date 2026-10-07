@@ -110,7 +110,8 @@ func TestConnStateJanitorBoundaries(t *testing.T) {
 		}
 	}
 
-	udpStats, tcpStats := cp.cleanupConnStateMapBeforeLocked(false, 0)
+	_, scratch := cp.maintenanceState()
+	udpStats, tcpStats := cp.cleanupConnStateMapBeforeLocked(false, 0, scratch)
 	t.Logf("janitor stats: udp=%+v tcp=%+v", udpStats, tcpStats)
 
 	for _, e := range entries {
@@ -131,7 +132,7 @@ func TestConnStateJanitorBoundaries(t *testing.T) {
 	if err := m.Put(staleKey, state(uint64(now-2*sec), 0, 1)); err != nil {
 		t.Fatalf("put stale-marker entry: %v", err)
 	}
-	cp.cleanupConnStateMapBeforeLocked(false, staleBefore)
+	cp.cleanupConnStateMapBeforeLocked(false, staleBefore, scratch)
 	if err := m.Lookup(staleKey, &bpfConnState{}); err == nil {
 		t.Error("entry younger than the TTL but older than staleBeforeNs must be retired")
 	}
@@ -142,7 +143,7 @@ func TestConnStateJanitorBoundaries(t *testing.T) {
 		t.Fatalf("put stop-path entry: %v", err)
 	}
 	close(cp.stop)
-	cp.cleanupConnStateMapBeforeLocked(false, 0)
+	cp.cleanupConnStateMapBeforeLocked(false, 0, scratch)
 	if err := m.Lookup(stopKey, &bpfConnState{}); err != nil {
 		t.Errorf("janitor must not modify the map after stop: %v", err)
 	}

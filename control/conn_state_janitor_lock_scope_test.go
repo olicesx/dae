@@ -83,10 +83,11 @@ func TestJanitorUdpDeleteDoesNotTakeGenerationsMu(t *testing.T) {
 	// Simulate a long TCP flow registration holding the generation lock.
 	f.manager.generationsMu.Lock()
 
+	_, scratch := f.plane.maintenanceState()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		f.plane.cleanupConnStateMapBeforeLocked(true, 0)
+		f.plane.cleanupConnStateMapBeforeLocked(true, 0, scratch)
 	}()
 	select {
 	case <-done:

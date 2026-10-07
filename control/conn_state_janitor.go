@@ -63,7 +63,10 @@ var (
 	// second when map pressure is low.
 	connStateJanitorSteadyInterval = 5 * time.Second
 	// connStateJanitorPressureEnterUsage is the usage percentage that activates
-	// pressure mode for connection-state cleanup.
+	// pressure mode for connection-state cleanup. It is a fraction of the
+	// *configured* map capacity (bpf_conn_state_map_size), so resizing that
+	// option moves the absolute entry count that triggers the halved TTLs:
+	// at the 65536 default pressure starts near 45.9k live entries.
 	connStateJanitorPressureEnterUsage = 70
 	// connStateJanitorPressureExitUsage is the usage percentage below which the
 	// janitor starts counting down to leave pressure mode.
@@ -279,10 +282,10 @@ func (c *ControlPlane) stopConnStateJanitor() {
 // This replaces the former separate cleanupUdpConnStateMap + cleanupTcpConnStateMap
 // pair, halving the BatchLookup syscalls and ClockGettime overhead per tick.
 func (c *ControlPlane) cleanupConnStateMap(aggressiveCleanup bool) (udpStats, tcpStats mapCleanupStats) {
-	cleanupMu, _ := c.maintenanceState()
+	cleanupMu, scratch := c.maintenanceState()
 	cleanupMu.Lock()
 	defer cleanupMu.Unlock()
-	return c.cleanupConnStateMapBeforeLocked(aggressiveCleanup, 0)
+	return c.cleanupConnStateMapBeforeLocked(aggressiveCleanup, 0, scratch)
 }
 
 // cleanupConnStateMapBeforeLocked scans ConnStateMap under connStateCleanupMu.
@@ -290,7 +293,12 @@ func (c *ControlPlane) cleanupConnStateMap(aggressiveCleanup bool) (udpStats, tc
 // staleBeforeNs (monotonic reload-request timestamp) additionally retires
 // entries not refreshed since the retired generation; pinned entries are
 // exempt via the pin snapshots and the scan-to-delete recheck below.
-func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, staleBeforeNs uint64) (udpStats, tcpStats mapCleanupStats) {
+//
+// scratch must come from the same maintenanceState() lookup as the held lock:
+// the scratch buffers belong to one cleanup runtime, and pairing a runtime's
+// lock with another runtime's buffers is exactly the aliasing the single
+// consumer relies on not happening.
+func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, staleBeforeNs uint64, scratch *connStateJanitorScratch) (udpStats, tcpStats mapCleanupStats) {
 	select {
 	case <-c.stop:
 		return
@@ -324,7 +332,6 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 		routinglessBackstopNano /= 2
 	}
 
-	scratch := c.connStateJanitorScratch()
 	udpKeysToDelete := takeJanitorDeleteScratch(scratch.udpDelete)
 	tcpKeysToDelete := takeJanitorDeleteScratch(scratch.tcpDelete)
 	keysOut := ensureJanitorLookupScratch(scratch.udpKeys)
@@ -539,12 +546,4 @@ func countConnStateJanitorDeleteError(class string, err error) {
 		"error": err.Error(),
 		"count": count,
 	}).Warn("cleanupConnStateMap: batch delete failed")
-}
-
-func (c *ControlPlane) connStateJanitorScratch() *connStateJanitorScratch {
-	if c == nil {
-		return nil
-	}
-	_, scratch := c.maintenanceState()
-	return scratch
 }

@@ -25,3 +25,10 @@ var tproxySource string
 //
 //go:embed bpf_utils.go
 var bpfUtilsSource string
+
+// bpfStubSource is the stub-build loader, which the real-datapath build
+// excludes. Embedding both lets one test binary compare the two build-tag
+// variants of a mirrored constant against the kernel source.
+//
+//go:embed bpf_stub.go
+var bpfStubSource string

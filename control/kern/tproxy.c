@@ -80,9 +80,14 @@
 // against a home/SMB gateway workload (concurrent live entries measured over
 // hours: conn_state ~10^2, redirect_track ~10^2, routing_handoff ~10^1,
 // cookie_pid ~10^1, domain_routing ~0), with >=250x headroom kept on every
-// map. Every map-full path degrades gracefully (slow-path fallback plus a
-// bpf_stats_map overflow counter that userspace reports), so an undersized
-// deployment is observable and recoverable instead of fatal.
+// map. A full map never drops traffic: conn_state and redirect_track count the
+// rejection in bpf_stats_map (userspace reports it, and conn_state overflow
+// also drives janitor pressure mode), while routing_handoff and cookie_pid
+// fall back to their slow path with no counter of their own, so for those two
+// the janitor's >90% capacity warning is the only signal that the map is too
+// small. The macros below are the clang-side defaults: at load, userspace sets
+// conn_state_map from bpf_conn_state_map_size, and a same-port reload keeps
+// the inherited live map, so the runtime capacity need not match the macro.
 #define MAX_CONN_STATE_NUM 65536
 #define MAX_REDIRECT_TRACK_NUM 16384
 // A reply binding (redirect_track entry) may only be rebound by a different

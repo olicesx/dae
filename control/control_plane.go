@@ -1642,12 +1642,12 @@ func (c *ControlPlane) runReloadRetirementCleanup(staleBeforeNs uint64) {
 		return
 	}
 
-	cleanupMu, _ := c.maintenanceState()
+	cleanupMu, scratch := c.maintenanceState()
 	cleanupMu.Lock()
-	redirectDeleted := c.cleanupRedirectTrackMapBeforeLocked(staleBeforeNs)
-	cookieDeleted := c.cleanupCookiePidMapBeforeLocked(staleBeforeNs)
-	routingHandoffDeleted := c.cleanupRoutingHandoffMapBeforeLocked(staleBeforeNs)
-	udpStats, tcpStats := c.cleanupConnStateMapBeforeLocked(true, staleBeforeNs)
+	redirectDeleted := c.cleanupRedirectTrackMapBeforeLocked(staleBeforeNs, scratch)
+	cookieDeleted := c.cleanupCookiePidMapBeforeLocked(staleBeforeNs, scratch)
+	routingHandoffDeleted := c.cleanupRoutingHandoffMapBeforeLocked(staleBeforeNs, scratch)
+	udpStats, tcpStats := c.cleanupConnStateMapBeforeLocked(true, staleBeforeNs, scratch)
 	cleanupMu.Unlock()
 
 	if c.log == nil {
@@ -1687,13 +1687,13 @@ const redirectTrackTimeout = 5 * time.Minute
 // cleanup of any other entry: redirect_track is a HASH map, so there is no LRU
 // eviction order for it to occupy.
 func (c *ControlPlane) cleanupRedirectTrackMap() int {
-	cleanupMu, _ := c.maintenanceState()
+	cleanupMu, scratch := c.maintenanceState()
 	cleanupMu.Lock()
 	defer cleanupMu.Unlock()
-	return c.cleanupRedirectTrackMapBeforeLocked(0)
+	return c.cleanupRedirectTrackMapBeforeLocked(0, scratch)
 }
 
-func (c *ControlPlane) cleanupRedirectTrackMapBeforeLocked(staleBeforeNs uint64) int {
+func (c *ControlPlane) cleanupRedirectTrackMapBeforeLocked(staleBeforeNs uint64, scratch *connStateJanitorScratch) int {
 	// Check if we're shutting down - if stop signal is sent, skip cleanup
 	select {
 	case <-c.stop:
@@ -1715,7 +1715,6 @@ func (c *ControlPlane) cleanupRedirectTrackMapBeforeLocked(staleBeforeNs uint64)
 
 	timeoutNano := redirectTrackTimeout.Nanoseconds()
 
-	scratch := c.connStateJanitorScratch()
 	keysToDelete := takeJanitorDeleteScratch(scratch.redirectDelete)
 	totalEntries := 0
 	maxAge := int64(0)
@@ -1788,13 +1787,13 @@ func (c *ControlPlane) cleanupRedirectTrackMapBeforeLocked(staleBeforeNs uint64)
 // cleanupCookiePidMap removes stale cookie->pid metadata that escaped the
 // cgroup sock_release backstop. Active sockets refresh last_seen_ns in BPF.
 func (c *ControlPlane) cleanupCookiePidMap() int {
-	cleanupMu, _ := c.maintenanceState()
+	cleanupMu, scratch := c.maintenanceState()
 	cleanupMu.Lock()
 	defer cleanupMu.Unlock()
-	return c.cleanupCookiePidMapBeforeLocked(0)
+	return c.cleanupCookiePidMapBeforeLocked(0, scratch)
 }
 
-func (c *ControlPlane) cleanupCookiePidMapBeforeLocked(staleBeforeNs uint64) int {
+func (c *ControlPlane) cleanupCookiePidMapBeforeLocked(staleBeforeNs uint64, scratch *connStateJanitorScratch) int {
 	select {
 	case <-c.stop:
 		return 0
@@ -1814,7 +1813,6 @@ func (c *ControlPlane) cleanupCookiePidMapBeforeLocked(staleBeforeNs uint64) int
 	nowNano := ts.Nano()
 	timeoutNano := cookiePidMapTimeout.Nanoseconds()
 
-	scratch := c.connStateJanitorScratch()
 	keysToDelete := takeJanitorDeleteScratch(scratch.cookiePidDelete)
 	keysOut := ensureJanitorLookupScratch(scratch.cookiePidKeys)
 	valuesOut := ensureJanitorLookupScratch(scratch.cookiePidValues)
@@ -1867,13 +1865,13 @@ func (c *ControlPlane) cleanupCookiePidMapBeforeLocked(staleBeforeNs uint64) int
 // The handoff map is a short-lived bridge for userspace consumers that miss the
 // authoritative conn-state publication window.
 func (c *ControlPlane) cleanupRoutingHandoffMap() int {
-	cleanupMu, _ := c.maintenanceState()
+	cleanupMu, scratch := c.maintenanceState()
 	cleanupMu.Lock()
 	defer cleanupMu.Unlock()
-	return c.cleanupRoutingHandoffMapBeforeLocked(0)
+	return c.cleanupRoutingHandoffMapBeforeLocked(0, scratch)
 }
 
-func (c *ControlPlane) cleanupRoutingHandoffMapBeforeLocked(staleBeforeNs uint64) int {
+func (c *ControlPlane) cleanupRoutingHandoffMapBeforeLocked(staleBeforeNs uint64, scratch *connStateJanitorScratch) int {
 	select {
 	case <-c.stop:
 		return 0
@@ -1891,7 +1889,6 @@ func (c *ControlPlane) cleanupRoutingHandoffMapBeforeLocked(staleBeforeNs uint64
 		return 0
 	}
 
-	scratch := c.connStateJanitorScratch()
 	keysToDelete := takeJanitorDeleteScratch(scratch.routingHandoffDelete)
 	keysOut := ensureJanitorLookupScratch(scratch.routingHandoffKeys)
 	valuesOut := ensureJanitorLookupScratch(scratch.routingHandoffValues)

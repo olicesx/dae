@@ -53,6 +53,13 @@ var (
 	// captures " #define MAX_REDIRECT_TRACK_NUM <n>".
 	redirectTrackNumPattern = regexp.MustCompile(`(?m)#define\s+MAX_REDIRECT_TRACK_NUM\s+(\d+)`)
 
+	// captures " #define MAX_CONN_STATE_NUM <n>".
+	connStateNumPattern = regexp.MustCompile(`(?m)#define\s+MAX_CONN_STATE_NUM\s+(\d+)`)
+
+	// captures the Go mirror in either loader variant:
+	// "defaultConnStateMapMaxEntries = <n>".
+	goConnStateDefaultPattern = regexp.MustCompile(`(?m)defaultConnStateMapMaxEntries\s*=\s*(\d+)`)
+
 	// captures " #define REDIRECT_REBIND_STALE_NS_FALLBACK <n>".
 	redirectRebindStalePattern = regexp.MustCompile(`(?m)#define\s+REDIRECT_REBIND_STALE_NS_FALLBACK\s+(\d+)U?LL?`)
 
@@ -482,6 +489,46 @@ func TestRedirectTrackCapacityParityWithKernelSource(t *testing.T) {
 	if uint32(want) != defaultRedirectTrackMapMaxEntries {
 		t.Fatalf("C MAX_REDIRECT_TRACK_NUM=%d diverges from Go defaultRedirectTrackMapMaxEntries=%d; tuneRedirectTrackMap cross-checks the compiled capacity against the Go value and would fail the load",
 			want, defaultRedirectTrackMapMaxEntries)
+	}
+}
+
+// TestConnStateCapacityParityWithKernelSource pins the conn_state_map capacity
+// across the C declaration and both Go loader variants. Unlike redirect_track,
+// this capacity is config-owned (bpf_conn_state_map_size) and tuneConnStateBpfMap
+// applies whatever value it is handed, so nothing fails at load when the
+// clang-side default and a Go mirror drift apart: the compile-time map
+// declaration and the number userspace sizes its capacity warnings and janitor
+// pressure threshold from would silently disagree. The stub and real loaders are
+// separate build-tag variants, so both sources are pinned here instead of only
+// whichever one the running build compiled.
+func TestConnStateCapacityParityWithKernelSource(t *testing.T) {
+	matches := connStateNumPattern.FindAllStringSubmatch(tproxySource, -1)
+	if len(matches) != 1 {
+		t.Fatalf("expected exactly one #define MAX_CONN_STATE_NUM in kern/tproxy.c, found %d", len(matches))
+	}
+	cValue, err := strconv.ParseUint(matches[0][1], 10, 32)
+	if err != nil {
+		t.Fatalf("parse MAX_CONN_STATE_NUM %q: %v", matches[0][1], err)
+	}
+	for _, variant := range []struct {
+		name   string
+		source string
+	}{
+		{"bpf_utils.go (real datapath)", bpfUtilsSource},
+		{"bpf_stub.go (stub gate)", bpfStubSource},
+	} {
+		m := goConnStateDefaultPattern.FindStringSubmatch(variant.source)
+		if m == nil {
+			t.Fatalf("defaultConnStateMapMaxEntries not found in %s", variant.name)
+		}
+		value, err := strconv.ParseUint(m[1], 10, 32)
+		if err != nil {
+			t.Fatalf("parse defaultConnStateMapMaxEntries in %s: %v", variant.name, err)
+		}
+		if value != cValue {
+			t.Errorf("%s: defaultConnStateMapMaxEntries=%d diverges from C MAX_CONN_STATE_NUM=%d; the C macro is the clang-side default that userspace overrides from bpf_conn_state_map_size, and both Go mirrors must stay in step with it",
+				variant.name, value, cValue)
+		}
 	}
 }
 

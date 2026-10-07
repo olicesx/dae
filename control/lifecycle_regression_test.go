@@ -303,7 +303,8 @@ func TestConnStateJanitorRetiresRoutinglessTCPBackstop(t *testing.T) {
 	seedRoutinglessConnState(t, f.connState, routinglessFresh, freshNs)
 	seedConnState(t, f.connState, routingStale, agedNs, 0)
 
-	f.plane.cleanupConnStateMapBeforeLocked(false, 0)
+	_, scratch := f.plane.maintenanceState()
+	f.plane.cleanupConnStateMapBeforeLocked(false, 0, scratch)
 
 	if connStateExists(f.connState, routinglessStale) {
 		t.Fatal("aged routing-less TCP entry survived the backstop")

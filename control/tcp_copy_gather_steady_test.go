@@ -16,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // fakeRelaySrc is a scriptable netproxy.Conn source: queued reads are
@@ -217,8 +219,31 @@ func TestRelaySteadyGatherTCPBulkBatchesFlushes(t *testing.T) {
 			_ = tc.CloseWrite()
 		}
 	}()
-	// Let the backlog queue in the kernel socket before copying.
-	time.Sleep(300 * time.Millisecond)
+	// Wait until the whole payload is queued in the kernel socket instead of
+	// assuming a fixed settle time. Under scheduler load the writer can still be
+	// mid-write after a sleep, and a partially queued backlog legitimately
+	// flushes more than once — which would blame the gather engine for the
+	// test's own timing.
+	raw, err := src.(*net.TCPConn).SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	queueDeadline := time.Now().Add(5 * time.Second)
+	for {
+		pending := 0
+		if err := raw.Control(func(fd uintptr) {
+			pending, _ = unix.IoctlGetInt(int(fd), unix.TIOCINQ)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if pending >= total {
+			break
+		}
+		if time.Now().After(queueDeadline) {
+			t.Fatalf("the peer queued only %d of %d bytes in 5s; the single-flush assertion needs the full backlog", pending, total)
+		}
+		time.Sleep(time.Millisecond)
+	}
 
 	dst := &fakeRelayDst{}
 	var flushes int

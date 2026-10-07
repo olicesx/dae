@@ -545,10 +545,15 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 	// The retained endpoint still belongs to this plane's connection, so
 	// meter it through the plane-bound recorder like every other egress
 	// write: the global recorder would attribute bytes of a retiring
-	// generation to whichever store is published mid-reload.
-	c.recordUploadTraffic(int64(len(data)))
-	if lifecycle, lifecycleOK := newUdpSessionLifecycleContext(ue, ""); lifecycleOK {
-		lifecycle.reportTrafficSuccess()
+	// generation to whichever store is published mid-reload. A batched
+	// endpoint is the exception: its flush reports via the aggregator's
+	// SentReporter, so inline metering would double-count (same guard as
+	// batchOwnsAccounting in handlePkt).
+	if ue.sentReporter == nil {
+		c.recordUploadTraffic(int64(len(data)))
+		if lifecycle, lifecycleOK := newUdpSessionLifecycleContext(ue, ""); lifecycleOK {
+			lifecycle.reportTrafficSuccess()
+		}
 	}
 	return true
 }
@@ -789,9 +794,16 @@ func (c *ControlPlane) handlePktOwned(data []byte, src, realDst netip.AddrPort, 
 				ue.TrackUdpConnStateTuplePair(realSrc, realDst)
 				_, err = ue.WriteTo(data, dialTarget)
 				if err == nil {
-					c.recordUploadTraffic(int64(len(data)))
-					if lifecycle, ok := newUdpSessionLifecycleContext(ue, ""); ok {
-						lifecycle.reportTrafficSuccess()
+					// A batched endpoint only queues the datagram in WriteTo;
+					// the flush reports the real bytes and health signal via the
+					// aggregator's SentReporter. Inline accounting here would
+					// double-count both (same guard as batchOwnsAccounting in
+					// handlePkt).
+					if ue.sentReporter == nil {
+						c.recordUploadTraffic(int64(len(data)))
+						if lifecycle, ok := newUdpSessionLifecycleContext(ue, ""); ok {
+							lifecycle.reportTrafficSuccess()
+						}
 					}
 					return nil
 				}

@@ -229,10 +229,10 @@ func (m *ResponseMatcher) Match(
 		return 0, fmt.Errorf("qName cannot be empty")
 	}
 	domainMatchBitmap := m.domainMatcher.MatchDomainBitmap(qName)
-	bin128 := make([]string, 0, len(ips))
-	for _, ip := range ips {
-		bin128 = append(bin128, trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(ip.As16()), 128)))
-	}
+	// bin128 is built lazily on the first ip() rule evaluation: most response
+	// routing configurations contain no ip() rule, and building it eagerly
+	// would cost one 128-byte string per answer IP on every response.
+	var bin128 []string
 
 	goodSubrule := false
 	badRule := false
@@ -246,6 +246,12 @@ func (m *ResponseMatcher) Match(
 				goodSubrule = true
 			}
 		case consts.MatchType_IpSet:
+			if bin128 == nil {
+				bin128 = make([]string, 0, len(ips))
+				for _, ip := range ips {
+					bin128 = append(bin128, trie.Prefix2bin128(netip.PrefixFrom(netip.AddrFrom16(ip.As16()), 128)))
+				}
+			}
 			if slices.ContainsFunc(bin128, m.ipSet[match.Value].HasPrefix) {
 				goodSubrule = true
 			}

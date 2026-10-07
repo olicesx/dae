@@ -1,5 +1,3 @@
-//go:build dae_stub_ebpf
-
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
  * Copyright (c) 2026, daeuniverse Organization <dae@v2raya.org>
@@ -58,18 +56,38 @@ var (
 	routingResultStructPattern = regexp.MustCompile(
 		`struct\s+routing_result\s*\{([^}]*)\}`)
 
+	// captures what sits between that closing brace and the terminating
+	// semicolon. A struct-level attribute (e.g. __attribute__((aligned(16))))
+	// raises sizeof and moves every field offset without touching a single
+	// field declaration, so the field parser cannot see it.
+	routingResultTrailerPattern = regexp.MustCompile(
+		`struct\s+routing_result\s*\{[^}]*\}\s*([^;]*);`)
+
+	// captures the body of "type bpfRoutingResult struct { ... }" in the
+	// real-datapath mirror, which the stub build cannot compile.
+	goRoutingResultStructPattern = regexp.MustCompile(
+		`type\s+bpfRoutingResult\s+struct\s*\{([^}]*)\}`)
+
 	// captures " #define NAME <n>" so macro-sized C arrays (e.g.
 	// TASK_COMM_LEN) resolve without a second owner of the value.
 	cDefinePattern = regexp.MustCompile(`(?m)#define\s+(\w+)\s+(\d+)`)
 )
 
 // cIntTypeWidths maps the fixed-width C integer types used by
-// struct routing_result to their byte widths.
+// struct routing_result to their byte widths. A type that is missing here fails
+// the layout test instead of being skipped, so a new C field cannot slip past
+// the contract unnoticed.
 var cIntTypeWidths = map[string]int{
 	"__u8":  1,
 	"__u16": 2,
 	"__u32": 4,
 	"__u64": 8,
+	"__s8":  1,
+	"__s16": 2,
+	"__s32": 4,
+	"__s64": 8,
+	"bool":  1,
+	"_Bool": 1,
 }
 
 func TestBpfVariablesParityWithKernelSource(t *testing.T) {
@@ -374,11 +392,23 @@ func TestRedirectTrackCapacityParityWithKernelSource(t *testing.T) {
 // side drifts: a reordered, re-typed or resized C field would silently
 // misread every routing decision userspace copies from the kernel. The test
 // pins field order, per-field byte width and the byte offsets that
-// unsafe.Offsetof computes on the Go side.
+// unsafe.Offsetof computes on the Go side. It carries no build tag, so it runs
+// in both the stub and the real-datapath build; the mirror that the current
+// build cannot compile is covered by TestRoutingResultMirrorSourcesAgree.
 func TestRoutingResultLayoutParityWithKernelSource(t *testing.T) {
-	m := routingResultStructPattern.FindStringSubmatch(stripCKernelComments(tproxySource))
+	kernelSource := stripCKernelComments(tproxySource)
+	m := routingResultStructPattern.FindStringSubmatch(kernelSource)
 	if m == nil {
 		t.Fatal("struct routing_result not found in kern/tproxy.c")
+	}
+	// A struct-level attribute changes the layout of every field at once, so
+	// the field-by-field comparison below could not notice it.
+	trailer := routingResultTrailerPattern.FindStringSubmatch(kernelSource)
+	if trailer == nil {
+		t.Fatal("struct routing_result is not terminated by a plain `};` in kern/tproxy.c")
+	}
+	if extra := strings.TrimSpace(trailer[1]); extra != "" {
+		t.Fatalf("struct routing_result carries %q between its closing brace and the terminating semicolon; a struct-level attribute can change sizeof and every field offset without touching a field declaration, so the Go mirror must be re-derived and this test taught to size the attribute before adding one", extra)
 	}
 
 	// The Go mirror of struct routing_result, in declaration order: the C
@@ -403,18 +433,29 @@ func TestRoutingResultLayoutParityWithKernelSource(t *testing.T) {
 	}
 
 	// Parse "type name;" and "type name[n];" declarations: width is the
-	// element width times the element count, alignment the element width.
-	fieldPattern := regexp.MustCompile(`(__u\d+)\s+(\w+)\s*(?:\[(\w+)\])?\s*;`)
+	// element width times the element count, alignment the element width. Every
+	// declaration in the body must resolve: scanning only for known types would
+	// let a field of an unrecognized type (a signed int, a bitfield, a nested
+	// aggregate) drop out of the layout contract silently.
 	type cField struct {
 		name  string
 		size  int
 		align int
 	}
+	declPattern := regexp.MustCompile(`^(.+?)\s+(\w+)\s*(?:\[\s*(\w+)\s*\])?$`)
 	var cFields []cField
-	for _, fm := range fieldPattern.FindAllStringSubmatch(m[1], -1) {
+	for _, decl := range strings.Split(m[1], ";") {
+		decl = strings.TrimSpace(decl)
+		if decl == "" {
+			continue
+		}
+		fm := declPattern.FindStringSubmatch(decl)
+		if fm == nil {
+			t.Fatalf("struct routing_result declares %q, which is not a plain `type name` or `type name[N]` field; size it here before adding it to the Go mirror", decl)
+		}
 		elemWidth, ok := cIntTypeWidths[fm[1]]
 		if !ok {
-			t.Fatalf("struct routing_result field %s has unmapped C type %s", fm[2], fm[1])
+			t.Fatalf("struct routing_result field %s has unmapped C type %s; add its width to cIntTypeWidths so the field cannot bypass the layout contract", fm[2], fm[1])
 		}
 		size := elemWidth
 		if array := fm[3]; array != "" {
@@ -485,5 +526,47 @@ func TestRoutingResultLayoutParityWithKernelSource(t *testing.T) {
 	cOffset = (cOffset + maxAlign - 1) / maxAlign * maxAlign
 	if size := unsafe.Sizeof(goResult); size != uintptr(cOffset) {
 		t.Fatalf("struct routing_result is %d bytes in C but bpfRoutingResult is %d in Go", cOffset, size)
+	}
+}
+
+// TestRoutingResultMirrorSourcesAgree pins the real-datapath mirror
+// declaration in control/bpf_utils.go to the compiled bpfRoutingResult. The two
+// mirrors are hand-written and live behind opposite build tags, so the layout
+// test above only ever sees one of them: without this check, editing only
+// bpf_utils.go keeps the stub unit-test gate green while the binary that ships
+// decodes the kernel struct with different field types or offsets.
+func TestRoutingResultMirrorSourcesAgree(t *testing.T) {
+	m := goRoutingResultStructPattern.FindStringSubmatch(bpfUtilsSource)
+	if m == nil {
+		t.Fatal("type bpfRoutingResult struct not found in control/bpf_utils.go")
+	}
+
+	var want []string
+	for _, line := range strings.Split(m[1], "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if len(fields) != 2 {
+			t.Fatalf("control/bpf_utils.go declares %q, which is not a plain `Name Type` field", strings.TrimSpace(line))
+		}
+		if fields[0] == "_" {
+			// Zero-size host-layout marker, absent from the real mirror.
+			continue
+		}
+		want = append(want, fields[0]+" "+fields[1])
+	}
+
+	var got []string
+	for field := range reflect.TypeFor[bpfRoutingResult]().Fields() {
+		if field.Name == "_" {
+			// Zero-size host-layout marker of the stub mirror.
+			continue
+		}
+		got = append(got, field.Name+" "+field.Type.String())
+	}
+	if !slices.Equal(want, got) {
+		t.Fatalf("control/bpf_utils.go declares bpfRoutingResult fields %v but the compiled mirror has %v; the two hand-written mirrors must stay identical",
+			want, got)
 	}
 }

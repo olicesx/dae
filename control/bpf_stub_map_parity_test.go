@@ -8,16 +8,12 @@
 package control
 
 import (
-	_ "embed"
 	"reflect"
 	"regexp"
 	"sort"
 	"strings"
 	"testing"
 )
-
-//go:embed kern/tproxy.c
-var tproxySource string
 
 var bpfMapDeclarationPattern = regexp.MustCompile("(?m)^}\\s*([a-z_][a-z0-9_]*)\\s+SEC\\(\"\\.maps\"\\);$")
 

@@ -436,7 +436,7 @@ func TestRoutingResultLayoutParityWithKernelSource(t *testing.T) {
 
 	// Go side: order and sizes from the real type, offsets from
 	// unsafe.Offsetof so the compiler's layout is what gets pinned.
-	goResult := bpfRoutingResult{}
+	var goResult bpfRoutingResult
 	goOffsets := map[string]uintptr{
 		"Mark":               unsafe.Offsetof(goResult.Mark),
 		"Must":               unsafe.Offsetof(goResult.Must),

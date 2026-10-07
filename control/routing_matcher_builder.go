@@ -440,9 +440,11 @@ func (b *RoutingMatcherBuilder) addSourceMac(f *config_parser.Function, macAddrs
 // lpmTrieIndexFor returns the simulated LPM trie index for the given
 // canonicalized prefix set, inserting a new trie when the set has not been
 // seen before. On a hash collision with a different prefix set it appends a
-// fresh trie but leaves the existing dedup entry in place: overwriting it
-// would silently redirect a previously registered colliding set to the new
-// trie.
+// fresh trie but leaves the existing dedup entry in place, so the set that was
+// registered first stays deduplicated; overwriting the entry would make every
+// later lookup of that first set allocate another trie. Both sets still resolve
+// to a trie holding their own prefixes, so a collision only costs an extra
+// trie, never a wrong match.
 func (b *RoutingMatcherBuilder) lpmTrieIndexFor(values []netip.Prefix) uint32 {
 	hash := hashLpmSet(values)
 	if entry, exists := b.lpmDedup[hash]; exists {

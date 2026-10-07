@@ -445,8 +445,17 @@ func (srv *socks5TestServer) serveUdpAssociate(t *testing.T, control net.Conn) {
 		}
 	}()
 
-	var clientAddr atomic.Value  // net.Addr
-	var requestedAt atomic.Value // netip.AddrPort
+	var clientAddr atomic.Value // net.Addr
+	// requestedByTarget maps the address a datagram was actually forwarded to
+	// back to the address the client asked for. A single last-writer-wins slot
+	// cannot report the requested address per reply once two peers share one
+	// association: the association's request and reply directions are
+	// independent, and UDP does not even guarantee that two datagrams written
+	// back to back arrive in order. Keying the reply on the address it was
+	// received from makes attribution order-independent while still reporting
+	// exactly the address the client asked for on the datagram that caused it.
+	var requestedMu sync.Mutex
+	requestedByTarget := make(map[netip.AddrPort]netip.AddrPort, len(srv.udpRedirect))
 	go func() {
 		buf := make([]byte, 65535)
 		for {
@@ -467,7 +476,9 @@ func (srv *socks5TestServer) serveUdpAssociate(t *testing.T, control net.Conn) {
 			}
 			requested := udpDst.AddrPort()
 			if wanted, ok := srv.udpRedirect[requested]; ok {
-				requestedAt.Store(requested)
+				requestedMu.Lock()
+				requestedByTarget[wanted] = requested
+				requestedMu.Unlock()
 				dst = net.UDPAddrFromAddrPort(wanted)
 			}
 			if _, err := egress.WriteTo(payload, dst); err != nil {
@@ -487,10 +498,19 @@ func (srv *socks5TestServer) serveUdpAssociate(t *testing.T, control net.Conn) {
 			continue // the client has not spoken yet
 		}
 		// Report the address the client asked for, not the internal forward
-		// target, whenever a redirect is in effect.
+		// target, whenever a redirect is in effect. The reply's sender address
+		// identifies the target it came from, so this is per-datagram and
+		// independent of how the association's two directions interleave.
 		reported := from
-		if requested, ok := requestedAt.Load().(netip.AddrPort); ok && len(srv.udpRedirect) > 0 {
-			reported = net.UDPAddrFromAddrPort(requested)
+		if len(srv.udpRedirect) > 0 {
+			if src, ok := from.(*net.UDPAddr); ok {
+				requestedMu.Lock()
+				requested, ok := requestedByTarget[src.AddrPort()]
+				requestedMu.Unlock()
+				if ok {
+					reported = net.UDPAddrFromAddrPort(requested)
+				}
+			}
 		}
 		frame, ok := encodeSocks5UdpDatagram(reported, buf[:n])
 		if !ok {

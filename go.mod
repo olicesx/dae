@@ -7,7 +7,7 @@ require (
 	github.com/antlr/antlr4/runtime/Go/antlr/v4 v4.0.0-20230305170008-8188dc5388df
 	github.com/cilium/ebpf v0.22.0
 	github.com/daeuniverse/dae-config-dist/go/dae_config v0.0.0-20230604120805-1c27619b592d
-	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20261007131130-f31dd560cc2e
+	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20261007133803-7f00c68f2b95
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/json-iterator/go v1.1.12
 	github.com/mholt/archives v0.1.5
@@ -163,7 +163,14 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20261007
 // one 32 KiB zeroed allocation per proxied raw-TCP session.
 // The current pin advances quic-go to the revision that removes the last
 // per-packet receive-path allocations (per-call stack packet-number scratch,
-// lazily grown frame-sorter reorder map, one shared stateless PING frame);
-// the protocol code itself is unchanged.
+// lazily grown frame-sorter reorder map, one shared stateless PING frame) and
+// keeps the tuic auth FIN best effort when the peer stops reading the
+// one-shot Authenticate stream: a server that cancels that stream once it has
+// consumed the command (sing-quic does, and the fork's e2e server mirrors it)
+// made quic-go refuse the FIN, so the dial failed whenever the peer's
+// STOP_SENDING won the race against the client's Close. That is a legal peer
+// ordering, not an authentication result - a rejecting server closes the
+// connection with an auth error - and the reference client discards the same
+// Close error.
 
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261007131130-f31dd560cc2e
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261007133803-7f00c68f2b95

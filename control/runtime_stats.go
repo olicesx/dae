@@ -94,7 +94,10 @@ func unpublishRuntimeStatsStore(s *runtimeStats) {
 	activeRuntimeStats.CompareAndSwap(s, nil)
 }
 
-// RecordUploadTraffic records upload bytes into the global runtime history.
+// RecordUploadTraffic records upload bytes into the store published by the
+// active control plane (globalRuntimeStats while no plane is published).
+// Generation-owned UDP endpoints meter into their own plane's store instead;
+// see ControlPlane.runtimeUploadRecorder.
 func RecordUploadTraffic(n int64) {
 	if n <= 0 {
 		return
@@ -104,7 +107,10 @@ func RecordUploadTraffic(n int64) {
 	}
 }
 
-// RecordDownloadTraffic records download bytes into the global runtime history.
+// RecordDownloadTraffic records download bytes into the store published by the
+// active control plane (globalRuntimeStats while no plane is published).
+// Generation-owned UDP endpoints meter into their own plane's store instead;
+// see ControlPlane.runtimeDownloadRecorder.
 func RecordDownloadTraffic(n int64) {
 	if n <= 0 {
 		return
@@ -262,6 +268,7 @@ func timeFromUnixNano(unixNano int64) time.Time {
 	return time.Unix(0, unixNano)
 }
 
+// runtimeStatsStore returns the store this plane snapshots.
 func (c *ControlPlane) runtimeStatsStore() *runtimeStats {
 	if c == nil || c.runtimeStats == nil {
 		return globalRuntimeStats
@@ -269,6 +276,15 @@ func (c *ControlPlane) runtimeStatsStore() *runtimeStats {
 	return c.runtimeStats
 }
 
+// The recorders below meter against the plane's own store rather than the
+// published one: UDP endpoints and their datapath sessions belong to the
+// generation that created them, so its bytes must not be attributed to a
+// successor generation (see the retained-endpoint rationale in udp.go). The
+// consequence is deliberate: once the plane is retired and its store is
+// unpublished, its counters are no longer part of SnapshotRuntimeStats.
+// Long-lived TCP relays meter through RecordUploadTraffic/RecordDownloadTraffic,
+// which target the published store, so their bytes follow whichever generation
+// is current when they flow.
 func (c *ControlPlane) runtimeUploadRecorder() func(int64) {
 	return c.recordUploadTraffic
 }

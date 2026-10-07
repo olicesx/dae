@@ -193,7 +193,7 @@ func TestUdpEndpointPoolRemoveUnlocksBeforeClose(t *testing.T) {
 	}
 	shard := p.shardFor(key)
 	shard.mu.Lock()
-	shard.pool[key] = ue
+	shard.poolLocked()[key] = ue
 	shard.mu.Unlock()
 
 	started := make(chan struct{})

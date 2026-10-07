@@ -39,7 +39,7 @@ func TestUdpEndpointCreateShardUnlocksAfterPanic(t *testing.T) {
 	}
 	stale.dead.Store(true)
 	firstShard.mu.Lock()
-	firstShard.pool[firstKey] = stale
+	firstShard.poolLocked()[firstKey] = stale
 	firstShard.mu.Unlock()
 
 	panicked := false

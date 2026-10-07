@@ -249,6 +249,17 @@ type udpEndpointPoolShard struct {
 	pool     map[UdpEndpointKey]*UdpEndpoint
 }
 
+// poolLocked returns the shard's endpoint map, creating it on first use.
+// Shard maps stay nil until the shard holds an endpoint so the per-shard
+// preallocation cost tracks the endpoint count, not the shard count; the
+// shard's mu must be held for writing by the caller.
+func (s *udpEndpointPoolShard) poolLocked() map[UdpEndpointKey]*UdpEndpoint {
+	if s.pool == nil {
+		s.pool = make(map[UdpEndpointKey]*UdpEndpoint)
+	}
+	return s.pool
+}
+
 type udpEndpointDialerBucket struct {
 	mu        sync.RWMutex
 	endpoints map[*UdpEndpoint]struct{}
@@ -435,9 +446,11 @@ func NewUdpEndpointPool() *UdpEndpointPool {
 		janitorStop: make(chan struct{}),
 		janitorDone: make(chan struct{}),
 	}
-	for i := range udpEndpointCreateShardCount {
-		p.shards[i].pool = make(map[UdpEndpointKey]*UdpEndpoint, 16)
-	}
+	// Shard maps are created lazily on first insert: most shards stay empty
+	// on small deployments, and eagerly preallocating a 16-slot map for all
+	// udpEndpointCreateShardCount shards costs ~1 MiB of resident heap that
+	// scales with the shard count instead of the endpoint count. Reads,
+	// len(), and range over a nil map are well-defined no-ops.
 	p.startJanitor()
 	return p
 }
@@ -880,7 +893,7 @@ dialSuccess:
 
 	shard := p.shardFor(key)
 	shard.mu.Lock()
-	shard.pool[key] = ue
+	shard.poolLocked()[key] = ue
 	shard.mu.Unlock()
 	p.registerEndpoint(ue)
 
@@ -950,7 +963,7 @@ func (p *UdpEndpointPool) cacheCreateFailure(key UdpEndpointKey, log *logrus.Log
 
 	shard := p.shardFor(key)
 	shard.mu.Lock()
-	shard.pool[key] = failedUe
+	shard.poolLocked()[key] = failedUe
 	shard.mu.Unlock()
 }
 

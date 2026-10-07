@@ -76,18 +76,12 @@ func (m *reloadManager) beginHandoff() {
 }
 
 func (m *reloadManager) setReloadError(err error) {
-	if m == nil {
-		return
-	}
 	m.mu.Lock()
 	m.reloadingErr = err
 	m.mu.Unlock()
 }
 
 func (m *reloadManager) reloadError() error {
-	if m == nil {
-		return nil
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.reloadingErr
@@ -116,9 +110,6 @@ coalesce:
 }
 
 func (m *reloadManager) setPendingStagedHandoff(handoff *stagedReloadHandoff, requestedAt time.Time, requestedAtMono uint64) {
-	if m == nil {
-		return
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.pendingStagedHandoff = handoff
@@ -127,27 +118,18 @@ func (m *reloadManager) setPendingStagedHandoff(handoff *stagedReloadHandoff, re
 }
 
 func (m *reloadManager) clearPendingStagedHandoff() {
-	if m == nil {
-		return
-	}
 	m.mu.Lock()
 	m.pendingStagedHandoff = nil
 	m.mu.Unlock()
 }
 
 func (m *reloadManager) currentPendingStagedHandoff() *stagedReloadHandoff {
-	if m == nil {
-		return nil
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.pendingStagedHandoff
 }
 
 func (m *reloadManager) setPendingReloadMetadata(requestedAt time.Time, requestedAtMono uint64) {
-	if m == nil {
-		return
-	}
 	m.mu.Lock()
 	m.pendingReloadRequestedAt = requestedAt
 	m.pendingReloadRequestedAtMono = requestedAtMono
@@ -155,18 +137,12 @@ func (m *reloadManager) setPendingReloadMetadata(requestedAt time.Time, requeste
 }
 
 func (m *reloadManager) clearPendingRetirement() {
-	if m == nil {
-		return
-	}
 	m.mu.Lock()
 	m.pendingRetirementDone = nil
 	m.mu.Unlock()
 }
 
 func (m *reloadManager) takePendingRetirementDone() <-chan struct{} {
-	if m == nil {
-		return nil
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	done := m.pendingRetirementDone
@@ -175,9 +151,6 @@ func (m *reloadManager) takePendingRetirementDone() <-chan struct{} {
 }
 
 func (m *reloadManager) buildShutdownHandoff() *signalShutdownStagedHandoff {
-	if m == nil {
-		return nil
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.pendingStagedHandoff == nil {
@@ -194,9 +167,6 @@ func (m *reloadManager) buildShutdownHandoff() *signalShutdownStagedHandoff {
 }
 
 func (m *reloadManager) pendingDNSHandoffActive(current *control.ControlPlane) bool {
-	if m == nil {
-		return false
-	}
 	handoff := m.currentPendingStagedHandoff()
 	return handoff != nil &&
 		!handoff.freshDatapath &&
@@ -247,7 +217,7 @@ func buildPreparedDNSHandoffHooks(log *logrus.Logger, enableReuse bool, callback
 }
 
 func (m *reloadManager) installPreparedDNSHandoffHooks(log *logrus.Logger, current *control.ControlPlane, conf *config.Config) {
-	if m == nil || current == nil || conf == nil {
+	if current == nil || conf == nil {
 		return
 	}
 	handoff := m.currentPendingStagedHandoff()
@@ -313,9 +283,6 @@ func (m *reloadManager) finishReloadSuccess() {
 // the same barrier so it cannot transfer generation ownership while a reload
 // is between datapath preparation and publication.
 func (m *reloadManager) beginReloadTransition() bool {
-	if m == nil {
-		return false
-	}
 	m.transitionMu.Lock()
 	defer m.transitionMu.Unlock()
 	if m.shutdownStarted || m.transitionActive {
@@ -326,9 +293,6 @@ func (m *reloadManager) beginReloadTransition() bool {
 }
 
 func (m *reloadManager) endReloadTransition() {
-	if m == nil {
-		return
-	}
 	m.transitionMu.Lock()
 	if m.transitionActive {
 		m.transitionActive = false
@@ -341,12 +305,6 @@ func (m *reloadManager) endReloadTransition() {
 // retirement worker, and then atomically transfers any remaining generation
 // ownership to the shutdown caller.
 func (m *reloadManager) shutdownSupervisor(supervisor *runtimeSupervisor) runtimeSupervisorSnapshot {
-	if m == nil {
-		if supervisor == nil {
-			return runtimeSupervisorSnapshot{}
-		}
-		return supervisor.shutdown()
-	}
 	m.transitionMu.Lock()
 	m.shutdownStarted = true
 	for m.transitionActive {
@@ -376,9 +334,6 @@ func (m *reloadManager) shutdownSupervisor(supervisor *runtimeSupervisor) runtim
 }
 
 func (m *reloadManager) buildShutdownHandoffWithSupervisor(snapshot runtimeSupervisorSnapshot, current *runtimeGeneration) *signalShutdownStagedHandoff {
-	if m == nil {
-		return nil
-	}
 	var handoff signalShutdownStagedHandoff
 	if snapshot.retiring != nil {
 		handoff.oldListener = snapshot.retiring.listener
@@ -410,7 +365,7 @@ func (m *reloadManager) startControlPlaneRetirement(
 	supervisor *runtimeSupervisor,
 	retiringGeneration *runtimeGeneration,
 ) {
-	if m == nil || oldControlPlane == nil {
+	if oldControlPlane == nil {
 		return
 	}
 	if supervisor == nil || retiringGeneration == nil || !supervisor.ownsRetiring(retiringGeneration) {
@@ -475,9 +430,6 @@ func (m *reloadManager) startControlPlaneRetirement(
 }
 
 func (m *reloadManager) refreshPprofServer(server **http.Server, port uint16) {
-	if server == nil {
-		return
-	}
 	if *server != nil {
 		pprofCtx, pprofCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_ = (*server).Shutdown(pprofCtx)

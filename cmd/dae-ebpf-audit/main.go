@@ -20,19 +20,6 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 )
 
-type daeParam struct {
-	TproxyPort      uint32
-	ControlPlanePid uint32
-	Dae0Ifindex     uint32
-	DaeNetnsId      uint32
-	Dae0peerMac     [6]uint8
-	PaddingAfterMac [2]uint8
-	UseRedirectPeer uint8
-	Padding1        uint8
-	Padding2        uint16
-	DaeSocketMark   uint32
-}
-
 func main() {
 	var objectPath string
 	var outputDir string
@@ -86,7 +73,10 @@ func run(objectPath string, outputDir string, hold bool) error {
 	}
 
 	if variable, ok := spec.Variables["PARAM"]; ok {
-		if err := variable.Set(daeParam{}); err != nil {
+		// The audit tool only needs PARAM zeroed so the collection loads; the
+		// concrete field layout belongs to the generated bindings, so take the
+		// size from the spec instead of mirroring the struct here.
+		if err := variable.Set(make([]byte, variable.Size())); err != nil {
 			return fmt.Errorf("set PARAM variable: %w", err)
 		}
 	} else {

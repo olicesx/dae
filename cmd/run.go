@@ -309,10 +309,6 @@ func restorePreviousFreshDatapathGeneration(
 	return nil
 }
 
-func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (err error) {
-	return newRunner(log, conf, externGeoDataDirs).Run()
-}
-
 // serveExitTracker records abnormal exits of serve goroutines tagged with
 // the control plane each goroutine served, so the run loop can tell an
 // abnormal exit of the ACTIVE generation apart from the benign exit of a
@@ -351,10 +347,9 @@ func (t *serveExitTracker) fatalFor(plane *control.ControlPlane) error {
 	return nil
 }
 
-func (r *Runner) Run() (err error) {
-	log := r.log
-	conf := r.conf
-	externGeoDataDirs := r.externGeoDataDirs
+// Run starts the daemon: it builds the initial control plane, serves it, and
+// drives the signal and reload loop until termination.
+func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (err error) {
 	processSessions := control.NewSessionManager(context.Background())
 	defer func() {
 		err = errors.Join(err, processSessions.Close())

@@ -20,6 +20,7 @@ import (
 
 	"github.com/daeuniverse/dae/common"
 	"github.com/daeuniverse/dae/common/assets"
+	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/common/netutils"
 	componentdns "github.com/daeuniverse/dae/component/dns"
 	"github.com/daeuniverse/dae/component/dnstransport"
@@ -315,6 +316,14 @@ func (r *Router) replaceHTTPClient(previous *dnstransport.HTTPClientGeneration, 
 }
 
 func (r *Router) initUpstreams(rawUpstreams []config.KeyableString) error {
+	// Mirror the bound dns.New enforces: UpstreamName2Id truncates each raw
+	// index to uint8, so beyond it the id would collide with the reserved
+	// reject/asis values or wrap around. Checked before the loop so a rejected
+	// configuration leaves no partially populated router behind.
+	if len(rawUpstreams) > int(consts.DnsRequestOutboundIndex_UserDefinedMax) ||
+		len(rawUpstreams) > int(consts.DnsResponseOutboundIndex_UserDefinedMax) {
+		return fmt.Errorf("too many upstreams")
+	}
 	resolveIp46 := r.resolveBootstrap
 	if len(r.bootstrapDns) == 0 {
 		resolveIp46 = nil

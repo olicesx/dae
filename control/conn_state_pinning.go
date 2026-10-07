@@ -11,23 +11,31 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// snapshotPinnedTCP returns a snapshot set of pinned TCP tuples for lock-free
-// batch queries. Shards are read one at a time, so the result is a union over
-// a short window rather than one instant — sufficient for janitor scans.
-func (m *SessionManager) snapshotPinnedTCP() map[bpfTuplesKey]struct{} {
+// snapshotPinnedTCPInto fills scratch (cleared first) with the set of pinned
+// TCP tuples for lock-free batch queries, reusing the janitor-owned map
+// across scan cycles instead of allocating a fresh snapshot per scan; a nil
+// scratch is created on first use and must be stored back by the caller.
+// Shards are read one at a time, so the result is a union over a short
+// window rather than one instant — sufficient for janitor scans. The caller
+// must finish consuming the returned map before the next call; the janitor
+// is the only caller and runs scans sequentially.
+func (m *SessionManager) snapshotPinnedTCPInto(scratch map[bpfTuplesKey]struct{}) map[bpfTuplesKey]struct{} {
 	if m == nil {
 		return nil
 	}
-	snap := make(map[bpfTuplesKey]struct{})
+	if scratch == nil {
+		scratch = make(map[bpfTuplesKey]struct{})
+	}
+	clear(scratch)
 	for i := range m.pinnedShards {
 		shard := &m.pinnedShards[i]
 		shard.mu.Lock()
 		for k := range shard.keys {
-			snap[k] = struct{}{}
+			scratch[k] = struct{}{}
 		}
 		shard.mu.Unlock()
 	}
-	return snap
+	return scratch
 }
 
 func (m *SessionManager) isRedirectTrackPinned(key bpfRedirectTuple) bool {
@@ -94,19 +102,26 @@ func (m *SessionManager) ReleaseUdpConnStateTuples(keys []bpfTuplesKey) error {
 	return err
 }
 
-// snapshotPinnedUDP returns a snapshot set of pinned UDP tuples for lock-free
-// batch queries. The snapshot is atomic with respect to retain/release.
-func (m *SessionManager) snapshotPinnedUDP() map[bpfTuplesKey]struct{} {
+// snapshotPinnedUDPInto fills scratch (cleared first) with the set of pinned
+// UDP tuples for lock-free batch queries, reusing the janitor-owned map
+// across scan cycles instead of allocating a fresh snapshot per scan; a nil
+// scratch is created on first use and must be stored back by the caller.
+// The snapshot is atomic with respect to retain/release. See
+// snapshotPinnedTCPInto for the single-consumer contract.
+func (m *SessionManager) snapshotPinnedUDPInto(scratch map[bpfTuplesKey]struct{}) map[bpfTuplesKey]struct{} {
 	if m == nil {
 		return nil
 	}
+	if scratch == nil {
+		scratch = make(map[bpfTuplesKey]struct{})
+	}
 	m.udpStateMu.RLock()
-	snap := make(map[bpfTuplesKey]struct{}, len(m.pinnedUDP))
+	clear(scratch)
 	for k := range m.pinnedUDP {
-		snap[k] = struct{}{}
+		scratch[k] = struct{}{}
 	}
 	m.udpStateMu.RUnlock()
-	return snap
+	return scratch
 }
 
 // retireUnpinnedUDPConnState removes stale kernel routing attribution before

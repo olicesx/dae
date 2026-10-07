@@ -418,6 +418,12 @@ type connStateJanitorScratch struct {
 
 	tcpDelete []bpfTuplesKey
 
+	// pinnedTCP/pinnedUDP hold the pin-set snapshots filled once per scan
+	// cycle by SessionManager.snapshotPinned*Into; the janitor is the only
+	// consumer, so the maps are cleared and refilled instead of reallocated.
+	pinnedTCP map[bpfTuplesKey]struct{}
+	pinnedUDP map[bpfTuplesKey]struct{}
+
 	routingHandoffKeys   []bpfTuplesKey
 	routingHandoffValues []bpfRoutingHandoffEntry
 	routingHandoffDelete []bpfTuplesKey

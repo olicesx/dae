@@ -342,8 +342,10 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 	// Snapshot pin sets once to avoid per-entry RLock/RUnlock during the scan.
 	// The final recheck at the bottom still acquires both locks for precise
 	// scan-to-delete race prevention.
-	pinnedUDPSnap := manager.snapshotPinnedUDP()
-	pinnedTCPSnap := manager.snapshotPinnedTCP()
+	pinnedUDPSnap := manager.snapshotPinnedUDPInto(scratch.pinnedUDP)
+	scratch.pinnedUDP = pinnedUDPSnap
+	pinnedTCPSnap := manager.snapshotPinnedTCPInto(scratch.pinnedTCP)
+	scratch.pinnedTCP = pinnedTCPSnap
 
 	for {
 		count, err := bpf.ConnStateMap.BatchLookup(&cursor, keysOut, valuesOut, nil)

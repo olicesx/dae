@@ -15,12 +15,12 @@ import (
 	"net/netip"
 )
 
-// TestSnapshotPinnedUDPEmpty verifies that snapshotPinnedUDP returns an empty
+// TestSnapshotPinnedUDPEmpty verifies that snapshotPinnedUDPInto returns an empty
 // (non-nil) map when no tuples are pinned, and nil for a nil manager.
 func TestSnapshotPinnedUDPEmpty(t *testing.T) {
 	// nil manager
 	var nilMgr *SessionManager
-	if got := nilMgr.snapshotPinnedUDP(); got != nil {
+	if got := nilMgr.snapshotPinnedUDPInto(nil); got != nil {
 		t.Fatalf("nil manager snapshot = %v, want nil", got)
 	}
 
@@ -28,7 +28,8 @@ func TestSnapshotPinnedUDPEmpty(t *testing.T) {
 	mgr := NewSessionManager(context.Background())
 	defer func() { _ = mgr.Close() }()
 
-	got := mgr.snapshotPinnedUDP()
+	scratch := make(map[bpfTuplesKey]struct{})
+	got := mgr.snapshotPinnedUDPInto(scratch)
 	if got == nil {
 		t.Fatal("expected non-nil empty map")
 	}
@@ -37,18 +38,19 @@ func TestSnapshotPinnedUDPEmpty(t *testing.T) {
 	}
 }
 
-// TestSnapshotPinnedTCPEmpty verifies that snapshotPinnedTCP returns an empty
+// TestSnapshotPinnedTCPEmpty verifies that snapshotPinnedTCPInto returns an empty
 // (non-nil) map when no tuples are pinned, and nil for a nil manager.
 func TestSnapshotPinnedTCPEmpty(t *testing.T) {
 	var nilMgr *SessionManager
-	if got := nilMgr.snapshotPinnedTCP(); got != nil {
+	if got := nilMgr.snapshotPinnedTCPInto(nil); got != nil {
 		t.Fatalf("nil manager snapshot = %v, want nil", got)
 	}
 
 	mgr := NewSessionManager(context.Background())
 	defer func() { _ = mgr.Close() }()
 
-	got := mgr.snapshotPinnedTCP()
+	scratch := make(map[bpfTuplesKey]struct{})
+	got := mgr.snapshotPinnedTCPInto(scratch)
 	if got == nil {
 		t.Fatal("expected non-nil empty map")
 	}
@@ -68,7 +70,7 @@ func TestSnapshotPinnedUDPReflectsRetained(t *testing.T) {
 	key := bpfTuplesKeyFromAddrPorts(src, dst, uint8(unix.IPPROTO_UDP))
 
 	// Before retain: not in snapshot
-	snap := mgr.snapshotPinnedUDP()
+	snap := mgr.snapshotPinnedUDPInto(make(map[bpfTuplesKey]struct{}))
 	if _, found := snap[key]; found {
 		t.Fatal("found unpinned key in snapshot")
 	}
@@ -77,7 +79,7 @@ func TestSnapshotPinnedUDPReflectsRetained(t *testing.T) {
 	mgr.RetainUdpConnStateTuples([]bpfTuplesKey{key})
 
 	// After retain: in snapshot
-	snap = mgr.snapshotPinnedUDP()
+	snap = mgr.snapshotPinnedUDPInto(make(map[bpfTuplesKey]struct{}))
 	if _, found := snap[key]; !found {
 		t.Fatal("retained key not found in snapshot")
 	}
@@ -89,7 +91,7 @@ func TestSnapshotPinnedUDPReflectsRetained(t *testing.T) {
 	delete(mgr.pinnedUDP, key)
 	mgr.udpStateMu.Unlock()
 
-	snap = mgr.snapshotPinnedUDP()
+	snap = mgr.snapshotPinnedUDPInto(make(map[bpfTuplesKey]struct{}))
 	if _, found := snap[key]; found {
 		t.Fatal("released key still in snapshot")
 	}
@@ -108,7 +110,7 @@ func TestSnapshotPinnedTCPReflectsRetained(t *testing.T) {
 	pinShard := &mgr.pinnedShards[tuplesShardIndex(&key)]
 	pinShard.pin(key)
 
-	snap := mgr.snapshotPinnedTCP()
+	snap := mgr.snapshotPinnedTCPInto(make(map[bpfTuplesKey]struct{}))
 	if _, found := snap[key]; !found {
 		t.Fatal("retained TCP key not found in snapshot")
 	}
@@ -116,7 +118,7 @@ func TestSnapshotPinnedTCPReflectsRetained(t *testing.T) {
 	// Decrement
 	pinShard.unpin(key)
 
-	snap = mgr.snapshotPinnedTCP()
+	snap = mgr.snapshotPinnedTCPInto(make(map[bpfTuplesKey]struct{}))
 	if _, found := snap[key]; found {
 		t.Fatal("released TCP key still in snapshot")
 	}
@@ -163,7 +165,7 @@ func TestSnapshotPinnedUDPConcurrentSafe(t *testing.T) {
 	for range readers {
 		wg.Go(func() {
 			for range iterations {
-				_ = mgr.snapshotPinnedUDP()
+				_ = mgr.snapshotPinnedUDPInto(make(map[bpfTuplesKey]struct{}))
 				// Should never panic or race
 			}
 		})
@@ -203,7 +205,7 @@ func TestSnapshotPinnedTCPConcurrentSafe(t *testing.T) {
 	for range readers {
 		wg.Go(func() {
 			for range iterations {
-				_ = mgr.snapshotPinnedTCP()
+				_ = mgr.snapshotPinnedTCPInto(make(map[bpfTuplesKey]struct{}))
 			}
 		})
 	}
@@ -226,7 +228,7 @@ func TestSnapshotPinnedUDPRefcountMultiple(t *testing.T) {
 	mgr.RetainUdpConnStateTuples([]bpfTuplesKey{key})
 	mgr.RetainUdpConnStateTuples([]bpfTuplesKey{key})
 
-	snap := mgr.snapshotPinnedUDP()
+	snap := mgr.snapshotPinnedUDPInto(make(map[bpfTuplesKey]struct{}))
 	if _, found := snap[key]; !found {
 		t.Fatal("multi-retained key not in snapshot")
 	}
@@ -236,7 +238,7 @@ func TestSnapshotPinnedUDPRefcountMultiple(t *testing.T) {
 	mgr.pinnedUDP[key]--
 	mgr.udpStateMu.Unlock()
 
-	snap = mgr.snapshotPinnedUDP()
+	snap = mgr.snapshotPinnedUDPInto(make(map[bpfTuplesKey]struct{}))
 	if _, found := snap[key]; !found {
 		t.Fatal("key disappeared after first release of refcount 2")
 	}
@@ -251,8 +253,42 @@ func TestSnapshotPinnedUDPRefcountMultiple(t *testing.T) {
 	}
 	mgr.udpStateMu.Unlock()
 
-	snap = mgr.snapshotPinnedUDP()
+	snap = mgr.snapshotPinnedUDPInto(make(map[bpfTuplesKey]struct{}))
 	if _, found := snap[key]; found {
 		t.Fatal("key still present after full release")
+	}
+}
+
+// TestSnapshotPinnedIntoNilScratchWithPins reproduces the production crash of
+// the janitor's first scan: a nil scratch map (the zero value of
+// connStateJanitorScratch) combined with a non-empty pin set used to panic
+// with an assignment to a nil map inside the fill loop.
+func TestSnapshotPinnedIntoNilScratchWithPins(t *testing.T) {
+	mgr := NewSessionManager(context.Background())
+	defer func() { _ = mgr.Close() }()
+
+	src := common.ConvergeAddrPort(netip.MustParseAddrPort("192.0.2.20:3000"))
+	dst := common.ConvergeAddrPort(netip.MustParseAddrPort("198.51.100.20:443"))
+	udpKey := bpfTuplesKeyFromAddrPorts(src, dst, uint8(unix.IPPROTO_UDP))
+	mgr.RetainUdpConnStateTuples([]bpfTuplesKey{udpKey})
+
+	got := mgr.snapshotPinnedUDPInto(nil)
+	if got == nil || len(got) != 1 {
+		t.Fatalf("UDP nil-scratch snapshot = %v (len %d), want the pinned key", got, len(got))
+	}
+	if _, found := got[udpKey]; !found {
+		t.Fatal("pinned UDP key missing from nil-scratch snapshot")
+	}
+
+	tcpKey := bpfTuplesKeyFromAddrPorts(src, dst, uint8(unix.IPPROTO_TCP))
+	pinShard := &mgr.pinnedShards[tuplesShardIndex(&tcpKey)]
+	pinShard.pin(tcpKey)
+
+	got = mgr.snapshotPinnedTCPInto(nil)
+	if got == nil || len(got) != 1 {
+		t.Fatalf("TCP nil-scratch snapshot = %v (len %d), want the pinned key", got, len(got))
+	}
+	if _, found := got[tcpKey]; !found {
+		t.Fatal("pinned TCP key missing from nil-scratch snapshot")
 	}
 }

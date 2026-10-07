@@ -47,3 +47,35 @@ func TestGenerationBoundMeteringFollowsOwningStore(t *testing.T) {
 		t.Fatalf("published-store download metering recorded %d bytes, want 19", got)
 	}
 }
+
+// TestRetiredGenerationLeavesTheSnapshot pins the observable half of the same
+// rule through the production API: a plane publishes its store and meters
+// through its own recorders, a successor publishes its own store, and the
+// successor's snapshot no longer carries the retired generation's bytes. The
+// retired plane still accounts for its own traffic — what changed is that
+// nothing publishes that store any more.
+func TestRetiredGenerationLeavesTheSnapshot(t *testing.T) {
+	retiring := &ControlPlane{runtimeStats: newRuntimeStats()}
+	retiring.publishRuntimeStats()
+	retiring.recordUploadTraffic(11)
+	retiring.recordDownloadTraffic(13)
+	if got := retiring.SnapshotRuntimeStats(60, 60); got.UploadTotal != 11 || got.DownloadTotal != 13 {
+		t.Fatalf("published plane snapshot = %d/%d bytes, want 11/13", got.UploadTotal, got.DownloadTotal)
+	}
+
+	successor := &ControlPlane{runtimeStats: newRuntimeStats()}
+	successor.publishRuntimeStats()
+	t.Cleanup(successor.unpublishRuntimeStats)
+	retiring.unpublishRuntimeStats()
+
+	if got := successor.SnapshotRuntimeStats(60, 60); got.UploadTotal != 0 || got.DownloadTotal != 0 {
+		t.Fatalf("retired generation still contributes %d/%d bytes to the successor snapshot", got.UploadTotal, got.DownloadTotal)
+	}
+	if got := retiring.SnapshotRuntimeStats(60, 60); got.UploadTotal != 11 || got.DownloadTotal != 13 {
+		t.Fatalf("retired plane snapshot = %d/%d bytes, want its own 11/13", got.UploadTotal, got.DownloadTotal)
+	}
+	RecordUploadTraffic(17)
+	if got := successor.SnapshotRuntimeStats(60, 60); got.UploadTotal != 17 {
+		t.Fatalf("published-store metering after the swap = %d bytes, want 17", got.UploadTotal)
+	}
+}

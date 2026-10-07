@@ -6,6 +6,10 @@
 package control
 
 import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"slices"
@@ -56,6 +60,12 @@ var (
 	routingResultStructPattern = regexp.MustCompile(
 		`struct\s+routing_result\s*\{([^}]*)\}`)
 
+	// captures the complete declaration "struct routing_result { ... } ... ;",
+	// attributes included, so the C-compiler oracle compiles exactly the
+	// declaration the kernel compiles instead of a reconstruction of it.
+	routingResultDeclarationPattern = regexp.MustCompile(
+		`struct\s+routing_result\s*\{[^}]*\}\s*[^;]*;`)
+
 	// captures what sits between that closing brace and the terminating
 	// semicolon. A struct-level attribute (e.g. __attribute__((aligned(16))))
 	// raises sizeof and moves every field offset without touching a single
@@ -71,6 +81,11 @@ var (
 	// captures " #define NAME <n>" so macro-sized C arrays (e.g.
 	// TASK_COMM_LEN) resolve without a second owner of the value.
 	cDefinePattern = regexp.MustCompile(`(?m)#define\s+(\w+)\s+(\d+)`)
+
+	// captures one `type name` or `type name[N]` struct field declaration.
+	// Every declaration of a mirrored struct must match it, so a field of an
+	// unrecognized shape cannot drop out of the layout contract silently.
+	cDeclarationPattern = regexp.MustCompile(`^(.+?)\s+(\w+)\s*(?:\[\s*(\w+)\s*\])?$`)
 )
 
 // cIntTypeWidths maps the fixed-width C integer types used by
@@ -207,14 +222,44 @@ func TestKernelSourceHasNoBitfieldHeaderReads(t *testing.T) {
 }
 
 func TestEventRateStructLayoutContract(t *testing.T) {
-	m := eventRateStructPattern.FindStringSubmatch(tproxySource)
-	if m == nil {
-		t.Fatal("struct dae_event_rate not found in kern/tproxy.c")
+	// Same two fail-closed rules as struct routing_result: the declaration is
+	// read out of code rather than prose and must be unique, and every field
+	// declaration must parse, so an added field cannot fall out of the contract.
+	kernelSource := stripCKernelComments(tproxySource)
+	declarations := eventRateStructPattern.FindAllStringSubmatch(kernelSource, -1)
+	if len(declarations) != 1 {
+		t.Fatalf("kern/tproxy.c contains %d definitions of struct dae_event_rate, want exactly 1; the gate must not guess which one compiles", len(declarations))
 	}
-	fieldPattern := regexp.MustCompile(`(__u\d+|\w+_t)\s+(\w+)\s*;`)
-	var fields []string
-	for _, fm := range fieldPattern.FindAllStringSubmatch(m[1], -1) {
-		fields = append(fields, fm[2])
+	m := declarations[0]
+	var signatures []string
+	offset, maxAlign := 0, 1
+	for _, decl := range strings.Split(m[1], ";") {
+		decl = strings.TrimSpace(decl)
+		if decl == "" {
+			continue
+		}
+		fm := cDeclarationPattern.FindStringSubmatch(decl)
+		if fm == nil {
+			t.Fatalf("struct dae_event_rate declares %q, which is not a plain `type name` or `type name[N]` field; the Go mirror is binary-injected, so every field must be accounted for here", decl)
+		}
+		width, ok := cIntTypeWidths[fm[1]]
+		if !ok {
+			t.Fatalf("struct dae_event_rate field %s has unmapped C type %s; add its width to cIntTypeWidths so the field cannot bypass the layout contract", fm[2], fm[1])
+		}
+		size, signature := width, fm[1]+" "+fm[2]
+		if fm[3] != "" {
+			count, err := strconv.Atoi(fm[3])
+			if err != nil {
+				t.Fatalf("struct dae_event_rate field %s has non-numeric array size %q", fm[2], fm[3])
+			}
+			size, signature = width*count, signature+"["+fm[3]+"]"
+		}
+		if width > maxAlign {
+			maxAlign = width
+		}
+		offset = (offset + width - 1) / width * width
+		offset += size
+		signatures = append(signatures, signature)
 	}
 
 	// Two u64 fields first (so the struct has no implicit padding between
@@ -222,21 +267,24 @@ func TestEventRateStructLayoutContract(t *testing.T) {
 	// C sizeof free of alignment holes. eventRateValue() mirrors this order
 	// with an explicit trailing byte array to match the C sizeof; the parity
 	// of the two sizes is enforced at load time by ebpf.VariableSpec.Set.
+	// Signatures, not names: a field silently widened to u64 would keep the
+	// name order and still change the mirrored size.
 	want := []string{
-		"window_ns",
-		"redirect_rebind_stale_ns",
-		"blocked_key",
-		"redirect_rebind_key",
-		"overflow_key",
-		"syn_rebind_key",
-		"stateless_tcp_key",
-		"frag_tail_key",
+		"__u64 window_ns",
+		"__u64 redirect_rebind_stale_ns",
+		"__u32 blocked_key",
+		"__u32 redirect_rebind_key",
+		"__u32 overflow_key",
+		"__u32 syn_rebind_key",
+		"__u32 stateless_tcp_key",
+		"__u32 frag_tail_key",
+		"__u32 padding[2]",
 	}
-	if !reflect.DeepEqual(fields, want) {
-		t.Fatalf("struct dae_event_rate field order %v, want %v (no implicit padding allowed: the Go mirror is binary-injected)", fields, want)
+	if !reflect.DeepEqual(signatures, want) {
+		t.Fatalf("struct dae_event_rate declares %v, want %v (no implicit padding and no extra field allowed: the Go mirror is binary-injected)", signatures, want)
 	}
-	if !regexp.MustCompile(`__u32\s+padding\s*\[2\]\s*;`).MatchString(m[1]) {
-		t.Fatalf("struct dae_event_rate must end with an explicit `__u32 padding[2]` so its sizeof (48) matches the packed Go mirror; body: %s", m[1])
+	if size := (offset + maxAlign - 1) / maxAlign * maxAlign; size != 48 {
+		t.Fatalf("struct dae_event_rate sizes to %d bytes, want the 48 bytes eventRateValue() encodes", size)
 	}
 }
 
@@ -447,6 +495,39 @@ func TestRedirectTrackCapacityParityWithKernelSource(t *testing.T) {
 // unsafe.Offsetof computes on the Go side. It carries no build tag, so it runs
 // in both the stub and the real-datapath build; the mirror that the current
 // build cannot compile is covered by TestRoutingResultMirrorSourcesAgree.
+// routingResultContract pairs each C field of struct routing_result with its Go
+// mirror field, in declaration order. The source-level gate and the C-compiler
+// oracle below both read this one list.
+var routingResultContract = []struct{ cName, goName string }{
+	{"mark", "Mark"},
+	{"must", "Must"},
+	{"mac", "Mac"},
+	{"outbound", "Outbound"},
+	{"pname", "Pname"},
+	{"pid", "Pid"},
+	{"dscp", "Dscp"},
+	{"routing_epoch_slot", "RoutingEpochSlot"},
+	{"datapath_generation", "DatapathGeneration"},
+}
+
+// goRoutingResultOffsets returns the compiled offset of every Go mirror field.
+// unsafe.Offsetof makes the compiler's layout, not a repeated table, the source
+// of truth.
+func goRoutingResultOffsets() map[string]uintptr {
+	var r bpfRoutingResult
+	return map[string]uintptr{
+		"Mark":               unsafe.Offsetof(r.Mark),
+		"Must":               unsafe.Offsetof(r.Must),
+		"Mac":                unsafe.Offsetof(r.Mac),
+		"Outbound":           unsafe.Offsetof(r.Outbound),
+		"Pname":              unsafe.Offsetof(r.Pname),
+		"Pid":                unsafe.Offsetof(r.Pid),
+		"Dscp":               unsafe.Offsetof(r.Dscp),
+		"RoutingEpochSlot":   unsafe.Offsetof(r.RoutingEpochSlot),
+		"DatapathGeneration": unsafe.Offsetof(r.DatapathGeneration),
+	}
+}
+
 func TestRoutingResultLayoutParityWithKernelSource(t *testing.T) {
 	kernelSource := stripCKernelComments(tproxySource)
 	// Fail closed on ambiguity: a second definition (a disabled block, a quoted
@@ -468,17 +549,6 @@ func TestRoutingResultLayoutParityWithKernelSource(t *testing.T) {
 
 	// The Go mirror of struct routing_result, in declaration order: the C
 	// name keys the parsed field, the Go name keys the offset table below.
-	contract := []struct{ cName, goName string }{
-		{"mark", "Mark"},
-		{"must", "Must"},
-		{"mac", "Mac"},
-		{"outbound", "Outbound"},
-		{"pname", "Pname"},
-		{"pid", "Pid"},
-		{"dscp", "Dscp"},
-		{"routing_epoch_slot", "RoutingEpochSlot"},
-		{"datapath_generation", "DatapathGeneration"},
-	}
 
 	macros := map[string]int{}
 	for _, dm := range cDefinePattern.FindAllStringSubmatch(tproxySource, -1) {
@@ -491,26 +561,25 @@ func TestRoutingResultLayoutParityWithKernelSource(t *testing.T) {
 	// element width times the element count, alignment the element width. Every
 	// declaration in the body must resolve: scanning only for known types would
 	// let a field of an unrecognized type (a signed int, a bitfield, a nested
-	// aggregate) drop out of the layout contract silently.
+	// aggregate) drop out of the layout routingResultContract silently.
 	type cField struct {
 		name  string
 		size  int
 		align int
 	}
-	declPattern := regexp.MustCompile(`^(.+?)\s+(\w+)\s*(?:\[\s*(\w+)\s*\])?$`)
 	var cFields []cField
 	for _, decl := range strings.Split(m[1], ";") {
 		decl = strings.TrimSpace(decl)
 		if decl == "" {
 			continue
 		}
-		fm := declPattern.FindStringSubmatch(decl)
+		fm := cDeclarationPattern.FindStringSubmatch(decl)
 		if fm == nil {
 			t.Fatalf("struct routing_result declares %q, which is not a plain `type name` or `type name[N]` field; size it here before adding it to the Go mirror", decl)
 		}
 		elemWidth, ok := cIntTypeWidths[fm[1]]
 		if !ok {
-			t.Fatalf("struct routing_result field %s has unmapped C type %s; add its width to cIntTypeWidths so the field cannot bypass the layout contract", fm[2], fm[1])
+			t.Fatalf("struct routing_result field %s has unmapped C type %s; add its width to cIntTypeWidths so the field cannot bypass the layout routingResultContract", fm[2], fm[1])
 		}
 		size := elemWidth
 		if array := fm[3]; array != "" {
@@ -525,25 +594,15 @@ func TestRoutingResultLayoutParityWithKernelSource(t *testing.T) {
 		}
 		cFields = append(cFields, cField{name: fm[2], size: size, align: elemWidth})
 	}
-	if len(cFields) != len(contract) {
+	if len(cFields) != len(routingResultContract) {
 		t.Fatalf("struct routing_result declares %d fields (%v) but the Go mirror bpfRoutingResult has %d; both sides must change together",
-			len(cFields), cFields, len(contract))
+			len(cFields), cFields, len(routingResultContract))
 	}
 
 	// Go side: order and sizes from the real type, offsets from
 	// unsafe.Offsetof so the compiler's layout is what gets pinned.
 	var goResult bpfRoutingResult
-	goOffsets := map[string]uintptr{
-		"Mark":               unsafe.Offsetof(goResult.Mark),
-		"Must":               unsafe.Offsetof(goResult.Must),
-		"Mac":                unsafe.Offsetof(goResult.Mac),
-		"Outbound":           unsafe.Offsetof(goResult.Outbound),
-		"Pname":              unsafe.Offsetof(goResult.Pname),
-		"Pid":                unsafe.Offsetof(goResult.Pid),
-		"Dscp":               unsafe.Offsetof(goResult.Dscp),
-		"RoutingEpochSlot":   unsafe.Offsetof(goResult.RoutingEpochSlot),
-		"DatapathGeneration": unsafe.Offsetof(goResult.DatapathGeneration),
-	}
+	goOffsets := goRoutingResultOffsets()
 	goType := reflect.TypeFor[bpfRoutingResult]()
 	var goNames []string
 	goSizes := map[string]int{}
@@ -557,14 +616,14 @@ func TestRoutingResultLayoutParityWithKernelSource(t *testing.T) {
 	}
 
 	cOffset, maxAlign := 0, 1
-	for i, want := range contract {
+	for i, want := range routingResultContract {
 		got := cFields[i]
 		if got.name != want.cName {
 			t.Fatalf("struct routing_result field %d is %q but the Go mirror expects %q at that position; a reorder silently misreads every routing decision",
 				i, got.name, want.cName)
 		}
 		if i >= len(goNames) || goNames[i] != want.goName {
-			t.Fatalf("bpfRoutingResult field order %v does not mirror the contract entry %q", goNames, want.goName)
+			t.Fatalf("bpfRoutingResult field order %v does not mirror the routingResultContract entry %q", goNames, want.goName)
 		}
 		if got.align > maxAlign {
 			maxAlign = got.align
@@ -581,6 +640,92 @@ func TestRoutingResultLayoutParityWithKernelSource(t *testing.T) {
 	cOffset = (cOffset + maxAlign - 1) / maxAlign * maxAlign
 	if size := unsafe.Sizeof(goResult); size != uintptr(cOffset) {
 		t.Fatalf("struct routing_result is %d bytes in C but bpfRoutingResult is %d in Go", cOffset, size)
+	}
+}
+
+// TestRoutingResultLayoutMatchesCCompiler asks a real C compiler for the
+// sizeof and offsetof of the declaration in kern/tproxy.c and compares them with
+// the compiled Go mirror. The source-level gate re-implements C alignment rules
+// in Go, so an attribute, pragma or compiler flag that changes the layout can
+// only be caught by the oracle. It also pins that -fpack-struct leaves this
+// struct unchanged: every field is already naturally packed, which is what lets
+// the hand-written Go mirror match the unpacked declaration.
+func TestRoutingResultLayoutMatchesCCompiler(t *testing.T) {
+	cc, err := exec.LookPath("clang")
+	if err != nil {
+		t.Skipf("no C compiler available to size the kernel struct: %v", err)
+	}
+	kernelSource := stripCKernelComments(tproxySource)
+	declarations := routingResultDeclarationPattern.FindAllString(kernelSource, -1)
+	if len(declarations) != 1 {
+		t.Fatalf("kern/tproxy.c contains %d declarations of struct routing_result, want exactly 1", len(declarations))
+	}
+
+	var probe strings.Builder
+	probe.WriteString("/* generated by control/bpf_variables_parity_test.go */\n")
+	probe.WriteString("#include <stddef.h>\n#include <stdint.h>\n#include <stdio.h>\n")
+	probe.WriteString("typedef uint8_t __u8; typedef uint16_t __u16; typedef uint32_t __u32; typedef uint64_t __u64;\n")
+	for _, dm := range cDefinePattern.FindAllStringSubmatch(kernelSource, -1) {
+		fmt.Fprintf(&probe, "#define %s %s\n", dm[1], dm[2])
+	}
+	probe.WriteString(declarations[0])
+	probe.WriteString("\nint main(void) {\n")
+	probe.WriteString("\tprintf(\"sizeof %zu\\n\", sizeof(struct routing_result));\n")
+	for _, entry := range routingResultContract {
+		fmt.Fprintf(&probe, "\tprintf(\"%s %%zu\\n\", offsetof(struct routing_result, %s));\n", entry.cName, entry.cName)
+	}
+	probe.WriteString("\treturn 0;\n}\n")
+
+	goResult := bpfRoutingResult{}
+	goOffsets := goRoutingResultOffsets()
+	layout := func(variant string, flags ...string) map[string]int {
+		t.Helper()
+		dir := t.TempDir()
+		source := filepath.Join(dir, "layout.c")
+		if err := os.WriteFile(source, []byte(probe.String()), 0o600); err != nil {
+			t.Fatalf("write the %s C probe: %v", variant, err)
+		}
+		binary := filepath.Join(dir, "layout")
+		args := append([]string{"-std=gnu11", "-O0", "-o", binary, source}, flags...)
+		if out, err := exec.Command(cc, args...).CombinedOutput(); err != nil {
+			t.Fatalf("%s C probe did not compile: %v\n%s", variant, err, out)
+		}
+		out, err := exec.Command(binary).Output()
+		if err != nil {
+			t.Fatalf("run the %s C probe: %v", variant, err)
+		}
+		got := map[string]int{}
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			name, value, ok := strings.Cut(line, " ")
+			if !ok {
+				t.Fatalf("%s C probe printed %q, want `name value`", variant, line)
+			}
+			n, err := strconv.Atoi(value)
+			if err != nil {
+				t.Fatalf("%s C probe printed %q: %v", variant, line, err)
+			}
+			got[name] = n
+		}
+		if size := int(unsafe.Sizeof(goResult)); got["sizeof"] != size {
+			t.Fatalf("%s: the C compiler sizes struct routing_result to %d bytes but bpfRoutingResult is %d; the Go mirror must match the declaration the compiler sees", variant, got["sizeof"], size)
+		}
+		for _, entry := range routingResultContract {
+			if got[entry.cName] != int(goOffsets[entry.goName]) {
+				t.Fatalf("%s: field %s sits at C offset %d but Go offset %d in bpfRoutingResult", variant, entry.goName, got[entry.cName], goOffsets[entry.goName])
+			}
+		}
+		return got
+	}
+
+	if len(cDefinePattern.FindAllStringSubmatch(kernelSource, -1)) == 0 {
+		t.Fatal("kern/tproxy.c declares no #define, so the C probe cannot resolve macro-sized fields")
+	}
+	unpacked := layout("default")
+	packed := layout("-fpack-struct", "-fpack-struct")
+	for name, offset := range unpacked {
+		if packed[name] != offset {
+			t.Fatalf("-fpack-struct moves %s from %d to %d: the Go mirror is written for the unpacked declaration, so this struct must stay free of implicit alignment holes (or both mirrors must be re-derived together)", name, offset, packed[name])
+		}
 	}
 }
 

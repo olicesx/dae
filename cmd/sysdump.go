@@ -235,13 +235,17 @@ func dumpSysctl(outputDir string) {
 
 	err := filepath.Walk(sysctlPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
+			// An unreadable or vanished entry (common under /proc/sys/net as
+			// interfaces come and go) must not dereference a nil info below.
 			fmt.Printf("Fail in filepath.Walk: %v\n", err)
+			return nil
 		}
 
 		if !info.IsDir() {
 			value, err := os.ReadFile(path)
 			if err != nil {
 				fmt.Printf("Fail in filepath.Walk: %v\n", err)
+				return nil
 			}
 
 			relativePath := strings.TrimPrefix(path, sysctlPath+"/")

@@ -36,8 +36,9 @@ var (
 				os.Exit(1)
 			}
 			if abort {
-				if f, err := os.Create(AbortFile); err == nil {
-					_ = f.Close()
+				if err := createReloadAbortMarker(AbortFile); err != nil {
+					fmt.Println("Failed to create abort marker:", err)
+					os.Exit(1)
 				}
 			}
 			if err = syscall.Kill(pid, syscall.SIGUSR2); err != nil {

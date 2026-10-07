@@ -109,11 +109,16 @@ type ControlPlane struct {
 	mptcp                  bool
 	udpRouteScopeSensitive bool
 	controlPlaneUDPRuntime
-	lastConnectionErrorLogTime     atomic.Int64
-	lastDnsFastPathErrorLogTime    atomic.Int64
-	lastDnsFastPathServfailLogTime atomic.Int64
-	lastHandlePktEpochWarnTime     atomic.Int64
-	tcpConnPanicCount              atomic.Uint64
+	// Rate limits for the per-connection/per-packet log conditions that used
+	// to carry their own hand-rolled CAS loops; pacedAlert keeps the same
+	// first-line-always-logs, then one line per cooldown, semantics.
+	connectionErrorLogAlert     pacedAlert
+	dnsFastPathErrorLogAlert    pacedAlert
+	dnsFastPathServfailLogAlert pacedAlert
+	// lastHandlePktEpochWarnTime cannot join the pacedAlert fields above:
+	// udp_epoch_pin_measure_test.go resets it directly to re-arm the pace.
+	lastHandlePktEpochWarnTime atomic.Int64
+	tcpConnPanicCount          atomic.Uint64
 	// The janitor map-capacity alerts are paced one per condition, not one per
 	// janitor run: see pacedAlert. They are per-map so that one saturated map
 	// cannot pace another map's alert out of the log.
@@ -1303,9 +1308,9 @@ func (c *ControlPlane) dnsControllerOption() *DnsControllerOption {
 }
 
 func (c *ControlPlane) dnsUpstreamReadyCallback(dnsUpstream *dns.Upstream) (err error) {
-	if c != nil {
-		c.noteDNSUpstreamAvailable()
-	}
+	// The callback is only registered by the constructor on the plane it just
+	// built, so c is never nil here.
+	c.noteDNSUpstreamAvailable()
 	// Waiting for ready.
 	select {
 	case <-c.ctx.Done():
@@ -2053,21 +2058,17 @@ func (c *ControlPlane) readDatapathCounters(m *ebpf.Map) (bpfStatsSnapshot, erro
 	return snap, nil
 }
 
+// allowDnsFastPathErrorLog rate-limits the DNS fast-path error warning.
 func (c *ControlPlane) allowDnsFastPathErrorLog(now time.Time) bool {
-	nowNano := now.UnixNano()
-	for {
-		last := c.lastDnsFastPathErrorLogTime.Load()
-		if nowNano-last < int64(dnsFastPathErrorLogInterval) {
-			return false
-		}
-		if c.lastDnsFastPathErrorLogTime.CompareAndSwap(last, nowNano) {
-			return true
-		}
-	}
+	_, emit := c.dnsFastPathErrorLogAlert.observe(now, dnsFastPathErrorLogInterval)
+	return emit
 }
 
 // allowHandlePktEpochWarn rate-limits the expected reload-window warning for
 // UDP packets whose stale routing-epoch attribution has no execution owner.
+// It keeps the hand-rolled CAS loop (instead of pacedAlert) because
+// udp_epoch_pin_measure_test.go resets lastHandlePktEpochWarnTime directly to
+// re-arm the pace for each exercised warning path.
 func (c *ControlPlane) allowHandlePktEpochWarn(now time.Time) bool {
 	nowNano := now.UnixNano()
 	for {
@@ -2081,17 +2082,10 @@ func (c *ControlPlane) allowHandlePktEpochWarn(now time.Time) bool {
 	}
 }
 
+// allowDnsFastPathServfailLog rate-limits the DNS fast-path SERVFAIL warning.
 func (c *ControlPlane) allowDnsFastPathServfailLog(now time.Time) bool {
-	nowNano := now.UnixNano()
-	for {
-		last := c.lastDnsFastPathServfailLogTime.Load()
-		if nowNano-last < int64(dnsFastPathErrorLogInterval) {
-			return false
-		}
-		if c.lastDnsFastPathServfailLogTime.CompareAndSwap(last, nowNano) {
-			return true
-		}
-	}
+	_, emit := c.dnsFastPathServfailLogAlert.observe(now, dnsFastPathErrorLogInterval)
+	return emit
 }
 
 // readBpfStatsCounter reads a counter from the BPF stats map by key index.
@@ -2812,24 +2806,6 @@ func (c *ControlPlane) Listen(port uint16) (listener *Listener, err error) {
 			_ = listener.Close()
 		}
 	}()
-
-	return listener, nil
-}
-
-func (c *ControlPlane) ListenAndServe(readyChan chan<- bool, port uint16) (listener *Listener, err error) {
-	listener, err = c.Listen(port)
-	if err != nil {
-		return nil, err
-	}
-
-	if err = c.Serve(readyChan, listener); err != nil {
-		// This wrapper created the sockets, so it owns them: close on failure
-		// so a retried startup cannot leave the previous attempt's listeners
-		// bound until GC. The caller receives nil on error, matching the
-		// historical contract.
-		_ = listener.Close()
-		return nil, fmt.Errorf("failed to serve: %w", err)
-	}
 
 	return listener, nil
 }

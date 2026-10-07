@@ -211,9 +211,9 @@ func newDnsForwarder(upstream *dns.Upstream, dialArgument dialArgument, log *log
 		case consts.L4ProtoStr_TCP:
 			switch upstream.Scheme {
 			case dns.UpstreamScheme_TCP, dns.UpstreamScheme_TCP_UDP:
-				return &DoTCP{Upstream: *upstream, Dialer: dialArgument.bestDialer, dialArgument: dialArgument}, nil
+				return newDoTCP(*upstream, dialArgument), nil
 			case dns.UpstreamScheme_TLS:
-				return &DoTLS{Upstream: *upstream, Dialer: dialArgument.bestDialer, dialArgument: dialArgument}, nil
+				return newDoTLS(*upstream, dialArgument), nil
 			case dns.UpstreamScheme_HTTPS:
 				return &DoH{Upstream: *upstream, Dialer: dialArgument.bestDialer, dialArgument: dialArgument, http3: false}, nil
 			default:
@@ -824,45 +824,23 @@ func (l *lazyConnPool) closePool() error {
 	return nil
 }
 
-type DoTLS struct {
-	dns.Upstream
-	netproxy.Dialer
-	dialArgument dialArgument
-
+// streamDnsForwarder is the pooled stream transport shared by DoTCP and DoTLS.
+// Both forward DNS queries over pooled TCP connections with identical
+// retry and close semantics; they differ only in the dial closure (DoTLS wraps
+// the dialed connection in a TLS handshake).
+type streamDnsForwarder struct {
 	lazyConnPool // embeds getOrInit / closePool
+
+	dial func(ctx context.Context) (netproxy.Conn, error)
 }
 
-func (d *DoTLS) getPool() *connPool {
+func (d *streamDnsForwarder) getPool() *connPool {
 	return d.getOrInit(func() *connPool {
-		return newConnPool(4, func(ctx context.Context) (netproxy.Conn, error) {
-			conn, err := d.dialArgument.bestDialer.DialContext(
-				ctx,
-				common.MagicNetwork("tcp", d.dialArgument.mark, d.dialArgument.mptcp),
-				d.dialArgument.bestTarget.String(),
-			)
-			if err != nil {
-				return nil, err
-			}
-			tlsConn := tls.Client(&netproxy.FakeNetConn{Conn: conn}, &tls.Config{
-				InsecureSkipVerify: false,
-				ServerName:         d.Hostname,
-			})
-			if deadline, ok := ctx.Deadline(); ok {
-				_ = tlsConn.SetDeadline(deadline)
-			} else {
-				_ = tlsConn.SetDeadline(time.Now().Add(consts.DefaultDialTimeout))
-			}
-			if err = tlsConn.HandshakeContext(ctx); err != nil {
-				_ = conn.Close()
-				return nil, err
-			}
-			_ = tlsConn.SetDeadline(time.Time{})
-			return tlsConn, nil
-		})
+		return newConnPool(4, d.dial)
 	})
 }
 
-func (d *DoTLS) getPConn(ctx context.Context) (*pipelinedConn, error) {
+func (d *streamDnsForwarder) getPConn(ctx context.Context) (*pipelinedConn, error) {
 	pool := d.getPool()
 	if pool == nil {
 		return nil, errors.New("connection pool is not available")
@@ -870,7 +848,7 @@ func (d *DoTLS) getPConn(ctx context.Context) (*pipelinedConn, error) {
 	return pool.get(ctx)
 }
 
-func (d *DoTLS) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, error) {
+func (d *streamDnsForwarder) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, error) {
 	var lastErr error
 	// With connection pool, we can retry with different connections
 	for range 2 {
@@ -891,14 +869,52 @@ func (d *DoTLS) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 		// Connection might be broken, but pool will handle it
 		// Next retry will get a different connection from pool
 	}
-	if lastErr != nil {
-		return nil, fmt.Errorf("failed to forward DNS after retry: %w", lastErr)
-	}
-	return nil, fmt.Errorf("failed to forward DNS after retry")
+	// The loop above either returned or recorded lastErr, so it is non-nil here.
+	return nil, fmt.Errorf("failed to forward DNS after retry: %w", lastErr)
 }
 
-func (d *DoTLS) Close() error {
+func (d *streamDnsForwarder) Close() error {
 	return d.closePool()
+}
+
+type DoTLS struct {
+	dns.Upstream
+	netproxy.Dialer
+	dialArgument dialArgument
+
+	streamDnsForwarder
+}
+
+func newDoTLS(upstream dns.Upstream, dialArg dialArgument) *DoTLS {
+	d := &DoTLS{Upstream: upstream, Dialer: dialArg.bestDialer, dialArgument: dialArg}
+	d.dial = d.dialTLS
+	return d
+}
+
+func (d *DoTLS) dialTLS(ctx context.Context) (netproxy.Conn, error) {
+	conn, err := d.dialArgument.bestDialer.DialContext(
+		ctx,
+		common.MagicNetwork("tcp", d.dialArgument.mark, d.dialArgument.mptcp),
+		d.dialArgument.bestTarget.String(),
+	)
+	if err != nil {
+		return nil, err
+	}
+	tlsConn := tls.Client(&netproxy.FakeNetConn{Conn: conn}, &tls.Config{
+		InsecureSkipVerify: false,
+		ServerName:         d.Hostname,
+	})
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = tlsConn.SetDeadline(deadline)
+	} else {
+		_ = tlsConn.SetDeadline(time.Now().Add(consts.DefaultDialTimeout))
+	}
+	if err = tlsConn.HandshakeContext(ctx); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	_ = tlsConn.SetDeadline(time.Time{})
+	return tlsConn, nil
 }
 
 type DoTCP struct {
@@ -906,58 +922,21 @@ type DoTCP struct {
 	netproxy.Dialer
 	dialArgument dialArgument
 
-	lazyConnPool // embeds getOrInit / closePool
+	streamDnsForwarder
 }
 
-func (d *DoTCP) getPool() *connPool {
-	return d.getOrInit(func() *connPool {
-		return newConnPool(4, func(ctx context.Context) (netproxy.Conn, error) {
-			return d.dialArgument.bestDialer.DialContext(
-				ctx,
-				common.MagicNetwork("tcp", d.dialArgument.mark, d.dialArgument.mptcp),
-				d.dialArgument.bestTarget.String(),
-			)
-		})
-	})
+func newDoTCP(upstream dns.Upstream, dialArg dialArgument) *DoTCP {
+	d := &DoTCP{Upstream: upstream, Dialer: dialArg.bestDialer, dialArgument: dialArg}
+	d.dial = d.dialPlain
+	return d
 }
 
-func (d *DoTCP) getPConn(ctx context.Context) (*pipelinedConn, error) {
-	pool := d.getPool()
-	if pool == nil {
-		return nil, errors.New("connection pool is not available")
-	}
-	return pool.get(ctx)
-}
-
-func (d *DoTCP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, error) {
-	var lastErr error
-	// With connection pool, we can retry with different connections
-	for range 2 {
-		pc, err := d.getPConn(ctx)
-		if err != nil {
-			return nil, err
-		}
-
-		msg, err := pc.RoundTrip(ctx, data)
-		if err == nil {
-			return msg, nil
-		}
-
-		// Close the connection explicitly if RoundTrip fails
-		pc.Close()
-		lastErr = err
-
-		// Connection might be broken, but pool will handle it
-		// Next retry will get a different connection from pool
-	}
-	if lastErr != nil {
-		return nil, fmt.Errorf("failed to forward DNS after retry: %w", lastErr)
-	}
-	return nil, fmt.Errorf("failed to forward DNS after retry")
-}
-
-func (d *DoTCP) Close() error {
-	return d.closePool()
+func (d *DoTCP) dialPlain(ctx context.Context) (netproxy.Conn, error) {
+	return d.dialArgument.bestDialer.DialContext(
+		ctx,
+		common.MagicNetwork("tcp", d.dialArgument.mark, d.dialArgument.mptcp),
+		d.dialArgument.bestTarget.String(),
+	)
 }
 
 // udpConnWithTimestamp wraps a connection with its last use time
@@ -1032,6 +1011,9 @@ func udpResponseSourceMismatch(from, target netip.AddrPort) bool {
 	return from.Addr().Unmap() != target.Addr().Unmap() || from.Port() != target.Port()
 }
 
+// noteDnsUDPResponseSourceMismatch keeps a hand-rolled CAS loop instead of
+// pacedAlert because dns_udp_source_check_test.go resets the timestamp and
+// asserts the standalone mismatch counter directly.
 func noteDnsUDPResponseSourceMismatch(log *logrus.Logger, target, from netip.AddrPort) {
 	dnsUDPResponseSourceMismatchCount.Add(1)
 	if log == nil {

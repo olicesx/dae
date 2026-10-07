@@ -322,16 +322,8 @@ func (c *DnsController) reportDnsDroppedDatagramSummary() {
 }
 
 func (c *DnsController) allowDnsTruncatedLog(now time.Time) bool {
-	nowNano := now.UnixNano()
-	for {
-		last := c.lastDnsTruncatedLogTime.Load()
-		if nowNano-last < int64(dnsTruncatedFallbackLogInterval) {
-			return false
-		}
-		if c.lastDnsTruncatedLogTime.CompareAndSwap(last, nowNano) {
-			return true
-		}
-	}
+	_, emit := c.dnsTruncatedLogAlert.observe(now, dnsTruncatedFallbackLogInterval)
+	return emit
 }
 
 // noteDnsTruncatedReplyToClient records a TC=1 answer handed back to a client

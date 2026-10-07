@@ -179,7 +179,7 @@ type dnsControllerStore struct {
 	dnsUdpTruncatedUpgrades        atomic.Uint64
 	dnsUdpTruncatedUpgradeFailures atomic.Uint64
 	dnsTruncatedRepliesToClient    atomic.Uint64
-	lastDnsTruncatedLogTime        atomic.Int64
+	dnsTruncatedLogAlert           pacedAlert
 	lastReportedTruncatedUpgrades  atomic.Uint64
 	lastReportedTruncatedFailures  atomic.Uint64
 	lastReportedTruncatedReplies   atomic.Uint64

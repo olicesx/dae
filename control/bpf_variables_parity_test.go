@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unsafe"
 )
 
 // The event rate-limit constants are owned by Go (event_rate_contract.go) and
@@ -52,7 +53,24 @@ var (
 
 	// captures " #define REDIRECT_REBIND_STALE_NS_FALLBACK <n>".
 	redirectRebindStalePattern = regexp.MustCompile(`(?m)#define\s+REDIRECT_REBIND_STALE_NS_FALLBACK\s+(\d+)U?LL?`)
+
+	// captures the body of "struct routing_result { ... }".
+	routingResultStructPattern = regexp.MustCompile(
+		`struct\s+routing_result\s*\{([^}]*)\}`)
+
+	// captures " #define NAME <n>" so macro-sized C arrays (e.g.
+	// TASK_COMM_LEN) resolve without a second owner of the value.
+	cDefinePattern = regexp.MustCompile(`(?m)#define\s+(\w+)\s+(\d+)`)
 )
+
+// cIntTypeWidths maps the fixed-width C integer types used by
+// struct routing_result to their byte widths.
+var cIntTypeWidths = map[string]int{
+	"__u8":  1,
+	"__u16": 2,
+	"__u32": 4,
+	"__u64": 8,
+}
 
 func TestBpfVariablesParityWithKernelSource(t *testing.T) {
 	found := map[string]string{} // variable name -> struct tag name
@@ -346,5 +364,126 @@ func TestRedirectTrackCapacityParityWithKernelSource(t *testing.T) {
 	if uint32(want) != defaultRedirectTrackMapMaxEntries {
 		t.Fatalf("C MAX_REDIRECT_TRACK_NUM=%d diverges from Go defaultRedirectTrackMapMaxEntries=%d; tuneRedirectTrackMap cross-checks the compiled capacity against the Go value and would fail the load",
 			want, defaultRedirectTrackMapMaxEntries)
+	}
+}
+
+// TestRoutingResultLayoutParityWithKernelSource pins the hand-written Go
+// mirror bpfRoutingResult (control/bpf_utils.go in the real build,
+// control/bpf_stub.go here) against struct routing_result in kern/tproxy.c.
+// The mirror is not bpf2go-generated, so nothing else fails when only the C
+// side drifts: a reordered, re-typed or resized C field would silently
+// misread every routing decision userspace copies from the kernel. The test
+// pins field order, per-field byte width and the byte offsets that
+// unsafe.Offsetof computes on the Go side.
+func TestRoutingResultLayoutParityWithKernelSource(t *testing.T) {
+	m := routingResultStructPattern.FindStringSubmatch(stripCKernelComments(tproxySource))
+	if m == nil {
+		t.Fatal("struct routing_result not found in kern/tproxy.c")
+	}
+
+	// The Go mirror of struct routing_result, in declaration order: the C
+	// name keys the parsed field, the Go name keys the offset table below.
+	contract := []struct{ cName, goName string }{
+		{"mark", "Mark"},
+		{"must", "Must"},
+		{"mac", "Mac"},
+		{"outbound", "Outbound"},
+		{"pname", "Pname"},
+		{"pid", "Pid"},
+		{"dscp", "Dscp"},
+		{"routing_epoch_slot", "RoutingEpochSlot"},
+		{"datapath_generation", "DatapathGeneration"},
+	}
+
+	macros := map[string]int{}
+	for _, dm := range cDefinePattern.FindAllStringSubmatch(tproxySource, -1) {
+		if v, err := strconv.Atoi(dm[2]); err == nil {
+			macros[dm[1]] = v
+		}
+	}
+
+	// Parse "type name;" and "type name[n];" declarations: width is the
+	// element width times the element count, alignment the element width.
+	fieldPattern := regexp.MustCompile(`(__u\d+)\s+(\w+)\s*(?:\[(\w+)\])?\s*;`)
+	type cField struct {
+		name  string
+		size  int
+		align int
+	}
+	var cFields []cField
+	for _, fm := range fieldPattern.FindAllStringSubmatch(m[1], -1) {
+		elemWidth, ok := cIntTypeWidths[fm[1]]
+		if !ok {
+			t.Fatalf("struct routing_result field %s has unmapped C type %s", fm[2], fm[1])
+		}
+		size := elemWidth
+		if array := fm[3]; array != "" {
+			elems, err := strconv.Atoi(array)
+			if err != nil {
+				elems, ok = macros[array]
+				if !ok {
+					t.Fatalf("struct routing_result field %s has unknown array size %q", fm[2], array)
+				}
+			}
+			size = elemWidth * elems
+		}
+		cFields = append(cFields, cField{name: fm[2], size: size, align: elemWidth})
+	}
+	if len(cFields) != len(contract) {
+		t.Fatalf("struct routing_result declares %d fields (%v) but the Go mirror bpfRoutingResult has %d; both sides must change together",
+			len(cFields), cFields, len(contract))
+	}
+
+	// Go side: order and sizes from the real type, offsets from
+	// unsafe.Offsetof so the compiler's layout is what gets pinned.
+	goResult := bpfRoutingResult{}
+	goOffsets := map[string]uintptr{
+		"Mark":               unsafe.Offsetof(goResult.Mark),
+		"Must":               unsafe.Offsetof(goResult.Must),
+		"Mac":                unsafe.Offsetof(goResult.Mac),
+		"Outbound":           unsafe.Offsetof(goResult.Outbound),
+		"Pname":              unsafe.Offsetof(goResult.Pname),
+		"Pid":                unsafe.Offsetof(goResult.Pid),
+		"Dscp":               unsafe.Offsetof(goResult.Dscp),
+		"RoutingEpochSlot":   unsafe.Offsetof(goResult.RoutingEpochSlot),
+		"DatapathGeneration": unsafe.Offsetof(goResult.DatapathGeneration),
+	}
+	goType := reflect.TypeFor[bpfRoutingResult]()
+	var goNames []string
+	goSizes := map[string]int{}
+	for field := range goType.Fields() {
+		if field.Name == "_" {
+			// Zero-size host-layout marker of the stub mirror.
+			continue
+		}
+		goNames = append(goNames, field.Name)
+		goSizes[field.Name] = int(field.Type.Size())
+	}
+
+	cOffset, maxAlign := 0, 1
+	for i, want := range contract {
+		got := cFields[i]
+		if got.name != want.cName {
+			t.Fatalf("struct routing_result field %d is %q but the Go mirror expects %q at that position; a reorder silently misreads every routing decision",
+				i, got.name, want.cName)
+		}
+		if i >= len(goNames) || goNames[i] != want.goName {
+			t.Fatalf("bpfRoutingResult field order %v does not mirror the contract entry %q", goNames, want.goName)
+		}
+		if got.align > maxAlign {
+			maxAlign = got.align
+		}
+		cOffset = (cOffset + got.align - 1) / got.align * got.align
+		if goOffsets[want.goName] != uintptr(cOffset) {
+			t.Fatalf("field %s sits at C offset %d but Go offset %d in bpfRoutingResult", want.goName, cOffset, goOffsets[want.goName])
+		}
+		if goSizes[want.goName] != got.size {
+			t.Fatalf("field %s is %d bytes in C but %d in Go", want.goName, got.size, goSizes[want.goName])
+		}
+		cOffset += got.size
+	}
+	cOffset = (cOffset + maxAlign - 1) / maxAlign * maxAlign
+	if size := unsafe.Sizeof(goResult); size != uintptr(cOffset) {
+		t.Fatalf("struct routing_result is %d bytes in C but bpfRoutingResult is %d in Go", cOffset, size)
 	}
 }

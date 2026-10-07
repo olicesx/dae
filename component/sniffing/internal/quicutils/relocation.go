@@ -194,10 +194,8 @@ var (
 
 type Locator interface {
 	Range(i, j int) ([]byte, error)
-	Slice(i, j int) (Locator, error)
 	At(i int) (byte, error)
 	Len() int
-	Bytes() ([]byte, error)
 }
 
 // LinearLocator only searches forward and have no boundary check.
@@ -311,18 +309,6 @@ func (l *LinearLocator) At(i int) (byte, error) {
 	return b, nil
 }
 
-func (l *LinearLocator) Slice(i, j int) (Locator, error) {
-	// We do not care about right.
-	newLL := *l
-	newLL.left += i
-	newLL.length = j - i + 1
-	return &newLL, nil
-}
-
-func (l *LinearLocator) Bytes() ([]byte, error) {
-	return l.Range(0, l.length)
-}
-
 var _ Locator = &LinearLocator{}
 
 func (l *LinearLocator) Len() int {
@@ -337,14 +323,8 @@ func (l BuiltinBytesLocator) Range(i, j int) ([]byte, error) {
 func (l BuiltinBytesLocator) At(i int) (byte, error) {
 	return l[i], nil
 }
-func (l BuiltinBytesLocator) Slice(i, j int) (Locator, error) {
-	return l[i:j], nil
-}
 func (l BuiltinBytesLocator) Len() int {
 	return len(l)
-}
-func (l BuiltinBytesLocator) Bytes() ([]byte, error) {
-	return l, nil
 }
 
 var _ Locator = BuiltinBytesLocator{}

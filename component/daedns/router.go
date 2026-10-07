@@ -185,15 +185,10 @@ func NewWithOption(log *logrus.Logger, global *config.Global, dnsCfg *config.Dns
 	if err = router.initUpstreams(dnsCfg.Upstream); err != nil {
 		return nil, err
 	}
-	upstreamName2Id := make(map[string]uint8, len(router.upstreamByIndex))
-	for i, upstreamRaw := range dnsCfg.Upstream {
-		tag, _ := common.GetTagFromLinkLikePlaintext(string(upstreamRaw))
-		if tag == "" {
-			continue
-		}
-		upstreamName2Id[tag] = uint8(i)
-	}
-	requestMatcherBuilder, err := componentdns.NewRequestMatcherBuilderFromProgram(log, requestProgram, upstreamName2Id)
+	// The shared namespace builder keeps this matcher resolving upstream names
+	// to the same ids dns.New assigns; initUpstreams rejects untagged entries,
+	// so those ids also index upstreamByIndex without renumbering.
+	requestMatcherBuilder, err := componentdns.NewRequestMatcherBuilderFromProgram(log, requestProgram, componentdns.UpstreamName2Id(dnsCfg))
 	if err != nil {
 		return nil, err
 	}
@@ -337,7 +332,10 @@ func (r *Router) initUpstreams(rawUpstreams []config.KeyableString) error {
 	for _, upstreamRaw := range rawUpstreams {
 		tag, link := common.GetTagFromLinkLikePlaintext(string(upstreamRaw))
 		if tag == "" {
-			continue
+			// Mirror dns.New: an untagged upstream is a configuration error,
+			// and rejecting it keeps upstreamByIndex indices identical to the
+			// raw indices UpstreamName2Id hands to the matchers.
+			return fmt.Errorf("%w: '%v' has no tag", componentdns.ErrBadUpstreamFormat, upstreamRaw)
 		}
 		u, err := url.Parse(link)
 		if err != nil {
@@ -439,69 +437,52 @@ func compileMatcher[T any](
 }
 
 func compileSubscriptionPredicate(f *config_parser.Function) (func(subscriptionMeta) bool, error) {
-	conditions := make([]func(subscriptionMeta) bool, 0, 1)
-	if len(f.Params) == 0 {
-		conditions = append(conditions, func(subscriptionMeta) bool { return true })
-	}
-	groups, keyOrder, err := groupParamValuesByKey(f.Params)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse '%v': %w", f.String(false, false, false), err)
-	}
-	for _, key := range keyOrder {
-		values := groups[key]
-		condition, err := compileSubscriptionCondition(key, values)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse '%v': %w", f.String(false, false, false), err)
-		}
-		conditions = append(conditions, condition)
-	}
-	return wrapNotPredicate(conditions, f.Not), nil
+	return compileParamPredicate(f, compileSubscriptionCondition)
 }
 
 func compileNodePredicate(f *config_parser.Function) (func(NodeMeta) bool, error) {
-	conditions := make([]func(NodeMeta) bool, 0, 1)
-	if len(f.Params) == 0 {
-		conditions = append(conditions, func(NodeMeta) bool { return true })
-	}
-	groups, keyOrder, err := groupParamValuesByKey(f.Params)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse '%v': %w", f.String(false, false, false), err)
-	}
-	for _, key := range keyOrder {
-		values := groups[key]
-		condition, err := compileNodeCondition(key, values)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse '%v': %w", f.String(false, false, false), err)
-		}
-		conditions = append(conditions, condition)
-	}
-	return wrapNotPredicate(conditions, f.Not), nil
+	return compileParamPredicate(f, compileNodeCondition)
 }
 
 func compileSubNodePredicate(f *config_parser.Function) (func(NodeMeta) bool, error) {
-	conditions := make([]func(NodeMeta) bool, 0, 1)
-	if len(f.Params) == 0 {
-		conditions = append(conditions, func(meta NodeMeta) bool { return meta.SubscriptionTag != "" })
-	}
-	groups, keyOrder, err := groupParamValuesByKey(f.Params)
+	base, err := compileParamPredicate(f, compileSubNodeCondition)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse '%v': %w", f.String(false, false, false), err)
+		return nil, err
 	}
-	for _, key := range keyOrder {
-		values := groups[key]
-		condition, err := compileSubNodeCondition(key, values)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse '%v': %w", f.String(false, false, false), err)
-		}
-		conditions = append(conditions, condition)
-	}
-	base := wrapNotPredicate(conditions, f.Not)
 	return func(meta NodeMeta) bool {
 		if meta.SubscriptionTag == "" {
 			return false
 		}
 		return base(meta)
 	}, nil
+}
+
+// compileParamPredicate compiles the parameter list of a sub/node/subnode
+// selector function into a predicate: an empty parameter list compiles to an
+// always-true condition, keyed parameters are grouped and compiled through
+// compileCondition, and the conditions are OR-combined with the function's
+// `not` modifier applied by wrapNotPredicate.
+func compileParamPredicate[T any](
+	f *config_parser.Function,
+	compileCondition func(key string, values []string) (func(T) bool, error),
+) (func(T) bool, error) {
+	conditions := make([]func(T) bool, 0, 1)
+	if len(f.Params) == 0 {
+		conditions = append(conditions, func(T) bool { return true })
+	}
+	groups, keyOrder, err := groupParamValuesByKey(f.Params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse '%v': %w", f.String(false, false, false), err)
+	}
+	for _, key := range keyOrder {
+		values := groups[key]
+		condition, err := compileCondition(key, values)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse '%v': %w", f.String(false, false, false), err)
+		}
+		conditions = append(conditions, condition)
+	}
+	return wrapNotPredicate(conditions, f.Not), nil
 }
 
 func wrapNotPredicate[T any](conditions []func(T) bool, not bool) func(T) bool {

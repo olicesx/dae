@@ -41,9 +41,6 @@ type udpWriteBufferSetter interface {
 }
 
 func newDefaultNetworkDialer(dialer netproxy.Dialer, mark uint32, mptcp bool) netproxy.Dialer {
-	if mark == 0 && !mptcp && defaultUDPReadBufferSize <= 0 && defaultUDPWriteBufferSize <= 0 {
-		return dialer
-	}
 	return &defaultNetworkDialer{
 		Dialer:             dialer,
 		mark:               mark,

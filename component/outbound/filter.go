@@ -187,6 +187,20 @@ func NewDialerSetFromLinksContext(ctx context.Context, option *dialer.GlobalOpti
 	return s
 }
 
+// cachedRegexp returns the compiled form of pattern from the process-wide
+// regexp cache, compiling and storing it on first use.
+func cachedRegexp(pattern string) (*regexp2.Regexp, error) {
+	if re, ok := regexpCache.Load(pattern); ok {
+		return re.(*regexp2.Regexp), nil
+	}
+	regex, err := regexp2.Compile(pattern, 0)
+	if err != nil {
+		return nil, err
+	}
+	regexpCache.Store(pattern, regex)
+	return regex, nil
+}
+
 func (s *DialerSet) filterHit(dialer *dialer.Dialer, filters []*config_parser.Function) (hit bool, err error) {
 	if len(filters) == 0 {
 		// No filter.
@@ -209,17 +223,9 @@ func (s *DialerSet) filterHit(dialer *dialer.Dialer, filters []*config_parser.Fu
 			for _, param := range filter.Params {
 				switch param.Key {
 				case FilterKey_Name_Regex:
-					re, ok := regexpCache.Load(param.Val)
-					var regex *regexp2.Regexp
-					if !ok {
-						var err error
-						regex, err = regexp2.Compile(param.Val, 0)
-						if err != nil {
-							return false, fmt.Errorf("bad regexp in filter %v: %w", filter.String(false, true, true), err)
-						}
-						regexpCache.Store(param.Val, regex)
-					} else {
-						regex = re.(*regexp2.Regexp)
+					regex, err := cachedRegexp(param.Val)
+					if err != nil {
+						return false, fmt.Errorf("bad regexp in filter %v: %w", filter.String(false, true, true), err)
 					}
 					matched, _ := regex.MatchString(dialer.Property().Name)
 					// logrus.Warnln(param.Val, matched, dialer.Name())
@@ -247,17 +253,9 @@ func (s *DialerSet) filterHit(dialer *dialer.Dialer, filters []*config_parser.Fu
 			for _, param := range filter.Params {
 				switch param.Key {
 				case FilterInput_SubscriptionTag_Regex:
-					re, ok := regexpCache.Load(param.Val)
-					var regex *regexp2.Regexp
-					if !ok {
-						var err error
-						regex, err = regexp2.Compile(param.Val, 0)
-						if err != nil {
-							return false, fmt.Errorf("bad regexp in filter %v: %w", filter.String(false, true, true), err)
-						}
-						regexpCache.Store(param.Val, regex)
-					} else {
-						regex = re.(*regexp2.Regexp)
+					regex, err := cachedRegexp(param.Val)
+					if err != nil {
+						return false, fmt.Errorf("bad regexp in filter %v: %w", filter.String(false, true, true), err)
 					}
 					matched, _ := regex.MatchString(s.nodeToTagMap[dialer])
 					if matched {

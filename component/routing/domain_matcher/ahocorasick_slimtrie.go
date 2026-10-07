@@ -246,13 +246,16 @@ func (n *AhocorasickSlimtrie) MatchDomainBitmap(domain string) (bitmap []uint32)
 	return bitmap
 }
 
+// matchDomainBitmapUncached computes the routing bitmap for domain. The
+// caller must pass a domain already lower-cased with any trailing root-zone
+// dot stripped, the way MatchDomainBitmap normalizes before dispatching here;
+// the trie and Aho-Corasick patterns are indexed against that form.
 func (n *AhocorasickSlimtrie) matchDomainBitmapUncached(domain string) (bitmap []uint32) {
 	N := len(n.ac) / 32
 	if len(n.ac)%32 != 0 {
 		N++
 	}
 	bitmap = make([]uint32, N)
-	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
 	// Domain should consist of 'a'-'z' and '.' and '-'
 	// NOTE: DO NOT VERIFY THE DOMAIN TO MATCH: https://github.com/daeuniverse/dae/issues/528
 	// for _, b := range []byte(domain) {

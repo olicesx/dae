@@ -397,29 +397,16 @@ type TcpCheckOption struct {
 }
 
 func parseTcpCheckOption(ctx context.Context, rawURL []string, method string, resolverNetwork string, directDialer netproxy.Dialer, systemDNSResolver SystemDNSResolver) (opt *TcpCheckOption, err error) {
-	if directDialer == nil {
-		directDialer = direct.SymmetricDirect
-	}
 	if method == "" {
 		method = http.MethodGet
 	}
-	var systemDns netip.AddrPort
-	if systemDNSResolver == nil {
-		systemDns, err = netutils.SystemDns()
-	} else {
-		systemDns, err = systemDNSResolver.SystemDNS()
-	}
+	systemDns, noteParseFailure, err := systemDnsForCheck(systemDNSResolver)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
-		if err == nil {
-			return
-		}
-		if systemDNSResolver == nil {
-			_ = netutils.TryUpdateSystemDnsElapse(time.Second)
-		} else {
-			_ = systemDNSResolver.TryUpdateElapse(time.Second)
+		if err != nil {
+			noteParseFailure()
 		}
 	}()
 
@@ -430,14 +417,9 @@ func parseTcpCheckOption(ctx context.Context, rawURL []string, method string, re
 	if err != nil {
 		return nil, err
 	}
-	var ip46 *netutils.Ip46
-	if len(rawURL) > 1 {
-		ip46 = parseIp46FromList(rawURL[1:])
-	} else {
-		ip46, _, _ = netutils.ResolveIp46(ctx, directDialer, systemDns, u.Hostname(), resolverNetwork, false)
-		if !ip46.Ip4.IsValid() && !ip46.Ip6.IsValid() {
-			return nil, fmt.Errorf("ResolveIp46: no valid ip for %v", u.Hostname())
-		}
+	ip46, err := resolveCheckTargetIp46(ctx, rawURL[1:], u.Hostname(), resolverNetwork, directDialer, systemDns)
+	if err != nil {
+		return nil, err
 	}
 	return &TcpCheckOption{
 		Url:    &netutils.URL{URL: u},
@@ -453,26 +435,13 @@ type CheckDnsOption struct {
 }
 
 func parseCheckDNSOption(ctx context.Context, dnsHostPort []string, resolverNetwork string, directDialer netproxy.Dialer, systemDNSResolver SystemDNSResolver) (opt *CheckDnsOption, err error) {
-	if directDialer == nil {
-		directDialer = direct.SymmetricDirect
-	}
-	var systemDns netip.AddrPort
-	if systemDNSResolver == nil {
-		systemDns, err = netutils.SystemDns()
-	} else {
-		systemDns, err = systemDNSResolver.SystemDNS()
-	}
+	systemDns, noteParseFailure, err := systemDnsForCheck(systemDNSResolver)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
-		if err == nil {
-			return
-		}
-		if systemDNSResolver == nil {
-			_ = netutils.TryUpdateSystemDnsElapse(time.Second)
-		} else {
-			_ = systemDNSResolver.TryUpdateElapse(time.Second)
+		if err != nil {
+			noteParseFailure()
 		}
 	}()
 
@@ -488,20 +457,56 @@ func parseCheckDNSOption(ctx context.Context, dnsHostPort []string, resolverNetw
 	if err != nil {
 		return nil, fmt.Errorf("bad port: %w", err)
 	}
-	var ip46 *netutils.Ip46
-	if len(dnsHostPort) > 1 {
-		ip46 = parseIp46FromList(dnsHostPort[1:])
-	} else {
-		ip46, _, _ = netutils.ResolveIp46(ctx, directDialer, systemDns, host, resolverNetwork, false)
-		if !ip46.Ip4.IsValid() && !ip46.Ip6.IsValid() {
-			return nil, fmt.Errorf("ResolveIp46: no valid ip for %v", host)
-		}
+	ip46, err := resolveCheckTargetIp46(ctx, dnsHostPort[1:], host, resolverNetwork, directDialer, systemDns)
+	if err != nil {
+		return nil, err
 	}
 	return &CheckDnsOption{
 		DnsHost: host,
 		DnsPort: uint16(port),
 		Ip46:    ip46,
 	}, nil
+}
+
+// systemDnsForCheck returns the system DNS view the connectivity-check option
+// parsers resolve their check targets through. The returned hook refreshes
+// the resolver's elapsed-time bookkeeping when invoked, so a parse that fails
+// after this point makes the next attempt re-read the system resolver instead
+// of reusing the failed view.
+func systemDnsForCheck(systemDNSResolver SystemDNSResolver) (systemDns netip.AddrPort, noteParseFailure func(), err error) {
+	if systemDNSResolver == nil {
+		systemDns, err = netutils.SystemDns()
+	} else {
+		systemDns, err = systemDNSResolver.SystemDNS()
+	}
+	if err != nil {
+		return netip.AddrPort{}, nil, err
+	}
+	return systemDns, func() {
+		if systemDNSResolver == nil {
+			_ = netutils.TryUpdateSystemDnsElapse(time.Second)
+		} else {
+			_ = systemDNSResolver.TryUpdateElapse(time.Second)
+		}
+	}, nil
+}
+
+// resolveCheckTargetIp46 resolves a connectivity-check target host to an
+// Ip46: an explicit IP list (the configuration entries after the first)
+// short-circuits DNS, otherwise the host is resolved through the given system
+// DNS view over the direct dialer and resolver network.
+func resolveCheckTargetIp46(ctx context.Context, rawAfterFirst []string, host string, resolverNetwork string, directDialer netproxy.Dialer, systemDns netip.AddrPort) (*netutils.Ip46, error) {
+	if directDialer == nil {
+		directDialer = direct.SymmetricDirect
+	}
+	if len(rawAfterFirst) > 0 {
+		return parseIp46FromList(rawAfterFirst), nil
+	}
+	ip46, _, _ := netutils.ResolveIp46(ctx, directDialer, systemDns, host, resolverNetwork, false)
+	if !ip46.Ip4.IsValid() && !ip46.Ip6.IsValid() {
+		return nil, fmt.Errorf("ResolveIp46: no valid ip for %v", host)
+	}
+	return ip46, nil
 }
 
 type TcpCheckOptionRaw struct {
@@ -527,8 +532,7 @@ func (c *TcpCheckOptionRaw) Option() (opt *TcpCheckOption, err error) {
 	if c.opt == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), Timeout)
 		defer cancel()
-		type contextKey string
-		ctx = context.WithValue(ctx, contextKey("logger"), c.Log)
+		ctx = context.WithValue(ctx, netutils.CtxKeyLogger, c.Log)
 		tcpCheckOption, err := parseTcpCheckOption(ctx, c.Raw, c.Method, c.ResolverNetwork, c.DirectDialer, c.SystemDNSResolver)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse tcp_check_url: %w", err)

@@ -16,11 +16,16 @@ import (
 
 const normalizedPolicyHashSchema = "dae.normalized-policy.v1"
 
+// canonicalPolicyHasher produces the canonical byte encoding of a normalized
+// routing program and digests it with SHA-256. The encoding -- the schema
+// prefix, length-prefixed strings, little-endian uint64 fields, and the
+// one-byte nil/present discriminators -- is a stability contract: the digest
+// of an unchanged program must stay identical across releases, so field order
+// and framing cannot change without a schema bump. Hashing runs once per
+// policy generation, so the writes below go straight to the digest.
 type canonicalPolicyHasher struct {
-	digest   hash.Hash
-	scratch  [8]byte
-	buffer   [1024]byte
-	buffered int
+	digest  hash.Hash
+	scratch [8]byte
 }
 
 func newCanonicalPolicyHasher(schema string) *canonicalPolicyHasher {
@@ -30,17 +35,13 @@ func newCanonicalPolicyHasher(schema string) *canonicalPolicyHasher {
 }
 
 func (h *canonicalPolicyHasher) sum() (sum [sha256.Size]byte) {
-	h.flush()
 	h.digest.Sum(sum[:0])
 	return sum
 }
 
 func (h *canonicalPolicyHasher) writeByte(value byte) {
-	if h.buffered == len(h.buffer) {
-		h.flush()
-	}
-	h.buffer[h.buffered] = value
-	h.buffered++
+	h.scratch[0] = value
+	_, _ = h.digest.Write(h.scratch[:1])
 }
 
 func (h *canonicalPolicyHasher) writeBool(value bool) {
@@ -52,48 +53,13 @@ func (h *canonicalPolicyHasher) writeBool(value bool) {
 }
 
 func (h *canonicalPolicyHasher) writeUint64(value uint64) {
-	if len(h.buffer)-h.buffered >= len(h.scratch) {
-		binary.LittleEndian.PutUint64(h.buffer[h.buffered:], value)
-		h.buffered += len(h.scratch)
-		return
-	}
 	binary.LittleEndian.PutUint64(h.scratch[:], value)
-	h.writeRawBytes(h.scratch[:])
+	_, _ = h.digest.Write(h.scratch[:])
 }
 
 func (h *canonicalPolicyHasher) writeString(value string) {
 	h.writeUint64(uint64(len(value)))
-	h.writeRawString(value)
-}
-
-func (h *canonicalPolicyHasher) writeRawString(value string) {
-	for len(value) > 0 {
-		if h.buffered == len(h.buffer) {
-			h.flush()
-		}
-		written := copy(h.buffer[h.buffered:], value)
-		h.buffered += written
-		value = value[written:]
-	}
-}
-
-func (h *canonicalPolicyHasher) writeRawBytes(value []byte) {
-	for len(value) > 0 {
-		if h.buffered == len(h.buffer) {
-			h.flush()
-		}
-		written := copy(h.buffer[h.buffered:], value)
-		h.buffered += written
-		value = value[written:]
-	}
-}
-
-func (h *canonicalPolicyHasher) flush() {
-	if h.buffered == 0 {
-		return
-	}
-	_, _ = h.digest.Write(h.buffer[:h.buffered])
-	h.buffered = 0
+	_, _ = h.digest.Write([]byte(value))
 }
 
 func (h *canonicalPolicyHasher) writeFunction(function *config_parser.Function) {

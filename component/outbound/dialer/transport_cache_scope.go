@@ -41,10 +41,6 @@ func scopeTransportCacheDialer(d netproxy.Dialer, namespace string) netproxy.Dia
 	return &transportCacheScopedDialer{Dialer: d, namespace: namespace}
 }
 
-func (d *transportCacheScopedDialer) DialContext(ctx context.Context, network, addr string) (netproxy.Conn, error) {
-	return d.Dialer.DialContext(ctx, network, addr)
-}
-
 func (d *transportCacheScopedDialer) LookupIPAddr(ctx context.Context, network, host string) ([]net.IPAddr, error) {
 	resolver, ok := d.Dialer.(interface {
 		LookupIPAddr(context.Context, string, string) ([]net.IPAddr, error)

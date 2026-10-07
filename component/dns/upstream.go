@@ -190,7 +190,6 @@ const upstreamInitRetryInterval = 2 * time.Second
 // upstreamState holds the result of initialization.
 type upstreamState struct {
 	upstream *Upstream
-	err      error
 }
 
 // errorSentinel is a marker to indicate initialization failed and should retry.
@@ -211,7 +210,7 @@ func (u *UpstreamResolver) GetUpstream(ctx context.Context) (_ *Upstream, err er
 	// Fast path: check if already initialized (lock-free read)
 	state := u.state.Load()
 	if state != nil && state != &errorSentinel {
-		return state.upstream, state.err
+		return state.upstream, nil
 	}
 	return u.initUpstream(ctx)
 }
@@ -223,7 +222,7 @@ func (u *UpstreamResolver) initUpstream(ctx context.Context) (*Upstream, error) 
 	// (or re-attempted) while this caller waited.
 	state := u.state.Load()
 	if state != nil && state != &errorSentinel {
-		return state.upstream, state.err
+		return state.upstream, nil
 	}
 	if now := time.Now(); now.UnixNano()-u.lastInitAttemptNano.Load() < int64(upstreamInitRetryInterval) {
 		return nil, fmt.Errorf("dns upstream init backed off after a recent failure; retry in <= %v", upstreamInitRetryInterval)

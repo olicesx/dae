@@ -324,13 +324,9 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 	)
 
 	switch a.selectionPolicy {
-	case consts.DialerSelectionPolicy_MinLastLatency:
-		rawLatency, hasLatency = dialer.snapshotLatencyForPolicy(a.CheckTyp, a.selectionPolicy)
-		minPolicy = true
-	case consts.DialerSelectionPolicy_MinAverage10Latencies:
-		rawLatency, hasLatency = dialer.snapshotLatencyForPolicy(a.CheckTyp, a.selectionPolicy)
-		minPolicy = true
-	case consts.DialerSelectionPolicy_MinMovingAverageLatencies:
+	case consts.DialerSelectionPolicy_MinLastLatency,
+		consts.DialerSelectionPolicy_MinAverage10Latencies,
+		consts.DialerSelectionPolicy_MinMovingAverageLatencies:
 		rawLatency, hasLatency = dialer.snapshotLatencyForPolicy(a.CheckTyp, a.selectionPolicy)
 		minPolicy = true
 	}

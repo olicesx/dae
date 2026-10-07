@@ -43,7 +43,7 @@ func TestValidateRoutingMatchesRunPath(t *testing.T) {
 	// dns.New calls and the same upstream namespace helper dns.New calls.
 	runPathErr := func(dnsCfg *config.Dns) error {
 		log := logrus.New()
-		named := upstreamName2Id(dnsCfg)
+		named := UpstreamName2Id(dnsCfg)
 		datReader := &routing.DatReaderOptimizer{Logger: log, LocationFinder: assets.NewLocationFinder(nil)}
 
 		requestProgram, err := NewNormalizedRequestRoutingProgram(

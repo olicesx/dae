@@ -13,12 +13,14 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// upstreamName2Id maps every dns.upstream tag to the index dns.New assigns it.
+// UpstreamName2Id maps every dns.upstream tag to the index dns.New assigns it.
 // The declared order of dns.Upstream is the only input, so the namespace the
 // DNS routing rules resolve against is a function of the configuration alone
 // and can be rebuilt outside dns.New without drifting from the run path.
-func upstreamName2Id(dnsCfg *config.Dns) map[string]uint8 {
-	upstreamName2Id := make(map[string]uint8, len(dnsCfg.Upstream))
+// It is exported for component/daedns, which resolves the same routing
+// grammar against the same namespace.
+func UpstreamName2Id(dnsCfg *config.Dns) map[string]uint8 {
+	ids := make(map[string]uint8, len(dnsCfg.Upstream))
 	for i, upstreamRaw := range dnsCfg.Upstream {
 		tag, _ := common.GetTagFromLinkLikePlaintext(string(upstreamRaw))
 		if tag == "" {
@@ -27,9 +29,9 @@ func upstreamName2Id(dnsCfg *config.Dns) map[string]uint8 {
 			// stays on the run path (see ValidateRouting).
 			continue
 		}
-		upstreamName2Id[tag] = uint8(i)
+		ids[tag] = uint8(i)
 	}
-	return upstreamName2Id
+	return ids
 }
 
 // ValidateRouting dry-runs the DNS request/response routing exactly the way
@@ -77,7 +79,7 @@ func ValidateRouting(log *logrus.Logger, dnsCfg *config.Dns, externGeoDataDirs [
 		return err
 	}
 	// Same upstream namespace dns.New hands to the request matcher.
-	requestBuilder, err := NewRequestMatcherBuilderFromProgram(log, requestProgram, upstreamName2Id(dnsCfg))
+	requestBuilder, err := NewRequestMatcherBuilderFromProgram(log, requestProgram, UpstreamName2Id(dnsCfg))
 	if err != nil {
 		return err
 	}
@@ -92,7 +94,7 @@ func ValidateRouting(log *logrus.Logger, dnsCfg *config.Dns, externGeoDataDirs [
 	if err != nil {
 		return err
 	}
-	responseBuilder, err := NewResponseMatcherBuilderFromProgram(log, responseProgram, upstreamName2Id(dnsCfg))
+	responseBuilder, err := NewResponseMatcherBuilderFromProgram(log, responseProgram, UpstreamName2Id(dnsCfg))
 	if err != nil {
 		return err
 	}

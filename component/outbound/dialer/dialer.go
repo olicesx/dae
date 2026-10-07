@@ -324,16 +324,6 @@ func NewDialerContext(ctx context.Context, dialer netproxy.Dialer, option *Globa
 	return d
 }
 
-// Clone returns a new dialer instance with the same GlobalOption.
-func (d *Dialer) Clone() *Dialer {
-	return d.CloneWithGlobalOption(d.GlobalOption)
-}
-
-// CloneWithGlobalOption returns a new dialer instance initialized with option.
-func (d *Dialer) CloneWithGlobalOption(option *GlobalOption) *Dialer {
-	return d.CloneWithGlobalOptionContext(d.ctx, option)
-}
-
 // CloneWithGlobalOptionContext returns a new dialer instance initialized with option.
 func (d *Dialer) CloneWithGlobalOptionContext(ctx context.Context, option *GlobalOption) *Dialer {
 	if d.property != nil && d.property.Link != "" {

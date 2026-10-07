@@ -74,8 +74,17 @@
 #define ROUTING_EPOCH_SLOT_RESULT_MASK 0x3
 #define MAX_LPM_SIZE 2048000
 #define MAX_LPM_NUM (ROUTING_EPOCH_SLOT_NUM * MAX_MATCH_SET_LEN + 8)
-#define MAX_CONN_STATE_NUM (65536 * 4)
-#define MAX_REDIRECT_TRACK_NUM 65536
+// Sizing of the BPF_F_NO_PREALLOC hash maps below follows the measured cost
+// model: the kernel charges max_entries * 16 B for the bucket array at load
+// time regardless of use, while live entries cost ~145 B each on top. Sized
+// against a home/SMB gateway workload (concurrent live entries measured over
+// hours: conn_state ~10^2, redirect_track ~10^2, routing_handoff ~10^1,
+// cookie_pid ~10^1, domain_routing ~0), with >=250x headroom kept on every
+// map. Every map-full path degrades gracefully (slow-path fallback plus a
+// bpf_stats_map overflow counter that userspace reports), so an undersized
+// deployment is observable and recoverable instead of fatal.
+#define MAX_CONN_STATE_NUM 65536
+#define MAX_REDIRECT_TRACK_NUM 16384
 // A reply binding (redirect_track entry) may only be rebound by a different
 // publisher (interface/MAC) once it has been silent for this long. The window
 // must be long enough that a roaming LAN client's gap (Wi-Fi roam, VM
@@ -83,9 +92,9 @@
 // writer cannot hand a live flow's reply path to itself. Userspace injects
 // EVENT_RATE.redirect_rebind_stale_ns; this is the clang-side fallback.
 #define REDIRECT_REBIND_STALE_NS_FALLBACK 2000000000ULL
-#define MAX_ROUTING_HANDOFF_NUM 65536
-#define MAX_COOKIE_PID_PNAME_MAPPING_NUM 65536
-#define MAX_DOMAIN_ROUTING_NUM 65536
+#define MAX_ROUTING_HANDOFF_NUM 16384
+#define MAX_COOKIE_PID_PNAME_MAPPING_NUM 16384
+#define MAX_DOMAIN_ROUTING_NUM 8192
 // MAX_TCP_OFFLOAD_NUM bounds concurrent TCP relay offload sessions. Each
 // session occupies two fast_sock entries (one per direction).
 #define MAX_TCP_OFFLOAD_NUM 16384

@@ -407,10 +407,10 @@ type loadBpfOptions struct {
 }
 
 const (
-	defaultConnStateMapMaxEntries = 65536 * 4
+	defaultConnStateMapMaxEntries = 65536
 	// Mirrors MAX_REDIRECT_TRACK_NUM in kern/tproxy.c; see bpf_utils.go for
 	// the single-owner contract with tuneRedirectTrackMap.
-	defaultRedirectTrackMapMaxEntries = 65536
+	defaultRedirectTrackMapMaxEntries = 16384
 )
 
 func fullLoadBpfObjects(

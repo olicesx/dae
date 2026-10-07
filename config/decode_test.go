@@ -85,7 +85,7 @@ routing {
 	// disable_thp defaults to false: dae does not alter kernel memory policy
 	// unless the user opts in.
 	require.False(t, conf.Global.DisableTHP)
-	require.EqualValues(t, 262144, conf.Global.BpfConnStateMapSize)
+	require.EqualValues(t, 65536, conf.Global.BpfConnStateMapSize)
 }
 
 func TestDnsMemoryDefaultsAndExplicitUnlimited(t *testing.T) {

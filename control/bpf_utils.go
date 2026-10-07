@@ -336,15 +336,19 @@ type loadBpfOptions struct {
 }
 
 const (
-	defaultConnStateMapMaxEntries = 65536 * 4
+	defaultConnStateMapMaxEntries = 65536
 	// defaultRedirectTrackMapMaxEntries mirrors MAX_REDIRECT_TRACK_NUM in
 	// kern/tproxy.c and is cross-checked against the compiled map capacity by
-	// tuneRedirectTrackMap. The C default is deliberately kept: raising it to
-	// 262144 must be justified by measuring resident memory first (HASH
-	// without preallocation only preallocates the bucket array, so the cost
-	// is dominated by live entries: roughly 24 B value + 48 B key + element
-	// overhead per entry), see the D4 report.
-	defaultRedirectTrackMapMaxEntries = 65536
+	// tuneRedirectTrackMap. Sizing follows the measured cost model: a
+	// BPF_F_NO_PREALLOC hash is charged max_entries * 16 B for the bucket
+	// array at load time regardless of use (live entries add ~145 B each), so
+	// the old "cost is dominated by live entries" rationale from the D4
+	// report only holds for small capacities. A 2026-10-07 resident-memory
+	// audit on a home gateway measured ~63 live redirect_track entries and a
+	// 1 MiB bucket floor at 65536 slots; 16384 keeps 250x headroom while
+	// freeing most of that floor. Map-full degrades to the slow path and is
+	// counted in bpf_stats_map for userspace overflow reporting.
+	defaultRedirectTrackMapMaxEntries = 16384
 )
 
 // The blocked-event rate-limit contract values (blockedEventRateKey,

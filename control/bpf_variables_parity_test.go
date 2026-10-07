@@ -676,7 +676,7 @@ func TestRoutingResultLayoutMatchesCCompiler(t *testing.T) {
 	}
 	probe.WriteString("\treturn 0;\n}\n")
 
-	goResult := bpfRoutingResult{}
+	var goResult bpfRoutingResult
 	goOffsets := goRoutingResultOffsets()
 	layout := func(variant string, flags ...string) map[string]int {
 		t.Helper()

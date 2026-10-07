@@ -168,6 +168,12 @@ var policyEpochSequence atomic.Uint64
 // DelayDNSListenerStart build a prepared candidate that does not touch the
 // kernel datapath until CommitPreparedDatapath; IsReload selects reload-mode
 // TC handle flipping and skips startup-only stale hook purges.
+// InheritedBpf is the eBPF object set a reload inherits from the previous
+// generation instead of loading a fresh datapath. It is an alias so the
+// unexported bpfObjects stays the canonical definition while cmd and tests
+// can name the handoff type.
+type InheritedBpf = bpfObjects
+
 type ControlPlaneBuildOptions struct {
 	DelayDatapathCommit   bool
 	DelayDNSListenerStart bool
@@ -176,6 +182,12 @@ type ControlPlaneBuildOptions struct {
 	DirectDialer          netproxy.Dialer
 	FullconeDirectDialer  netproxy.Dialer
 	SystemDNSResolver     *netutils.SystemDNSResolver
+	// Datapath inheritance: at most one of InheritedBpf (shared object
+	// handoff from the previous generation) and FreshDatapath (a flow-state
+	// snapshot applied to a fresh load) may be non-nil; both nil means a
+	// cold load.
+	InheritedBpf  *InheritedBpf
+	FreshDatapath *FreshDatapathState
 }
 
 var (
@@ -316,7 +328,6 @@ func isIPLikeDomain(domain string) bool {
 func NewControlPlaneWithContextOptions(
 	ctx context.Context,
 	log *logrus.Logger,
-	_bpf any,
 	dnsCache map[string]*DnsCache,
 	tagToNodeList map[string][]string,
 	groups []config.Group,
@@ -326,10 +337,10 @@ func NewControlPlaneWithContextOptions(
 	externGeoDataDirs []string,
 	buildOpts ControlPlaneBuildOptions,
 ) (plane *ControlPlane, err error) {
-	var freshDatapathState *FreshDatapathState
-	if state, ok := _bpf.(*FreshDatapathState); ok {
-		freshDatapathState = state
-		_bpf = nil
+	freshDatapathState := buildOpts.FreshDatapath
+	inheritedBpf := buildOpts.InheritedBpf
+	if freshDatapathState != nil && inheritedBpf != nil {
+		return nil, fmt.Errorf("inherited bpf objects and a fresh datapath snapshot are mutually exclusive")
 	}
 	// The ctx parameter may carry a preparation timeout from the caller (e.g.
 	// context.WithTimeout in cmd/run.go). All long-lived objects owned by the
@@ -438,7 +449,7 @@ func NewControlPlaneWithContextOptions(
 	}()
 	pinPath := filepath.Join(consts.BpfPinRoot, consts.AppName)
 	ephemeralPinPath := false
-	if _bpf == nil && buildOpts.IsReload {
+	if inheritedBpf == nil && buildOpts.IsReload {
 		pinPath = filepath.Join(pinPath, fmt.Sprintf("reload-%d-%d", os.Getpid(), time.Now().UnixNano()))
 		ephemeralPinPath = true
 	}
@@ -457,7 +468,7 @@ func NewControlPlaneWithContextOptions(
 	}
 
 	/// Load pre-compiled programs and maps into the kernel.
-	if _bpf == nil {
+	if inheritedBpf == nil {
 		// Conn-state maps are preserved across in-process reload via object handoff,
 		// so fresh loads should not inherit stale bpffs pins from previous processes.
 		if !ephemeralPinPath {
@@ -493,12 +504,8 @@ func NewControlPlaneWithContextOptions(
 	}
 
 	var bpf *bpfObjects
-	if _bpf != nil {
-		if obj, ok := _bpf.(*bpfObjects); ok {
-			bpf = obj
-		} else {
-			return nil, fmt.Errorf("unexpected bpf type: %T", _bpf)
-		}
+	if inheritedBpf != nil {
+		bpf = inheritedBpf
 	} else {
 		bpf = new(bpfObjects)
 		datapathGeneration := nextDatapathGeneration()
@@ -515,7 +522,7 @@ func NewControlPlaneWithContextOptions(
 		}
 		registerBpfDatapathGeneration(bpf, datapathGeneration)
 	}
-	sharedBpfReload := _bpf != nil
+	sharedBpfReload := inheritedBpf != nil
 	// Ensure critical maps are always present. DNS fast-path optimizations only
 	// skip per-flow map updates, never map object creation.
 	if err = validateRequiredBpfMapsLoaded(bpf); err != nil {
@@ -2200,14 +2207,6 @@ func udpDualStackListenControl(c syscall.RawConn) error {
 	return enableUDPDualStackSocket(c)
 }
 
-func udpIngressSupportsBatch(conn *net.UDPConn) bool {
-	if conn == nil {
-		return false
-	}
-	_, ok := conn.LocalAddr().(*net.UDPAddr)
-	return ok
-}
-
 func wakeTCPListener(listener net.Listener) {
 	tcpListener, ok := listener.(*net.TCPListener)
 	if !ok || tcpListener == nil {
@@ -2672,11 +2671,12 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			// }
 		}
 
-		if udpIngressSupportsBatch(udpConn) {
-			batchReader := newUDPIngressBatchReader(udpConn, 0)
-			if batchReader == nil {
-				goto singleRead
-			}
+		// validateListener has already pinned packetConn to a non-nil
+		// *net.UDPConn, so batch construction never refuses in production; the
+		// single-read loop below only covers defensive construction failure,
+		// and udpIngressSingleReader is also constructed directly by tests.
+		batchReader := newUDPIngressBatchReader(udpConn, 0)
+		if batchReader != nil {
 			defer batchReader.Close()
 
 			for {
@@ -2710,7 +2710,6 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			return
 		}
 
-	singleRead:
 		var oob [udpIngressOobSize]byte
 		singleReader := udpIngressSingleReader{pc: udpConn}
 		for {
@@ -2735,9 +2734,8 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				continue
 			}
 
-			// Dual-stack UDP listener path: prefer correctness and IPv6 coverage
-			// over batch-read optimization. OOB is consumed synchronously in
-			// processPacket, so reusing the stack buffer is safe here.
+			// OOB is consumed synchronously in processPacket, so reusing the
+			// stack buffer is safe here.
 			processPacket(pktBuf, src, oob[:oobn])
 		}
 	}()

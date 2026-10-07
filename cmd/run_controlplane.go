@@ -55,12 +55,12 @@ func listenControlPlaneInDaeNetns(c *control.ControlPlane, port uint16) (*contro
 	return listener, nil
 }
 
-func newControlPlane(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {
-	return newControlPlaneWithMode(ctx, log, bpf, dnsCache, conf, externGeoDataDirs, false, dnsRoutingUnchanged, isReloadBuild)
+func newControlPlane(ctx context.Context, log *logrus.Logger, bpf *control.InheritedBpf, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {
+	return newControlPlaneWithMode(ctx, log, bpf, nil, dnsCache, conf, externGeoDataDirs, false, dnsRoutingUnchanged, isReloadBuild)
 }
 
-func newPreparedControlPlane(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {
-	return newControlPlaneWithMode(ctx, log, bpf, dnsCache, conf, externGeoDataDirs, true, dnsRoutingUnchanged, isReloadBuild)
+func newPreparedControlPlane(ctx context.Context, log *logrus.Logger, bpf *control.InheritedBpf, freshDatapath *control.FreshDatapathState, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {
+	return newControlPlaneWithMode(ctx, log, bpf, freshDatapath, dnsCache, conf, externGeoDataDirs, true, dnsRoutingUnchanged, isReloadBuild)
 }
 
 // buildControlPlaneRuntime is the final construction boundary after config
@@ -71,7 +71,8 @@ func newPreparedControlPlane(ctx context.Context, log *logrus.Logger, bpf any, d
 func buildControlPlaneRuntime(
 	ctx context.Context,
 	log *logrus.Logger,
-	bpf any,
+	bpf *control.InheritedBpf,
+	freshDatapath *control.FreshDatapathState,
 	dnsCache map[string]*control.DnsCache,
 	tagToNodeList map[string][]string,
 	groups []config.Group,
@@ -89,7 +90,6 @@ func buildControlPlaneRuntime(
 	return control.NewControlPlaneWithContextOptions(
 		ctx,
 		log,
-		bpf,
 		dnsCache,
 		tagToNodeList,
 		groups,
@@ -105,6 +105,8 @@ func buildControlPlaneRuntime(
 			DirectDialer:          directDialer,
 			FullconeDirectDialer:  fullconeDirectDialer,
 			SystemDNSResolver:     systemDNSResolver,
+			InheritedBpf:          bpf,
+			FreshDatapath:         freshDatapath,
 		},
 	)
 }
@@ -194,7 +196,7 @@ func mergeSubscriptionResults(log *logrus.Logger, tagToNodeList map[string][]str
 	return resolvingFailed
 }
 
-func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {
+func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf *control.InheritedBpf, freshDatapath *control.FreshDatapathState, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {
 	// Deep copy to prevent modification.
 	conf = deepcopy.Copy(conf).(*config.Config)
 	if conf.Global.SoMarkFromDae == 0 {
@@ -413,6 +415,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf any, d
 		ctx,
 		log,
 		bpf,
+		freshDatapath,
 		dnsCache,
 		tagToNodeList,
 		conf.Group,

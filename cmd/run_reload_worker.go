@@ -183,10 +183,6 @@ func (w *reloadWorker) run() {
 		} else if !stagedHotHandoff {
 			obj = w.c.EjectBpf()
 		}
-		var reloadBpf any
-		if obj != nil {
-			reloadBpf = obj
-		}
 		if portChanged {
 			w.log.Warnf("[Reload] Tproxy port changed from %d to %d; will perform a full reload of eBPF programs", w.conf.Global.TproxyPort, newConf.Global.TproxyPort)
 		} else if datapathChanged {
@@ -206,7 +202,7 @@ func (w *reloadWorker) run() {
 		if stagedHotHandoff {
 			w.log.Infoln("[Reload] Prepare staged same-port handoff")
 			ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
-			newC, prepareErr := newPreparedControlPlane(ctx, w.log, reloadBpf, dnsCache, newConf, w.externGeoDataDirs, dnsConfigUnchanged, true)
+			newC, prepareErr := newPreparedControlPlane(ctx, w.log, obj, nil, dnsCache, newConf, w.externGeoDataDirs, dnsConfigUnchanged, true)
 			prepareErr = attachPreparedSessionManager(newC, w.processSessions, prepareErr)
 			if prepareErr != nil {
 				reloadErr := wrapReloadTimeoutError("prepare staged reload", prepareErr, reloadPrepareTimeout)
@@ -295,7 +291,7 @@ func (w *reloadWorker) run() {
 			freshState, prepareErr := w.c.SnapshotFreshDatapathState()
 			var newC *control.ControlPlane
 			if prepareErr == nil {
-				newC, prepareErr = newPreparedControlPlane(ctx, w.log, freshState, dnsCache, newConf, w.externGeoDataDirs, false, true)
+				newC, prepareErr = newPreparedControlPlane(ctx, w.log, nil, freshState, dnsCache, newConf, w.externGeoDataDirs, false, true)
 			}
 			prepareErr = attachPreparedSessionManager(newC, w.processSessions, prepareErr)
 			if prepareErr != nil {
@@ -364,7 +360,7 @@ func (w *reloadWorker) run() {
 
 		w.log.Infoln("[Reload] Load new control plane")
 		ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
-		newC, err := newControlPlane(ctx, w.log, reloadBpf, dnsCache, newConf, w.externGeoDataDirs, dnsConfigUnchanged, true)
+		newC, err := newControlPlane(ctx, w.log, obj, dnsCache, newConf, w.externGeoDataDirs, dnsConfigUnchanged, true)
 		err = attachPreparedSessionManager(newC, w.processSessions, err)
 
 		var newCancel context.CancelFunc
@@ -379,10 +375,9 @@ func (w *reloadWorker) run() {
 			if freshDatapathReload {
 				w.log.Warnln("[Reload] BPF objects already replaced; attempting rollback with fresh eBPF objects")
 				obj = nil
-				reloadBpf = nil
 			}
 			ctx, cancel = context.WithTimeout(context.Background(), reloadPrepareTimeout)
-			newC, err = newControlPlane(ctx, w.log, reloadBpf, rollbackDNSCache, w.conf, w.externGeoDataDirs, false, true)
+			newC, err = newControlPlane(ctx, w.log, obj, rollbackDNSCache, w.conf, w.externGeoDataDirs, false, true)
 			err = attachPreparedSessionManager(newC, w.processSessions, err)
 			err = wrapReloadTimeoutError("rollback control plane", err, reloadPrepareTimeout)
 			if err != nil {

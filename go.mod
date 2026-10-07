@@ -7,7 +7,7 @@ require (
 	github.com/antlr/antlr4/runtime/Go/antlr/v4 v4.0.0-20230305170008-8188dc5388df
 	github.com/cilium/ebpf v0.22.0
 	github.com/daeuniverse/dae-config-dist/go/dae_config v0.0.0-20230604120805-1c27619b592d
-	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20261007021745-2f4eba2dd011
+	github.com/daeuniverse/outbound v0.0.0-sticky-ip.0.20261007040940-b952d6230e34
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/json-iterator/go v1.1.12
 	github.com/mholt/archives v0.1.5
@@ -149,4 +149,4 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20261006
 // every other peer) and releases the REALITY spider path-map lock on the
 // panic path.
 
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261007021745-2f4eba2dd011
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261007040940-b952d6230e34

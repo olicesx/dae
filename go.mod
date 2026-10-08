@@ -7,7 +7,7 @@ require (
 	github.com/antlr/antlr4/runtime/Go/antlr/v4 v4.0.0-20230305170008-8188dc5388df
 	github.com/cilium/ebpf v0.22.0
 	github.com/daeuniverse/dae-config-dist/go/dae_config v0.0.0-20230604120805-1c27619b592d
-	github.com/daeuniverse/outbound v0.0.0-20261007215202-4c354171b96c
+	github.com/daeuniverse/outbound v0.0.0-20261008000641-93226e08de54
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/json-iterator/go v1.1.12
 	github.com/mholt/archives v0.1.5
@@ -175,4 +175,4 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20261007
 // connection with an auth error - and the reference client discards the same
 // Close error.
 
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-20261007215202-4c354171b96c
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-20261008000641-93226e08de54

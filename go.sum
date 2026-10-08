@@ -226,6 +226,8 @@ github.com/olicesx/outbound v0.0.0-20261007212023-a21c367f0f0e h1:BGR+d/S9sZjzRs
 github.com/olicesx/outbound v0.0.0-20261007212023-a21c367f0f0e/go.mod h1:Lr4BKebz8Xa/RUgtcMqx/wp2iMOwIKoWGKMCgiZ9ick=
 github.com/olicesx/outbound v0.0.0-20261007215202-4c354171b96c h1:rzha8Wv6csMohGi1BnpZ46kIFJHAyWiG0f8TiE1fDZg=
 github.com/olicesx/outbound v0.0.0-20261007215202-4c354171b96c/go.mod h1:Lr4BKebz8Xa/RUgtcMqx/wp2iMOwIKoWGKMCgiZ9ick=
+github.com/olicesx/outbound v0.0.0-20261008000641-93226e08de54 h1:g7C//GR88LA3C42T/rPZJhkdrmAY6dY08WG8/ZLfdZ4=
+github.com/olicesx/outbound v0.0.0-20261008000641-93226e08de54/go.mod h1:Lr4BKebz8Xa/RUgtcMqx/wp2iMOwIKoWGKMCgiZ9ick=
 github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261007144729-aa7bb5f96deb h1:GiCQ7EUcEhnarRjDIhX7QJjCC3/MXz8FNMzKrxQH+Kk=
 github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261007144729-aa7bb5f96deb/go.mod h1:Lr4BKebz8Xa/RUgtcMqx/wp2iMOwIKoWGKMCgiZ9ick=
 github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261007193259-75a71952f79b h1:3mchlMlxGtiitNJF7Hr/WaQZ2NXfrVGBjfjE+5MBE5M=

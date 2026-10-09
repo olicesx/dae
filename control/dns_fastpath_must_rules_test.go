@@ -166,11 +166,9 @@ func TestMustRulesUDPDnsUsesPlainIngress(t *testing.T) {
 			key := bpfTuplesKeyFromAddrPorts(src, dst, unix.IPPROTO_UDP)
 			entry := bpfRoutingHandoffEntry{
 				LastSeenNs: now,
-				Result: bpfRoutingResult{
-					Must:     must,
-					Outbound: uint8(consts.OutboundUserDefinedMin),
-				},
 			}
+			entry.Result.Must = must
+			entry.Result.Outbound = uint8(consts.OutboundUserDefinedMin)
 			if err := m.Update(&key, &entry, ebpf.UpdateAny); err != nil {
 				t.Fatalf("seed routing handoff: %v", err)
 			}

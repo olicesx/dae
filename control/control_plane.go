@@ -1295,15 +1295,12 @@ func (c *ControlPlane) dnsControllerOption() *DnsControllerOption {
 				return
 			}
 			c.penalizeDnsDialArg(dialArgument, time.Now())
-			if dialArgument == nil || dialArgument.l4proto == consts.L4ProtoStr_UDP {
-				return
-			}
-			dialArgument.bestDialer.ReportUnavailable(&dialer.NetworkType{
-				L4Proto:         dialArgument.l4proto,
-				IpVersion:       dialArgument.ipversion,
-				IsDns:           true,
-				UdpHealthDomain: dialer.UdpHealthDomainDns,
-			}, err)
+			// The TCP-leg availability report that used to live here is
+			// subsumed by the leg-agnostic DNS transactional evidence in
+			// DnsController.reportDnsForwardFailure: it fed the shared
+			// traffic-failure threshold (50 consecutive), which an
+			// interleaved degradation never reached, and it bypassed the
+			// evidence ring entirely.
 		},
 		FixedDomainTtl:          c.dnsFixedDomainTtl,
 		OptimisticCache:         c.dnsOptimisticCache,
@@ -2822,6 +2819,7 @@ func (c *ControlPlane) chooseBestDnsDialerSnapshot(
 	var (
 		bestCandidate          *dnsDialerCandidate
 		bestPenalizedCandidate *dnsDialerCandidate
+		bestAnyCandidate       *dnsDialerCandidate
 	)
 	// Get the min latency path.
 	networkType := dialer.NetworkType{
@@ -2875,6 +2873,18 @@ func (c *ControlPlane) chooseBestDnsDialerSnapshot(
 				},
 				latency: latency,
 			}
+			// DNS eligibility gate. The UDP leg selects from the DNS-UDP
+			// class, which the transactional evidence ring evicts directly;
+			// the TCP leg selects from the shared TCP class, where a node
+			// whose generic TCP health is fine would keep winning the DNS
+			// dial argument forever while its DNS path fails (the production
+			// livelock). Require the same dialer's DNS-domain aliveness for
+			// every leg; when no candidate passes the gate, fall back to the
+			// ungated best rather than failing the upstream outright.
+			if !d.MustGetAlive(dnsEvidenceNetworkType(candidate.dialArg)) {
+				bestAnyCandidate = pickBetterDnsDialerCandidate(bestAnyCandidate, candidate)
+				continue
+			}
 			if c.isDnsDialArgPenalized(candidate.dialArg, now) {
 				bestPenalizedCandidate = pickBetterDnsDialerCandidate(bestPenalizedCandidate, candidate)
 				continue
@@ -2886,6 +2896,14 @@ func (c *ControlPlane) chooseBestDnsDialerSnapshot(
 		}
 	}
 	selectedCandidate, selectedPenalized := chooseDnsDialerCandidate(bestCandidate, bestPenalizedCandidate)
+	if selectedCandidate == nil {
+		// Every candidate is DNS-domain dead. Keep serving through the best
+		// ungated one instead of failing the upstream: the evidence gate is
+		// a preference, not a hard requirement, and a fleet-wide DNS-domain
+		// outage (e.g. the udp_check_dns target itself unreachable) must not
+		// turn into "no proper dialer for DNS upstream".
+		selectedCandidate = bestAnyCandidate
+	}
 	if selectedCandidate == nil || selectedCandidate.dialArg == nil {
 		return nil, fmt.Errorf("no proper dialer for DNS upstream: %v", dnsUpstream.String())
 	}

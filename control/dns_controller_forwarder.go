@@ -252,19 +252,48 @@ func (c *DnsController) handleDnsForwardFailure(upstream *dns.Upstream, dialArg 
 	}
 }
 
+// dnsEvidenceNetworkType returns the DNS health-domain network type that
+// carries a dialer's DNS transactional evidence. The domain is deliberately
+// leg-agnostic: a DNS upstream failing over TCP and the same upstream failing
+// over UDP are the same service failing on the same path, so both legs'
+// outcomes are recorded against the DNS-UDP collections of the query's IP
+// version — the collections the DNS chooser consults. A TCP-leg dial argument
+// used to report through the traffic-failure path instead (threshold 50,
+// evidence-blind), which is exactly how an interleaved degradation held a
+// class for a whole production log.
+func dnsEvidenceNetworkType(dialArg *dialArgument) *dialer.NetworkType {
+	return &dialer.NetworkType{
+		L4Proto:         consts.L4ProtoStr_UDP,
+		IpVersion:       dialArg.ipversion,
+		IsDns:           true,
+		UdpHealthDomain: dialer.UdpHealthDomainDns,
+	}
+}
+
 func (c *DnsController) reportDnsForwardFailure(dialArg *dialArgument, err error) {
-	if dialArg == nil || err == nil {
+	if dialArg == nil || err == nil || dialArg.bestDialer == nil {
 		return
 	}
 	// Classification happened in handleDnsForwardFailure; only hard failures
 	// and the soft-auth family reach here.
-	if lifecycle, ok := newDnsUdpLifecycleContext(dialArg, UdpLifecycleProfile{}); ok {
-		lifecycle.reportUnavailable(err)
-	}
+	dialArg.bestDialer.ReportUnavailableTransactional(dnsEvidenceNetworkType(dialArg), err)
 	if rt := c.runtime(); rt != nil && rt.timeoutExceedCallback != nil {
 		rt.timeoutExceedCallback(dialArg, err)
 	}
 	notifyProxyDialerHealthCheck(dialArg.bestDialer, dialArg.l4proto, err)
+}
+
+// reportDnsForwardSuccess feeds the serving dialer's DNS health domain with
+// the successful outcome of one forward, on either leg. Failures already
+// carried transactional evidence; without this success leg the evidence ring
+// would only ever hear from bad days, and a healthy node under a
+// sporadic-failure burst could be evicted with no way for its own traffic to
+// vouch for it.
+func (c *DnsController) reportDnsForwardSuccess(dialArg *dialArgument) {
+	if dialArg == nil || dialArg.bestDialer == nil {
+		return
+	}
+	dialArg.bestDialer.ReportAvailableTransactional(dnsEvidenceNetworkType(dialArg))
 }
 
 // logDnsForwardFailure logs one classified forward failure. A dropped
@@ -452,13 +481,18 @@ func (c *DnsController) forwardWithDialArg(ctx context.Context, upstream *dns.Up
 			// large for UDP), not a transport failure.  Propagate the error
 			// so the caller can react (e.g. tcp+udp fallback, or TC=1 to
 			// client), but do NOT retire the forwarder, penalise the dialer
-			// or emit a misleading failure log.
-			if !errors.Is(err, ErrDNSTruncated) {
-				c.handleDnsForwardFailure(upstream, dialArg, key, entry, err)
+			// or emit a misleading failure log. The upstream DID answer, so
+			// the exchange still counts as successful transactional
+			// evidence for the dialer's DNS health.
+			if errors.Is(err, ErrDNSTruncated) {
+				c.reportDnsForwardSuccess(dialArg)
+				return nil, err
 			}
+			c.handleDnsForwardFailure(upstream, dialArg, key, entry, err)
 			return nil, err
 		}
 		entry.consecutiveErrors.Store(0)
+		c.reportDnsForwardSuccess(dialArg)
 		return respMsg, nil
 	}
 	return nil, fmt.Errorf("dns forwarder retired before request could start")

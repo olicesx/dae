@@ -161,7 +161,19 @@ changed. Review them before upgrading:
 
 #### Bug Fixes
 
-- fix(control): let `EINVAL` trigger the raw-UDP fallback and log `bind_addr` on write failure
+- fix(dns): both DNS fast paths honor a `must_rules` verdict, so a matched
+  port-53 flow forwards as plain traffic for the routing result's outbound
+  instead of being absorbed into the DNS controller
+- fix(control): `ChooseDialTarget` consults the DNS handoff controller, so
+  `dial_mode: domain` no longer stays stuck on IP targets (or panics on a
+  controller-less plane) while a staged reload is in flight
+- fix(control): a question-less NXDOMAIN, REFUSED, or SERVFAIL with no answer
+  or authority data (an EDNS OPT is allowed; e.g. DNSPod's QDCOUNT=0 answers
+  to Bonjour reverse lookups) is delivered instead of dropped by the RFC 5452
+  echo check. Any other question-less reply, including one that carries
+  records, is still dropped
+- fix(control): `EINVAL` on a port-53 reply write triggers the raw-UDP
+  fallback, and the failed write logs `bind_addr`
 - fix(control): flush short TCP splice writes without corking
 - fix(control): gate the opt-in TCP sockmap offload on the transparent unwrap — the
   outbound pin advance made wrapped proxy legs peelable, which would have redirected

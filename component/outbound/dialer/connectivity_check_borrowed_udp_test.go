@@ -13,16 +13,18 @@ import (
 )
 
 func borrowedUdpTestTypes() (dns, data *NetworkType) {
-	return &NetworkType{
-			L4Proto:         consts.L4ProtoStr_UDP,
-			IpVersion:       consts.IpVersionStr_4,
-			IsDns:           true,
-			UdpHealthDomain: UdpHealthDomainDns,
-		}, &NetworkType{
-			L4Proto:         consts.L4ProtoStr_UDP,
-			IpVersion:       consts.IpVersionStr_4,
-			UdpHealthDomain: UdpHealthDomainData,
-		}
+	dns = &NetworkType{
+		L4Proto:         consts.L4ProtoStr_UDP,
+		IpVersion:       consts.IpVersionStr_4,
+		IsDns:           true,
+		UdpHealthDomain: UdpHealthDomainDns,
+	}
+	data = &NetworkType{
+		L4Proto:         consts.L4ProtoStr_UDP,
+		IpVersion:       consts.IpVersionStr_4,
+		UdpHealthDomain: UdpHealthDomainData,
+	}
+	return dns, data
 }
 
 // TestDnsUdpMarkNotifiesBorrowingDataUdpSet is the P2-28 regression: the

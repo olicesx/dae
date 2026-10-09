@@ -53,7 +53,11 @@ func (c *ControlPlane) ChooseDialTarget(outbound consts.OutboundIndex, dst netip
 			if isIPLikeDomain(domain) {
 				break
 			}
-			if c.dnsController.HasDnsKnowledge(c.dnsController.cacheKey(domain, common.AddrToDnsType(dst.Addr()))) {
+			// Consult the handoff controller when one is published: during a
+			// staged reload, fresh DNS knowledge may live only in the handoff
+			// controller while this plane's own controller no longer absorbs it.
+			dnsController := c.ActiveDnsController()
+			if dnsController != nil && dnsController.HasDnsKnowledge(dnsController.cacheKey(domain, common.AddrToDnsType(dst.Addr()))) {
 				// Has A/AAAA records. It is a real domain.
 				dialMode = consts.DialMode_Domain
 				shouldReroute = true

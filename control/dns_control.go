@@ -184,6 +184,10 @@ type dnsControllerStore struct {
 	lastReportedTruncatedFailures  atomic.Uint64
 	lastReportedTruncatedReplies   atomic.Uint64
 
+	// lastReportedEvidenceEvictions anchors the interval delta the janitor
+	// publishes for DNS transactional evidence evictions.
+	lastReportedEvidenceEvictions atomic.Uint64
+
 	// Dropped-datagram bookkeeping. A drop is a per-datagram event that leaves
 	// the transport session usable, so it never touches dialer health; it is
 	// still the operator's only signal that a transport cannot carry the

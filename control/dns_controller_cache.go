@@ -974,6 +974,7 @@ func (c *DnsController) startDnsCacheJanitor() {
 				c.evictIdleDnsForwarders(now)
 				c.reportDnsTruncationSummary()
 				c.reportDnsDroppedDatagramSummary()
+				c.reportDnsEvidenceSummary()
 			}
 		}
 	}()

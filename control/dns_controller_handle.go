@@ -274,6 +274,29 @@ func (c *DnsController) reportDnsTruncationSummary() {
 	c.log.WithFields(fields).Info("DNS truncation (TC=1) answers were upgraded to TCP")
 }
 
+// reportDnsEvidenceSummary publishes the DNS transactional evidence
+// eviction trend: interval delta plus the lifetime total, silent on an idle
+// interval. The per-eviction Info line answers "which node, which ring"; this
+// answers the calibration question — steady single-digit intervals mean
+// chronically bad nodes being contained, a continuous high churn means either
+// a flaky fleet or window constants tuned too aggressively for this
+// network's query mix. It follows the same visibility pattern as the
+// truncation and dropped-datagram summaries.
+func (c *DnsController) reportDnsEvidenceSummary() {
+	if c == nil || c.log == nil {
+		return
+	}
+	total := dialer.DnsEvidenceEvictions()
+	interval := total - c.lastReportedEvidenceEvictions.Swap(total)
+	if interval == 0 {
+		return
+	}
+	c.log.WithFields(logrus.Fields{
+		"evictions":       interval,
+		"evictions_total": total,
+	}).Info("DNS transactional evidence evictions in this interval")
+}
+
 // reportDnsDroppedDatagramSummary publishes the dropped-datagram counters to
 // the operator, following the same janitor pattern as
 // reportDnsTruncationSummary: one line per interval that saw activity as an

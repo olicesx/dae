@@ -251,6 +251,19 @@ func (e *transactionalEvidence) reset() {
 	*e = transactionalEvidence{}
 }
 
+// dnsEvidenceEvictions counts ring-verdict evictions process-wide. It follows
+// the package-global counter precedent of the proxy-failure promotion
+// tracker: the dialer owns the verdict, while the DNS controller's janitor
+// publishes the trend, so an operator can tell a chronically bad node from
+// constants calibrated too aggressively without per-node instrumentation.
+var dnsEvidenceEvictions atomic.Uint64
+
+// DnsEvidenceEvictions returns the lifetime count of DNS transactional
+// evidence evictions.
+func DnsEvidenceEvictions() uint64 {
+	return dnsEvidenceEvictions.Load()
+}
+
 func newCollection() *collection {
 	c := &collection{
 		AliveDialerSetSet: make(AliveDialerSetSet),
@@ -1461,6 +1474,7 @@ func (d *Dialer) markUnavailableTransactional(typ *NetworkType) collectionUpdate
 	d.attachBorrowedUdpFanOutLocked(typ, &update)
 	d.collectionFineMu.Unlock()
 	if ringEvicts {
+		dnsEvidenceEvictions.Add(1)
 		if d.Log != nil && d.property != nil {
 			d.Log.WithFields(logrus.Fields{
 				"network": typ.String(),

@@ -195,23 +195,29 @@ func (c *ControlPlane) chooseProxyDialer(p *proxyDialParam) (*proxyDialResult, e
 	}
 
 	if err != nil {
-		return &proxyDialResult{
-				OutboundIndex:           outboundIndex,
-				Outbound:                outbound,
-				Must:                    must,
-				IsDialIp:                strictIpVersion,
-				OrigNetworkType:         networkType.StringWithoutDns(),
-				SelectionNetworkType:    selectionNetworkType.StringWithoutDns(),
-				OrigNetworkTypeObj:      networkType,
-				SelectionNetworkTypeObj: selectionNetworkType,
-				AdmissionNetworkTypeObj: admissionNetworkType,
-			}, fmt.Errorf("select dialer from group %v (orig:%v sel:%v src:%v): %w",
-				outbound.Name,
-				networkType.StringWithoutDns(),
-				selectionNetworkType.StringWithoutDns(),
-				p.Src.String(),
-				err,
-			)
+		// Return the composite literals through variables: a direct
+		// `return &proxyDialResult{...}, fmt.Errorf(...)` sits exactly on the
+		// indentation gofmt generations disagree about (go1.26 indents the
+		// literal one level deeper than go1.27), which made local and CI
+		// formatters fight over these lines.
+		res := &proxyDialResult{
+			OutboundIndex:           outboundIndex,
+			Outbound:                outbound,
+			Must:                    must,
+			IsDialIp:                strictIpVersion,
+			OrigNetworkType:         networkType.StringWithoutDns(),
+			SelectionNetworkType:    selectionNetworkType.StringWithoutDns(),
+			OrigNetworkTypeObj:      networkType,
+			SelectionNetworkTypeObj: selectionNetworkType,
+			AdmissionNetworkTypeObj: admissionNetworkType,
+		}
+		return res, fmt.Errorf("select dialer from group %v (orig:%v sel:%v src:%v): %w",
+			outbound.Name,
+			networkType.StringWithoutDns(),
+			selectionNetworkType.StringWithoutDns(),
+			p.Src.String(),
+			err,
+		)
 	}
 
 	selectionNetworkType = endpointNetworkTypeForSelection(selectionNetworkType, admissionNetworkType)

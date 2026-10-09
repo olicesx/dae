@@ -42,15 +42,17 @@ func newTestListener(t *testing.T) (*Listener, listenerAddrs) {
 		_ = tcp6.Close()
 		_ = udp.Close()
 	})
-	return &Listener{
-			tcp4Listener: tcp4,
-			tcp6Listener: tcp6,
-			packetConn:   udp,
-		}, listenerAddrs{
-			tcp4: tcp4.Addr().String(),
-			tcp6: tcp6.Addr().String(),
-			udp:  udp.LocalAddr().String(),
-		}
+	l := &Listener{
+		tcp4Listener: tcp4,
+		tcp6Listener: tcp6,
+		packetConn:   udp,
+	}
+	addrs := listenerAddrs{
+		tcp4: tcp4.Addr().String(),
+		tcp6: tcp6.Addr().String(),
+		udp:  udp.LocalAddr().String(),
+	}
+	return l, addrs
 }
 
 // tryReclaim asserts that a previously bound address can be rebound without

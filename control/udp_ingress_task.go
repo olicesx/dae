@@ -204,6 +204,15 @@ func (t *udpIngressTask) Run() {
 					"dst": realDst.String(),
 				}).WithError(retrieveErr).Debug("UDP routing tuple lookup failed for DNS ingress fast path; fallback to minimal routing metadata")
 			}
+			if !dnsFastPathPermitted(dnsRoutingResult) {
+				// must_rules matched this flow: hand the packet to the
+				// ordinary UDP path below, reusing the routing result this
+				// path already retrieved.
+				routingResult = dnsRoutingResult
+				rrCopy := *dnsRoutingResult
+				freshRoutingResult = &rrCopy
+				goto plainUdpIngress
+			}
 			handler, release, ownerErr := c.acquireRoutingEpochExecutionOwner(dnsRoutingResult)
 			if ownerErr != nil {
 				// The owner is missing for every DNS packet of every flow while
@@ -305,6 +314,7 @@ func (t *udpIngressTask) Run() {
 		}
 	}
 
+plainUdpIngress:
 	var cacheLookup cachedRoutingLookup
 	if !c.udpRouteScopeSensitive && c.ownsActiveRoutingEpoch() {
 		cacheLookup = lookupCachedRoutingBinding(flowDecision, realDst)

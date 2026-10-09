@@ -192,9 +192,11 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 	// DNS is a stateless protocol and doesn't need the connection tracking
 	// features that TCP relay provides. This optimization handles DNS queries
 	// directly through the DNS controller.
+	// A must_rules verdict skips the fast path: the flow is forwarded as plain
+	// TCP for the routing result's outbound instead.
 	// Uses bufio.Reader to peek at data without consuming it,
 	// allowing proper fallback if this isn't DNS traffic.
-	if dst.Port() == 53 {
+	if dst.Port() == 53 && dnsFastPathPermitted(routingResult) {
 		bufReader := bufio.NewReader(lConn)
 		handled, dnsErr := c.handleTCPDnsFastPathOwned(ctx, lConn, bufReader, src, dst, routingResult, ownership)
 		if handled {

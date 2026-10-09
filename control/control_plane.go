@@ -1426,6 +1426,20 @@ func chooseDnsDialerCandidate(preferred, penalized *dnsDialerCandidate) (*dnsDia
 	return nil, false
 }
 
+// chooseGatedDnsDialerCandidate ranks the chooser's candidate pools: a
+// DNS-evidence-gated candidate first, then a gated-but-penalized one (a
+// recent timeout on a node whose DNS domain is healthy says less than a
+// convicted ring), and only then the best ungated candidate. The ungated
+// fallback keeps a fleet-wide DNS-domain outage (e.g. the udp_check_dns
+// target itself unreachable) from turning into "no proper dialer for DNS
+// upstream": the evidence gate is a preference, not a hard requirement.
+func chooseGatedDnsDialerCandidate(gated, gatedPenalized, ungated *dnsDialerCandidate) (*dnsDialerCandidate, bool) {
+	if cand, penalized := chooseDnsDialerCandidate(gated, gatedPenalized); cand != nil {
+		return cand, penalized
+	}
+	return ungated, false
+}
+
 func buildDnsDialerSnapshotKeyForSnapshot(snapshot DnsRequestSnapshot, upstream *dns.Upstream) (dnsDialerSnapshotKey, bool) {
 	if upstream == nil {
 		return dnsDialerSnapshotKey{}, false
@@ -2895,15 +2909,7 @@ func (c *ControlPlane) chooseBestDnsDialerSnapshot(
 			}
 		}
 	}
-	selectedCandidate, selectedPenalized := chooseDnsDialerCandidate(bestCandidate, bestPenalizedCandidate)
-	if selectedCandidate == nil {
-		// Every candidate is DNS-domain dead. Keep serving through the best
-		// ungated one instead of failing the upstream: the evidence gate is
-		// a preference, not a hard requirement, and a fleet-wide DNS-domain
-		// outage (e.g. the udp_check_dns target itself unreachable) must not
-		// turn into "no proper dialer for DNS upstream".
-		selectedCandidate = bestAnyCandidate
-	}
+	selectedCandidate, selectedPenalized := chooseGatedDnsDialerCandidate(bestCandidate, bestPenalizedCandidate, bestAnyCandidate)
 	if selectedCandidate == nil || selectedCandidate.dialArg == nil {
 		return nil, fmt.Errorf("no proper dialer for DNS upstream: %v", dnsUpstream.String())
 	}

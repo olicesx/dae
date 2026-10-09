@@ -101,3 +101,32 @@ func TestDnsForwardEvidenceIsLegAgnostic(t *testing.T) {
 			"a 2:1 failure-to-success interleaving on the TCP leg must evict on evidence, not on never-reaching consecutive strikes")
 	})
 }
+
+// TestChooseGatedDnsDialerCandidate pins the chooser's candidate
+// preference: an evidence-gated candidate beats a gated-but-penalized one,
+// which beats the ungated fallback, and all-empty returns nil so the caller's
+// "no proper dialer" error path stays reachable.
+func TestChooseGatedDnsDialerCandidate(t *testing.T) {
+	gated := &dnsDialerCandidate{latency: 300}
+	penalized := &dnsDialerCandidate{latency: 200}
+	ungated := &dnsDialerCandidate{latency: 100}
+
+	cases := []struct {
+		name                             string
+		gated, gatedPenalized, ungatedIn *dnsDialerCandidate
+		want                             *dnsDialerCandidate
+		wantPenalized                    bool
+	}{
+		{"gated wins over penalized and ungated", gated, penalized, ungated, gated, false},
+		{"penalized beats ungated fallback", nil, penalized, ungated, penalized, true},
+		{"ungated fallback only", nil, nil, ungated, ungated, false},
+		{"empty pools", nil, nil, nil, nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, gotPenalized := chooseGatedDnsDialerCandidate(tc.gated, tc.gatedPenalized, tc.ungatedIn)
+			require.Same(t, tc.want, got)
+			require.Equal(t, tc.wantPenalized, gotPenalized)
+		})
+	}
+}

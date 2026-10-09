@@ -1,6 +1,7 @@
 name: BPF Test
 
 on:
+  workflow_dispatch:
   pull_request:
     paths:
       - "**/*.c"

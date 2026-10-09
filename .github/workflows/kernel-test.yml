@@ -1,6 +1,7 @@
 name: Kernel Test
 
 on:
+  workflow_dispatch:
   pull_request:
     paths:
       - "**/*.go"

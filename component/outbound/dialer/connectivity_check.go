@@ -183,6 +183,72 @@ type collection struct {
 	MovingAverage     time.Duration
 	LastProbe         DialerProbeObservationSnapshot
 	Alive             atomic.Bool
+	// evidence is the DNS health domain's per-query outcome memory. It is
+	// only maintained by the transactional report APIs; other domains keep a
+	// zero value and ignore it.
+	evidence transactionalEvidence
+}
+
+// Transactional evidence constants.
+//
+// The consecutive-strike counters that govern probe- and traffic-driven
+// death are blind to an interleaved fail/success pattern: a node whose
+// per-attempt probes pass on an intermittently degraded path while its
+// production DNS forwards fail keeps getting its strikes reset, and holds
+// the class forever (observed in production: hundreds of "DNS forward to
+// upstream failed" lines against one eviction). The evidence ring remembers
+// the last transactionalEvidenceWindow per-query outcomes and evicts on the
+// accumulated count, and a passed probe no longer clears the verdict by
+// itself: while the verdict stands, evidenceRevivalConfirmations
+// consecutive probe successes are required, and any transactional failure
+// breaks that confirmation chain (traffic outranks a probe when the two
+// disagree at the same client).
+const (
+	transactionalEvidenceWindow  = 8
+	transactionalEvictFails      = 5
+	evidenceRevivalConfirmations = 3
+)
+
+// transactionalEvidence is a bounded ring of recent per-query outcomes.
+// failCount-style streaks answer "did it fail N times in a row"; the ring
+// answers "what fraction of the recent queries failed", which is the
+// question an interleaved degradation actually poses.
+type transactionalEvidence struct {
+	ring  [transactionalEvidenceWindow]bool
+	head  int
+	used  int
+	fails int
+	// evicted records that the ring's verdict, not a streak, took the class
+	// down; only that state makes probe confirmations meaningful.
+	evicted bool
+	// probeConfirm counts consecutive probe successes while evicted.
+	probeConfirm int
+}
+
+func (e *transactionalEvidence) append(ok bool) {
+	if e.used == transactionalEvidenceWindow {
+		if !e.ring[e.head] {
+			e.fails--
+		}
+	} else {
+		e.used++
+	}
+	e.ring[e.head] = ok
+	e.head++
+	if e.head == transactionalEvidenceWindow {
+		e.head = 0
+	}
+	if !ok {
+		e.fails++
+	}
+}
+
+func (e *transactionalEvidence) shouldEvict() bool {
+	return e.fails >= transactionalEvictFails
+}
+
+func (e *transactionalEvidence) reset() {
+	*e = transactionalEvidence{}
 }
 
 func newCollection() *collection {
@@ -1133,7 +1199,15 @@ func (d *Dialer) logUnavailable(
 }
 
 func (d *Dialer) markUnavailable(typ *NetworkType) collectionUpdate {
-	return d.markUnavailableInternal(typ, false, false)
+	update := d.markUnavailableInternal(typ, false, false)
+	if typ != nil && typ.HealthDomain() == HealthDomainDnsUDP {
+		// A failed probe breaks a pending probe-confirmation chain: the
+		// evidence revival requires consecutive successes.
+		d.collectionFineMu.Lock()
+		d.mustGetCollection(typ).evidence.probeConfirm = 0
+		d.collectionFineMu.Unlock()
+	}
+	return update
 }
 
 func (d *Dialer) markUnavailableInternal(typ *NetworkType, force bool, isTraffic bool) collectionUpdate {
@@ -1236,9 +1310,24 @@ func (d *Dialer) markAvailable(typ *NetworkType, latency time.Duration) (collect
 	collection.Latencies10.AppendLatency(latency)
 	avg, _ := collection.Latencies10.AvgLatency()
 	collection.MovingAverage = (collection.MovingAverage + latency) / 2
-	wasAlive := collection.Alive.Swap(true)
+	// Evidence gating: while the transactional evidence ring holds an
+	// eviction verdict, a single passing probe is exactly the signal the
+	// interleaved-degradation livelock fed on. Record it as one
+	// confirmation instead of a revival; evidenceRevivalConfirmations
+	// consecutive confirmations (each breakable by a transactional failure)
+	// clear the verdict.
+	nowAlive := true
+	if collection.evidence.evicted {
+		collection.evidence.probeConfirm++
+		if collection.evidence.probeConfirm >= evidenceRevivalConfirmations {
+			collection.evidence.reset()
+		} else {
+			nowAlive = false
+		}
+	}
+	wasAlive := collection.Alive.Swap(nowAlive)
 	update := collectionUpdate{
-		alive:             true,
+		alive:             nowAlive,
 		movingAverage:     collection.MovingAverage,
 		aliveDialerGroups: d.snapshotAliveDialerGroupsLocked(collection),
 	}
@@ -1249,7 +1338,7 @@ func (d *Dialer) markAvailable(typ *NetworkType, latency time.Duration) (collect
 	// isRevival is true if we were dead.
 	// We no longer trigger recovery detection for explicit resuscitation probes on already-alive nodes
 	// to prevent "self-punishment" (unnecessary level increments).
-	isRevival := !wasAlive
+	isRevival := !wasAlive && nowAlive
 	d.NotifyHealthCheckResult(typ, true, isRevival)
 	if isRevival {
 		d.notifyAliveTransition(typ, true)
@@ -1332,7 +1421,98 @@ func (d *Dialer) ReportUnavailableTransactional(typ *NetworkType, err error) {
 		return
 	}
 	d.logUnavailable(typ, err)
-	d.informDialerGroupUpdate(d.markUnavailableInternal(typ, false, false))
+	d.informDialerGroupUpdate(d.markUnavailableTransactional(typ))
+}
+
+// markUnavailableTransactional is the transactional counterpart of
+// markUnavailable: it keeps the consecutive-strike accounting, and also
+// records the outcome in the DNS health domain's evidence ring. The ring may
+// evict on its own when strikes keep being reset by passing probes, and any
+// recorded failure breaks a pending probe-confirmation chain — when a probe
+// and real traffic disagree at the same client, the traffic wins. A death by
+// strikes alone also enters the confirmation gate: otherwise three purely
+// consecutive failures would hand the class back on the first passing probe
+// and restart the cycle, just slower.
+func (d *Dialer) markUnavailableTransactional(typ *NetworkType) collectionUpdate {
+	wasAlive := typ != nil && d.MustGetAlive(typ)
+	update := d.markUnavailableInternal(typ, false, false)
+	if typ == nil || typ.HealthDomain() != HealthDomainDnsUDP {
+		return update
+	}
+	d.collectionFineMu.Lock()
+	collection := d.mustGetCollection(typ)
+	collection.evidence.append(false)
+	collection.evidence.probeConfirm = 0
+	diedByStrikes := wasAlive && !collection.Alive.Load()
+	if collection.evidence.shouldEvict() || diedByStrikes {
+		collection.evidence.evicted = true
+	}
+	ringEvicts := collection.evidence.evicted && collection.Alive.Load()
+	evictFails := collection.evidence.fails
+	if ringEvicts {
+		// The ring passed the verdict on its own, over strikes that a probe
+		// kept resetting: take the class down through the same transition
+		// semantics the streak path uses.
+		collection.Alive.Store(false)
+		update.alive = false
+		update.movingAverage = collection.MovingAverage
+		update.aliveDialerGroups = d.snapshotAliveDialerGroupsLocked(collection)
+	}
+	d.attachBorrowedUdpFanOutLocked(typ, &update)
+	d.collectionFineMu.Unlock()
+	if ringEvicts {
+		if d.Log != nil && d.property != nil {
+			d.Log.WithFields(logrus.Fields{
+				"network": typ.String(),
+				"node":    d.property.Name,
+				"fails":   evictFails,
+				"window":  transactionalEvidenceWindow,
+			}).Info("DNS transactional evidence eviction: probes kept passing while queries kept failing")
+		}
+		d.NotifyHealthCheckResult(typ, false, false)
+	}
+	return update
+}
+
+// ReportAvailableTransactional records one successful transactional attempt
+// in the DNS health domain. Query-rate successes are the honest revival
+// signal for an evidence-evicted node — unlike a probe, a successful forward
+// cannot pass on a path that is failing real traffic — so a recovering ring
+// revives the class on its own. Successes never flip an alive class (they
+// only feed the ring), so a healthy node's report stream stays cheap.
+func (d *Dialer) ReportAvailableTransactional(typ *NetworkType) {
+	if typ == nil || typ.HealthDomain() != HealthDomainDnsUDP {
+		return
+	}
+	d.collectionFineMu.Lock()
+	collection := d.mustGetCollection(typ)
+	collection.evidence.append(true)
+	// A successful forward is proof of life: it must reset the consecutive
+	// strike counters exactly like a passing probe does, or three sporadic
+	// failures inside one probe interval evict a healthy node on strikes
+	// alone (the successes were previously invisible to the counters).
+	d.failCount[typ.Index()] = 0
+	d.trafficFailCount[typ.Index()].Store(0)
+	cleared := collection.evidence.evicted && !collection.evidence.shouldEvict()
+	if cleared {
+		collection.evidence.reset()
+	}
+	wasAlive := collection.Alive.Load()
+	if cleared && !wasAlive {
+		collection.Alive.Store(true)
+	}
+	update := collectionUpdate{
+		alive:             collection.Alive.Load(),
+		movingAverage:     collection.MovingAverage,
+		aliveDialerGroups: d.snapshotAliveDialerGroupsLocked(collection),
+	}
+	d.attachBorrowedUdpFanOutLocked(typ, &update)
+	d.collectionFineMu.Unlock()
+	if cleared && !wasAlive {
+		d.NotifyHealthCheckResult(typ, true, true)
+		d.notifyAliveTransition(typ, true)
+		d.informDialerGroupUpdate(update)
+	}
 }
 
 func (d *Dialer) ReportUnavailableForced(typ *NetworkType, err error) {

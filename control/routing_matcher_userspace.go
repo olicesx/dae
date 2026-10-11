@@ -24,6 +24,14 @@ type RoutingMatcher struct {
 	// needs records which fact strings any compiled rule can consume, so the
 	// hot path skips building 128-char binary keys nothing will ever read.
 	needs routingMatcherNeeds
+
+	// terminalDomainMask has bit i set when match_set i belongs to a rule
+	// whose real outbound is OutboundDirect or OutboundBlock. The SNI
+	// learning writer clears those bits from projected bitmaps unless the
+	// user opted in (sni_learning_direct): a learned bit must never, on its
+	// own, drive the kernel's terminal direct/block verdicts, which bypass
+	// userspace and therefore cannot self-heal a mis-learned domain.
+	terminalDomainMask bpfDomainRouting
 }
 
 type routingMatcherNeeds struct {
@@ -48,6 +56,39 @@ func computeRoutingMatcherNeeds(matches []compiledRoutingMatch) routingMatcherNe
 		}
 	}
 	return n
+}
+
+// buildTerminalDomainMask walks the compiled match_set array and marks every
+// bit whose owning rule resolves to a terminal outbound (direct or block).
+// A rule's match_sets end at their tail: the only entry carrying the rule's
+// real outbound instead of an Or/And logical marker, because the builder
+// writes real outbounds solely on the last function's last match_set. Every
+// match_set since the previous tail therefore belongs to the rule this tail
+// closes. The mapping is derived from rule structure, not from source order,
+// so optimizer reordering of conditions cannot invalidate it.
+func buildTerminalDomainMask(compiled []compiledRoutingMatch) (mask bpfDomainRouting) {
+	start := 0
+	for i, m := range compiled {
+		if m.outbound&consts.OutboundLogicalMask == consts.OutboundLogicalMask {
+			// Or/And logical marker: mid-rule entry.
+			continue
+		}
+		if m.outbound == consts.OutboundDirect || m.outbound == consts.OutboundBlock {
+			for j := start; j <= i && j < consts.MaxMatchSetLen; j++ {
+				mask.Bitmap[j>>5] |= 1 << (j % 32)
+			}
+		}
+		start = i + 1
+	}
+	return mask
+}
+
+// gateTerminalDomainBits clears direct/block-outbound rule bits from a raw
+// domain bitmap (the D11a write-side gate of SNI learning).
+func (m *RoutingMatcher) gateTerminalDomainBits(bitmap *bpfDomainRouting) {
+	for i := range bitmap.Bitmap {
+		bitmap.Bitmap[i] &^= m.terminalDomainMask.Bitmap[i]
+	}
 }
 
 // routingMatcherPredicateGroupSpan maps one immutable policy predicate group

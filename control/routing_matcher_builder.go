@@ -1145,11 +1145,12 @@ func (b *RoutingMatcherBuilder) BuildUserspace() (matcher *RoutingMatcher, err e
 	}
 
 	matcher = &RoutingMatcher{
-		lpmMatcher:      lpmMatcher,
-		domainMatcher:   domainMatcher,
-		compiledMatches: compiledMatches,
-		needs:           computeRoutingMatcherNeeds(compiledMatches),
-		predicateGroups: append([]routingMatcherPredicateGroupSpan(nil), b.predicateGroups...),
+		lpmMatcher:         lpmMatcher,
+		domainMatcher:      domainMatcher,
+		compiledMatches:    compiledMatches,
+		needs:              computeRoutingMatcherNeeds(compiledMatches),
+		predicateGroups:    append([]routingMatcherPredicateGroupSpan(nil), b.predicateGroups...),
+		terminalDomainMask: buildTerminalDomainMask(compiledMatches),
 	}
 
 	// Memory optimization: Release large temporary data structures

@@ -92,7 +92,7 @@ func replayPhase0TCPTLSCorpusFixture(t *testing.T, fixture phase0TCPTLSCorpusFix
 
 	sniffer := sniffing.NewStreamSniffer(bytes.NewReader(fixture.clientHello), time.Second)
 	t.Cleanup(func() { _ = sniffer.Close() })
-	domain, err := sniffer.SniffTcp()
+	domain, _, err := sniffer.SniffTcp()
 	if err != nil {
 		t.Fatalf("SniffTcp() error = %v", err)
 	}

@@ -210,6 +210,7 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 
 	var (
 		domain     string
+		sniffProto sniffing.SniffProtocol
 		lRelayConn netproxy.Conn = lConn
 	)
 	if c.shouldTryTcpSniff(dst, routingResult) {
@@ -242,7 +243,7 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 				defer func() { _ = sniffer.Close() }()
 				lRelayConn = sniffer
 
-				domain, err = sniffer.SniffTcp()
+				domain, sniffProto, err = sniffer.SniffTcp()
 				if err != nil {
 					// Best practice:
 					// 1) Sniffing-domain errors (not applicable/need more/not found) should not break relay.
@@ -267,6 +268,9 @@ func (c *ControlPlane) handleConnWithRoutingResultOwned(
 				} else {
 					// Any success means this flow signature is sniffable; clear suppression.
 					c.clearTcpSniffNegative(cacheKey)
+					// Learn TLS sniffed domains into the kernel routing
+					// fallback (nil-safe when SNI learning is disabled).
+					c.sniLearning.LearnSniffed(dst.Addr(), domain, sniffProto)
 				}
 			}
 		}

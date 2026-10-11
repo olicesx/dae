@@ -417,6 +417,9 @@ func clearPreviousRoutingEpochMaps(bpf *bpfObjects, previous uint32) error {
 	if err := clearReloadDomainRoutingMapSlot(bpf, previous); err != nil {
 		errs = append(errs, err)
 	}
+	if err := clearReloadSniRoutingMapSlot(bpf, previous); err != nil {
+		errs = append(errs, err)
+	}
 	return stderrors.Join(errs...)
 }
 
@@ -534,6 +537,9 @@ func (c *controlPlaneCore) clearDomainRoutingSlot(slot uint32) error {
 	c.domainRoutingProjectionMu[slot].Lock()
 	defer c.domainRoutingProjectionMu[slot].Unlock()
 	if err := clearReloadDomainRoutingMapSlot(c.PeekBpf(), slot); err != nil {
+		return err
+	}
+	if err := clearReloadSniRoutingMapSlot(c.PeekBpf(), slot); err != nil {
 		return err
 	}
 	c.resetDomainRoutingSlot(slot)

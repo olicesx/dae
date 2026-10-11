@@ -263,4 +263,8 @@ func (c *ControlPlane) cleanupNegativeCaches(now time.Time) {
 
 	// 3. Cleanup TCP sniff negative cache
 	c.cleanupTcpSniffNegative(now)
+
+	// 4. Expire SNI learning owners and refresh their kernel projection
+	// (nil-safe when SNI learning is disabled).
+	c.sniLearning.sweep(now)
 }

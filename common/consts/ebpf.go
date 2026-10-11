@@ -57,6 +57,12 @@ var (
 	MaxMatchSetLen  = 32 * 32
 )
 
+// MaxSniRoutingNum bounds one routing epoch slot of sni_routing_map (the
+// sniffed-domain learning fallback). Keep in sync with MAX_SNI_ROUTING_NUM in
+// control/kern/tproxy.c. Unlike domain_routing_map this map is LRU, so the
+// value is a memory budget, not a hard limit.
+const MaxSniRoutingNum = 4096
+
 func init() {
 	if MaxMatchSetLen_ != "" {
 		i, err := strconv.Atoi(MaxMatchSetLen_)

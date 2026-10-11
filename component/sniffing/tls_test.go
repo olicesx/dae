@@ -42,7 +42,7 @@ func TestSniffer_SniffTls(t *testing.T) {
 	logrus.SetLevel(logrus.DebugLevel)
 	for _, test := range tests {
 		sniffer := NewStreamSniffer(test.Stream, 300*time.Millisecond)
-		d, err := sniffer.SniffTcp()
+		d, _, err := sniffer.SniffTcp()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -63,7 +63,7 @@ func TestSniffer_SniffTls_AcceptsLegacyMinorVersions(t *testing.T) {
 	payload[10] = 0x02
 
 	sniffer := NewStreamSniffer(bytes.NewReader(payload), 300*time.Millisecond)
-	d, err := sniffer.SniffTcp()
+	d, _, err := sniffer.SniffTcp()
 	if err != nil {
 		t.Fatal(err)
 	}

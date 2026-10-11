@@ -54,7 +54,7 @@ func BenchmarkSniffer_SniffTcp_TLS(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		sniffer := NewStreamSniffer(newDeadlineConn(tlsStreamGoogle), 300*time.Millisecond)
-		d, err := sniffer.SniffTcp()
+		d, _, err := sniffer.SniffTcp()
 		if err != nil {
 			b.Fatalf("sniff failed: %v", err)
 		}
@@ -75,7 +75,7 @@ func BenchmarkSniffer_SniffTcp_HTTP(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		sniffer := NewStreamSniffer(newDeadlineConn(payload), 300*time.Millisecond)
-		d, err := sniffer.SniffTcp()
+		d, _, err := sniffer.SniffTcp()
 		if err != nil {
 			b.Fatalf("sniff failed: %v", err)
 		}
@@ -163,7 +163,7 @@ func BenchmarkSniffer_SniffTcp_NotApplicable(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		sniffer := NewStreamSniffer(newDeadlineConn(payload), 50*time.Millisecond)
-		_, _ = sniffer.SniffTcp()
+		_, _, _ = sniffer.SniffTcp()
 		_ = sniffer.Close()
 	}
 }
@@ -203,7 +203,7 @@ func TestSniffAllocationBudget(t *testing.T) {
 
 	tlsAllocs := testing.AllocsPerRun(20, func() {
 		sniffer := NewStreamSniffer(newDeadlineConn(tlsStreamGoogle), 300*time.Millisecond)
-		if _, err := sniffer.SniffTcp(); err != nil {
+		if _, _, err := sniffer.SniffTcp(); err != nil {
 			t.Fatalf("SniffTcp: %v", err)
 		}
 		_ = sniffer.Close()

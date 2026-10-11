@@ -123,6 +123,19 @@ global {
     # Requires sniffing to be enabled (sniffing_timeout > 0 and dial_mode != ip).
     auto_sniff_punt: true
 
+    # Learn "destination IP -> sniffed domain" after successful TLS sniffs and project it
+    # into the kernel routing fallback, so later connections to the same IP can be routed
+    # by domain rules in the kernel. DNS knowledge stays authoritative; bits whose rules
+    # resolve to direct/block are not projected unless sni_learning_direct opts in.
+    # Requires sniffing to be enabled and at least one domain condition in routing.
+    sni_learning: true
+    # How long a learned domain stays fresh for one destination IP (30s-3600s).
+    sni_learning_ttl: 300s
+    # Opt in to kernel-decided direct/block for learned domains. Off by default: those
+    # verdicts are terminal in the kernel and a mis-learned shared-IP domain (CDN) cannot
+    # self-correct.
+    sni_learning_direct: false
+
     # TLS implementation. tls is to use Go's crypto/tls. utls is to use uTLS, which can imitate browser's Client Hello.
     tls_implementation: tls
 

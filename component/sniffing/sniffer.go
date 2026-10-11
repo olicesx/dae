@@ -51,14 +51,15 @@ type Sniffer struct {
 	dataError     error
 
 	// Common
-	sniffed  string
-	buf      *bytes.Buffer
-	readMu   sync.RWMutex
-	ctxOnce  sync.Once
-	closeMu  sync.Once
-	ctx      context.Context
-	cancel   func()
-	deadline time.Time
+	sniffed      string
+	sniffedProto SniffProtocol
+	buf          *bytes.Buffer
+	readMu       sync.RWMutex
+	ctxOnce      sync.Once
+	closeMu      sync.Once
+	ctx          context.Context
+	cancel       func()
+	deadline     time.Time
 
 	// Packet
 	data           [][]byte
@@ -148,17 +149,32 @@ func (s *Sniffer) ensureAsyncContext() context.Context {
 
 type sniff func() (d string, err error)
 
-func sniffGroup(sniffs ...sniff) (d string, err error) {
-	for _, sniffer := range sniffs {
+// SniffProtocol identifies which payload probe produced a successful sniff.
+// Callers that only route on the domain can ignore it; callers that must act
+// only on specific protocols (for example the SNI learning path, which is
+// TLS-ClientHello-only) use it to gate.
+type SniffProtocol uint8
+
+const (
+	SniffProtocolNone SniffProtocol = iota
+	SniffProtocolTLS
+	SniffProtocolHTTP
+	SniffProtocolQUIC
+)
+
+// sniffGroup tries each probe in order and returns the matched probe's index
+// alongside the domain, so callers can map it back to a SniffProtocol.
+func sniffGroup(sniffs ...sniff) (d string, matched int, err error) {
+	for i, sniffer := range sniffs {
 		d, err = sniffer()
 		if err == nil {
-			return NormalizeDomain(d), nil
+			return NormalizeDomain(d), i, nil
 		}
 		if err != ErrNotApplicable {
-			return "", err
+			return "", -1, err
 		}
 	}
-	return "", ErrNotApplicable
+	return "", -1, ErrNotApplicable
 }
 
 var errReadDeadlineUnsupported = errors.New("read deadline unsupported")
@@ -249,18 +265,20 @@ func (s *Sniffer) readStreamOnceAsync() error {
 	return nil
 }
 
-func (s *Sniffer) SniffTcp() (d string, err error) {
+func (s *Sniffer) SniffTcp() (d string, proto SniffProtocol, err error) {
 	if s.sniffed != "" {
-		return s.sniffed, nil
+		return s.sniffed, s.sniffedProto, nil
 	}
 	defer func() {
 		if err == nil {
 			s.sniffed = d
+			s.sniffedProto = proto
 		}
 	}()
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 	var oerr error
+	var matched int
 	defer func() {
 		if err != nil && oerr != nil {
 			err = fmt.Errorf("%w: %w", oerr, err)
@@ -270,7 +288,7 @@ func (s *Sniffer) SniffTcp() (d string, err error) {
 		if s.stream {
 			bufLen := s.buf.Len()
 			if err := s.readStreamOnce(); err != nil {
-				return "", err
+				return "", SniffProtocolNone, err
 			}
 			if s.buf.Len() == bufLen {
 				// A read round that added no bytes is a clean peer FIN
@@ -279,21 +297,29 @@ func (s *Sniffer) SniffTcp() (d string, err error) {
 				// re-snooping the unchanged buffer would spin on Read
 				// syscalls until the deadline. End the sniff as not found
 				// instead; routing falls back to the IP verdict.
-				return "", ErrNotFound
+				return "", SniffProtocolNone, ErrNotFound
 			}
 		} else {
 			s.closeDataReady()
 		}
 
 		if s.buf.Len() == 0 {
-			return "", ErrNotApplicable
+			return "", SniffProtocolNone, ErrNotApplicable
 		}
 
-		d, err = sniffGroup(
+		d, matched, err = sniffGroup(
 			// Most sniffable traffic is TLS, thus we sniff it first.
 			s.SniffTls,
 			s.SniffHttp,
 		)
+		switch matched {
+		case 0:
+			proto = SniffProtocolTLS
+		case 1:
+			proto = SniffProtocolHTTP
+		default:
+			proto = SniffProtocolNone
+		}
 		if errors.Is(err, ErrNeedMore) {
 			oerr = err
 			// The previous dataReady was already closed by readStreamOnce
@@ -306,7 +332,7 @@ func (s *Sniffer) SniffTcp() (d string, err error) {
 			s.dataReadyOnce = sync.Once{}
 			continue
 		}
-		return d, err
+		return d, proto, err
 	}
 }
 
@@ -340,9 +366,10 @@ func (s *Sniffer) SniffUdp() (d string, err error) {
 		}
 	}
 
-	return sniffGroup(
+	d, _, err = sniffGroup(
 		s.SniffQuic,
 	)
+	return d, err
 }
 
 func (s *Sniffer) AppendData(data []byte) {

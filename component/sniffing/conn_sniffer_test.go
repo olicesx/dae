@@ -47,7 +47,7 @@ func TestSnifferDataReadyReopenAfterNeedMore(t *testing.T) {
 	// SniffTcp loops internally across both fragments and succeeds. After
 	// the loop the current dataReady (the one rebuilt on ErrNeedMore) must
 	// be closed; without the Once reset it stays open forever.
-	domain, err := s.SniffTcp()
+	domain, _, err := s.SniffTcp()
 	if err != nil {
 		t.Fatalf("multi-round sniff: unexpected error: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestTakeRelayPrefixSingleRound(t *testing.T) {
 	go func() {
 		_, _ = client.Write(hello)
 	}()
-	domain, err := sniffer.SniffTcp()
+	domain, _, err := sniffer.SniffTcp()
 	if err != nil {
 		t.Fatalf("sniff error: %v", err)
 	}

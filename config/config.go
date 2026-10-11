@@ -46,7 +46,19 @@ type Global struct {
 	// later selector -> direct/block fallback) so the whitelist still
 	// applies when the client's DNS bypasses dae. Requires sniffing to be
 	// enabled (sniffing_timeout > 0 and dial_mode != ip).
-	AutoSniffPunt       bool          `mapstructure:"auto_sniff_punt" default:"true"`
+	AutoSniffPunt bool `mapstructure:"auto_sniff_punt" default:"true"`
+	// SniLearning projects sniffed TLS SNI knowledge into the kernel routing
+	// fallback so later connections to the same IP can be routed by domain
+	// rules without re-sniffing. Requires sniffing to be enabled
+	// (sniffing_timeout > 0 and dial_mode != ip) and at least one domain
+	// match in the routing section; otherwise it stays inert.
+	SniLearning    bool          `mapstructure:"sni_learning" default:"true"`
+	SniLearningTtl time.Duration `mapstructure:"sni_learning_ttl" default:"300s"`
+	// SniLearningDirect opts in to projecting domain bits whose rules
+	// resolve to direct/block. Those verdicts are terminal in the kernel and
+	// cannot self-heal a mis-learned shared-IP domain, so the default keeps
+	// SNI knowledge out of them.
+	SniLearningDirect   bool          `mapstructure:"sni_learning_direct" default:"false"`
 	TlsImplementation   string        `mapstructure:"tls_implementation" default:"tls"`
 	UtlsImitate         string        `mapstructure:"utls_imitate" default:"chrome_auto"`
 	TlsFragment         bool          `mapstructure:"tls_fragment" default:"false"`

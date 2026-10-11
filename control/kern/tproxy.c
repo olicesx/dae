@@ -100,6 +100,12 @@
 #define MAX_ROUTING_HANDOFF_NUM 16384
 #define MAX_COOKIE_PID_PNAME_MAPPING_NUM 16384
 #define MAX_DOMAIN_ROUTING_NUM 8192
+// MAX_SNI_ROUTING_NUM bounds the sniffed-domain learning fallback map. Unlike
+// domain_routing_map it is an LRU map, so this is a memory budget rather than
+// a hard limit: eviction silently drops one learned IP whose next connection
+// simply re-sniffs. Keep in sync with MaxSniRoutingNum in
+// common/consts/ebpf.go.
+#define MAX_SNI_ROUTING_NUM 4096
 // MAX_TCP_OFFLOAD_NUM bounds concurrent TCP relay offload sessions. Each
 // session occupies two fast_sock entries (one per direction).
 #define MAX_TCP_OFFLOAD_NUM 16384
@@ -407,6 +413,19 @@ struct {
 	__type(value, struct domain_routing);
 	__uint(max_entries, ROUTING_EPOCH_SLOT_NUM * MAX_DOMAIN_ROUTING_NUM);
 } domain_routing_map SEC(".maps");
+
+// sni_routing_map: epoch+address → routing bitmap learned from sniffed TLS
+// ClientHello SNIs. Userspace writes it after a successful sniff; the routing
+// program consults it only where domain_routing_map (DNS projection) misses,
+// so DNS knowledge stays strictly authoritative. LRU keeps capacity a budget:
+// eviction never fails the writer, and the userspace tracker owns TTL
+// semantics (owners expire from a janitor, not from this map).
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__type(key, struct routing_epoch_ip);
+	__type(value, struct domain_routing);
+	__uint(max_entries, ROUTING_EPOCH_SLOT_NUM * MAX_SNI_ROUTING_NUM);
+} sni_routing_map SEC(".maps");
 
 struct ip_port_proto {
 	__u32 ip[4];
@@ -1705,6 +1724,13 @@ static __always_inline int route_match_domain_set(struct route_ctx *ctx,
 		__builtin_memcpy(daddr.addr, ctx->lpm_key_daddr.data,
 				 sizeof(daddr.addr));
 		domain_routing = bpf_map_lookup_elem(&domain_routing_map, &daddr);
+		if (!domain_routing) {
+			// DNS projection (authoritative) missed; fall back to the
+			// sniffed-domain knowledge before declaring the word empty.
+			// Both lookups share the per-word cache below.
+			domain_routing = bpf_map_lookup_elem(&sni_routing_map,
+							     &daddr);
+		}
 		ctx->domain_word_idx = bitmap_word_idx;
 		if (domain_routing)
 			ctx->domain_word_bits =

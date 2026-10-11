@@ -233,6 +233,7 @@ type bpfMapSpecs struct {
 	RoutingHandoffMap        *ebpf.MapSpec `ebpf:"routing_handoff_map"`
 	RoutingMap               *ebpf.MapSpec `ebpf:"routing_map"`
 	RoutingMetaMap           *ebpf.MapSpec `ebpf:"routing_meta_map"`
+	SniRoutingMap            *ebpf.MapSpec `ebpf:"sni_routing_map"`
 	ConnStateMap             *ebpf.MapSpec `ebpf:"conn_state_map"`
 	UnusedLpmType            *ebpf.MapSpec `ebpf:"unused_lpm_type"`
 	WanEgressRouteScratchMap *ebpf.MapSpec `ebpf:"wan_egress_route_scratch_map"`
@@ -277,6 +278,7 @@ type bpfMaps struct {
 	RoutingHandoffMap        *ebpf.Map `ebpf:"routing_handoff_map"`
 	RoutingMap               *ebpf.Map `ebpf:"routing_map"`
 	RoutingMetaMap           *ebpf.Map `ebpf:"routing_meta_map"`
+	SniRoutingMap            *ebpf.Map `ebpf:"sni_routing_map"`
 	ConnStateMap             *ebpf.Map `ebpf:"conn_state_map"`
 	UnusedLpmType            *ebpf.Map `ebpf:"unused_lpm_type"`
 	WanEgressRouteScratchMap *ebpf.Map `ebpf:"wan_egress_route_scratch_map"`

@@ -127,7 +127,7 @@ func TestSniffTcpEndsOnCleanFinWithIncompleteHeaders(t *testing.T) {
 	conn := &eofAfterPartialConn{payload: []byte("GET /path HTTP/1.1\r\nHost: exam")}
 	sniffer := NewStreamSniffer(conn, 10*time.Second)
 	start := time.Now()
-	_, err := sniffer.SniffTcp()
+	_, _, err := sniffer.SniffTcp()
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound on a clean FIN with incomplete headers", err)
 	}

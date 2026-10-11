@@ -295,7 +295,8 @@ func (s *sniLearning) writer() sniRoutingMapWriter {
 		return s.writerOverride
 	}
 	bpf := s.core.PeekBpf()
-	if bpf == nil {
+	if bpf == nil || bpf.SniRoutingMap == nil {
+		s.log.Warnf("SNI learning: sni_routing_map unavailable in the loaded datapath")
 		return ebpfSniRoutingMapWriter{}
 	}
 	return ebpfSniRoutingMapWriter{m: bpf.SniRoutingMap}
@@ -329,9 +330,16 @@ func (s *sniLearning) projectAddr(addr [4]uint32, merged bpfDomainRouting, epoch
 	defer s.core.domainRoutingProjectionMu[slot].Unlock()
 	if !s.verifySlotLocked(slot, epoch) {
 		s.staleDropped.Add(1)
+		// Expected during reload windows: the task simply re-learns on the
+		// next connection. Debug, not a warning.
+		s.log.Debugf("SNI learning: dropped stale task (epoch/slot mismatch) for addr %v", sniRoutingKeyAddr(addr))
 		return
 	}
 	writer := s.writer()
+	if writer == nil {
+		s.log.Warnf("SNI learning: no map writer available")
+		return
+	}
 	if isZeroDomainRoutingBitmap(merged) {
 		// Zero gated bitmap: identical to a map miss for the kernel, so skip
 		// the entry and keep the capacity.
@@ -346,6 +354,9 @@ func (s *sniLearning) projectAddr(addr [4]uint32, merged bpfDomainRouting, epoch
 		return
 	}
 	s.mapWritten.Add(1)
+	if s.log.IsLevelEnabled(logrus.DebugLevel) {
+		s.log.Debugf("SNI projected slot=%d addr=%v", slot, sniRoutingKeyAddr(addr))
+	}
 }
 
 // sweep is the janitor: expire owners whose TTL elapsed, then refresh or drop

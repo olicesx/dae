@@ -307,6 +307,7 @@ func (m *bpfMaps) Close() error {
 		m.RoutingHandoffMap,
 		m.RoutingMap,
 		m.RoutingMetaMap,
+		m.SniRoutingMap,
 		m.ConnStateMap,
 		m.UnusedLpmType,
 		m.WanEgressRouteScratchMap,

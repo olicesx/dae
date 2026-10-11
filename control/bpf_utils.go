@@ -409,6 +409,7 @@ type bpfDataplaneMaps struct {
 	RoutingHandoffMap        *ebpf.Map `ebpf:"routing_handoff_map"`
 	RoutingMap               *ebpf.Map `ebpf:"routing_map"`
 	RoutingMetaMap           *ebpf.Map `ebpf:"routing_meta_map"`
+	SniRoutingMap            *ebpf.Map `ebpf:"sni_routing_map"`
 	UnusedLpmType            *ebpf.Map `ebpf:"unused_lpm_type"`
 	WanEgressRouteScratchMap *ebpf.Map `ebpf:"wan_egress_route_scratch_map"`
 }
@@ -828,6 +829,7 @@ func assignDataplaneToBpf(bpf *bpfObjects, dp *bpfDataplane) {
 	bpf.RoutingHandoffMap = dp.RoutingHandoffMap
 	bpf.RoutingMap = dp.RoutingMap
 	bpf.RoutingMetaMap = dp.RoutingMetaMap
+	bpf.SniRoutingMap = dp.SniRoutingMap
 	bpf.UnusedLpmType = dp.UnusedLpmType
 	bpf.WanEgressRouteScratchMap = dp.WanEgressRouteScratchMap
 

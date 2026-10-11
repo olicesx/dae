@@ -161,3 +161,13 @@ Safety properties worth knowing:
 Requires sniffing to be enabled (`sniffing_timeout > 0`, `dial_mode != ip`)
 and at least one `domain` condition in the routing section; otherwise the
 feature stays inert. Disable with `sni_learning: false`.
+
+On top of the kernel-side projection, a destination IP with exactly one
+freshly learned domain also skips the sniff itself: the connection dials
+straight to the cached domain instead of waiting for a ClientHello parse.
+One connection per learned domain every 30 seconds still pays the real
+sniff, so the knowledge stays fresh, sibling domains sharing the IP turn
+the shortcut off again, and a domain whose routing resolves to
+direct/block is never adopted as a dial target. If a domain changes on a
+shared IP within that window the failure is a visible certificate
+mismatch that self-heals at the next sample.

@@ -43,42 +43,55 @@ func (c *ControlPlane) OnHealthCheckSuccess() {
 	ClearFailedQuicDcids()
 }
 
+// resolveDomainDialMode decides whether the given domain is dialed as a
+// domain (instead of the raw destination IP) and whether dialing it
+// re-routes through the userspace matcher. ChooseDialTarget and the SNI
+// consult preview share it so the two verdicts cannot drift apart. warm
+// controls the asynchronous real-domain probe for unknown domains: the
+// production dial warms (the probe only changes future verdicts), while the
+// preview must stay side-effect-free because its job is to predict this
+// connection's verdict.
+func (c *ControlPlane) resolveDomainDialMode(outbound consts.OutboundIndex, dst netip.AddrPort, domain string, warm bool) (dialDomain, shouldReroute bool) {
+	if outbound.IsReserved() || domain == "" {
+		return false, false
+	}
+	switch c.dialMode {
+	case consts.DialMode_Domain:
+		// Avoid blocking probe for literal IP / host:port values.
+		if isIPLikeDomain(domain) {
+			return false, false
+		}
+		// Consult the handoff controller when one is published: during a
+		// staged reload, fresh DNS knowledge may live only in the handoff
+		// controller while this plane's own controller no longer absorbs it.
+		dnsController := c.ActiveDnsController()
+		if dnsController != nil && dnsController.HasDnsKnowledge(dnsController.cacheKey(domain, common.AddrToDnsType(dst.Addr()))) {
+			// Has A/AAAA records. It is a real domain.
+			return true, true
+		}
+		if known, real := c.lookupRealDomainCache(domain); known {
+			return real, real
+		}
+		// Unknown domain on first hit: warm it asynchronously to avoid
+		// blocking connection setup on webpage first paint path.
+		if warm {
+			c.triggerRealDomainProbe(domain)
+		}
+		return false, false
+	case consts.DialMode_DomainCao:
+		return true, true
+	case consts.DialMode_DomainPlus:
+		return true, false
+	}
+	return false, false
+}
+
 func (c *ControlPlane) ChooseDialTarget(outbound consts.OutboundIndex, dst netip.AddrPort, domain string) (dialTarget string, shouldReroute bool, dialIp bool) {
 	dialMode := consts.DialMode_Ip
 
-	if !outbound.IsReserved() && domain != "" {
-		switch c.dialMode {
-		case consts.DialMode_Domain:
-			// Avoid blocking probe for literal IP / host:port values.
-			if isIPLikeDomain(domain) {
-				break
-			}
-			// Consult the handoff controller when one is published: during a
-			// staged reload, fresh DNS knowledge may live only in the handoff
-			// controller while this plane's own controller no longer absorbs it.
-			dnsController := c.ActiveDnsController()
-			if dnsController != nil && dnsController.HasDnsKnowledge(dnsController.cacheKey(domain, common.AddrToDnsType(dst.Addr()))) {
-				// Has A/AAAA records. It is a real domain.
-				dialMode = consts.DialMode_Domain
-				shouldReroute = true
-			} else {
-				if known, real := c.lookupRealDomainCache(domain); known {
-					if real {
-						dialMode = consts.DialMode_Domain
-						shouldReroute = true
-					}
-				} else {
-					// Unknown domain on first hit: warm it asynchronously to avoid
-					// blocking connection setup on webpage first paint path.
-					c.triggerRealDomainProbe(domain)
-				}
-			}
-		case consts.DialMode_DomainCao:
-			shouldReroute = true
-			fallthrough
-		case consts.DialMode_DomainPlus:
-			dialMode = consts.DialMode_Domain
-		}
+	if dialDomain, reroute := c.resolveDomainDialMode(outbound, dst, domain, true); dialDomain {
+		dialMode = consts.DialMode_Domain
+		shouldReroute = reroute
 	}
 
 	switch dialMode {

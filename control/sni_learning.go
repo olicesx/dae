@@ -52,6 +52,14 @@ const (
 	// opportunistic: a dropped task only costs one extra sniff on the next
 	// connection to that IP, so the queue is lossy by design (D10).
 	sniLearningQueueSize = 1024
+	// sniConsultVerifyInterval bounds how long a consult adoption may ride on
+	// the owner's last true sniff (P2 sampling). One connection per owner per
+	// interval pays the real sniff again: that refreshes the TTL, learns
+	// sibling domains sharing the IP (which turns consult off through the
+	// ambiguity guard), and re-projects the kernel map. It is deliberately
+	// not configurable: it balances freshness against sniff savings and is
+	// not a user-facing semantic.
+	sniConsultVerifyInterval = 30 * time.Second
 )
 
 // sniRoutingMapWriter abstracts sni_routing_map writes so unit tests can
@@ -96,10 +104,17 @@ type sniLearnTask struct {
 // The bitmap is cached because it only depends on the plane's immutable
 // routing matcher; re-sniffing the same domain refreshes the TTL.
 type sniOwner struct {
-	bitmap    bpfDomainRouting
-	ips       map[[4]uint32]struct{}
-	learnedAt time.Time
-	expiresAt time.Time
+	bitmap bpfDomainRouting
+	ips    map[[4]uint32]struct{}
+	// learnedAt/expiresAt follow the P1 rule: refreshed only by real sniff
+	// successes, never by consult hits. verifiedAt drives P2's sampling:
+	// one connection per owner per sniConsultVerifyInterval pays the real
+	// sniff again, which refreshes the TTL, learns sibling domains on the
+	// same IP (turning consult off via the ambiguity guard), and
+	// re-projects the kernel map.
+	learnedAt  time.Time
+	expiresAt  time.Time
+	verifiedAt time.Time
 }
 
 // SniLearningStats is a point-in-time snapshot of the subsystem counters.
@@ -110,6 +125,10 @@ type SniLearningStats struct {
 	MapDeleted    uint64
 	ExpiredOwners uint64
 	StaleDropped  uint64
+	ConsultHit    uint64
+	ConsultAmbig  uint64
+	ConsultStale  uint64
+	ConsultGate   uint64
 }
 
 type sniLearning struct {
@@ -139,6 +158,10 @@ type sniLearning struct {
 	mapDeleted    atomic.Uint64
 	expiredOwners atomic.Uint64
 	staleDropped  atomic.Uint64
+	consultHit    atomic.Uint64
+	consultAmbig  atomic.Uint64
+	consultStale  atomic.Uint64
+	consultGate   atomic.Uint64
 }
 
 // newSniLearning builds the per-plane learning subsystem. It returns nil when
@@ -246,6 +269,7 @@ func (s *sniLearning) processTask(task sniLearnTask) {
 	owner.ips[task.addr] = struct{}{}
 	owner.learnedAt = now
 	owner.expiresAt = now.Add(s.ttl)
+	owner.verifiedAt = now
 	domains := s.ips[task.addr]
 	if domains == nil {
 		domains = make(map[string]struct{})
@@ -450,7 +474,52 @@ func (s *sniLearning) Stats() SniLearningStats {
 		MapDeleted:    s.mapDeleted.Load(),
 		ExpiredOwners: s.expiredOwners.Load(),
 		StaleDropped:  s.staleDropped.Load(),
+		ConsultHit:    s.consultHit.Load(),
+		ConsultAmbig:  s.consultAmbig.Load(),
+		ConsultStale:  s.consultStale.Load(),
+		ConsultGate:   s.consultGate.Load(),
 	}
+}
+
+// consultDialDomain returns the cached dial domain for a destination IP
+// when it is safe to skip sniffing (P2). Safe means: exactly one live owner
+// (ambiguity guard — with several owners any choice can mis-dial), and its
+// last true sniff is fresh within sniConsultVerifyInterval (sampling — the
+// stale case returns miss so THIS connection pays the real sniff and
+// refreshes the knowledge).
+func (s *sniLearning) consultDialDomain(dst netip.Addr, now time.Time) (domain string, ok bool) {
+	if s == nil || !s.enabled {
+		return "", false
+	}
+	key := sniRoutingKey(dst)
+	s.trackerMu.Lock()
+	var candidate string
+	var verifiedAt time.Time
+	live := 0
+	for d := range s.ips[key] {
+		owner := s.owners[d]
+		if owner == nil || !now.Before(owner.expiresAt) {
+			continue
+		}
+		live++
+		if live > 1 {
+			break
+		}
+		candidate = d
+		verifiedAt = owner.verifiedAt
+	}
+	s.trackerMu.Unlock()
+	switch {
+	case live == 0:
+		return "", false
+	case live > 1:
+		s.consultAmbig.Add(1)
+		return "", false
+	case now.Sub(verifiedAt) >= sniConsultVerifyInterval:
+		s.consultStale.Add(1)
+		return "", false
+	}
+	return candidate, true
 }
 
 // LearnSniffed is the hook the TCP relay path calls on every sniff success.
@@ -460,6 +529,59 @@ func (s *sniLearning) LearnSniffed(addr netip.Addr, domain string, proto sniffin
 		return
 	}
 	s.enqueue(addr, domain)
+}
+
+// SniConsultDomain is the P2 consult entry the TCP path calls before the
+// sniff decision: it returns the cached dial domain for dst when sniffing
+// may be skipped entirely. Beyond the tracker guards (single live owner,
+// fresh sample) it runs the D11b preview: the cached domain is not this
+// connection's measured fact, and under a rerouting dial mode it would
+// reach the userspace matcher via chooseProxyDialer; a preview verdict of
+// direct or block refuses the adoption so the connection falls back to a
+// real sniff whose own domain decides. The preview shares
+// resolveDomainDialMode and the same routingResult facts with the real
+// call, so the two verdicts cannot drift apart.
+func (c *ControlPlane) SniConsultDomain(routingResult *bpfRoutingResult, src, dst netip.AddrPort, now time.Time) (string, bool) {
+	if c == nil || c.sniLearning == nil {
+		return "", false
+	}
+	domain, ok := c.sniLearning.consultDialDomain(dst.Addr(), now)
+	if !ok {
+		return "", false
+	}
+	// Mirror chooseProxyDialer exactly: the userspace matcher is consulted
+	// when the original outbound is the punt outbound (unconditionally,
+	// dial.go re-routes every punted flow) or when the dial mode re-routes
+	// this domain. Preview that call with the same facts and refuse the
+	// adoption on a terminal verdict.
+	outbound := consts.OutboundIndex(routingResult.Outbound)
+	wouldConsultMatcher := outbound == consts.OutboundControlPlaneRouting
+	if !wouldConsultMatcher {
+		_, wouldConsultMatcher = c.resolveDomainDialMode(outbound, dst, domain, false)
+	}
+	if wouldConsultMatcher {
+		facts := &bpfRoutingResult{
+			Mark:     routingResult.Mark,
+			Mac:      routingResult.Mac,
+			Outbound: routingResult.Outbound,
+			Pname:    routingResult.Pname,
+			Dscp:     routingResult.Dscp,
+		}
+		if verdict, _, _, err := c.Route(src, dst, domain, consts.L4ProtoType_TCP, facts); err == nil &&
+			(verdict == consts.OutboundDirect || verdict == consts.OutboundBlock) {
+			c.sniLearning.consultGate.Add(1)
+			return "", false
+		}
+	}
+	c.sniLearning.consultHit.Add(1)
+	if c.log.IsLevelEnabled(logrus.TraceLevel) {
+		c.log.WithFields(logrus.Fields{
+			"src":    src.String(),
+			"dst":    dst.String(),
+			"domain": domain,
+		}).Trace("TCP sniff skipped by SNI consult")
+	}
+	return domain, true
 }
 
 // ValidateSniLearningTtl checks the configured owner TTL bounds.

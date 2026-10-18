@@ -222,6 +222,8 @@ github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac h1:0h5zys3uIyKGGt6Lo
 github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac/go.mod h1:4soZNh0zW0LtYGdQ416i0jO0EIqMGcbtaspRS4BDvRQ=
 github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261009155203-131419a83a70 h1:Il5IkHEmoFoupGbaO40X1Ywqi9KunX3EdlEfcUSJG0c=
 github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261009155203-131419a83a70/go.mod h1:Lr4BKebz8Xa/RUgtcMqx/wp2iMOwIKoWGKMCgiZ9ick=
+github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261018105123-0fb28f7aa64b h1:N3N8AQEXQD7Mb7dKAuX4HR5BBqDPhFuzqZLvZTNN7e4=
+github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261018105123-0fb28f7aa64b/go.mod h1:Lr4BKebz8Xa/RUgtcMqx/wp2iMOwIKoWGKMCgiZ9ick=
 github.com/olicesx/qpack v0.6.1-0.20260910092525-3d8903e3255f h1:hjUaM52me7aDLXAw9/mkwIpGRnj8ayskzxe3l3h8HPE=
 github.com/olicesx/qpack v0.6.1-0.20260910092525-3d8903e3255f/go.mod h1:K9yV+5HSESp5ZMHcVRlV3RoL4Vbx2/zIZxUwk9JJcME=
 github.com/olicesx/quic-go v0.0.0-20261007104854-44a1f9eb14fe h1:ZsvR1KQf8s7LkD+cbE+8x7nQ8RnzwEgNtUtDALeaIxE=

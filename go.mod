@@ -1,6 +1,6 @@
 module github.com/daeuniverse/dae
 
-go 1.26.0
+go 1.26.10
 
 require (
 	github.com/adrg/xdg v0.5.3
@@ -14,7 +14,7 @@ require (
 	github.com/miekg/dns v1.1.72
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
 	github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac
-	github.com/olicesx/quic-go v0.0.0-20261007104854-44a1f9eb14fe
+	github.com/olicesx/quic-go v0.0.0-20261022020930-ffb41ccbd9d2
 	github.com/panjf2000/ants/v2 v2.11.5
 	github.com/safchain/ethtool v0.7.0
 	github.com/shirou/gopsutil/v4 v4.26.1
@@ -118,7 +118,10 @@ require (
 // frame sorter's reorder map grows lazily instead of reserving 64 slots
 // (~6.4 KiB per stream and per crypto stream on every connection), and PING
 // frames share one stateless instance.
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20261007104854-44a1f9eb14fe
+// This pin also raises the fork's module floor to go1.26.10 (CVE-2026-111943:
+// crypto/x509 distrusts the eight compromised eMudhra intermediates), the
+// same floor the dae module now requires.
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20261022020930-ffb41ccbd9d2
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
@@ -172,5 +175,8 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20261007
 // ordering, not an authentication result - a rejecting server closes the
 // connection with an auth error - and the reference client discards the same
 // Close error.
+// This pin carries the fork's go1.26.10 toolchain floor for CVE-2026-111943
+// and re-pins its quic-go replace to the same floor commit, so a standalone
+// fork build validates exactly the revisions dae consumes.
 
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261018111503-1cf3439537df
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261022022531-a64d874f4942

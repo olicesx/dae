@@ -4,7 +4,9 @@ Reference for the Go 1.26 toolchain pass applied to this tree. It records what t
 toolchain changed, what was deliberately left alone, and which newer language and
 runtime capabilities are available but not yet used.
 
-Toolchain at the time of writing: `go1.26.8`, module directive `go 1.26.0`.
+Toolchain at the time of writing: `go1.26.10`, module directive `go 1.26.10`
+(the floor was raised from `go 1.26.0` for CVE-2026-111943, the `crypto/x509`
+release that distrusts the compromised eMudhra intermediates).
 
 ## What the toolchain changed
 
@@ -174,8 +176,9 @@ without the second died with SIGILL
 checks `HasAVX512DQ` — present in go1.26.8, and backported for 1.26.5 and later
 (the backport was approved 2026-06-09, after 1.26.4). Release builds are unaffected
 because `release.yml` and the `Dockerfile` use the floating `1.26` /
-`golang:1.26-bookworm` pins. The only pin predating the backport is `lint.yml`'s
-exact `"1.26.0"`, which builds CI tooling only. If a deployed daemon is ever seen
+`golang:1.26-bookworm` pins, and the CVE-2026-111943 pass raised `lint.yml` to
+the exact `"1.26.10"`, so no pin in the tree predates the backport anymore. If a
+deployed daemon is ever seen
 dying with SIGILL on such a host, `GOEXPERIMENT=nogreenteagc` is the documented
 workaround.
 

@@ -145,7 +145,8 @@ func shouldRejectNewUdpDialSelection(res *proxyDialResult) bool {
 	if networkType == nil || networkType.L4Proto != consts.L4ProtoStr_UDP {
 		return false
 	}
-	if res.Outbound != nil && res.Outbound.GetSelectionPolicy() == consts.DialerSelectionPolicy_Fixed {
+	if res.Outbound != nil && (res.Outbound.GetSelectionPolicy().IgnoresDialerHealth() ||
+		res.Outbound.PinsSelection(ob.SelectionNetworkUDP)) {
 		return false
 	}
 	return !res.Dialer.MustGetAlive(networkType)
@@ -155,7 +156,8 @@ func (c *ControlPlane) checkUdpEndpointHealth(ue *UdpEndpoint, isFastPath bool) 
 	if ue == nil || ue.Dialer == nil || ue.IsDead() {
 		return false
 	}
-	if ue.Outbound != nil && ue.Outbound.GetSelectionPolicy() == consts.DialerSelectionPolicy_Fixed {
+	if ue.Outbound != nil && (ue.Outbound.GetSelectionPolicy().IgnoresDialerHealth() ||
+		ue.Outbound.PinsSelection(ob.SelectionNetworkUDP)) {
 		return true
 	}
 	if ue.survivesDialerHealthInvalidation() {
@@ -480,6 +482,19 @@ func noteUdpReplyReinjectionDrop(log *logrus.Logger, err error, from, clientAddr
 	}
 }
 
+// recordUdpEndpointDownload meters reply bytes into this plane's store and
+// against the endpoint's current outbound. The counters are resolved per call
+// (one atomic pointer load) rather than cached on UdpEndpoint: a retained
+// session can be handed another outbound after its creation, and UdpEndpoint
+// is the UDP hot path's largest per-session object, so it carries no API-only
+// state.
+func (c *ControlPlane) recordUdpEndpointDownload(ue *UdpEndpoint, n int64) {
+	if ue == nil {
+		return
+	}
+	c.recordDownloadTrafficFor(ue.Outbound.Counters(), n)
+}
+
 func forwardUdpEndpointReplyToClient(log *logrus.Logger, ue *UdpEndpoint, data []byte, from netip.AddrPort, clientAddr netip.AddrPort, send udpEndpointReplySender, recordDownload func(int64)) error {
 	recordDownload = normalizeTrafficRecord(recordDownload)
 	var cacheSlot udpEndpointResponseConnSlot
@@ -577,7 +592,7 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 	// SentReporter, so inline metering would double-count (same guard as
 	// batchOwnsAccounting in handlePkt).
 	if ue.sentReporter == nil {
-		c.recordUploadTraffic(int64(len(data)))
+		c.recordUploadTrafficFor(ue.Outbound.Counters(), int64(len(data)))
 		if lifecycle, lifecycleOK := newUdpSessionLifecycleContext(ue, ""); lifecycleOK {
 			lifecycle.reportTrafficSuccess()
 		}
@@ -847,7 +862,7 @@ func (c *ControlPlane) handlePktOwned(data []byte, src, realDst netip.AddrPort, 
 					// double-count both (same guard as batchOwnsAccounting in
 					// handlePkt).
 					if ue.sentReporter == nil {
-						c.recordUploadTraffic(int64(len(data)))
+						c.recordUploadTrafficFor(ue.Outbound.Counters(), int64(len(data)))
 						if lifecycle, ok := newUdpSessionLifecycleContext(ue, ""); ok {
 							lifecycle.reportTrafficSuccess()
 						}
@@ -1122,16 +1137,17 @@ getNew:
 			endpointDrainTracker = nil
 		}
 		replyLog := c.log
-		// Bind the reply-side download metering to this plane so that a
-		// retired generation's endpoints keep attributing bytes to the
-		// runtime store they were created under, mirroring the upload
-		// metering on the batch aggregator below.
-		replyDownload := c.runtimeDownloadRecorder()
 		ue, isNew, err = DefaultUdpEndpointPool.GetOrCreate(ueKey, &UdpEndpointOptions{
 			Ctx: c.ctx,
 			// Handler handles response packets and send it to the client.
 			Handler: func(ue *UdpEndpoint, data []byte, from netip.AddrPort) (err error) {
-				return forwardUdpEndpointReplyToClient(replyLog, ue, data, from, realSrc, nil, replyDownload)
+				// The recorder closes over the endpoint instead of living on it, so
+				// it follows the endpoint's current outbound (see
+				// recordUdpEndpointDownload). It does not escape the callee's frame,
+				// so the reply path still allocates nothing.
+				return forwardUdpEndpointReplyToClient(replyLog, ue, data, from, realSrc, nil, func(n int64) {
+					c.recordUdpEndpointDownload(ue, n)
+				})
 			},
 			NatTimeout:     natTimeout,
 			ConnStateOwner: connStateOwner,
@@ -1147,7 +1163,7 @@ getNew:
 			// (non-batched) path keeps the inline accounting below.
 			SentReporter: func(sent *UdpEndpoint, datagrams, bytes int) {
 				if bytes > 0 {
-					c.recordUploadTraffic(int64(bytes))
+					c.recordUploadTrafficFor(sent.Outbound.Counters(), int64(bytes))
 				}
 				if datagrams <= 0 {
 					return
@@ -1173,6 +1189,11 @@ getNew:
 
 				res, err := c.chooseProxyDialer(dialParam)
 				if err != nil {
+					if res != nil {
+						c.noteOutboundDialError(res)
+					} else if dialParam.Outbound != consts.OutboundBlock {
+						c.outboundCountersForIndex(dialParam.Outbound).AddError()
+					}
 					if res != nil && res.Outbound != nil && stderrors.Is(err, ob.ErrNoAliveDialer) {
 						res.Outbound.HandleNoAliveDialer(
 							res.OrigNetworkType,
@@ -1293,7 +1314,7 @@ getNew:
 			goto getNew
 		}
 		if !batchOwnsAccounting {
-			c.recordUploadTraffic(int64(len(payloads[packetIndex])))
+			c.recordUploadTrafficFor(ue.Outbound.Counters(), int64(len(payloads[packetIndex])))
 		}
 		packetIndex++
 	}

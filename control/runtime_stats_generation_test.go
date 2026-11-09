@@ -7,6 +7,16 @@ package control
 
 import "testing"
 
+// resetRuntimeStatsHandoff detaches these tests from the process-global totals
+// handoff. Publishing a store inherits the lifetime totals of the last
+// published one (see inheritTotalsFrom), and the pointer outlives an
+// unpublish; an earlier test's store must not surface as inherited bytes.
+func resetRuntimeStatsHandoff(t *testing.T) {
+	t.Helper()
+	lastPublishedRuntimeStats.Store(nil)
+	t.Cleanup(func() { lastPublishedRuntimeStats.Store(nil) })
+}
+
 // TestGenerationBoundMeteringFollowsOwningStore pins the accounting rule of
 // runtimeUploadRecorder/runtimeDownloadRecorder: a generation-owned UDP endpoint
 // meters into the store of the plane that created it, even after a successor
@@ -17,6 +27,8 @@ import "testing"
 // RecordUploadTraffic/RecordDownloadTraffic, which do land in the published
 // store.
 func TestGenerationBoundMeteringFollowsOwningStore(t *testing.T) {
+	resetRuntimeStatsHandoff(t)
+
 	retiring := &ControlPlane{runtimeStats: newRuntimeStats()}
 	successor := newRuntimeStats()
 	publishRuntimeStatsStore(successor)
@@ -50,11 +62,14 @@ func TestGenerationBoundMeteringFollowsOwningStore(t *testing.T) {
 
 // TestRetiredGenerationLeavesTheSnapshot pins the observable half of the same
 // rule through the production API: a plane publishes its store and meters
-// through its own recorders, a successor publishes its own store, and the
-// successor's snapshot no longer carries the retired generation's bytes. The
-// retired plane still accounts for its own traffic — what changed is that
-// nothing publishes that store any more.
+// through its own recorders, a successor publishes its own store, and every
+// byte the retired plane meters from then on stays out of the successor's
+// snapshot. What the retired plane had accumulated at the handoff crosses over
+// exactly once, as lifetime totals (see
+// TestLifetimeTotalsSurviveGenerationHandoff).
 func TestRetiredGenerationLeavesTheSnapshot(t *testing.T) {
+	resetRuntimeStatsHandoff(t)
+
 	retiring := &ControlPlane{runtimeStats: newRuntimeStats()}
 	retiring.publishRuntimeStats()
 	retiring.recordUploadTraffic(11)
@@ -68,14 +83,48 @@ func TestRetiredGenerationLeavesTheSnapshot(t *testing.T) {
 	t.Cleanup(successor.unpublishRuntimeStats)
 	retiring.unpublishRuntimeStats()
 
-	if got := successor.SnapshotRuntimeStats(60, 60); got.UploadTotal != 0 || got.DownloadTotal != 0 {
-		t.Fatalf("retired generation still contributes %d/%d bytes to the successor snapshot", got.UploadTotal, got.DownloadTotal)
+	// The retired plane still accounts for its own traffic; nothing forwards it
+	// to the published store any more.
+	retiring.recordUploadTraffic(1000)
+	retiring.recordDownloadTraffic(1000)
+	if got := successor.SnapshotRuntimeStats(60, 60); got.UploadTotal != 11 || got.DownloadTotal != 13 {
+		t.Fatalf("successor snapshot = %d/%d bytes, want only the handed-over 11/13: the retired generation's later bytes leaked in", got.UploadTotal, got.DownloadTotal)
 	}
-	if got := retiring.SnapshotRuntimeStats(60, 60); got.UploadTotal != 11 || got.DownloadTotal != 13 {
-		t.Fatalf("retired plane snapshot = %d/%d bytes, want its own 11/13", got.UploadTotal, got.DownloadTotal)
+	if got := retiring.SnapshotRuntimeStats(60, 60); got.UploadTotal != 1011 || got.DownloadTotal != 1013 {
+		t.Fatalf("retired plane snapshot = %d/%d bytes, want its own 1011/1013", got.UploadTotal, got.DownloadTotal)
 	}
+
 	RecordUploadTraffic(17)
-	if got := successor.SnapshotRuntimeStats(60, 60); got.UploadTotal != 17 {
-		t.Fatalf("published-store metering after the swap = %d bytes, want 17", got.UploadTotal)
+	if got := successor.SnapshotRuntimeStats(60, 60); got.UploadTotal != 28 {
+		t.Fatalf("published-store metering after the swap = %d bytes, want 28 (11 handed over + 17)", got.UploadTotal)
+	}
+}
+
+// TestLifetimeTotalsSurviveGenerationHandoff pins why the retired plane's
+// totals cross over: a reload builds a fresh generation-local store, and the
+// reported totals must not drop to zero at the handoff while runtime/outbounds
+// keep counting for the whole process. Only the lifetime totals are inherited;
+// the successor's traffic history starts empty.
+func TestLifetimeTotalsSurviveGenerationHandoff(t *testing.T) {
+	resetRuntimeStatsHandoff(t)
+
+	retiring := &ControlPlane{runtimeStats: newRuntimeStats()}
+	retiring.publishRuntimeStats()
+	retiring.recordUploadTraffic(11)
+	retiring.recordDownloadTraffic(13)
+
+	successor := &ControlPlane{runtimeStats: newRuntimeStats()}
+	successor.publishRuntimeStats()
+	t.Cleanup(successor.unpublishRuntimeStats)
+
+	if successor.runtimeStats.historyLen != 0 {
+		t.Fatalf("successor inherited %d history buckets; the traffic history is per generation", successor.runtimeStats.historyLen)
+	}
+	if got := successor.SnapshotRuntimeStats(60, 60); got.UploadTotal != 11 || got.DownloadTotal != 13 {
+		t.Fatalf("successor snapshot = %d/%d bytes right after the handoff, want the lifetime 11/13", got.UploadTotal, got.DownloadTotal)
+	}
+	successor.recordUploadTraffic(5)
+	if got := successor.SnapshotRuntimeStats(60, 60); got.UploadTotal != 16 {
+		t.Fatalf("successor snapshot = %d bytes after its own 5, want 16", got.UploadTotal)
 	}
 }

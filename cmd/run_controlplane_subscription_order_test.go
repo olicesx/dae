@@ -45,7 +45,7 @@ func TestMergeSubscriptionResultsKeepsConfigOrderAcrossReloads(t *testing.T) {
 			results[0] = subA
 		}
 		tagToNodeList := map[string][]string{"": {"inline-node"}}
-		if failed := mergeSubscriptionResults(discardLogger(), tagToNodeList, results); failed {
+		if _, failed := mergeSubscriptionResults(discardLogger(), tagToNodeList, map[string]string{}, map[string]error{}, results); failed {
 			t.Fatalf("reload %d: merge reported a failure although no result failed", reload)
 		}
 		if got := tagToNodeList["shared"]; !slices.Equal(got, want) {

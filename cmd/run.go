@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -26,6 +25,7 @@ import (
 
 	"github.com/daeuniverse/dae/cmd/internal"
 	"github.com/daeuniverse/dae/common/consts"
+	"github.com/daeuniverse/dae/component/nativeapi"
 	"github.com/daeuniverse/dae/component/outbound"
 	outbounddialer "github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/daeuniverse/dae/config"
@@ -120,6 +120,9 @@ type reloadRequest struct {
 	isSuspend       bool
 	requestedAt     time.Time
 	requestedAtMono uint64
+	// apiOperationID ties the reload to a native API operation. A signal
+	// triggered reload leaves it empty and only records last_reload.
+	apiOperationID string
 }
 
 type reloadRetirementControlPlane interface {
@@ -158,6 +161,9 @@ type stagedReloadHandoff struct {
 	oldCancel             context.CancelFunc
 	oldConf               *config.Config
 	oldListener           *control.Listener
+	oldGenerationID       string
+	oldConfigRevision     string
+	oldActivatedAt        time.Time
 	newControlPlane       *control.ControlPlane
 	newCancel             context.CancelFunc
 	newListener           *control.Listener
@@ -189,6 +195,9 @@ func newStagedReloadHandoff(active, candidate *runtimeGeneration, abortConnectio
 		oldCancel:          active.cancel,
 		oldConf:            active.conf,
 		oldListener:        active.listener,
+		oldGenerationID:    active.id,
+		oldConfigRevision:  active.configRevision,
+		oldActivatedAt:     active.activatedAt,
 		newControlPlane:    candidate.controlPlane,
 		newCancel:          candidate.cancel,
 		newListener:        candidate.listener,
@@ -291,12 +300,11 @@ func restorePreviousFreshDatapathGeneration(
 		return fmt.Errorf("recover previous generation %s: %w", step, rollbackErr)
 	}
 	w.listener = recoveredListener
-	if err := supervisor.replaceActive(&runtimeGeneration{
-		controlPlane: handoff.oldControlPlane,
-		listener:     recoveredListener,
-		cancel:       handoff.oldCancel,
-		conf:         handoff.oldConf,
-	}); err != nil {
+	restoredGeneration := newRuntimeGeneration(handoff.oldControlPlane, recoveredListener, handoff.oldCancel, handoff.oldConf)
+	restoredGeneration.id = handoff.oldGenerationID
+	restoredGeneration.configRevision = handoff.oldConfigRevision
+	restoredGeneration.activatedAt = handoff.oldActivatedAt
+	if err := supervisor.replaceActive(restoredGeneration); err != nil {
 		w.log.WithError(err).Errorf("[Reload] Failed to restore supervisor %s", step)
 		return fmt.Errorf("restore supervisor %s: %w", step, err)
 	}
@@ -350,6 +358,10 @@ func (t *serveExitTracker) fatalFor(plane *control.ControlPlane) error {
 // Run starts the daemon: it builds the initial control plane, serves it, and
 // drives the signal and reload loop until termination.
 func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (err error) {
+	if err := conf.Api.Validate(); err != nil {
+		return fmt.Errorf("invalid api config: %w", err)
+	}
+	rtStatus := newRuntimeStatus()
 	processSessions := control.NewSessionManager(context.Background())
 	defer func() {
 		err = errors.Join(err, processSessions.Close())
@@ -375,11 +387,8 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 		_ = c.Close()
 		return fmt.Errorf("attach process session manager: %w", err)
 	}
-	runtimeSupervisor := newRuntimeSupervisor(&runtimeGeneration{
-		controlPlane: c,
-		cancel:       currCancel,
-		conf:         conf,
-	})
+	initialGeneration := newRuntimeGeneration(c, nil, currCancel, conf)
+	runtimeSupervisor := newRuntimeSupervisor(initialGeneration)
 
 	// Serve tproxy TCP/UDP server util signals.
 	listener, listenErr := listenControlPlaneInDaeNetns(c, conf.Global.TproxyPort)
@@ -388,12 +397,8 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 		_ = c.Close()
 		return listenErr
 	}
-	if supervisorErr := runtimeSupervisor.replaceActive(&runtimeGeneration{
-		controlPlane: c,
-		listener:     listener,
-		cancel:       currCancel,
-		conf:         conf,
-	}); supervisorErr != nil {
+	initialGeneration.listener = listener
+	if supervisorErr := runtimeSupervisor.replaceActive(initialGeneration); supervisorErr != nil {
 		_ = listener.Close()
 		cancel()
 		_ = c.Close()
@@ -413,9 +418,11 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 		listener:          listener,
 	}
 	if conf.Global.PprofPort != 0 {
-		pprofAddr := fmt.Sprintf("localhost:%d", conf.Global.PprofPort)
-		w.pprofServer = &http.Server{Addr: pprofAddr, Handler: nil}
-		go func() { _ = w.pprofServer.ListenAndServe() }()
+		if pprofServer, err := startPprofServer(conf.Global.PprofPort); err != nil {
+			log.WithError(err).Warnln("Failed to start pprof server")
+		} else {
+			w.pprofServer = pprofServer
+		}
 	}
 	sigs := make(chan os.Signal, 1)
 	// Keep internal wake-ups separate so queued OS signals cannot mask reload handoff notifications.
@@ -440,6 +447,7 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 				if !disablePidFile {
 					_ = os.WriteFile(PidFilePath, []byte(strconv.Itoa(os.Getpid())), 0o644)
 				}
+				rtStatus.setState(runtimeStateRunning)
 				_ = setRunSignalProgress(consts.ReloadDone, "")
 			} else {
 				w.log.Warn("Initialization failed; not signaling readiness to supervisor")
@@ -466,12 +474,90 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 
 	reloadReqs := make(chan reloadRequest, 1)
 	reloadManager := newReloadManager(reloadReqs, runStateChanges, sigs)
+	reloadManager.setRuntimeStatus(rtStatus)
 	w.reloadManager = reloadManager
 	w.runStateChanges = runStateChanges
+
+	var apiServer *nativeapi.Server
+	if conf.Api.Enabled {
+		logHub := newFrameHub(rtStatus.snapshot().InstanceID, "logs", nativeapi.LogMaxBufferedRecords, nativeapi.LogRetentionSeconds*time.Second, nativeapi.LogMaxClients)
+		eventHub := newFrameHub(rtStatus.snapshot().InstanceID, "events", nativeapi.EventMaxBufferedEvents, nativeapi.EventRetentionSeconds*time.Second, nativeapi.EventMaxClients)
+		log.AddHook(&logHubHook{hub: logHub})
+		provider := &nativeAPIProvider{
+			supervisor:      runtimeSupervisor,
+			status:          rtStatus,
+			log:             log,
+			geoDirs:         externGeoDataDirs,
+			logHub:          logHub,
+			eventHub:        eventHub,
+			connectionBytes: !conf.Api.DisableConnectionBytes,
+		}
+		if active := runtimeSupervisor.activeSnapshot(); active != nil {
+			provider.lastGenerationID = active.id
+		}
+		operations := newNativeAPIOperations(reloadManager, runtimeSupervisor)
+		operations.events = provider
+		server, err := nativeapi.NewServer(nativeAPIConfig(conf), provider, log)
+		if err != nil {
+			_ = listener.Close()
+			cancel()
+			_ = c.Close()
+			return fmt.Errorf("initialize native api: %w", err)
+		}
+		server.SetGroupProvider(provider)
+		server.SetNodeProvider(provider)
+		server.SetTrafficHistoryProvider(provider)
+		server.SetOutboundProvider(provider)
+		server.SetMemoryProvider(provider)
+		server.SetDirectStatsProvider(provider)
+		server.SetDatapathProvider(provider)
+		server.SetRulesProvider(provider)
+		server.SetProviderProvider(provider)
+		server.SetGeoDataProvider(provider)
+		server.SetDnsProvider(provider)
+		server.SetConnectionProvider(provider)
+		server.SetFlowProvider(provider)
+		server.SetLogProvider(provider)
+		server.SetEventProvider(provider)
+		server.SetOperationProvider(operations)
+		server.SetProbeProvider(operations)
+		configSource, err := newConfigEditor(cfgFile, conf.Api, operations, reloadManager, runtimeSupervisor, log)
+		if err != nil {
+			_ = listener.Close()
+			cancel()
+			_ = c.Close()
+			return fmt.Errorf("initialize config editor: %w", err)
+		}
+		server.SetConfigProvider(configSource)
+		// Node create and delete edit the same managed tree, and a provider
+		// refresh queues the reload the operations adapter owns.
+		provider.config = configSource
+		provider.operations = operations
+		reloadManager.setReloadObserver(operations.FollowReload)
+		if err := server.Start(); err != nil {
+			_ = listener.Close()
+			cancel()
+			_ = c.Close()
+			return fmt.Errorf("start native api listener %q: %w", conf.Api.Listen, err)
+		}
+		apiServer = server
+		log.Infof("Native API listening on %s", conf.Api.Listen)
+		for _, warning := range conf.Api.Warnings() {
+			log.Warnln("Native API:", warning)
+		}
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := apiServer.Shutdown(ctx); err != nil {
+				log.WithError(err).Warnln("Failed to shut down native API")
+			}
+		}()
+	}
 	fastExit := false
 	var fatalRunErr error
 	failRun := func(err error) {
 		fastExit = true
+		rtStatus.setState(runtimeStateFailed)
 		fatalRunErr = errors.Join(fatalRunErr, err)
 		reloadManager.setReloadError(fatalRunErr)
 		_ = setRunSignalProgress(consts.ReloadError, fatalRunErr.Error())
@@ -864,6 +950,9 @@ loop:
 
 	defer func() {
 		_ = sdnotify.Stopping()
+		if rtStatus.getState() != string(runtimeStateFailed) {
+			rtStatus.setState(runtimeStateDraining)
+		}
 		if w.pprofServer != nil {
 			w.log.Infoln("Shutting down pprof server")
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

@@ -819,7 +819,7 @@ func (p *UdpEndpointPool) createEndpointUnderCreateMu(key UdpEndpointKey, create
 	}
 	udpConn, err := dialOption.Dialer.DialContext(ctx, dialOption.Network, dialOption.Target)
 	if err != nil {
-		reportUdpEndpointDialCreateFailure(key, dialOption, err)
+		reportUdpEndpointDialCreateFailure(key, dialOption, err, !shouldForceMarkUnavailableOnProxyDialError(err))
 		if shouldForceMarkUnavailableOnProxyDialError(err) {
 			// Use a fresh timeout context for the retry to avoid inheriting a
 			// nearly-expired deadline from the first dial attempt. When the first
@@ -836,7 +836,7 @@ func (p *UdpEndpointPool) createEndpointUnderCreateMu(key UdpEndpointKey, create
 				if err == nil {
 					goto dialSuccess
 				}
-				reportUdpEndpointDialCreateFailure(key, dialOption, err)
+				reportUdpEndpointDialCreateFailure(key, dialOption, err, true)
 			} else {
 				retryCancel()
 				err = retryErr
@@ -935,7 +935,7 @@ dialSuccess:
 	return ue, nil
 }
 
-func reportUdpEndpointDialCreateFailure(key UdpEndpointKey, dialOption *DialOption, err error) {
+func reportUdpEndpointDialCreateFailure(key UdpEndpointKey, dialOption *DialOption, err error, final bool) {
 	if err == nil || dialOption == nil || dialOption.Dialer == nil {
 		return
 	}
@@ -944,6 +944,9 @@ func reportUdpEndpointDialCreateFailure(key UdpEndpointKey, dialOption *DialOpti
 	}
 	if isTransientLocalUdpDialCreateError(err) {
 		return
+	}
+	if final && dialOption.Binding.Route.Outbound != consts.OutboundBlock {
+		dialOption.Outbound.Counters().AddError()
 	}
 
 	lifecycle, ok := newUdpDialOptionLifecycleContext(dialOption, key.Src)

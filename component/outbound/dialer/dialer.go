@@ -244,6 +244,11 @@ type InstanceOption struct {
 type Property struct {
 	D.Property
 	SubscriptionTag string
+	// ProviderTag is the provider identity this node is reported under. An
+	// untagged subscription has no SubscriptionTag (so subtag() filters keep
+	// their historical meaning) but still needs its own provider, otherwise its
+	// nodes look like the inline node section and DELETE /nodes acts on them.
+	ProviderTag string
 }
 
 const (
@@ -330,6 +335,27 @@ func NewDialerContext(ctx context.Context, dialer netproxy.Dialer, option *Globa
 		WithField("p", unsafe.Pointer(d)).
 		Traceln("NewDialer")
 	return d
+}
+
+// Clone returns a new dialer instance with the same GlobalOption.
+func (d *Dialer) Clone() *Dialer {
+	return d.CloneWithGlobalOption(d.GlobalOption)
+}
+
+// CloneWithGlobalOption returns a new dialer instance initialized with option.
+func (d *Dialer) CloneWithGlobalOption(option *GlobalOption) *Dialer {
+	return d.CloneWithGlobalOptionContext(d.ctx, option)
+}
+
+// SetProviderTag records the provider identity this dialer is reported under.
+// Callers set it once, right after construction and before the dialer is
+// published, so no lock is needed here: Property reads happen only through
+// Property(), which is used after construction.
+func (d *Dialer) SetProviderTag(tag string) {
+	if d == nil || d.property == nil {
+		return
+	}
+	d.property.ProviderTag = tag
 }
 
 // CloneWithGlobalOptionContext returns a new dialer instance initialized with option.

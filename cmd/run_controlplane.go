@@ -9,8 +9,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
-	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -256,22 +254,12 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf *contr
 	if !conf.Global.DisableWaitingNetwork {
 		networkWaitStart := time.Now()
 		epo := 5 * time.Second
-		client := http.Client{
-			Transport: &http.Transport{
-				DialContext: func(ctx context.Context, network, addr string) (c net.Conn, err error) {
-					conn, err := directDialers.Symmetric.DialContext(ctx, common.MagicNetwork("tcp", conf.Global.SoMarkFromDae, conf.Global.Mptcp), addr)
-					if err != nil {
-						return nil, err
-					}
-					return &netproxy.FakeNetConn{
-						Conn:  conn,
-						LAddr: nil,
-						RAddr: nil,
-					}, nil
-				},
-			},
-			Timeout: epo,
-		}
+		client := newHTTPClientForDialer(directDialers.Symmetric, epo, conf.Global.SoMarkFromDae, conf.Global.Mptcp)
+		// One-shot connectivity probe: release the keep-alive connection
+		// eagerly on return; the transport's idle timeout is only the backstop
+		// for the hand-back window. Left behind, the probe's fd and its
+		// read/write loop goroutines would accumulate once per reload.
+		defer client.CloseIdleConnections()
 		log.Infoln("Waiting for network...")
 		attempts, online, err := waitForNetworkOnline(ctx, &client, log, CheckNetworkLinks, epo, networkWaitTimeout)
 		if err != nil {
@@ -325,6 +313,12 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf *contr
 					subDialer = wrappedDialer
 				}
 				client := newHTTPClientForDialer(subDialer, 30*time.Second, conf.Global.SoMarkFromDae, conf.Global.Mptcp)
+				// The fetch is one-shot and the Transport sets no IdleConnTimeout:
+				// abandoned idle keep-alive connections would keep their fd and
+				// read/write loop goroutines alive forever. Every reload fetches
+				// every subscription again, so those connections would accumulate
+				// once per generation.
+				defer client.CloseIdleConnections()
 				tag, nodes, err := subscription.ResolveSubscription(log, &client, filepath.Dir(cfgFile), string(s))
 				results[idx] = subscriptionResult{
 					tag:     tag,

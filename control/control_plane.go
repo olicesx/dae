@@ -51,7 +51,12 @@ type ControlPlane struct {
 
 	runtimeStats *runtimeStats
 
-	core       *controlPlaneCore
+	core *controlPlaneCore
+	// deferFuncs holds cleanup closures. Registrations happen only before
+	// Close (construction, and the handoff hooks installed before the new
+	// generation is published); closeTail drains the slice exactly once and
+	// drops it so a retired plane that surviving flows keep reachable does not
+	// root what the closures capture (e.g. the daedns Router).
 	deferFuncs []func() error
 	listenIp   string
 
@@ -3088,11 +3093,19 @@ func ResetGlobalUdpState() {
 func (c *ControlPlane) closeTail() error {
 	var errs []error
 
-	for i := len(c.deferFuncs) - 1; i >= 0; i-- {
-		if e := c.deferFuncs[i](); e != nil {
+	pending := c.deferFuncs
+	c.deferFuncs = nil
+	for i := len(pending) - 1; i >= 0; i-- {
+		if e := pending[i](); e != nil {
 			errs = append(errs, e)
 		}
 	}
+	// Established-flow goroutines deliberately outlive this generation (they
+	// keep the ControlPlane itself reachable), and the executed closures pin
+	// large satellites (e.g. the daedns Router and its domain matchers via
+	// option.DaeDNS.Close). closeOnce guarantees this runs exactly once and
+	// all registrations happen before Close, so copy-drop-run is race-free —
+	// the same shape as controlPlaneCore.Close.
 	if c.egressRuntime != nil {
 		if err := c.egressRuntime.releaseOwner(); err != nil {
 			errs = append(errs, err)
@@ -3105,6 +3118,30 @@ func (c *ControlPlane) closeTail() error {
 		c.realDomainNegSet.Delete(key)
 		return true
 	})
+	// The confirmed-real set is consulted only by new-connection dialtarget
+	// resolution, and an established flow never re-reads it. Its preallocated
+	// 8192-slot map and FIFO order slice are the single largest per-generation
+	// retention once flow goroutines keep the retired plane reachable, so drop
+	// both under the lock rememberRealDomain uses. A late upstream dial from
+	// this plane then dials by IP instead of by domain — the same degraded but
+	// working path the cleared negative caches already take. The replacement
+	// map is empty rather than nil because such a late dial still records into
+	// it.
+	//
+	// A dial this plane still initiates after retirement therefore falls back to
+	// dialing by IP, and it cannot re-learn: the probe derives its context from
+	// the cancelled c.ctx. That is accepted on purpose. Decoupling the probe
+	// from c.ctx would keep a retired generation writing negative-cache entries
+	// after its janitor was stopped (unbounded growth), regrow the table just
+	// freed, and break the "Close means quiescent" retirement contract — while
+	// its learnings stay invisible to the successor, which builds its own empty
+	// set. Carrying knowledge across reloads belongs in a reload handoff, the
+	// way the DNS cache is reused, not in extending a dead generation's
+	// lifetime.
+	c.muRealDomainSet.Lock()
+	c.realDomainSet = make(map[string]struct{})
+	c.realDomainOrd = nil
+	c.muRealDomainSet.Unlock()
 	c.dnsDialerSnapshot.Range(func(key, value any) bool {
 		c.dnsDialerSnapshot.Delete(key)
 		return true
@@ -3160,6 +3197,16 @@ func (c *ControlPlane) releaseRetainedState() {
 	c.takeDNSHandoffController()
 	c.bpfMaintenance = nil
 	c.ClearReloadDnsCacheSource()
+	// The DNS routing tree (request/response matchers and their tries) is read
+	// only by the reload handoff (ReuseDNSControllerFrom), which runs before
+	// retirement, and by new-connection paths. When the handoff reused the
+	// controller it already dropped its own reference, so this nil is the last
+	// one and the matcher graphs become collectible instead of accumulating
+	// once per reload. When the DNS config changed the controller is
+	// deliberately not reused and still owns the same tree for its own
+	// resolution (see releaseRetainedState); the assignment is then a no-op,
+	// not a leak fix.
+	c.dnsRouting = nil
 }
 
 func (c *ControlPlane) Close() (err error) {

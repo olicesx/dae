@@ -120,6 +120,12 @@ func newHTTPClientForDialer(d netproxy.Dialer, timeout time.Duration, soMark uin
 					RAddr: nil,
 				}, nil
 			},
+			// Callers run one-shot work with this client and release it with
+			// CloseIdleConnections on return. The timeout is the backstop for
+			// the window where a connection is still being handed back to the
+			// idle pool and cannot be closed eagerly — the same belt-and-braces
+			// the long-lived clients in this tree use.
+			IdleConnTimeout: 90 * time.Second,
 		},
 		Timeout: timeout,
 	}

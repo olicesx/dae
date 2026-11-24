@@ -3208,6 +3208,22 @@ func (c *ControlPlane) releaseRetainedState() {
 	// resolution (see releaseRetainedState); the assignment is then a no-op,
 	// not a leak fix.
 	c.dnsRouting = nil
+
+	// The routing projections are this generation's userspace mirror of its
+	// slice of the kernel domain_routing map: they turn each DNS answer into a
+	// map delta. Only new connections depend on that slice, the successor
+	// builds its own mirror from the DNS cache, and the retirement below makes
+	// any further projection a no-op. The mirror can therefore go while the
+	// plane itself stays reachable through live flow goroutines.
+	if c.core != nil {
+		c.core.releaseDomainRoutingTrackers()
+	}
+	// The kernspace snapshot is consumed by CommitPreparedDatapath and the
+	// reload rebuild/rollback paths, all of which run before retirement.
+	c.routingKernspaceSnapshot = nil
+	// The SNI learning tables serve only new connections on THIS plane. A dial
+	// that still lands after retirement pays a fresh sniff instead.
+	c.sniLearning.release()
 }
 
 func (c *ControlPlane) Close() (err error) {

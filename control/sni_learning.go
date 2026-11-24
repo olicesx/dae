@@ -462,6 +462,24 @@ func (s *sniLearning) sweep(now time.Time) {
 	}
 }
 
+// release drops the authoritative owner/IP maps when the generation retires.
+// Established-flow goroutines keep the plane reachable, but these maps serve
+// only new connections on THIS plane. A late dial therefore degrades to a real
+// sniff (or IP routing), while the memory is released instead of accumulating
+// once per reload.
+func (s *sniLearning) release() {
+	if s == nil {
+		return
+	}
+	s.trackerMu.Lock()
+	// Empty rather than nil: a learn task may already be queued when the
+	// generation retires, and assigning into a nil map panics. The empty maps
+	// are tiny; the point is to release the accumulated owners/IPs.
+	s.owners = make(map[string]*sniOwner)
+	s.ips = make(map[[4]uint32]map[string]struct{})
+	s.trackerMu.Unlock()
+}
+
 // Stats returns the subsystem counters (nil-safe).
 func (s *sniLearning) Stats() SniLearningStats {
 	if s == nil {

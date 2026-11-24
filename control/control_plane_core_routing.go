@@ -84,6 +84,12 @@ func (c *controlPlaneCore) BatchUpdateDomainRouting(cache *DnsCache) error {
 	}
 	c.domainRoutingProjectionMu[slot].RLock()
 	defer c.domainRoutingProjectionMu[slot].RUnlock()
+	if c.domainRoutingRetired.Load() {
+		// A DNS answer that lands after retirement has no slot to project
+		// into: the epoch handoff cleared it, and the successor owns the
+		// tracker for new connections.
+		return nil
+	}
 	tracker := c.domainRoutingTrackerForSlot(slot)
 	if tracker == nil {
 		return fmt.Errorf("domain routing tracker slot %d is unavailable", slot)
@@ -106,6 +112,12 @@ func (c *controlPlaneCore) BatchRemoveDomainRouting(cache *DnsCache) error {
 	}
 	c.domainRoutingProjectionMu[slot].RLock()
 	defer c.domainRoutingProjectionMu[slot].RUnlock()
+	if c.domainRoutingRetired.Load() {
+		// A DNS answer that lands after retirement has no slot to project
+		// into: the epoch handoff cleared it, and the successor owns the
+		// tracker for new connections.
+		return nil
+	}
 	tracker := c.domainRoutingTrackerForSlot(slot)
 	if tracker == nil {
 		return fmt.Errorf("domain routing tracker slot %d is unavailable", slot)

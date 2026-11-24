@@ -518,6 +518,35 @@ func (c *controlPlaneCore) domainRoutingTrackerForSlot(slot uint32) *domainRouti
 	return c.domainRoutingSlots[slot]
 }
 
+// releaseDomainRoutingTrackers drops both userspace projections when the
+// generation retires and retires the entry points that fill them. The
+// successor builds its own from the DNS cache; the kernel-side maps are
+// cleared by the epoch handoff, not here.
+//
+// Retiring the entry points is part of the release: DNS callbacks keep
+// arriving on this plane while it drains, and without the flag each one
+// re-created an empty tracker through domainRoutingTrackerForSlot.
+func (c *controlPlaneCore) releaseDomainRoutingTrackers() {
+	if c == nil {
+		return
+	}
+	// Retire first, then wait for in-flight projections: each one holds the
+	// slot's projection read lock while using the tracker it looked up, so
+	// the write lock is what lets it finish. A projection that takes the
+	// read lock afterwards sees the flag and returns.
+	c.domainRoutingRetired.Store(true)
+	for slot := range c.domainRoutingSlots {
+		c.domainRoutingProjectionMu[slot].Lock()
+		c.routingEpochMu.Lock()
+		c.domainRoutingSlots[slot] = nil
+		if slot == 0 {
+			c.domainRouting = nil
+		}
+		c.routingEpochMu.Unlock()
+		c.domainRoutingProjectionMu[slot].Unlock()
+	}
+}
+
 func (c *controlPlaneCore) resetDomainRoutingSlot(slot uint32) {
 	if c == nil || !validRoutingEpochSlot(slot) {
 		return

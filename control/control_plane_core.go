@@ -173,11 +173,15 @@ type controlPlaneCore struct {
 	domainRoutingSlots        [routingEpochSlotCount]*domainRoutingTracker
 	domainRoutingProjectionMu [routingEpochSlotCount]sync.RWMutex
 	routingEpochMu            sync.Mutex
-	routingEpochSlot          atomic.Uint32
-	routingEpochPreviousSlot  atomic.Uint32
-	routingEpochRollbackOff   atomic.Bool
-	routingEpochPolicyEpoch   atomic.Uint64
-	datapathGeneration        atomic.Uint32
+	// domainRoutingRetired is set when releaseDomainRoutingTrackers drops the
+	// projections. The batch entry points check it under the slot's
+	// projection lock and return instead of recreating a tracker.
+	domainRoutingRetired     atomic.Bool
+	routingEpochSlot         atomic.Uint32
+	routingEpochPreviousSlot atomic.Uint32
+	routingEpochRollbackOff  atomic.Bool
+	routingEpochPolicyEpoch  atomic.Uint64
+	datapathGeneration       atomic.Uint32
 	// routingEpochStaged* records the slot/epoch prepared by StageRoutingEpoch
 	// for cutover or rollback decisions. All three fields are guarded by
 	// routingEpochMu (see the *RoutingEpochLocked helpers and their callers);

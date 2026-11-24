@@ -53,3 +53,41 @@ func TestValidateRoutingRulesRejectsUnknownOperands(t *testing.T) {
 		t.Errorf("supported rule must validate, got %v", err)
 	}
 }
+
+// TestValidateRoutingRulesRejectsReversedPortRange covers the config seam for
+// ParsePortRange: a reversed range used to pass validate and compile into a
+// rule that matches no port.
+func TestValidateRoutingRulesRejectsReversedPortRange(t *testing.T) {
+	log := logrus.New()
+	log.SetOutput(io.Discard)
+
+	parse := func(rule string) (*config.Config, error) {
+		sections, err := config_parser.Parse("global {\n    tproxy_port: 12345\n}\nrouting {\n" + rule + "\n}\n")
+		if err != nil {
+			return nil, err
+		}
+		return config.New(sections)
+	}
+
+	for _, rule := range []string{
+		"dport(8080-80) -> block",
+		"sport(2-1) -> block",
+	} {
+		conf, err := parse(rule)
+		if err != nil {
+			t.Fatalf("parse %q: %v", rule, err)
+		}
+		if err := validateRoutingRules(log, conf, nil); err == nil {
+			t.Errorf("validate accepted %q; a reversed port range must be rejected", rule)
+		}
+	}
+
+	// Positive control: an ascending range still validates.
+	conf, err := parse("dport(80-8080) -> block")
+	if err != nil {
+		t.Fatalf("parse supported rule: %v", err)
+	}
+	if err := validateRoutingRules(log, conf, nil); err != nil {
+		t.Errorf("ascending port range must validate, got %v", err)
+	}
+}

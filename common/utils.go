@@ -97,6 +97,9 @@ func ParsePortRange(pr string) (portRange [2]uint16, err error) {
 	if len(fields) == 1 {
 		portRange[1] = portRange[0]
 	}
+	if portRange[0] > portRange[1] {
+		return portRange, fmt.Errorf("bad port range: %v", pr)
+	}
 	return portRange, nil
 }
 

@@ -15,6 +15,7 @@ import (
 	"unsafe"
 
 	"github.com/cilium/ebpf"
+	"github.com/daeuniverse/dae/common/consts"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
@@ -84,7 +85,34 @@ func TestConnStateJanitorBoundaries(t *testing.T) {
 	dnsTimeout := udpConnStateTimeoutDNS.Nanoseconds()
 	closingTimeout := tcpConnStateTimeoutClosing.Nanoseconds()
 	routinglessBackstop := tcpConnStateRoutinglessBackstop.Nanoseconds()
+	blockedBackstop := tcpConnStateBlockedBackstop.Nanoseconds()
+	unpinnedBackstop := tcpConnStateUnpinnedBackstop.Nanoseconds()
 	sec := time.Second.Nanoseconds()
+
+	// A BLOCK verdict, and a forwarded verdict that no flow pins, are released
+	// by nothing but the janitor. DIRECT is never handed to userspace and must
+	// not age out.
+	blocked := state(uint64(now-blockedBackstop-sec), 0, 1)
+	blocked.Meta.Data.Outbound = uint8(consts.OutboundBlock)
+	blockedFresh := blocked
+	blockedFresh.LastSeenNs = uint64(now - sec)
+	forwardedOld := state(uint64(now-unpinnedBackstop-sec), 0, 1)
+	forwardedOld.Meta.Data.Outbound = 2
+	forwardedFresh := forwardedOld
+	forwardedFresh.LastSeenNs = uint64(now - sec)
+	directOld := forwardedOld
+	directOld.Meta.Data.Outbound = uint8(consts.OutboundDirect)
+
+	// A live flow is the pin, not an age: the entry below is past the
+	// unpinned backstop and past the stale marker further down, and must
+	// survive both.
+	manager := NewSessionManager(t.Context())
+	t.Cleanup(func() { _ = manager.Close() })
+	if err := cp.AttachSessionManager(manager); err != nil {
+		t.Fatalf("attach session manager: %v", err)
+	}
+	pinnedKey := tcpKey(2012, 443, 16)
+	(&manager.pinnedShards[tuplesShardIndex(&pinnedKey)]).pin(pinnedKey)
 
 	type entry struct {
 		name  string
@@ -103,6 +131,12 @@ func TestConnStateJanitorBoundaries(t *testing.T) {
 		{"tcp routingless fresh", tcpKey(2004, 443, 8), state(uint64(now-sec), 0, 0), true},
 		{"tcp routingless expired", tcpKey(2005, 443, 9), state(uint64(now-routinglessBackstop-sec), 0, 0), false},
 		{"tcp zero last-seen", tcpKey(2006, 443, 10), state(0, 0, 1), true},
+		{"tcp blocked fresh", tcpKey(2007, 443, 11), blockedFresh, true},
+		{"tcp blocked expired", tcpKey(2008, 443, 12), blocked, false},
+		{"tcp forwarded fresh", tcpKey(2009, 443, 13), forwardedFresh, true},
+		{"tcp forwarded unpinned expired", tcpKey(2010, 443, 14), forwardedOld, false},
+		{"tcp direct old survives", tcpKey(2011, 443, 15), directOld, true},
+		{"tcp forwarded expired but pinned", pinnedKey, forwardedOld, true},
 	}
 	for _, e := range entries {
 		if err := m.Put(e.key, e.value); err != nil {
@@ -135,6 +169,9 @@ func TestConnStateJanitorBoundaries(t *testing.T) {
 	cp.cleanupConnStateMapBeforeLocked(false, staleBefore, scratch)
 	if err := m.Lookup(staleKey, &bpfConnState{}); err == nil {
 		t.Error("entry younger than the TTL but older than staleBeforeNs must be retired")
+	}
+	if err := m.Lookup(pinnedKey, &bpfConnState{}); err != nil {
+		t.Errorf("a pinned entry must survive the stale marker too: %v", err)
 	}
 
 	// A stopped control plane must not touch the map at all.

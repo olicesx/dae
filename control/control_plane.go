@@ -133,6 +133,7 @@ type ControlPlane struct {
 	redirectTrackCapacityAlert  pacedAlert
 	cookiePidCapacityAlert      pacedAlert
 	routingHandoffCapacityAlert pacedAlert
+	connStateCapacityAlert      pacedAlert
 	// Per-packet datapath conditions that hold for every packet of every
 	// affected flow until the underlying state changes. Each has its own pace
 	// so one condition cannot suppress the report of another.

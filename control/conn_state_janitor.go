@@ -11,6 +11,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/daeuniverse/dae/common"
+	"github.com/daeuniverse/dae/common/consts"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
@@ -19,6 +20,11 @@ const (
 	janitorBatchLookupSize = 1024
 	janitorDeleteInitCap   = 256
 	janitorDeleteRetainMax = 8192
+
+	// tcpConnStateClosing is TCP_STATE_CLOSING on the kernel side (FIN or
+	// RST seen). The generated layout exposes conn_state.state as a bare
+	// uint8; ACTIVE is the zero value.
+	tcpConnStateClosing uint8 = 1
 )
 
 func ensureJanitorLookupScratch[T any](buf []T) []T {
@@ -87,6 +93,28 @@ var (
 	// and a same-tuple SYN recreates it, so retiring idle ones is
 	// behavior-neutral. Aligned with the kernel's 300s UDP backstop.
 	tcpConnStateRoutinglessBackstop = 5 * time.Minute
+
+	// tcpConnStateBlockedBackstop and tcpConnStateUnpinnedBackstop bound the
+	// forwarded TCP entries that no userspace flow ever owns. LAN ingress and
+	// WAN egress both cache a BLOCK verdict before shooting the packet, and a
+	// handoff that userspace never turned into a flow, or a release whose
+	// best-effort delete failed, keeps its forwarded verdict. Nothing else
+	// releases either, so they lived until the next reload's stale threshold.
+	// The kernel leaves ACTIVE entries to userspace on purpose
+	// (tcp_conn_state_expired only retires CLOSING): only userspace can tell
+	// a pinned session from stale kernel state. BLOCK gets the shorter age:
+	// a retry of the same tuple re-routes to the same verdict, whereas the
+	// unpinned backstop is the one rule whose wrong side would drop a live
+	// flow's entry, so it keeps the wider margin.
+	tcpConnStateBlockedBackstop  = 5 * time.Minute
+	tcpConnStateUnpinnedBackstop = 10 * time.Minute
+
+	// connStateJanitorUsageWarnPercent is the conn_state occupancy at which
+	// the janitor warns, at most once a minute. The datapath overflow report
+	// only fires once inserts already fail; this leaves room to raise
+	// bpf_conn_state_map_size before that. The janitor itself can only
+	// retire entries no flow owns.
+	connStateJanitorUsageWarnPercent = 90
 )
 
 type mapCleanupStats struct {
@@ -206,11 +234,11 @@ func (r *bpfMaintenanceRuntime) run() {
 			udpStats, tcpStats := c.cleanupConnStateMap(pressureState.active)
 			mapEntries = udpStats.entries + tcpStats.entries
 
-			maxUsagePercent := 0
-			if udpStats.maxEntries > 0 {
-				maxUsagePercent = (udpStats.entries + tcpStats.entries) * 100 / udpStats.maxEntries
+			usagePercent := connStateUsagePercent(udpStats, tcpStats)
+			pressureState = updateConnStateJanitorPressure(pressureState, overflowDelta, usagePercent)
+			if usagePercent >= connStateJanitorUsageWarnPercent {
+				c.logMapCapacityAlert(&c.connStateCapacityAlert, "cleanupConnStateMap", float64(usagePercent), mapEntries)
 			}
-			pressureState = updateConnStateJanitorPressure(pressureState, overflowDelta, maxUsagePercent)
 			lastConnCleanup = now
 			cleaned += udpStats.deleted + tcpStats.deleted
 		}
@@ -277,6 +305,89 @@ func (c *ControlPlane) stopConnStateJanitor() {
 	})
 }
 
+// connStateUsagePercent returns the share of the conn_state map's capacity in
+// use. UDP and TCP share one map, so neither protocol's usagePercent in
+// mapCleanupStats is the number to apply pressure or alert on. It returns
+// zero when the capacity is unknown.
+func connStateUsagePercent(udpStats, tcpStats mapCleanupStats) int {
+	if udpStats.maxEntries <= 0 {
+		return 0
+	}
+	return (udpStats.entries + tcpStats.entries) * 100 / udpStats.maxEntries
+}
+
+// connStateStale reports whether an entry was last refreshed before the
+// reload that requested stale retirement. A zero staleBeforeNs disables the
+// check; an entry the kernel never stamped counts as stale.
+func connStateStale(value *bpfConnState, staleBeforeNs uint64) bool {
+	return staleBeforeNs > 0 && (value.LastSeenNs == 0 || value.LastSeenNs < staleBeforeNs)
+}
+
+// tcpConnStateBackstops are the idle ages after which the janitor retires a
+// TCP conn_state entry that no live flow pins:
+//
+//   - closing: FIN or RST was seen and nothing followed.
+//   - routingless: a tracking entry without routing metadata. Every read
+//     path treats it like a missing one (LAN ingress passes it through, WAN
+//     egress re-routes the packet), and a same-tuple SYN recreates it.
+//   - blocked: a cached BLOCK verdict. No flow adopts it, so nothing else
+//     ever releases it.
+//   - unpinned: a forwarded verdict without a flow. Userspace adopts a
+//     forwarded flow by pinning its tuples for the flow's whole life, and
+//     releaseFlow deletes the entry when the last pin goes.
+//
+// DIRECT never takes the unpinned backstop: the kernel delivers those flows
+// without a handoff, so they are never pinned, and an idle direct connection
+// must keep its entry.
+type tcpConnStateBackstops struct {
+	closing     time.Duration
+	routingless time.Duration
+	blocked     time.Duration
+	unpinned    time.Duration
+}
+
+// tcpConnStateBackstopsFor returns the backstops in force. Pressure mode
+// halves them like every other TTL here: the map is filling, exactly when
+// entries no flow owns should retire fastest.
+func tcpConnStateBackstopsFor(aggressiveCleanup bool) tcpConnStateBackstops {
+	backstops := tcpConnStateBackstops{
+		closing:     tcpConnStateTimeoutClosing,
+		routingless: tcpConnStateRoutinglessBackstop,
+		blocked:     tcpConnStateBlockedBackstop,
+		unpinned:    tcpConnStateUnpinnedBackstop,
+	}
+	if aggressiveCleanup {
+		backstops.closing /= 2
+		backstops.routingless /= 2
+		backstops.blocked /= 2
+		backstops.unpinned /= 2
+	}
+	return backstops
+}
+
+// tcpConnStateExpired reports whether an entry that no live flow pins has
+// outlived its backstop. The pin snapshot and the scan-to-delete recheck in
+// the caller are what keep a live flow's entry; this only decides about the
+// rest. The kernel refreshes last_seen_ns on every packet more than a second
+// apart, so an entry still receiving traffic stays. A zero LastSeenNs reads
+// as infinitely old under every age rule; the kernel stamps each entry it
+// creates, so it cannot occur in production.
+func tcpConnStateExpired(value *bpfConnState, nowNano int64, backstops tcpConnStateBackstops) bool {
+	age := time.Duration(nowNano - int64(value.LastSeenNs))
+	switch {
+	case value.State == tcpConnStateClosing:
+		return age > backstops.closing
+	case value.Meta.Data.HasRouting == 0:
+		return age > backstops.routingless
+	case value.Meta.Data.Outbound == uint8(consts.OutboundBlock):
+		return age > backstops.blocked
+	case value.Meta.Data.Outbound == uint8(consts.OutboundDirect):
+		return false
+	default:
+		return age > backstops.unpinned
+	}
+}
+
 // cleanupConnStateMap performs a single-pass scan of ConnStateMap, classifying
 // entries by L4 protocol and applying protocol-specific timeout/expiry logic.
 // This replaces the former separate cleanupUdpConnStateMap + cleanupTcpConnStateMap
@@ -322,15 +433,7 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 	aggressiveTimeout := normalTimeoutNano / 2
 	aggressiveDnsTimeout := dnsTimeoutNano / 2
 
-	closingTimeoutNano := tcpConnStateTimeoutClosing.Nanoseconds()
-	aggressiveClosingTimeout := closingTimeoutNano / 2
-	routinglessBackstopNano := tcpConnStateRoutinglessBackstop.Nanoseconds()
-	if aggressiveCleanup {
-		// Halve like every other protocol TTL here: pressure mode runs when
-		// the map is filling, exactly when dead-SYN tracking entries should
-		// retire fastest.
-		routinglessBackstopNano /= 2
-	}
+	tcpBackstops := tcpConnStateBackstopsFor(aggressiveCleanup)
 
 	udpKeysToDelete := takeJanitorDeleteScratch(scratch.udpDelete)
 	tcpKeysToDelete := takeJanitorDeleteScratch(scratch.tcpDelete)
@@ -379,8 +482,7 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 						}
 					}
 					age := nowNano - int64(value.LastSeenNs)
-					if age > timeout ||
-						(staleBeforeNs > 0 && (value.LastSeenNs == 0 || value.LastSeenNs < staleBeforeNs)) {
+					if age > timeout || connStateStale(&value, staleBeforeNs) {
 						udpKeysToDelete = append(udpKeysToDelete, key)
 					}
 				case unix.IPPROTO_TCP:
@@ -388,36 +490,11 @@ func (c *ControlPlane) cleanupConnStateMapBeforeLocked(aggressiveCleanup bool, s
 					if _, pinned := pinnedTCPSnap[key]; pinned {
 						continue
 					}
-					closingTimeout := closingTimeoutNano
-					if aggressiveCleanup {
-						closingTimeout = aggressiveClosingTimeout
-					}
-					shouldDelete := false
-					if value.State == 1 {
-						age := nowNano - int64(value.LastSeenNs)
-						if age > closingTimeout {
-							shouldDelete = true
-						}
-					}
-					// Routing-less tracking entries are neutral to delete on
-					// every read path (LAN ingress passes them through, WAN
-					// egress re-routes the packet, and a same-tuple SYN
-					// recreates them), so idle ones get a backstop instead
-					// of lingering until the next reload's stale threshold.
-					if !shouldDelete && value.Meta.Data.HasRouting == 0 {
-						age := nowNano - int64(value.LastSeenNs)
-						if age > routinglessBackstopNano {
-							shouldDelete = true
-						}
-					}
-					// Established TCP with routing metadata has no TTL here
-					// (pin-governed), so the stale threshold is the only
-					// retirement path for orphaned entries.
-					if !shouldDelete && staleBeforeNs > 0 &&
-						(value.LastSeenNs == 0 || value.LastSeenNs < staleBeforeNs) {
-						shouldDelete = true
-					}
-					if shouldDelete {
+					// The backstops reach what no flow owns; the stale threshold
+					// additionally retires what the retired generation left
+					// behind.
+					if tcpConnStateExpired(&value, nowNano, tcpBackstops) ||
+						connStateStale(&value, staleBeforeNs) {
 						tcpKeysToDelete = append(tcpKeysToDelete, key)
 					}
 				}

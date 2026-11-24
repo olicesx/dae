@@ -932,3 +932,23 @@ func TestGroupPublishesOptimisticAlive(t *testing.T) {
 		}
 	}
 }
+
+func TestDialerGroup_MinCheckIntervalSharesTheDialerFloor(t *testing.T) {
+	at := func(interval time.Duration) *dialer.Dialer {
+		return &dialer.Dialer{GlobalOption: &dialer.GlobalOption{CheckInterval: interval}}
+	}
+	cases := []struct {
+		name    string
+		dialers []*dialer.Dialer
+		want    time.Duration
+	}{
+		{"empty group keeps its default", nil, 30 * time.Second},
+		{"sub-second dialer is floored", []*dialer.Dialer{at(500 * time.Millisecond), at(5 * time.Second)}, dialer.MinCheckInterval},
+		{"the smallest valid cadence wins", []*dialer.Dialer{at(5 * time.Second), at(3 * time.Second)}, 3 * time.Second},
+	}
+	for _, tc := range cases {
+		if got := (&DialerGroup{Dialers: tc.dialers}).MinCheckInterval(); got != tc.want {
+			t.Errorf("%s: MinCheckInterval() = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

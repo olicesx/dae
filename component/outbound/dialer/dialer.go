@@ -101,6 +101,10 @@ type Dialer struct {
 	ctx           context.Context
 	cancel        context.CancelFunc
 
+	// checkIntervalClampOnce keeps the low-interval warning to one line per
+	// dialer.
+	checkIntervalClampOnce sync.Once
+
 	checkActivated bool
 
 	httpClients  map[string]*http.Client
@@ -316,7 +320,7 @@ func NewDialerContext(ctx context.Context, dialer netproxy.Dialer, option *Globa
 	d.recoveryManager = newDialerRecoveryManager(d)
 
 	// Initialize recovery detection with adjusted max backoff
-	d.initRecoveryDetection(option.CheckInterval)
+	d.initRecoveryDetection(clampCheckInterval(option.CheckInterval))
 
 	option.Log.WithField("dialer", d.Property().Name).
 		WithField("p", unsafe.Pointer(d)).

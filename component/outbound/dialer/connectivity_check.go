@@ -748,7 +748,25 @@ func getActiveDialerCount() int {
 	return poolActiveCount
 }
 
-func (d *Dialer) aliveBackground() {
+// MinCheckInterval is the floor for any connectivity-check cadence, however
+// low check_interval is set. The config layer only rejects non-positive
+// values, and a sub-second cycle turns the per-cycle probes of every dialer
+// into a permanent probe storm and the per-cycle goroutine hand-off into
+// scheduler load.
+const MinCheckInterval = 2 * time.Second
+
+// clampCheckInterval raises a positive interval below MinCheckInterval up to
+// it and returns every other value unchanged: callers decide what a missing
+// interval means.
+func clampCheckInterval(interval time.Duration) time.Duration {
+	if interval > 0 && interval < MinCheckInterval {
+		return MinCheckInterval
+	}
+	return interval
+}
+
+// effectiveCheckInterval returns the cadence aliveBackground may run at.
+func (d *Dialer) effectiveCheckInterval() time.Duration {
 	cycle := d.CheckInterval
 	if cycle <= 0 {
 		// The daemon config layer enforces a positive interval, but a
@@ -757,6 +775,34 @@ func (d *Dialer) aliveBackground() {
 		// to the shortest sensible cadence instead of crashing.
 		cycle = time.Second
 	}
+	if clamped := clampCheckInterval(cycle); clamped != cycle {
+		d.warnCheckIntervalClamped()
+		return clamped
+	}
+	return cycle
+}
+
+// warnCheckIntervalClamped logs the clamp once per dialer. The configured
+// value is left untouched.
+func (d *Dialer) warnCheckIntervalClamped() {
+	d.checkIntervalClampOnce.Do(func() {
+		if d.Log == nil {
+			return
+		}
+		var dialerName string
+		if property := d.Property(); property != nil {
+			dialerName = property.Name
+		}
+		d.Log.WithFields(logrus.Fields{
+			"dialer":   dialerName,
+			"interval": d.CheckInterval.String(),
+			"actual":   MinCheckInterval.String(),
+		}).Warnf("check_interval too low, clamped to minimum %v to prevent probe storm", MinCheckInterval)
+	})
+}
+
+func (d *Dialer) aliveBackground() {
+	cycle := d.effectiveCheckInterval()
 	var tcpSomark uint32
 	var mptcp bool
 	if network, err := netproxy.ParseMagicNetwork(d.TcpCheckOptionRaw.ResolverNetwork); err == nil {

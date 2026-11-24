@@ -170,8 +170,8 @@ func (g *DialerGroup) MinCheckInterval() time.Duration {
 			min = d.CheckInterval
 		}
 	}
-	if min < 2*time.Second {
-		return 2 * time.Second
+	if min < dialer.MinCheckInterval {
+		return dialer.MinCheckInterval
 	}
 	return min
 }

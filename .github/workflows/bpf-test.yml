@@ -107,12 +107,18 @@ jobs:
               TestDetectCgroupPathCachesSuccessOnly
               TestDetectCgroupPathRetriesAfterFailure
               TestDetectCgroupPathConcurrentCallersShareOneScan
+              # Conn-state janitor against a real BPF map: which entries the
+              # age backstops and the stale marker retire, and that a pinned
+              # entry survives both.
+              TestConnStateJanitorBoundaries
             )
             printf '%s\n' "${whitelist[@]}" | sort -u > /tmp/datapath-whitelist.txt
 
-            # Direction 1: every func Test* in a !dae_stub_ebpf test file must be
+            # Direction 1: every func Test* in a test file the stub build
+            # excludes (any go:build line with !dae_stub_ebpf, also inside a
+            # larger expression such as "linux && !dae_stub_ebpf") must be
             # whitelisted, so a new/renamed case cannot silently stop running.
-            mapfile -t tagged_files < <(git grep -l 'go:build !dae_stub_ebpf' -- '*_test.go')
+            mapfile -t tagged_files < <(git grep -l 'go:build.*!dae_stub_ebpf' -- '*_test.go')
             declared="$(grep -hE '^func (Test[A-Za-z0-9_]*)\(' "${tagged_files[@]}" \
               | sed -E 's/^func (Test[A-Za-z0-9_]*)\(.*/\1/' \
               | grep -v '^TestMain$' | sort -u)"

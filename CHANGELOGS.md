@@ -169,6 +169,11 @@ changed. Review them before upgrading:
 
 #### Bug Fixes
 
+- fix(kern): the cgroup socket programs load when the daemon is built with
+  clang 23. It regrouped the command-name index into a pointer plus a counter,
+  so the verifier saw a stack read whose offset the bound check did not cover
+  and rejected the program with `invalid variable-offset read from stack` at
+  startup (port of upstream PR daeuniverse/dae#1172)
 - fix(reload): a retiring control plane releases its userspace routing
   projections, the kernspace routing snapshot and the SNI learning tables, and
   a DNS answer that lands afterwards no longer rebuilds a projection. Live

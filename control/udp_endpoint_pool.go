@@ -263,6 +263,11 @@ func (s *udpEndpointPoolShard) poolLocked() map[UdpEndpointKey]*UdpEndpoint {
 type udpEndpointDialerBucket struct {
 	mu        sync.RWMutex
 	endpoints map[*UdpEndpoint]struct{}
+	// closed marks a bucket that unregisterEndpoint emptied and is detaching
+	// from dialerIndex. It is set under mu before the detach, so a register
+	// that loaded the bucket just before sees it under the same mutex and
+	// retries with a fresh one. Same contract as udpEndpointTransportBucket.
+	closed bool
 }
 
 type udpEndpointTransportBucket struct {
@@ -557,13 +562,21 @@ func (p *UdpEndpointPool) registerEndpoint(ue *UdpEndpoint) {
 	}
 	key, ok := p.endpointDialerNetworkKey(ue)
 	if ok {
-		actual, _ := p.dialerIndex.LoadOrStore(key, &udpEndpointDialerBucket{
-			endpoints: make(map[*UdpEndpoint]struct{}),
-		})
-		bucket := actual.(*udpEndpointDialerBucket)
-		bucket.mu.Lock()
-		bucket.endpoints[ue] = struct{}{}
-		bucket.mu.Unlock()
+		for {
+			actual, _ := p.dialerIndex.LoadOrStore(key, &udpEndpointDialerBucket{
+				endpoints: make(map[*UdpEndpoint]struct{}),
+			})
+			bucket := actual.(*udpEndpointDialerBucket)
+			bucket.mu.Lock()
+			if bucket.closed {
+				bucket.mu.Unlock()
+				p.dialerIndex.CompareAndDelete(key, bucket)
+				continue
+			}
+			bucket.endpoints[ue] = struct{}{}
+			bucket.mu.Unlock()
+			break
+		}
 	}
 	p.registerTransportEndpoint(ue)
 }
@@ -576,10 +589,19 @@ func (p *UdpEndpointPool) unregisterEndpoint(ue *UdpEndpoint) {
 			bucket := actual.(*udpEndpointDialerBucket)
 			bucket.mu.Lock()
 			delete(bucket.endpoints, ue)
-			// Keep empty buckets for the lifetime of the pool. The key space is tiny
-			// (dialer x UDP family), and never deleting avoids a register/unregister
-			// race where a newly re-added endpoint could lose its reverse index.
+			empty := len(bucket.endpoints) == 0
+			if empty {
+				// The key holds the *dialer.Dialer itself, so an empty bucket keeps
+				// that dialer (collections, proxy cache, HTTP clients) reachable.
+				// "The key space is tiny" holds within one generation only: a
+				// seamless reload installs a new dialer set each time, and buckets
+				// kept "for the lifetime of the pool" pinned every retired set.
+				bucket.closed = true
+			}
 			bucket.mu.Unlock()
+			if empty {
+				p.dialerIndex.CompareAndDelete(key, bucket)
+			}
 		}
 	}
 

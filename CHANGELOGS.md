@@ -158,8 +158,31 @@ changed. Review them before upgrading:
 - `ipversion_prefer` is enforced on every delivery path, including the
   cache-hit and background-refresh paths that could previously release an answer
   from the non-preferred family while the preferred family had records.
+- `port`, `dport` and `sport` reject a range whose start is greater than its
+  end, such as `dport(8080-80)`. It used to compile into a rule that could never
+  match, so `dae validate` now fails on a config that used to route nothing
+  (port of upstream PR daeuniverse/dae#1163)
+- a positive `check_interval` below 2s runs at 2s and logs one warning per
+  dialer. Such a value used to be taken as configured, which multiplied every
+  dialer's probe traffic by the same factor (port of upstream PR
+  daeuniverse/dae#1025)
 
 #### Bug Fixes
+
+- fix(reload): a retiring control plane releases its userspace routing
+  projections, the kernspace routing snapshot and the SNI learning tables, and
+  a DNS answer that lands afterwards no longer rebuilds a projection. Live
+  flows pin the plane, so this state rode along once per reload although only
+  new connections use it
+- fix(control): an empty UDP dialer-index bucket is dropped as soon as its last
+  endpoint leaves. Its key holds the dialer, so the buckets kept for the pool's
+  lifetime pinned every retired dialer generation across seamless reloads
+- fix(control): the conn_state janitor retires the TCP entries that no live
+  flow pins: a cached BLOCK verdict after 5 idle minutes and a forwarded
+  verdict without a flow after 10. The kernel leaves ACTIVE entries to
+  userspace, and they used to wait for the next reload. A pinned flow, a DIRECT
+  flow and a flow still receiving packets keep their entry, and a map above 90%
+  capacity now warns at most once a minute
 
 - fix(dns): both DNS fast paths honor a `must_rules` verdict, so a matched
   port-53 flow forwards as plain traffic for the routing result's outbound

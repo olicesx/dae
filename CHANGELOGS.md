@@ -169,6 +169,11 @@ changed. Review them before upgrading:
 
 #### Bug Fixes
 
+- fix(netutils): the resolver dae uses for itself reports SERVFAIL, REFUSED,
+  FORMERR and NOTIMP as errors instead of as a name with no record. A failing
+  upstream no longer caches a domain as `not a real domain` or hides behind the
+  generic `no usable address` text. NXDOMAIN stays a negative answer, so the
+  negative cache keeps working (port of upstream PR daeuniverse/dae#1150)
 - fix(kern): the cgroup socket programs load when the daemon is built with
   clang 23. It regrouped the command-name index into a pointer plus a counter,
   so the verifier saw a stack read whose offset the bound check did not cover

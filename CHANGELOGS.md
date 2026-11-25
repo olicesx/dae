@@ -166,9 +166,21 @@ changed. Review them before upgrading:
   dialer. Such a value used to be taken as configured, which multiplied every
   dialer's probe traffic by the same factor (port of upstream PR
   daeuniverse/dae#1025)
+- New `check_dns_tcp` option (default `true`). dae now runs the TCP DNS check that
+  `udp_check_dns` has always promised for a `tcp` upstream: it probes that host over
+  TCP, once per address family per `check_interval`. The result is advisory. A failure
+  is logged once when it starts and once when it clears, and never takes a node out of
+  selection. Turn it off when `dns.upstream` is `https` (DoH) or `udp`, where the probe
+  cannot see the real upstream and only spends quota (port of upstream PR
+  daeuniverse/dae#1146)
 
 #### Bug Fixes
 
+- fix(dialer): the TCP DNS connectivity check that `udp_check_dns` promises for a
+  `tcp` upstream actually runs. It was declared by a flag that nothing read, so such
+  an upstream could fail on every node while all probes stayed green. The result is
+  logged only; `check_dns_tcp` above turns the check off (port of upstream PR
+  daeuniverse/dae#1146)
 - fix(netutils): the resolver dae uses for itself reports SERVFAIL, REFUSED,
   FORMERR and NOTIMP as errors instead of as a name with no record. A failing
   upstream no longer caches a domain as `not a real domain` or hides behind the

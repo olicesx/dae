@@ -62,11 +62,11 @@ func TestRetainedUDPEndpointDeclinesShortcutForReapedPeer(t *testing.T) {
 	if _, ok := manager.retainedUDPEndpoint(src, peerB, &bpfRoutingResult{}, cp.PolicyEpoch()); !ok {
 		t.Fatal("precondition: the stale-epoch session must be found as retained")
 	}
-	if cp.handleRetainedUDPEndpoint([]byte("hello"), src, peerB, &bpfRoutingResult{}, UdpFlowDecision{}) {
-		t.Fatal("the retained path consumed a reaped peer's datagram: the promotion below the lookup would never run")
+	if consumed, pin := cp.handleRetainedUDPEndpoint([]byte("hello"), src, peerB, &bpfRoutingResult{}, UdpFlowDecision{}); consumed || pin != nil {
+		t.Fatal("the retained path consumed a reaped peer's datagram or handed over a pin: the promotion below the lookup would never run")
 	}
-	if !cp.handleRetainedUDPEndpoint([]byte("hello"), src, peerA, &bpfRoutingResult{}, UdpFlowDecision{}) {
-		t.Fatal("a healthy peer must keep being served by the retained session")
+	if consumed, pin := cp.handleRetainedUDPEndpoint([]byte("hello"), src, peerA, &bpfRoutingResult{}, UdpFlowDecision{}); !consumed || pin != nil {
+		t.Fatal("a healthy peer must keep being served by the retained session without a rebuild pin")
 	}
 }
 

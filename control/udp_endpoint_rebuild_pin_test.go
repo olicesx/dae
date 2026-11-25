@@ -11,12 +11,14 @@ import (
 	"net/netip"
 	"slices"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
 	daeerrors "github.com/daeuniverse/dae/common/errors"
 	"github.com/daeuniverse/dae/component/routing"
+	"github.com/daeuniverse/dae/config"
 	"github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
 	"golang.org/x/sys/unix"
@@ -42,9 +44,9 @@ func requirePinnedUDPRefs(t *testing.T, m *SessionManager, keys []bpfTuplesKey, 
 // newDroughtTrackedEndpoint builds an established endpoint whose upstream
 // stopped replying while the client kept sending, with src -> dst tracked. Its
 // next write retires it, which is the fork's stale-session rebuild.
-func newDroughtTrackedEndpoint(manager *SessionManager, src, dst netip.AddrPort) *UdpEndpoint {
+func newDroughtTrackedEndpoint(owner udpConnStateOwner, src, dst netip.AddrPort) *UdpEndpoint {
 	ue := newTestEndpoint(&mockPacketConn{})
-	ue.udpConnStateOwner = manager
+	ue.udpConnStateOwner = owner
 	ue.hasReply.Store(true)
 	ue.lastReplyNano.Store(time.Now().Add(-udpEndpointReplyDroughtWindow - time.Second).UnixNano())
 	ue.writesSinceReply.Store(300)
@@ -146,9 +148,12 @@ func TestUdpEndpointDroughtRebuildHandsOverNoPinWithoutTrackedState(t *testing.T
 	}
 }
 
-// The retained path declines the shortcut instead of carrying the pin on, so
-// it must give the pin back at once. A pin left here would outlive the flow.
-func TestRetainedUDPEndpointUnpinsDroughtRebuildHandoff(t *testing.T) {
+// The retained path declines the shortcut and hands its pin to the caller:
+// the caller dials the replacement on the current epoch and must keep the
+// conn-state pinned until that replacement tracks the flow. Releasing the pin
+// on the decline deleted the entry before the re-track and reopened the gap
+// the pin exists to close (daeuniverse/dae#1137).
+func TestRetainedUDPEndpointHandsDroughtRebuildPinToCaller(t *testing.T) {
 	manager := NewSessionManager(context.Background())
 	defer func() { _ = manager.Close() }()
 
@@ -178,10 +183,148 @@ func TestRetainedUDPEndpointUnpinsDroughtRebuildHandoff(t *testing.T) {
 	keys := udpPairKeys(src, dst)
 	requirePinnedUDPRefs(t, manager, keys, 1, "before the write")
 
-	if cp.handleRetainedUDPEndpoint([]byte("hello"), src, dst, &bpfRoutingResult{}, UdpFlowDecision{}) {
+	consumed, pin := cp.handleRetainedUDPEndpoint([]byte("hello"), src, dst, &bpfRoutingResult{}, UdpFlowDecision{})
+	if consumed {
 		t.Fatal("a retired endpoint must make the retained path decline the shortcut")
 	}
-	requirePinnedUDPRefs(t, manager, keys, 0, "after the retained path declined")
+	if pin == nil {
+		t.Fatal("a drought rebuild on the retained path must hand its pin to the caller")
+	}
+	requirePinnedUDPRefs(t, manager, keys, 1, "while the caller holds the handover pin")
+
+	replacement := &UdpEndpoint{conn: &mockPacketConn{}, udpConnStateOwner: manager}
+	replacement.TrackUdpConnStateTuplePair(src, dst)
+	pin()
+	requirePinnedUDPRefs(t, manager, keys, 1, "after the handover (the replacement)")
+	replacement.releaseTrackedUdpConnState()
+	requirePinnedUDPRefs(t, manager, keys, 0, "after the replacement is released")
+}
+
+func TestRetainedUDPDroughtFallsBackWhenEpochOwnerIsGone(t *testing.T) {
+	resetActiveControlPlanePublicationForTest(t)
+	manager := NewSessionManager(context.Background())
+	t.Cleanup(func() { _ = manager.Close() })
+	oldPool := DefaultUdpEndpointPool
+	DefaultUdpEndpointPool = NewUdpEndpointPool()
+	t.Cleanup(func() {
+		DefaultUdpEndpointPool.Reset()
+		DefaultUdpEndpointPool = oldPool
+	})
+
+	conn := &udpReuseSimulationConn{
+		reads:   make(chan scriptedPacketRead),
+		closeCh: make(chan struct{}),
+	}
+	d, underlay := newCountingProxyEndpointDialer("hysteria2", "proxy.example:443", conn)
+	cp := newUdpReuseSimulationControlPlane(newTestFixedOutboundGroup(d))
+	cp.sessionManager = manager
+	program, err := routing.NewNormalizedProgram(nil, config.FunctionOrString("proxy"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	builder, err := NewRoutingMatcherBuilderFromProgram(cp.log, program, map[string]uint8{"proxy": uint8(consts.OutboundUserDefinedMin)}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp.routingMatcher, err = builder.BuildUserspace()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	src := netip.MustParseAddrPort("192.0.2.55:3074")
+	dst := netip.MustParseAddrPort("198.51.100.55:3074")
+	ue := newDroughtTrackedEndpoint(manager, src, dst)
+	ue.Dialer = newTestEndpointDialer(&mockPacketConn{})
+	ue.poolKey = UdpEndpointKey{Src: src}
+	ue.hasSent.Store(true)
+	manager.generationsMu.Lock()
+	manager.appendUDPFlowSourceLocked(src, &UDPFlowRuntime{
+		manager:  manager,
+		endpoint: ue,
+		binding:  UdpFlowBinding{Route: UdpRouteBinding{PolicyEpoch: routing.PolicyEpoch(7)}},
+	})
+	manager.generationsMu.Unlock()
+
+	result := &bpfRoutingResult{DatapathGeneration: 1}
+	payload := []byte("rebuild")
+	decision := ClassifyUdpFlow(src, dst, payload)
+	if err := cp.handlePktWithPrefetch(payload, src, dst, result, decision, nil, UdpEndpointKey{}, false); err != nil {
+		t.Fatalf("retained UDP rebuild did not fall back to current policy: %v", err)
+	}
+	if dials, writes := underlay.calls.Load(), conn.writeCalls.Load(); dials != 1 || writes != 1 || !ue.dead.Load() {
+		t.Fatalf("want a retired endpoint and one replacement write, got dead=%v dials=%d writes=%d", ue.dead.Load(), dials, writes)
+	}
+	requirePinnedUDPRefs(t, manager, udpPairKeys(src, dst), 1, "after fallback (held by the replacement)")
+}
+
+// gatingUDPConnStateOwner parks the pin's retain between its snapshot and its
+// effect, which is exactly the window in which a concurrent close used to slip
+// in: the close released the last reference and deleted the kernel entry, and
+// the parked retain then counted a reference to an entry that no longer existed.
+type gatingUDPConnStateOwner struct {
+	udpConnStateOwner
+	// gateArmed lets the endpoint's initial track pass; the next retain, the
+	// pin's, is parked.
+	gateArmed     atomic.Bool
+	retainEntered chan struct{}
+	retainRelease chan struct{}
+}
+
+func (o *gatingUDPConnStateOwner) RetainUdpConnStateTuples(keys []bpfTuplesKey) {
+	if !o.gateArmed.Swap(true) {
+		o.udpConnStateOwner.RetainUdpConnStateTuples(keys)
+		return
+	}
+	close(o.retainEntered)
+	<-o.retainRelease
+	o.udpConnStateOwner.RetainUdpConnStateTuples(keys)
+}
+
+// A pin taken while the endpoint closes must never count a reference to an
+// entry that Close already deleted. The retain runs under the endpoint lock,
+// so a concurrent release waits for it and then sees the pinned tuple: it takes
+// the whole count down in one pass and the entry is deleted once. Taken outside
+// the lock, the release completed while the retain was parked, deleted the
+// entry, and the parked retain raised a phantom reference to it.
+func TestUdpEndpointRebuildPinInterleavedWithCloseNeverResurrectsDeletedState(t *testing.T) {
+	src := netip.MustParseAddrPort("192.0.2.54:3074")
+	dst := netip.MustParseAddrPort("198.51.100.54:3074")
+	keys := udpPairKeys(src, dst)
+	manager := NewSessionManager(context.Background())
+	defer func() { _ = manager.Close() }()
+	owner := &gatingUDPConnStateOwner{
+		udpConnStateOwner: manager,
+		retainEntered:     make(chan struct{}),
+		retainRelease:     make(chan struct{}),
+	}
+	ue := newDroughtTrackedEndpoint(owner, src, dst)
+
+	pin := make(chan func(), 1)
+	go func() { pin <- ue.pinTrackedUdpConnStatePair() }()
+	<-owner.retainEntered // The pin has taken its snapshot; its retain is parked.
+
+	released := make(chan struct{})
+	go func() {
+		ue.releaseTrackedUdpConnState()
+		close(released)
+	}()
+	releasedBeforeRetain := false
+	select {
+	case <-released:
+		releasedBeforeRetain = true
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(owner.retainRelease)
+	<-released
+	if unpin := <-pin; unpin != nil {
+		unpin()
+	} else {
+		t.Error("the pin was taken before the endpoint closed and must not decline")
+	}
+	if releasedBeforeRetain {
+		t.Error("close released the tuple before the pin's retain completed")
+	}
+	requirePinnedUDPRefs(t, manager, keys, 0, "after the pin and the close both completed")
 }
 
 // pooledUdpEndpointsExcept returns every endpoint left in the default pool.

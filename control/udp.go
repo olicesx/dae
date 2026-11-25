@@ -508,21 +508,27 @@ func forwardUdpEndpointReplyToClient(log *logrus.Logger, ue *UdpEndpoint, data [
 	return nil
 }
 
-func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision) bool {
+// handleRetainedUDPEndpoint writes one datagram through a session that a
+// previous routing epoch established. It reports whether the datagram was
+// consumed. On a reply-drought rebuild the session's conn-state pin is handed
+// back instead of being dropped: the caller dials the replacement on the
+// current epoch and must keep the pin until that replacement tracks the flow
+// (daeuniverse/dae#1137), exactly as the current-epoch paths do.
+func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision) (consumed bool, rebuildPin func()) {
 	manager, _ := c.controlPlaneSessionManager()
 	if manager == nil {
-		return false
+		return false, nil
 	}
 	ue, ok := manager.retainedUDPEndpoint(src, realDst, routingResult, c.PolicyEpoch())
 	if !ok {
-		return false
+		return false, nil
 	}
 	if !c.checkUdpEndpointHealth(ue, true) {
 		ue.retire()
 		// Same treatment as the write-failure retirement below: retire, then
 		// decline the shortcut so the triggering datagram is delivered on a
 		// fresh session instead of dying with the drained one.
-		return false
+		return false, nil
 	}
 	if ue.peerNeedsDedicatedSession(realDst, time.Now()) {
 		// A peer whose mapping the far end has forgotten gets the same treatment
@@ -530,7 +536,7 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 		// so the normal path dials it its own session instead of writing into a
 		// hole. The retained session keeps serving its other peers until its
 		// epoch drains.
-		return false
+		return false, nil
 	}
 	if flowDecision.HasConfirmedQuicState() || ue.SniffedDomain != "" {
 		ue.UpdateNatTimeout(QuicNatTimeout)
@@ -540,12 +546,7 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 	if err != nil {
 		if isUdpEndpointWriteTolerated(err) {
 			// Transient write failure: drop the datagram, keep the session.
-			return true
-		}
-		// The fresh session is dialed by the normal path, which does not see
-		// this error, so the pin cannot be handed on: unpin now.
-		if pin := takeUdpEndpointRebuildPin(err); pin != nil {
-			pin()
+			return true, nil
 		}
 		if lifecycle, lifecycleOK := newUdpSessionLifecycleContext(ue, ""); lifecycleOK && c.shouldPenalizeUdpEndpointWriteError(err) {
 			lifecycle.reportUnavailable(fmt.Errorf("retained UDP endpoint write failed: %w", err))
@@ -562,7 +563,11 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 		// classifies as a normal close) as remove-and-redial and delivers the
 		// triggering datagram on the fresh session. A draining old epoch
 		// should not lose one datagram per drought event.
-		return false
+		//
+		// The pin travels with the decline: releasing it here would delete the
+		// conn-state entry before the replacement below re-tracks the flow,
+		// reopening the gap the pin exists to close.
+		return false, takeUdpEndpointRebuildPin(err)
 	}
 	// The retained endpoint still belongs to this plane's connection, so
 	// meter it through the plane-bound recorder like every other egress
@@ -577,7 +582,7 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 			lifecycle.reportTrafficSuccess()
 		}
 	}
-	return true
+	return true, nil
 }
 
 func currentPolicyUDPRoutingResult(stale *bpfRoutingResult) *bpfRoutingResult {
@@ -613,17 +618,24 @@ func (c *ControlPlane) prepareUnownedUDPCurrentPolicyFallback(src, dst netip.Add
 }
 
 func (c *ControlPlane) handlePktWithPrefetch(data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision, prefetched *UdpEndpoint, prefetchKey UdpEndpointKey, prefetchOK bool) (err error) {
-	if c.handleRetainedUDPEndpoint(data, src, realDst, routingResult, flowDecision) {
+	consumed, rebuildPin := c.handleRetainedUDPEndpoint(data, src, realDst, routingResult, flowDecision)
+	if consumed {
 		return nil
 	}
 	owner, release, ownerErr := c.acquireRoutingEpochExecutionOwner(routingResult)
 	if ownerErr != nil {
+		// A replacement for this epoch cannot use the cached routing result.
+		// Drop our temporary pin before checking whether the tuple can be
+		// retired. Pins owned by other live endpoints still block fallback.
+		if rebuildPin != nil {
+			rebuildPin()
+		}
 		if stderrors.Is(ownerErr, errRoutingEpochOwnerUnavailable) {
 			if fallbackResult, fallback, retireErr := c.prepareUnownedUDPCurrentPolicyFallback(src, realDst, routingResult); fallback {
 				if retireErr != nil && c.log != nil && c.log.IsLevelEnabled(logrus.DebugLevel) {
 					c.log.WithError(retireErr).Debug("Failed to remove unowned stale UDP conn-state before current-policy fallback")
 				}
-				return c.handlePktOwned(data, src, realDst, fallbackResult, flowDecision, nil, UdpEndpointKey{}, false)
+				return c.handlePktOwned(data, src, realDst, fallbackResult, flowDecision, nil, UdpEndpointKey{}, false, nil)
 			}
 		}
 		return fmt.Errorf("select UDP routing epoch owner: %w", ownerErr)
@@ -632,19 +644,23 @@ func (c *ControlPlane) handlePktWithPrefetch(data []byte, src, realDst netip.Add
 		defer release()
 	}
 	if owner != c {
-		return owner.handlePktOwned(data, src, realDst, routingResult, flowDecision, prefetched, prefetchKey, prefetchOK)
+		return owner.handlePktOwned(data, src, realDst, routingResult, flowDecision, prefetched, prefetchKey, prefetchOK, rebuildPin)
 	}
-	return c.handlePktOwned(data, src, realDst, routingResult, flowDecision, prefetched, prefetchKey, prefetchOK)
+	return c.handlePktOwned(data, src, realDst, routingResult, flowDecision, prefetched, prefetchKey, prefetchOK, rebuildPin)
 }
 
-func (c *ControlPlane) handlePktOwned(data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision, prefetched *UdpEndpoint, prefetchKey UdpEndpointKey, prefetchOK bool) (err error) {
+// handlePktOwned delivers one datagram on the plane that owns the routing
+// epoch. rebuildPin is an optional conn-state pin inherited from a retained
+// session that rebuilt while writing this datagram; like a pin taken on the
+// paths below, it is released once the replacement tracks the flow, or at
+// return when the datagram is not delivered through a replacement.
+func (c *ControlPlane) handlePktOwned(data []byte, src, realDst netip.AddrPort, routingResult *bpfRoutingResult, flowDecision UdpFlowDecision, prefetched *UdpEndpoint, prefetchKey UdpEndpointKey, prefetchOK bool, rebuildPin func()) (err error) {
 	var realSrc netip.AddrPort
 	var domain string
 	var ueKey UdpEndpointKey
 	var excludedDialer *dialer.Dialer
 	// Held from a reply-drought rebuild until the replacement tracks the
 	// flow (daeuniverse/dae#1137).
-	var rebuildPin func()
 	defer func() {
 		if rebuildPin != nil {
 			rebuildPin()

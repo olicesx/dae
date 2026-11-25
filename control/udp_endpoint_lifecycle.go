@@ -87,9 +87,9 @@ func (ue *UdpEndpoint) setFlowBinding(binding UdpFlowBinding) {
 // entry only when the shared refcount reaches zero, so a tuple another endpoint
 // (or another flow) still pins survives the move.
 //
-// Lock order: udpConnStateMu protects the tuple set and the last-pair snapshot
-// together; it is never held while calling into the owner (Retain/Release take
-// udpStateMu downstream), matching releaseTrackedUdpConnState.
+// udpConnStateMu protects the tuple set and the last-pair snapshot. Retain
+// new tuples before unlocking so Close can only release counted references.
+// Superseded tuples are already detached from the set when released.
 func (ue *UdpEndpoint) TrackUdpConnStateTuplePair(src, dst netip.AddrPort) {
 	if ue == nil || !src.IsValid() || !dst.IsValid() {
 		return
@@ -141,11 +141,11 @@ func (ue *UdpEndpoint) TrackUdpConnStateTuplePair(src, dst netip.AddrPort) {
 			release = append(release, key)
 		}
 	}
-	ue.udpConnStateMu.Unlock()
-
 	if len(retain) > 0 {
 		owner.RetainUdpConnStateTuples(retain)
 	}
+	ue.udpConnStateMu.Unlock()
+
 	if len(release) > 0 {
 		if err := owner.ReleaseUdpConnStateTuples(release); err != nil &&
 			ue.log != nil && ue.log.IsLevelEnabled(logrus.DebugLevel) {
@@ -156,16 +156,24 @@ func (ue *UdpEndpoint) TrackUdpConnStateTuplePair(src, dst netip.AddrPort) {
 
 // pinTrackedUdpConnStatePair pins the endpoint's current tuple pair and
 // returns the unpin function, or nil when nothing is tracked.
+//
+// The retain runs under udpConnStateMu, the same lock Close takes to release
+// the endpoint's tuples. Taken outside, a concurrent Close could release the
+// last reference and delete the kernel entry between the snapshot and the
+// retain; the retain would then count a reference to an entry that no longer
+// exists, and the flow would lose its routing state for the rebuild. Under the
+// lock either order is safe: the pin is counted before Close releases, or the
+// pin observes the closed flag and declines. RetainUdpConnStateTuples only
+// takes udpStateMu and never calls back into the endpoint, so the lock order
+// udpConnStateMu -> udpStateMu introduces no cycle.
 func (ue *UdpEndpoint) pinTrackedUdpConnStatePair() func() {
 	if ue == nil {
 		return nil
 	}
 	ue.udpConnStateMu.Lock()
-	owner := ue.udpConnStateOwner
-	pair := ue.udpConnStateLastPair.Load()
-	closed := ue.udpConnStateClosed
-	ue.udpConnStateMu.Unlock()
+	owner, pair, closed := ue.udpConnStateOwner, ue.udpConnStateLastPair.Load(), ue.udpConnStateClosed
 	if closed || owner == nil || pair == nil {
+		ue.udpConnStateMu.Unlock()
 		return nil
 	}
 	keys := []bpfTuplesKey{
@@ -173,6 +181,7 @@ func (ue *UdpEndpoint) pinTrackedUdpConnStatePair() func() {
 		bpfTuplesKeyFromAddrPorts(pair.dst, pair.src, uint8(syscall.IPPROTO_UDP)),
 	}
 	owner.RetainUdpConnStateTuples(keys)
+	ue.udpConnStateMu.Unlock()
 	log := ue.log
 	return func() {
 		if err := owner.ReleaseUdpConnStateTuples(keys); err != nil &&
@@ -183,7 +192,8 @@ func (ue *UdpEndpoint) pinTrackedUdpConnStatePair() func() {
 }
 
 // udpEndpointRebuildError is returned by WriteTo after it retires a stale
-// endpoint. The caller drops its pin once the replacement tracks the flow.
+// endpoint. The caller drops its pin once the replacement tracks the flow, or
+// right away when no replacement is dialed for the triggering datagram.
 type udpEndpointRebuildError struct {
 	err     error
 	release func()

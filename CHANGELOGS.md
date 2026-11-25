@@ -176,6 +176,13 @@ changed. Review them before upgrading:
 
 #### Bug Fixes
 
+- fix(kern): dae starts on kernels that check packet alignment strictly, such
+  as LoongArch with `ARCH_STRICT_ALIGN=y`. The L3 TC programs read the IPv4 and
+  IPv6 addresses and the TCP sequence numbers with 4-byte loads; without an
+  Ethernet header those sit two bytes off a word boundary, and the verifier
+  rejected all six `_l3` programs as misaligned. They are read as two halves on
+  those hooks now; the L2 programs are unchanged (port of upstream PR
+  daeuniverse/dae#1160, which fixes daeuniverse/dae#1159)
 - fix(control): a UDP session rebuilt after a reply drought no longer risks
   bypassing the proxy for the rest of the flow. The rebuild deleted the kernel
   conn-state of the flow before the replacement session took it over; a reply

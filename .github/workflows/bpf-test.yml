@@ -37,7 +37,8 @@ permissions: read-all
 jobs:
   bpf_tests:
     name: BPF Unit Test
-    runs-on: ubuntu-latest
+    # Each clang comes from the archive of the image that still ships it: Ubuntu 26.04 dropped 15 to 19.
+    runs-on: ubuntu-24.04
     env:
       CGO_ENABLED: 0
     strategy:
@@ -174,7 +175,8 @@ jobs:
 
   bpf_abi_big_endian:
     name: BPF ABI (s390x)
-    runs-on: ubuntu-latest
+    # Ubuntu 26.04 has no qemu-user-static package.
+    runs-on: ubuntu-24.04
     env:
       CGO_ENABLED: 0
 

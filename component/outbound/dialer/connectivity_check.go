@@ -677,6 +677,10 @@ type CheckOption struct {
 	// state is logged at debug level and only a transition is logged loudly.
 	advisorySeen atomic.Bool
 	advisoryOK   atomic.Bool
+
+	// A slow advisory probe may span several health cycles. Skip new
+	// attempts until it finishes so verdicts stay in order.
+	advisoryRunning atomic.Bool
 }
 
 func (d *Dialer) ActivateCheck() {
@@ -1145,7 +1149,9 @@ func filterCheckOptsByFamily(opts []*CheckOption, family consts.L4ProtoStr) []*C
 	return result
 }
 
-// submitCheckTasks submits check tasks to worker pool.
+// submitCheckTasks sends health probes to the shared pool and counts them in
+// wg. Advisory probes run independently so they cannot occupy a health probe
+// slot or delay the next health cycle.
 func (d *Dialer) submitCheckTasks(workerPool *ants.Pool, wg *sync.WaitGroup, opts []*CheckOption, isResuscitation bool, cycle *cycleResult) {
 	for _, opt := range opts {
 		// No need to test if there is no dialer selection policy using its latency.
@@ -1168,10 +1174,8 @@ func (d *Dialer) submitCheckTasks(workerPool *ants.Pool, wg *sync.WaitGroup, opt
 		default:
 		}
 
-		wg.Add(1)
 		checkOpt := opt
 		worker := func() {
-			defer wg.Done()
 			select {
 			case <-d.ctx.Done():
 				return
@@ -1179,10 +1183,25 @@ func (d *Dialer) submitCheckTasks(workerPool *ants.Pool, wg *sync.WaitGroup, opt
 			}
 			_, _ = d.check(checkOpt, isResuscitation, cycle)
 		}
+
+		if opt.Advisory {
+			if opt.advisoryRunning.CompareAndSwap(false, true) {
+				go func() {
+					defer checkOpt.advisoryRunning.Store(false)
+					worker()
+				}()
+			}
+			continue
+		}
+
+		wg.Add(1)
 		submitNow := func() {
 			// wg ownership: the worker Dones on completion; callers of
 			// submitNow must Done only when the worker never runs.
-			if err := workerPool.Submit(worker); err != nil {
+			if err := workerPool.Submit(func() {
+				defer wg.Done()
+				worker()
+			}); err != nil {
 				// Nonblocking pools report overload immediately. Health checks are
 				// periodic, so skip this probe instead of spawning an unbounded
 				// goroutine that can outlive the dialer lifecycle.
@@ -1196,7 +1215,7 @@ func (d *Dialer) submitCheckTasks(workerPool *ants.Pool, wg *sync.WaitGroup, opt
 			// OUTSIDE the worker pool — sleeping inside pool workers makes
 			// each emergency probe occupy a pool slot for the whole delay and,
 			// during a fleet-wide outage (every node resuscitating at once),
-			// starves the periodic checks of healthy nodes exactly when they
+			// starve the periodic checks of healthy nodes exactly when they
 			// matter most.
 			time.AfterFunc(time.Duration(fastrand.Int63n(int64(2*time.Second))), func() {
 				select {
@@ -1792,10 +1811,11 @@ func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResu
 }
 
 // logAdvisoryProbeResult reports an advisory probe outcome without touching any
-// health state. Skips (no applicable IP, probe-infrastructure failure) and the
-// plain "no result" case carry no evidence about the path and stay at debug
-// level; only a change of verdict is logged loudly, so a path that stays broken
-// costs one warning rather than one per cycle.
+// health state. Skips (no applicable IP, probe-infrastructure failure, the
+// dialer being torn down mid-probe) and the plain "no result" case carry no
+// evidence about the path and stay at debug level; only a change of verdict is
+// logged loudly, so a path that stays broken costs one warning rather than one
+// per cycle.
 func (d *Dialer) logAdvisoryProbeResult(opt *CheckOption, ok bool, err error, latency time.Duration) {
 	fields := logrus.Fields{
 		"network": opt.networkType.String(),
@@ -1806,7 +1826,13 @@ func (d *Dialer) logAdvisoryProbeResult(opt *CheckOption, ok bool, err error, la
 	} else if err != nil {
 		fields["err"] = err.Error()
 	}
-	if !ok && (err == nil || stderrors.Is(err, ErrNoApplicableIP) || stderrors.Is(err, errCheckOptionUnavailable)) {
+	// A teardown error means the dialer was retired while the probe was in
+	// flight (a reload cancels d.ctx). It says nothing about the path, so it is
+	// a skip like the others above: logging it as a failure would blame the
+	// upstream for the operator's own reload, and flipping advisoryOK would
+	// make the next real probe report a spurious recovery.
+	if !ok && (err == nil || stderrors.Is(err, ErrNoApplicableIP) ||
+		stderrors.Is(err, errCheckOptionUnavailable) || d.isLifecycleTeardownError(err)) {
 		d.Log.WithFields(fields).Debugln("Advisory probe skipped")
 		return
 	}

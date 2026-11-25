@@ -9,9 +9,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/config"
@@ -221,7 +223,12 @@ func TestSubmitCheckTasks_SkipsAdvisoryProbesWhenResuscitating(t *testing.T) {
 			var wg sync.WaitGroup
 			d.submitCheckTasks(pool, &wg, []*CheckOption{opt}, tc.resuscitation, nil)
 			wg.Wait()
-			require.Equal(t, tc.wantCalls, calls.Load())
+			if !tc.resuscitation {
+				require.Eventually(t, func() bool { return calls.Load() == tc.wantCalls }, time.Second, time.Millisecond)
+			} else {
+				require.False(t, opt.advisoryRunning.Load())
+				require.Zero(t, calls.Load())
+			}
 		})
 	}
 }
@@ -236,4 +243,131 @@ func TestNewGlobalOption_CheckDnsTcpComesFromConfig(t *testing.T) {
 		got := NewGlobalOption(&config.Global{CheckDnsTcp: want}, log).CheckDnsTcp
 		require.Equal(t, want, got)
 	}
+}
+
+// newAdvisoryTestDialer returns a dialer that a random-policy group selects on
+// typ, so its probes are not skipped for lack of a consumer.
+func newAdvisoryTestDialer(t *testing.T, typ *NetworkType) *Dialer {
+	t.Helper()
+	d := newNamedTestDialer(t, "node")
+	set := NewAliveDialerSet(
+		d.Log,
+		"group",
+		typ,
+		0,
+		consts.DialerSelectionPolicy_Random,
+		[]*Dialer{d},
+		[]*Annotation{{}},
+		func(bool) {},
+		true,
+	)
+	d.RegisterAliveDialerSet(set)
+	t.Cleanup(func() { d.UnregisterAliveDialerSet(set) })
+	return d
+}
+
+// A parked diagnostic must leave the shared worker slot and the health
+// wait group available. Consecutive cycles must also skip the parked option.
+func TestSubmitCheckTasks_AdvisoryDoesNotBlockHealthOrOverlap(t *testing.T) {
+	typ := newTestNetworkType()
+	pool, err := ants.NewPool(1, ants.WithNonblocking(true))
+	require.NoError(t, err)
+	t.Cleanup(pool.Release)
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	var advisoryCalls, healthCalls atomic.Int32
+	advisory := &CheckOption{
+		networkType: typ,
+		Advisory:    true,
+		CheckFunc: func(context.Context, *NetworkType) (bool, error) {
+			if advisoryCalls.Add(1) == 1 {
+				close(entered)
+				<-release
+			}
+			return true, nil
+		},
+	}
+	health := &CheckOption{
+		networkType: typ,
+		CheckFunc: func(context.Context, *NetworkType) (bool, error) {
+			healthCalls.Add(1)
+			return true, nil
+		},
+	}
+	var wg sync.WaitGroup
+	d := newAdvisoryTestDialer(t, typ)
+	t.Cleanup(unblock)
+	d.submitCheckTasks(pool, &wg, []*CheckOption{advisory}, false, nil)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("advisory probe did not start")
+	}
+
+	d.submitCheckTasks(pool, &wg, []*CheckOption{advisory, health}, false, nil)
+	healthDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(healthDone)
+	}()
+	select {
+	case <-healthDone:
+	case <-time.After(time.Second):
+		t.Fatal("the health wait group waited for a pending advisory probe")
+	}
+	require.Equal(t, int32(1), healthCalls.Load(), "the parked advisory probe held the health worker slot")
+
+	unblock()
+	require.Eventually(t, func() bool { return !advisory.advisoryRunning.Load() }, time.Second, time.Millisecond)
+	require.Equal(t, int32(1), advisoryCalls.Load(), "the next cycle duplicated a pending advisory probe")
+	d.submitCheckTasks(pool, &wg, []*CheckOption{advisory}, false, nil)
+	require.Eventually(t, func() bool { return advisoryCalls.Load() == 2 }, time.Second, time.Millisecond)
+}
+
+// A reload cancels d.ctx while a probe may be in flight. For a health probe
+// that is a teardown error which leaves node state alone; an advisory probe
+// owes the path the same courtesy. Logging the cancellation as a failure would
+// blame the upstream for the operator's reload, and flipping advisoryOK would
+// make the next real probe announce a recovery that never happened.
+func TestAdvisoryProbe_TeardownIsASkipNotAFailure(t *testing.T) {
+	typ := newTestNetworkType()
+	d := newAdvisoryTestDialer(t, typ)
+	// A skip is a debug-level entry; the default Info level would drop it.
+	d.Log.SetLevel(logrus.DebugLevel)
+	hook := test.NewLocal(d.Log)
+
+	// Establish a healthy verdict so a failure would be a visible transition.
+	healthy := &CheckOption{
+		networkType: typ,
+		Advisory:    true,
+		CheckFunc:   func(context.Context, *NetworkType) (bool, error) { return true, nil },
+	}
+	_, _ = d.check(healthy, false, nil)
+	require.True(t, healthy.advisoryOK.Load(), "precondition: the path is recorded as healthy")
+
+	// Cancel the dialer from inside the probe, the way a reload does.
+	// check() derives its timeout from d.ctx, so the probe cancels the dialer
+	// only once it is running.
+	torn := &CheckOption{
+		networkType: typ,
+		Advisory:    true,
+		CheckFunc: func(ctx context.Context, _ *NetworkType) (bool, error) {
+			d.cancel()
+			return false, ctx.Err()
+		},
+	}
+	hook.Reset()
+	_, _ = d.check(torn, false, nil)
+
+	var advisory []*logrus.Entry
+	for _, e := range hook.AllEntries() {
+		if strings.HasPrefix(e.Message, "Advisory probe") {
+			advisory = append(advisory, e)
+		}
+	}
+	require.Len(t, advisory, 1)
+	require.Equal(t, "Advisory probe skipped", advisory[0].Message)
+	require.Equal(t, logrus.DebugLevel, advisory[0].Level, "a teardown must not be logged as a path failure")
+	require.False(t, torn.advisorySeen.Load(), "a teardown carries no verdict, so none is recorded")
 }

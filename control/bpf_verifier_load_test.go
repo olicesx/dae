@@ -8,6 +8,7 @@
 package control
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
+	"github.com/daeuniverse/dae/common"
 	"golang.org/x/sys/unix"
 )
 
@@ -76,6 +78,14 @@ func loadProductionProgramsOnce(t *testing.T, useRedirectPeer, hasBpfGetCurrentT
 		controlPlanePid:      uint32(os.Getpid()),
 		useRedirectPeer:      useRedirectPeer,
 		hasBpfGetCurrentTask: hasBpfGetCurrentTask,
+		// The values a running daemon has, not the zero values. A cold start
+		// stamps its socket mark and a non-zero generation, and both change
+		// which branches the verifier keeps: with a zero mark the socket-mark
+		// test folds away, and so do packet paths behind it. Loading with the
+		// production values is what makes this gate stand for the configuration
+		// users actually run.
+		datapathGeneration: 1,
+		daeSocketMark:      common.InternalSoMarkFromDae,
 	}
 	if err := spec.Variables["PARAM"].Set(param); err != nil {
 		t.Fatalf("set PARAM: %v", err)
@@ -101,8 +111,15 @@ func loadProductionProgramsOnce(t *testing.T, useRedirectPeer, hasBpfGetCurrentT
 		Programs: ebpf.ProgramOptions{LogLevel: ebpf.LogLevelStats},
 	})
 	if err != nil {
-		// %+v prints the whole verifier log of every rejected program.
-		t.Fatalf("load programs: %+v", err)
+		// The collection loader wraps a verifier rejection in its own error,
+		// and formatting that wrapper prints only the summary line. Unwrap to
+		// the VerifierError for the instruction and register detail that is
+		// needed to diagnose a compiler-specific rejection.
+		var ve *ebpf.VerifierError
+		if errors.As(err, &ve) {
+			t.Fatalf("load programs: %+v", ve)
+		}
+		t.Fatalf("load programs: %v", err)
 	}
 	defer coll.Close()
 	names := make([]string, 0, len(coll.Programs))

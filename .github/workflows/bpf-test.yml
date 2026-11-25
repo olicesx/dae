@@ -111,6 +111,11 @@ jobs:
               # age backstops and the stale marker retire, and that a pinned
               # entry survives both.
               TestConnStateJanitorBoundaries
+              # The production object must also load under the strict-alignment
+              # kernel model (BPF_F_STRICT_ALIGNMENT): the L3 hooks have no
+              # Ethernet header, where a 4-byte packet read is misaligned
+              # (daeuniverse/dae#1159). Load only, nothing is attached.
+              TestProductionProgramsLoad
             )
             printf '%s\n' "${whitelist[@]}" | sort -u > /tmp/datapath-whitelist.txt
 

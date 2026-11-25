@@ -127,6 +127,36 @@ func testAddr(t *testing.T, s string) netip.Addr {
 	return addr
 }
 
+// release retires the generation's tracker. A task the worker already
+// dequeued must not repopulate the maps release emptied, and no further task may
+// be enqueued: the plane only serves its established flows from then on.
+func TestSniLearningReleaseRejectsInFlightAndNewTasks(t *testing.T) {
+	s, fake, _ := newTestSniLearning(t, false)
+	addr := testAddr(t, "2001:db8::2")
+
+	// A task is queued, and the worker has taken it off the queue, when the
+	// generation retires.
+	s.LearnSniffed(addr, "a.group.example", sniffing.SniffProtocolTLS)
+	task := <-s.queue
+	s.release()
+
+	s.processTask(task)
+	s.LearnSniffed(addr, "b.group.example", sniffing.SniffProtocolTLS)
+
+	if puts, _, _ := fake.snapshot(); len(puts) != 0 {
+		t.Fatalf("a released tracker projected %d entries; want none", len(puts))
+	}
+	if queued := len(s.queue); queued != 0 {
+		t.Fatalf("%d task(s) enqueued after release; want none", queued)
+	}
+	s.trackerMu.Lock()
+	owners, ips := len(s.owners), len(s.ips)
+	s.trackerMu.Unlock()
+	if owners != 0 || ips != 0 {
+		t.Fatalf("after release owners=%d ips=%d; the dequeued task refilled the maps", owners, ips)
+	}
+}
+
 func TestSniLearningLearnsTlsIntoActiveSlot(t *testing.T) {
 	s, fake, _ := newTestSniLearning(t, false)
 	addr := testAddr(t, "2001:db8::1")

@@ -151,6 +151,14 @@ type sniLearning struct {
 	trackerMu sync.Mutex
 	owners    map[string]*sniOwner
 	ips       map[[4]uint32]map[string]struct{}
+	// released is set by release. Once set, a task the worker already
+	// dequeued must not repopulate the maps release just emptied, and no new
+	// task is accepted: the generation is gone and the plane only serves its
+	// established flows. It is atomic so enqueue, which runs on every sniff
+	// success, can test it without contending for trackerMu against the
+	// worker; processTask re-checks it under the lock, where it must hold to
+	// stay mutually exclusive with the map reset.
+	released atomic.Bool
 
 	enqueued      atomic.Uint64
 	dropped       atomic.Uint64
@@ -220,6 +228,9 @@ func (s *sniLearning) enqueue(addr netip.Addr, domain string) {
 	if s == nil || !s.enabled || domain == "" {
 		return
 	}
+	if s.released.Load() {
+		return
+	}
 	task := sniLearnTask{
 		addr:   sniRoutingKey(addr),
 		domain: domain,
@@ -254,6 +265,13 @@ func (s *sniLearning) serve(ctx context.Context) {
 func (s *sniLearning) processTask(task sniLearnTask) {
 	raw := s.rawOwnerBitmap(task.domain)
 	s.trackerMu.Lock()
+	if s.released.Load() {
+		// release ran between the dequeue and here. Learning for this
+		// generation is over; the projection below would be dropped as stale
+		// anyway, and writing here would undo the release.
+		s.trackerMu.Unlock()
+		return
+	}
 	now := time.Now()
 	owner := s.owners[task.domain]
 	if owner == nil {
@@ -471,12 +489,12 @@ func (s *sniLearning) release() {
 	if s == nil {
 		return
 	}
+	// Publish under the lock so a processTask that already passed its check
+	// cannot be interleaved with the map reset below.
 	s.trackerMu.Lock()
-	// Empty rather than nil: a learn task may already be queued when the
-	// generation retires, and assigning into a nil map panics. The empty maps
-	// are tiny; the point is to release the accumulated owners/IPs.
-	s.owners = make(map[string]*sniOwner)
-	s.ips = make(map[[4]uint32]map[string]struct{})
+	s.released.Store(true)
+	s.owners = nil
+	s.ips = nil
 	s.trackerMu.Unlock()
 }
 

@@ -6,8 +6,10 @@ package netutils
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,8 +17,7 @@ import (
 )
 
 // startUDPDNSRcode starts a UDP DNS responder that answers every query with
-// rcode and no answer records: what a failing or empty upstream looks like on
-// the wire, without needing a real resolver.
+// rcode and no answer records.
 func startUDPDNSRcode(t *testing.T, rcode int) netip.AddrPort {
 	t.Helper()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -46,6 +47,18 @@ func startUDPDNSRcode(t *testing.T, rcode int) netip.AddrPort {
 		}
 	}()
 	return netip.MustParseAddrPort(pc.LocalAddr().String())
+}
+
+// requireRcodeError fails unless err is the resolution error for want, as
+// opposed to a timeout, a dial failure, or any other unrelated error.
+func requireRcodeError(t *testing.T, err error, want int) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("want a %s error, got nil", dnsmessage.RcodeToString[want])
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("dns rcode %s (%d)", dnsmessage.RcodeToString[want], want)) {
+		t.Fatalf("want a %s error, got: %v", dnsmessage.RcodeToString[want], err)
+	}
 }
 
 func packedAnswer(t *testing.T, rcode int, withA bool) ([]byte, uint16) {
@@ -110,9 +123,10 @@ func TestResolveNetipSERVFAILReturnsError(t *testing.T) {
 	defer cancel()
 
 	addrs, err := ResolveNetip(ctx, stdNetDialer{}, srv, "example.com", dnsmessage.TypeA, "udp")
-	if err == nil {
-		t.Fatalf("SERVFAIL must be reported as an error, got addrs=%v err=nil", addrs)
+	if len(addrs) != 0 {
+		t.Fatalf("SERVFAIL returned addresses %v; want none", addrs)
 	}
+	requireRcodeError(t, err, dnsmessage.RcodeServerFailure)
 }
 
 func TestResolveIp46SERVFAILReportsBothLegs(t *testing.T) {
@@ -124,9 +138,8 @@ func TestResolveIp46SERVFAILReportsBothLegs(t *testing.T) {
 	if ip46.Ip4.IsValid() || ip46.Ip6.IsValid() {
 		t.Fatalf("unexpected addresses: %v %v", ip46.Ip4, ip46.Ip6)
 	}
-	if err4 == nil || err6 == nil {
-		t.Fatalf("both legs got SERVFAIL but reported err4=%v err6=%v", err4, err6)
-	}
+	requireRcodeError(t, err4, dnsmessage.RcodeServerFailure)
+	requireRcodeError(t, err6, dnsmessage.RcodeServerFailure)
 }
 
 // NXDOMAIN has to stay a non-error. Callers key their negative caches off
@@ -143,5 +156,10 @@ func TestResolveIp46NXDOMAINStaysNonError(t *testing.T) {
 	}
 	if err4 != nil || err6 != nil {
 		t.Fatalf("NXDOMAIN must stay a non-error, got err4=%v err6=%v", err4, err6)
+	}
+	// ResolveIp46 can also return an empty result when its context expires
+	// before either leg responds.
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("NXDOMAIN lookup did not complete before its deadline: %v", err)
 	}
 }

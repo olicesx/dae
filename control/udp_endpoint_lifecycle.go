@@ -154,6 +154,69 @@ func (ue *UdpEndpoint) TrackUdpConnStateTuplePair(src, dst netip.AddrPort) {
 	}
 }
 
+// pinTrackedUdpConnStatePair pins the endpoint's current tuple pair and
+// returns the unpin function, or nil when nothing is tracked.
+func (ue *UdpEndpoint) pinTrackedUdpConnStatePair() func() {
+	if ue == nil {
+		return nil
+	}
+	ue.udpConnStateMu.Lock()
+	owner := ue.udpConnStateOwner
+	pair := ue.udpConnStateLastPair.Load()
+	closed := ue.udpConnStateClosed
+	ue.udpConnStateMu.Unlock()
+	if closed || owner == nil || pair == nil {
+		return nil
+	}
+	keys := []bpfTuplesKey{
+		bpfTuplesKeyFromAddrPorts(pair.src, pair.dst, uint8(syscall.IPPROTO_UDP)),
+		bpfTuplesKeyFromAddrPorts(pair.dst, pair.src, uint8(syscall.IPPROTO_UDP)),
+	}
+	owner.RetainUdpConnStateTuples(keys)
+	log := ue.log
+	return func() {
+		if err := owner.ReleaseUdpConnStateTuples(keys); err != nil &&
+			log != nil && log.IsLevelEnabled(logrus.DebugLevel) {
+			log.WithError(err).Debug("[UdpEndpoint] Failed to release pinned UDP conn-state tuples")
+		}
+	}
+}
+
+// udpEndpointRebuildError is returned by WriteTo after it retires a stale
+// endpoint. The caller drops its pin once the replacement tracks the flow.
+type udpEndpointRebuildError struct {
+	err     error
+	release func()
+}
+
+func (e *udpEndpointRebuildError) Error() string { return e.err.Error() }
+func (e *udpEndpointRebuildError) Unwrap() error { return e.err }
+
+// takeUdpEndpointRebuildPin returns the pin carried by err once, or nil.
+func takeUdpEndpointRebuildPin(err error) func() {
+	var rebuild *udpEndpointRebuildError
+	if !stderrors.As(err, &rebuild) {
+		return nil
+	}
+	release := rebuild.release
+	rebuild.release = nil
+	return release
+}
+
+// chainUdpConnStatePins runs both unpin functions; either may be nil.
+func chainUdpConnStatePins(first, second func()) func() {
+	switch {
+	case first == nil:
+		return second
+	case second == nil:
+		return first
+	}
+	return func() {
+		second()
+		first()
+	}
+}
+
 func (ue *UdpEndpoint) releaseTrackedUdpConnState() {
 	if ue == nil {
 		return
@@ -621,6 +684,11 @@ func (ue *UdpEndpoint) maybeRebuildOnReplyDrought(now time.Time) error {
 		ue.poolRef.rememberDroughtRebuild(ue.poolKey, ue.droughtRebuildGeneration+1)
 	}
 	ue.retiredByReplyDrought.Store(true)
+	// Without this pin the retirement deletes the conn-state the kernel
+	// used for this packet, and a reply arriving before the replacement
+	// tracks the flow recreates it as inbound, so later packets go
+	// direct (daeuniverse/dae#1137).
+	pin := ue.pinTrackedUdpConnStatePair()
 	ue.retire()
 	if ue.log != nil {
 		dialerName := ""
@@ -637,8 +705,11 @@ func (ue *UdpEndpoint) maybeRebuildOnReplyDrought(now time.Time) error {
 			"writes_since_reply": writes,
 		}).Debug("[UdpEndpoint] Rebuilding UDP session after reply drought")
 	}
-	return fmt.Errorf("%w: no reply for %s while %d packets were sent, rebuilding session",
-		errors.ErrClosedConnection, time.Duration(drought), writes)
+	return &udpEndpointRebuildError{
+		err: fmt.Errorf("%w: no reply for %s while %d packets were sent, rebuilding session",
+			errors.ErrClosedConnection, time.Duration(drought), writes),
+		release: pin,
+	}
 }
 
 // droughtSendRate reports the client's transmission rate into a session whose

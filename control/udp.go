@@ -542,6 +542,11 @@ func (c *ControlPlane) handleRetainedUDPEndpoint(data []byte, src, realDst netip
 			// Transient write failure: drop the datagram, keep the session.
 			return true
 		}
+		// The fresh session is dialed by the normal path, which does not see
+		// this error, so the pin cannot be handed on: unpin now.
+		if pin := takeUdpEndpointRebuildPin(err); pin != nil {
+			pin()
+		}
 		if lifecycle, lifecycleOK := newUdpSessionLifecycleContext(ue, ""); lifecycleOK && c.shouldPenalizeUdpEndpointWriteError(err) {
 			lifecycle.reportUnavailable(fmt.Errorf("retained UDP endpoint write failed: %w", err))
 		}
@@ -637,6 +642,14 @@ func (c *ControlPlane) handlePktOwned(data []byte, src, realDst netip.AddrPort, 
 	var domain string
 	var ueKey UdpEndpointKey
 	var excludedDialer *dialer.Dialer
+	// Held from a reply-drought rebuild until the replacement tracks the
+	// flow (daeuniverse/dae#1137).
+	var rebuildPin func()
+	defer func() {
+		if rebuildPin != nil {
+			rebuildPin()
+		}
+	}()
 	now := time.Now()
 	nowNano := now.UnixNano()
 	realSrc = src
@@ -829,6 +842,7 @@ func (c *ControlPlane) handlePktOwned(data []byte, src, realDst netip.AddrPort, 
 					// Transient write failure: drop the datagram, keep the session.
 					return nil
 				}
+				rebuildPin = chainUdpConnStatePins(rebuildPin, takeUdpEndpointRebuildPin(err))
 				if c.log.IsLevelEnabled(logrus.DebugLevel) {
 					c.log.WithFields(logrus.Fields{
 						"to":      realDst.String(),
@@ -1213,6 +1227,10 @@ getNew:
 		domain = ue.SniffedDomain
 	}
 	ue.TrackUdpConnStateTuplePair(realSrc, realDst)
+	if rebuildPin != nil {
+		rebuildPin()
+		rebuildPin = nil
+	}
 
 	// A batched endpoint only queues the datagram inside WriteTo; the flush
 	// reports the real bytes and the health signal from the aggregator's
@@ -1228,6 +1246,7 @@ getNew:
 				packetIndex++
 				continue
 			}
+			rebuildPin = chainUdpConnStatePins(rebuildPin, takeUdpEndpointRebuildPin(err))
 			if c.log.IsLevelEnabled(logrus.DebugLevel) {
 				c.log.WithFields(logrus.Fields{
 					"to":      realDst.String(),

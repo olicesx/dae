@@ -176,6 +176,12 @@ changed. Review them before upgrading:
 
 #### Bug Fixes
 
+- fix(control): a UDP session rebuilt after a reply drought no longer risks
+  bypassing the proxy for the rest of the flow. The rebuild deleted the kernel
+  conn-state of the flow before the replacement session took it over; a reply
+  arriving in that gap recreated it as an inbound flow, so later packets from
+  the client went direct. The conn-state is now held across the handover (port
+  of upstream PR daeuniverse/dae#1170, which fixes daeuniverse/dae#1137)
 - fix(dialer): the TCP DNS connectivity check that `udp_check_dns` promises for a
   `tcp` upstream actually runs. It was declared by a flag that nothing read, so such
   an upstream could fail on every node while all probes stayed green. The result is

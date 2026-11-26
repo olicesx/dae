@@ -104,9 +104,10 @@ jobs:
       #
       # ubuntu:22.04 is the image the test runs, so a throwaway one resolves
       # exactly what its apt would install, recommends included. It downloads
-      # the set here over the runner's own network; the test jobs hand the
-      # directory to the VM through the workspace mount and install it with
-      # dpkg, so the timed job makes no setup download of its own.
+      # the set here over the runner's own network, and the installer travels
+      # with it: the test jobs hand the directory to the VM through the
+      # workspace mount and run that script in the dae container, so the timed
+      # job makes no setup download of its own.
       run: |
         set -euo pipefail
         mkdir -p vm-tools/debs
@@ -118,10 +119,28 @@ jobs:
           apt-get update -o APT::Update::Error-Mode=any
           apt-get install -y --download-only -o Dir::Cache::archives=/debs \
             curl dnsutils netcat iproute2 iptables iputils-ping'
+        # The VM step runs this file rather than an inline script: the cmd of a
+        # little-vm-helper step is expanded by the runner's shell before it
+        # reaches the VM (the action's note on the input says every "$" must be
+        # escaped), and in run 45803979986 an inline loop's "$t" arrived in the
+        # container as "". That shell never reads this file.
+        cat > vm-tools/install.sh <<'EOF'
+        #!/bin/sh
+        # Installs the .deb files next to this script without the network. The
+        # build job resolved them for this very image, so dpkg -i is enough.
+        set -e
+        cd "$(dirname "$0")"
+        dpkg -i debs/*.deb
+        # dpkg exiting 0 is no proof the set was complete: say here which tool
+        # is missing, not at the check that first needs it.
+        for t in curl dig nc ip iptables-legacy ping sysctl; do
+          command -v "$t" > /dev/null || { echo "missing $t after the offline install" >&2; exit 1; }
+        done
+        EOF
         # apt runs as root inside the container; hand the files back so the
         # runner user can clean the workspace up.
         sudo chown -R "$(id -u):$(id -g)" vm-tools
-        ls vm-tools/debs/*.deb > /dev/null
+        ls vm-tools/debs/*.deb vm-tools/install.sh > /dev/null
 
     - name: Store VM tools
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -273,14 +292,7 @@ jobs:
             # come from the directory the build job fetched ("Fetch the tools
             # the VM installs offline"), along with the LAN tools, so nothing
             # in this timed job waits on the VM's own network.
-            docker exec -e DEBIAN_FRONTEND=noninteractive dae sh -c '
-              set -e
-              dpkg -i /host/vm-tools/debs/*.deb
-              # dpkg exiting 0 is no proof the set was complete: say here which
-              # tool is missing, not at the check that first needs it.
-              for t in curl dig nc ip iptables-legacy ping sysctl; do
-                command -v "$t" > /dev/null || { echo "missing $t after the offline install" >&2; exit 1; }
-              done'
+            docker exec -e DEBIAN_FRONTEND=noninteractive dae sh /host/vm-tools/install.sh
 
             vmess_link=$(base64 -w0 vmess.json)
             cat > ./conf.dae <<!

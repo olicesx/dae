@@ -6,6 +6,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -477,6 +478,21 @@ func (e *configEditor) commitValidatedSource(
 	kind, scope, idempotencyKey string,
 	resolve func() (any, error),
 ) (nativeapi.OperationAccepted, error) {
+	// e.mu serialises API writers, not whatever else edits the tree. The
+	// contract asks for If-Match to be judged again when the replacement is
+	// committed, so read the file once more at that moment: a change that landed
+	// while this request was being validated must neither be overwritten nor be
+	// archived as the backup of what the write replaced.
+	onDisk, err := os.ReadFile(target.abs)
+	if err != nil {
+		return nativeapi.OperationAccepted{}, fmt.Errorf("re-read config source: %w", err)
+	}
+	if !bytes.Equal(onDisk, target.raw) {
+		return nativeapi.OperationAccepted{}, &nativeapi.APIError{
+			Status: 412, Code: nativeapi.CodeStaleRevision,
+			Message: "config source changed since it was read",
+		}
+	}
 	mode := os.FileMode(0o600)
 	if fi, statErr := os.Stat(target.abs); statErr == nil {
 		mode = fi.Mode().Perm()

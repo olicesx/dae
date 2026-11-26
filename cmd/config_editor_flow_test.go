@@ -262,6 +262,39 @@ func TestConfigReplaceSyntaxErrorReturnsLocatedDiagnostics(t *testing.T) {
 	}
 }
 
+// TestConfigCommitRechecksTheFileOnDisk pins the "at commit" half of the
+// contract's If-Match rule. The editor's lock serialises API writers, not an
+// editor on disk: a change that lands while a replacement is being validated
+// is answered with 412, stays in place, and is not archived as the backup.
+func TestConfigCommitRechecksTheFileOnDisk(t *testing.T) {
+	main, _ := newManagedTree(t)
+	ops := &fakeConfigOperations{}
+	e := newFlowEditor(t, main, true, ops)
+	target := flowSource(t, e, flowGlobalRel)
+
+	external := append([]byte(nil), target.raw...)
+	external = append(external, "\n# edited elsewhere\n"...)
+	if err := os.WriteFile(target.abs, external, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := e.commitValidatedSource(context.Background(), target, []byte("global {\n  tproxy_port: 42345\n}\n"),
+		nativeapi.OperationKindReload, "scope", "", nil)
+	apiErr := flowAPIError(t, err)
+	if apiErr.Status != 412 || apiErr.Code != nativeapi.CodeStaleRevision {
+		t.Fatalf("status/code = %d/%s, want 412/%s", apiErr.Status, apiErr.Code, nativeapi.CodeStaleRevision)
+	}
+	if got, _ := os.ReadFile(target.abs); string(got) != string(external) {
+		t.Fatal("the change from elsewhere must stay on disk")
+	}
+	if _, err := os.Stat(target.abs + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("a refused commit must not write a backup")
+	}
+	if ops.calls != 0 {
+		t.Fatalf("a refused commit queued %d operations, want 0", ops.calls)
+	}
+}
+
 func TestConfigValidateSyntaxModeSkipsMerge(t *testing.T) {
 	main, _ := newManagedTree(t)
 	e := newFlowEditor(t, main, true, &fakeConfigOperations{})

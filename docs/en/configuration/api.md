@@ -1,12 +1,12 @@
 # Native API
 
 dae can expose a native HTTP control-plane API compatible with the
-[api-standardize](https://github.com/daeuniverse/api-standardize) contract. The
+[`api-standardize`](https://github.com/daeuniverse/api-standardize) contract. The
 listener is **disabled by default**.
 
 This page covers configuring and deploying the listener, plus the directory
 layout that API writes require. Endpoint behaviour and the resource contract live
-in [development/api.md](../development/api.md).
+in the [development notes](../development/api.md).
 
 ## Configuration
 

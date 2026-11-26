@@ -1,10 +1,10 @@
 # 原生 API
 
-dae 可以提供与 [api-standardize](https://github.com/daeuniverse/api-standardize)
+dae 可以提供与 [`api-standardize`](https://github.com/daeuniverse/api-standardize)
 契约兼容的原生 HTTP 控制面。该 listener **默认关闭**。
 
 本页讲 listener 的配置与部署，以及通过 API 写配置所需的目录规范；端点行为与资源契约见
-[development/api.md](../development/api.md)。
+[开发说明](../development/api.md)。
 
 ## 配置
 

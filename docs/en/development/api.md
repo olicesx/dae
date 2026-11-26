@@ -2,7 +2,7 @@
 
 Listener configuration, authentication, TLS, Host/Origin checks and
 self-hosting the UI are covered in
-[configuration/api.md](../configuration/api.md). This page documents the
+[configuration notes](../configuration/api.md). This page documents the
 endpoints and the resource contract dae implements.
 
 ## Endpoints
@@ -58,15 +58,15 @@ through the API.
 gated on the configuration write switch: `nodes.can_manage` is true only with
 `api.config_write` and the managed layout. Both queue a reload and answer `202`
 with a `node_create` or `node_delete` operation; `DELETE` stays idempotent for an
-unknown id (`200 {"deleted": 0}`).
+unknown ID (`200 {"deleted": 0}`).
 
 `PATCH /api/v1/nodes/{node_id}` edits an inline node. The body is
 `{"name"?: string, "link"?: string}`: an omitted field (or an explicit `null`)
 keeps its current value and at least one must be set. It also queues a reload and
 answers `202` with a `node_update` operation whose result is the node; a rename
-keeps the node id, a new link produces a new one (the id is derived from the
+keeps the node ID, a new link produces a new one (the ID is derived from the
 dialer the engine parses the link into, which may normalize a plugin link).
-Existence and ownership are resolved before the values are checked: an unknown id
+Existence and ownership are resolved before the values are checked: an unknown ID
 is `404 resource_not_found` and a subscription or file node is
 `404 capability_not_supported` even when the body carries an invalid link; a bad
 name or link answers `422 unsupported_value` and a taken name `409 state_conflict`.
@@ -101,7 +101,7 @@ editing: `GET /api/v1/config`, `GET /api/v1/config/sources/{source_id}`,
 `PUT /api/v1/config/sources/{source_id}` (requires `If-Match`) and
 `POST /api/v1/config/validate`. A `sources[].id` is the contract's request-local
 diagnostic label: it defaults to `source-N`, overrides the visible source with
-that id when one exists (a dae extension), and otherwise validates as a
+that ID when one exists (a dae extension), and otherwise validates as a
 standalone candidate that is never written; only `path` names a file. A
 syntax check of a rewritten node block under `id: "node"` therefore does not
 answer `404`. A rename (through `PATCH /nodes/{id}` or the dashboard editor)
@@ -123,8 +123,8 @@ whether writes are currently available.
 
 Deliberate deviations from the contract:
 
-- `api.dae` is hidden. It is omitted from `sources[]`, and its id answers
-  `404 resource_not_found`, the same as an unknown id. Capabilities report it in
+- `api.dae` is hidden. It is omitted from `sources[]`, and its ID answers
+  `404 resource_not_found`, the same as an unknown ID. Capabilities report it in
   `x-dae.hidden_sources`.
 - `config.dae` is read-only (`entry_source`). A replacement may not change the
   `api` section.

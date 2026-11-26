@@ -1,7 +1,7 @@
 # 原生 API 参考
 
 listener 的配置、认证、TLS、Host/Origin 校验与自托管前端见
-[configuration/api.md](../configuration/api.md)。本页记录 dae 实现的端点与资源契约。
+[配置说明](../configuration/api.md)。本页记录 dae 实现的端点与资源契约。
 
 ## 端点
 
@@ -54,12 +54,12 @@ listener 的配置、认证、TLS、Host/Origin 校验与自托管前端见
 `POST /api/v1/nodes` 与 `DELETE /api/v1/nodes/{node_id}` 已实现，受配置写入闸门约束：
 `nodes.can_manage` 随 `api.config_write` 与受管目录布局一起为真。
 两者都排队一个 reload，分别以 `202` + `node_create` / `node_delete` 操作返回；
-`DELETE` 对未知 id 保持幂等（`200 {"deleted": 0}`）。
+`DELETE` 对未知 ID 保持幂等（`200 {"deleted": 0}`）。
 
 `PATCH /api/v1/nodes/{node_id}` 编辑 inline 节点，body 为 `{"name"?: string, "link"?: string}`：
 缺省字段保留当前值（显式 `null` 同义），至少给一个。它同样排队一个 reload 并以 `202` + `node_update`
-操作返回，结果为新节点；只改名称时节点 id 不变，改链接会得到新的 id（id 由引擎解析链接后的
-dialer 派生，插件链接可能先被归一化）。先判定节点存在与归属，再校验值：未知 id `404 resource_not_found`、
+操作返回，结果为新节点；只改名称时节点 ID 不变，改链接会得到新的 ID（ID 由引擎解析链接后的
+dialer 派生，插件链接可能先被归一化）。先判定节点存在与归属，再校验值：未知 ID `404 resource_not_found`、
 订阅/文件来源 `404 capability_not_supported`（即使 body 里的链接非法）；名称与链接非法时
 `422 unsupported_value`，重名 `409 state_conflict`。换链接时目标链接被其他 inline 条目或已加载节点占用
 也返回 `409 state_conflict`：API 用链接标识节点，两条同链接的条目会塌成一个节点。生成代次领先于文件
@@ -84,7 +84,7 @@ provider 可以刷新，inline/file provider 返回 `404 capability_not_supporte
 `GET /api/v1/config/sources/{source_id}`、
 `PUT /api/v1/config/sources/{source_id}`（需 `If-Match`）与 `POST /api/v1/config/validate`。
 `POST /api/v1/config/validate` 的 `sources[].id` 按契约是请求内诊断标识：缺省用 `source-N`；
-命中现有可见源 id 时作为该源的候选覆盖（dae 扩展），未命中时作为独立候选校验（不落盘），
+命中现有可见源 ID 时作为该源的候选覆盖（dae 扩展），未命中时作为独立候选校验（不落盘），
 只有 `path` 指向真实文件；因此前端以 `id: "node"` 校验重写后的 node 块不会得到 `404`。
 改名（`PATCH /nodes/{id}` 或前端节点编辑）只改节点所在源，不会重写其他源里的组过滤/规则引用。
 契约没有 `GET /api/v1/config/sources` 列表路由：源清单取自 `GET /api/v1/config` 的
@@ -97,7 +97,7 @@ provider 可以刷新，inline/file provider 返回 `404 capability_not_supporte
 `capabilities.mutable_config` 会反映当前是否可写。
 与契约的有意偏离：
 
-- `api.dae` 被隐藏：不出现在 `sources[]` 中，其 id 返回 `404 resource_not_found`，与未知 id 一致。
+- `api.dae` 被隐藏：不出现在 `sources[]` 中，其 ID 返回 `404 resource_not_found`，与未知 ID 一致。
   能力信息通过 `x-dae.hidden_sources` 体现。
 - `config.dae` 只读（`entry_source`）。替换时不得修改 `api` 段。
 - `GET` 读取磁盘文件，而非已接受的快照。其 `revision` 与

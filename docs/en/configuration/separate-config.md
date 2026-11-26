@@ -215,4 +215,3 @@ replacement.
 
 `example-separated/` in the repository is this tree without comments, ready to
 copy to `/etc/dae`.
-

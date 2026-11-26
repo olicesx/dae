@@ -233,6 +233,42 @@ func TestConfigReplaceRejectsStaleRevision(t *testing.T) {
 	}
 }
 
+func TestConfigRejectsMalformedFallbackResolver(t *testing.T) {
+	main, _ := newManagedTree(t)
+	ops := &fakeConfigOperations{}
+	e := newFlowEditor(t, main, true, ops)
+	target := flowSource(t, e, flowGlobalRel)
+	const invalidAddr = "invalid-resolver"
+	content := "global {\n  fallback_resolver: '" + invalidAddr + "'\n}\n"
+
+	result, err := e.ValidateConfig(t.Context(), nativeapi.ConfigValidationRequest{
+		Mode: "full", Sources: []nativeapi.ConfigValidationSource{{ID: target.id, Content: &content}},
+	})
+	if err != nil || result.Valid || len(result.Diagnostics) == 0 {
+		t.Fatalf("full validation = %+v, %v; want diagnostics", result, err)
+	}
+	_, err = e.ReplaceConfigSource(t.Context(), nativeapi.ReplaceConfigSourceRequest{
+		SourceID: target.id, IfMatch: rawSHA256(target.raw), Content: content,
+	})
+	if apiErr := flowAPIError(t, err); apiErr.Status != 422 {
+		t.Fatalf("write returned %d, want 422", apiErr.Status)
+	}
+	got, err := os.ReadFile(target.abs)
+	if err != nil || string(got) != string(target.raw) || ops.calls != 0 {
+		t.Fatalf("rejected config changed the source or queued a reload: read error=%v, queued=%d", err, ops.calls)
+	}
+	if _, err := os.Stat(target.abs + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backup stat = %v, want file absent", err)
+	}
+
+	conf := &config.Config{}
+	conf.Global.FallbackResolver = invalidAddr
+	_, err = newControlPlaneWithMode(t.Context(), nil, nil, nil, nil, conf, nil, false, false, false)
+	if err == nil || !strings.Contains(err.Error(), "fallback_resolver") {
+		t.Fatalf("control plane returned %v, want fallback_resolver error", err)
+	}
+}
+
 func TestConfigReplaceSyntaxErrorReturnsLocatedDiagnostics(t *testing.T) {
 	main, _ := newManagedTree(t)
 	e := newFlowEditor(t, main, true, &fakeConfigOperations{})
@@ -259,6 +295,30 @@ func TestConfigReplaceSyntaxErrorReturnsLocatedDiagnostics(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(target.abs); string(got) != string(target.raw) {
 		t.Fatal("rejected write must not change the file")
+	}
+}
+
+func TestConfigWriteRestoresSourceWhenStopping(t *testing.T) {
+	main, _ := newManagedTree(t)
+	ops, manager := newTestOperations()
+	e := newFlowEditorWithReload(t, main, true, ops, manager)
+	target := flowSource(t, e, flowGlobalRel)
+
+	// The request passed the HTTP gate, but shutdown started before it queued.
+	ops.stopAcceptingReloads()
+	accepted, err := e.ReplaceConfigSource(t.Context(), nativeapi.ReplaceConfigSourceRequest{
+		SourceID: target.id, IfMatch: rawSHA256(target.raw), Content: flowValidGlobal, IdempotencyKey: "stopping",
+	})
+	apiErr := flowAPIError(t, err)
+	if apiErr.Status != 503 || apiErr.RetryAfterSeconds != 1 || accepted.OperationID != "" {
+		t.Fatalf("stopping response = %+v, %+v", accepted, apiErr)
+	}
+	got, err := os.ReadFile(target.abs)
+	if err != nil || string(got) != string(target.raw) {
+		t.Fatalf("source was not restored: read error=%v", err)
+	}
+	if len(manager.reloadReqs) != 0 || manager.reloadPending.Load() {
+		t.Fatal("write queued a reload during shutdown")
 	}
 }
 

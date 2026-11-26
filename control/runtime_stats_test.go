@@ -76,47 +76,63 @@ func BenchmarkRuntimeStatsRecord(b *testing.B) {
 	}
 }
 
-func TestThinRuntimeSamplesDecimatesWithoutAggregating(t *testing.T) {
-	samples := make([]RuntimeTrafficSample, 1000)
-	base := time.Unix(1_700_000_000, 0)
-	for i := range samples {
-		samples[i] = RuntimeTrafficSample{
-			Timestamp:  base.Add(time.Duration(i) * runtimeBucketDuration),
-			UploadRate: uint64(1000 + i),
+func TestRuntimeHistoryDecimatesWrappedRingWithoutAggregating(t *testing.T) {
+	store, now := fullRuntimeHistory()
+	for _, tc := range []struct {
+		window, limit int
+	}{
+		{1800, 180},
+		{3600, 1},
+		{1, 180},
+	} {
+		snapshot := store.snapshot(0, 0, tc.window, tc.limit, now, true)
+		// The newest bucket ends at now and the cutoff is inclusive.
+		available := min(maxRuntimeHistoryBuckets(), tc.window*4+1)
+		stride := (available + tc.limit - 1) / tc.limit
+		wantCount := (available + stride - 1) / stride
+		if got := len(snapshot.Samples); got != wantCount {
+			t.Fatalf("window=%d limit=%d: samples=%d, want %d", tc.window, tc.limit, got, wantCount)
+		}
+		for i, sample := range snapshot.Samples {
+			age := (wantCount - 1 - i) * stride
+			if at := now.Add(-time.Duration(age) * runtimeBucketDuration); !sample.Timestamp.Equal(at) || sample.UploadRate != uint64(age*4) || sample.DownloadRate != uint64(age*8) {
+				t.Fatalf("window=%d limit=%d sample=%d: %+v, want original bucket at %s", tc.window, tc.limit, i, sample, at)
+			}
 		}
 	}
-	samples[500].UploadRate = 999_999 // a real spike that must be preserved as-is
+}
 
-	thinned := thinRuntimeSamples(samples, 180)
-	if len(thinned) > 180 {
-		t.Fatalf("thinned length = %d, want <= 180", len(thinned))
+func TestRuntimeHistoryKeepsInFlightOutOfSamples(t *testing.T) {
+	store, newest := fullRuntimeHistory()
+	store.record(1024, 2048)
+	now := newest.Add(runtimeBucketDuration / 2)
+	snapshot := store.snapshot(0, 0, 1800, 180, now, true)
+	last := snapshot.Samples[len(snapshot.Samples)-1]
+	if !last.Timestamp.Equal(newest) || last.UploadRate != 0 || last.DownloadRate != 0 {
+		t.Fatalf("newest completed sample = %+v, want zero-byte bucket at %s", last, newest)
 	}
-	// stride = ceil(1000/180) = 6
-	if want := (1000 + 5) / 6; len(thinned) != want {
-		t.Fatalf("thinned length = %d, want %d", len(thinned), want)
+	if snapshot.UploadRate != 1028 || snapshot.DownloadRate != 2057 {
+		t.Fatalf("headline rate = %d/%d, want 1028/2057 including the partial bucket", snapshot.UploadRate, snapshot.DownloadRate)
 	}
-	for i := 1; i < len(thinned); i++ {
-		if !thinned[i].Timestamp.After(thinned[i-1].Timestamp) {
-			t.Fatalf("timestamps are not increasing at %d", i)
-		}
-	}
-	if last := thinned[len(thinned)-1]; last.Timestamp != samples[len(samples)-1].Timestamp {
-		t.Fatalf("newest sample missing: got %v want %v", last.Timestamp, samples[len(samples)-1].Timestamp)
-	}
-	// No synthetic value may appear: every rate must be one the recorder saw.
-	original := make(map[uint64]struct{}, len(samples))
-	for _, sample := range samples {
-		original[sample.UploadRate] = struct{}{}
-	}
-	for _, sample := range thinned {
-		if _, ok := original[sample.UploadRate]; !ok {
-			t.Fatalf("thinned sample carries a fabricated rate %d", sample.UploadRate)
-		}
-	}
+}
 
-	// Short series pass through untouched.
-	short := samples[:50]
-	if got := thinRuntimeSamples(short, 180); len(got) != 50 {
-		t.Fatalf("short series length = %d", len(got))
+func fullRuntimeHistory() (*runtimeStats, time.Time) {
+	store := newRuntimeStats()
+	now := time.Unix(1_700_000_000, 0)
+	store.currentBucketStartUnixNano.Store(now.UnixNano())
+	for i := maxRuntimeHistoryBuckets() + 7; i >= 0; i-- {
+		store.pushHistoryBucket(runtimeBucket{
+			Timestamp: now.Add(-time.Duration(i) * runtimeBucketDuration),
+			Duration:  runtimeBucketDuration, UploadBytes: uint64(i), DownloadBytes: uint64(2 * i),
+		})
+	}
+	return store, now
+}
+
+func BenchmarkRuntimeHistorySnapshot(b *testing.B) {
+	store, now := fullRuntimeHistory()
+	b.ReportAllocs()
+	for b.Loop() {
+		store.snapshot(0, 0, 1800, 180, now, true)
 	}
 }

@@ -7,6 +7,7 @@ package cmd
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -37,6 +38,10 @@ var (
 				os.Exit(1)
 			}
 			if err := conf.Api.Validate(); err != nil {
+				fmt.Println(err)
+				os.Exit(1)
+			}
+			if _, err := parseFallbackResolver(conf.Global.FallbackResolver); err != nil {
 				fmt.Println(err)
 				os.Exit(1)
 			}
@@ -74,6 +79,15 @@ func init() {
 	rootCmd.AddCommand(validateCmd)
 
 	validateCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "config file")
+}
+
+// parseFallbackResolver is shared by validation and control-plane construction.
+func parseFallbackResolver(value string) (netip.AddrPort, error) {
+	addr, err := netip.ParseAddrPort(value)
+	if err != nil {
+		return netip.AddrPort{}, fmt.Errorf("invalid global.fallback_resolver: expected an IP address and port")
+	}
+	return addr, nil
 }
 
 // validateRoutingRules is the rules-only dry-run of the run-time build chain.

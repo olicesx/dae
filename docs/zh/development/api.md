@@ -66,8 +66,9 @@ listener 的配置、认证、TLS、Host/Origin 校验与自托管前端见
 dialer 派生，插件链接可能先被归一化）。先判定节点存在与归属，再校验值：未知 ID `404 resource_not_found`、
 订阅/文件来源 `404 capability_not_supported`（即使 body 里的链接非法）；名称与链接非法时
 `422 unsupported_value`，重名 `409 state_conflict`。换链接时目标链接被其他 inline 条目或已加载节点占用
-也返回 `409 state_conflict`：API 用链接标识节点，两条同链接的条目会塌成一个节点。生成代次领先于文件
-（`node.dae` 里已无该行）返回 `409 state_conflict`；以无 key 形式书写（`node { 'ss://…' }`）的条目没有
+也返回 `409 state_conflict`：API 用链接标识节点，两条同链接的条目会塌成一个节点。
+如果磁盘上的同名条目已对应另一个节点 ID，`PATCH` 和 `DELETE` 都返回 `409 state_conflict`。
+若条目已从文件移除，`PATCH` 也返回此错误。以无 key 形式书写（`node { 'ss://…' }`）的条目没有
 名称可供寻址，不能通过 API 编辑，需直接改文件。patch 的两值都是节点已有值时不做写入、不触发
 reload，返回 `200 {"updated": 0}`。该端点是 dae 在契约之外的扩展：契约
 （`api-standardize`）目前只定义新增与删除。
@@ -430,7 +431,8 @@ cgroup 部分取决于系统。cgroup v2 只有在父级委派控制器之后
 
 操作报告 `succeeded` 时，切换已经完成。旧控制面仍可能在后台退役并关闭连接。
 退役期间，`reload`、`suspend` 和 `resume` 会返回 `409 state_conflict`。
-客户端可以等几秒后重试。
+客户端可以等几秒后重试。进程开始停机后，在 HTTP 监听器关闭前，新的写请求会收到
+`503 temporarily_unavailable` 和 `Retry-After: 1`。
 
 配置了 `ui` 时，`/ui/` 提供前端，其余非 `/api` 路径都会重定向到那里，因此只有 `/api` 与
 `/api/v1/...` 参与认证。

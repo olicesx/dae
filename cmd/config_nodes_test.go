@@ -20,6 +20,15 @@ import (
 // mockLink is a share link the engine parses; nothing connects during a test.
 const mockLink = "socks5://user:pass@192.0.2.10:1080"
 
+func mockNodeID(t *testing.T, link string) string {
+	t.Helper()
+	id, err := validateNodeLink(t.Context(), logrus.New(), link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
 func emptyNodeIndex() (map[string]nodeRef, error) { return map[string]nodeRef{}, nil }
 
 func nodeIndexWith(refs ...map[string]nodeRef) nodeIndexFunc {
@@ -202,8 +211,8 @@ func TestConfigDeleteNodeRemovesLine(t *testing.T) {
 	}
 	ops.calls = 0
 
-	index := nodeIndexWith(map[string]nodeRef{"n_mock": {Name: "mock-01", ProviderID: inlineProviderID}})
-	outcome, err := e.DeleteNode(context.Background(), nativeapi.NodeDeleteRequest{NodeID: "n_mock"}, index, nil)
+	index := nodeIndexWith(map[string]nodeRef{mockNodeID(t, mockLink): {Name: "mock-01", ProviderID: inlineProviderID}})
+	outcome, err := e.DeleteNode(context.Background(), nativeapi.NodeDeleteRequest{NodeID: mockNodeID(t, mockLink)}, index, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,9 +353,9 @@ func TestConfigUpdateNodeRenamesAndRelinks(t *testing.T) {
 	ops.calls = 0
 	relinked := "socks5://user:pass@192.0.2.11:1080"
 
-	index := nodeIndexWith(map[string]nodeRef{"n_mock": {Name: "mock-01", ProviderID: inlineProviderID}})
+	index := nodeIndexWith(map[string]nodeRef{mockNodeID(t, mockLink): {Name: "mock-01", ProviderID: inlineProviderID}})
 	outcome, err := e.UpdateNode(context.Background(), nativeapi.NodeUpdateRequest{
-		NodeID: "n_mock",
+		NodeID: mockNodeID(t, mockLink),
 		Name:   nodeStringPtr("mock-02"),
 		Link:   nodeStringPtr(relinked),
 	}, index, func(nodeID string) (any, error) { return nodeID, nil })
@@ -388,10 +397,10 @@ func TestConfigUpdateNodeKeepsNameWhenOnlyTheLinkChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	index := nodeIndexWith(map[string]nodeRef{"n_mock": {Name: "mock-01", ProviderID: inlineProviderID}})
+	index := nodeIndexWith(map[string]nodeRef{mockNodeID(t, mockLink): {Name: "mock-01", ProviderID: inlineProviderID}})
 	relinked := "socks5://user:pass@192.0.2.11:1080"
 	if _, err := e.UpdateNode(context.Background(), nativeapi.NodeUpdateRequest{
-		NodeID: "n_mock",
+		NodeID: mockNodeID(t, mockLink),
 		Link:   nodeStringPtr(relinked),
 	}, index, nil); err != nil {
 		t.Fatal(err)
@@ -415,11 +424,11 @@ func TestConfigUpdateNodeRejectsDuplicateName(t *testing.T) {
 
 	// A name a subscription delivered is taken too: names are global.
 	index := nodeIndexWith(
-		map[string]nodeRef{"n_mock": {Name: "mock-01", ProviderID: inlineProviderID}},
+		map[string]nodeRef{mockNodeID(t, mockLink): {Name: "mock-01", ProviderID: inlineProviderID}},
 		map[string]nodeRef{"n_sub": {Name: "taken", ProviderID: "p_abc"}},
 	)
 	_, err := e.UpdateNode(context.Background(), nativeapi.NodeUpdateRequest{
-		NodeID: "n_mock",
+		NodeID: mockNodeID(t, mockLink),
 		Name:   nodeStringPtr("taken"),
 	}, index, nil)
 	if apiErr := flowAPIError(t, err); apiErr.Status != 409 || apiErr.Code != "state_conflict" {
@@ -444,9 +453,9 @@ func TestConfigUpdateNodeRejectsUnsupportedLink(t *testing.T) {
 	before, _ := os.ReadFile(target.abs)
 	ops.calls = 0
 
-	index := nodeIndexWith(map[string]nodeRef{"n_mock": {Name: "mock-01", ProviderID: inlineProviderID}})
+	index := nodeIndexWith(map[string]nodeRef{mockNodeID(t, mockLink): {Name: "mock-01", ProviderID: inlineProviderID}})
 	_, err := e.UpdateNode(context.Background(), nativeapi.NodeUpdateRequest{
-		NodeID: "n_mock",
+		NodeID: mockNodeID(t, mockLink),
 		Link:   nodeStringPtr("vless://not-a-real-node"),
 	}, index, nil)
 	if apiErr := flowAPIError(t, err); apiErr.Status != 422 || apiErr.Code != "unsupported_value" {
@@ -499,9 +508,9 @@ func TestConfigUpdateNodeRejectsALinkAnotherInlineNodeUses(t *testing.T) {
 	before, _ := os.ReadFile(target.abs)
 	ops.calls = 0
 
-	index := nodeIndexWith(map[string]nodeRef{"n_mock": {Name: "mock-01", ProviderID: inlineProviderID}})
+	index := nodeIndexWith(map[string]nodeRef{mockNodeID(t, mockLink): {Name: "mock-01", ProviderID: inlineProviderID}})
 	_, err := e.UpdateNode(context.Background(), nativeapi.NodeUpdateRequest{
-		NodeID: "n_mock",
+		NodeID: mockNodeID(t, mockLink),
 		Link:   nodeStringPtr(other),
 	}, index, nil)
 	if apiErr := flowAPIError(t, err); apiErr.Status != 409 || apiErr.Code != "state_conflict" {
@@ -526,11 +535,11 @@ func TestConfigUpdateNodeRejectsALinkAnotherNodeUses(t *testing.T) {
 
 	taken := "socks5://user:pass@192.0.2.13:1080"
 	index := nodeIndexWith(
-		map[string]nodeRef{"n_mock": {Name: "mock-01", ProviderID: inlineProviderID}},
+		map[string]nodeRef{mockNodeID(t, mockLink): {Name: "mock-01", ProviderID: inlineProviderID}},
 		map[string]nodeRef{nodeIDOfLink(taken, "sub-01"): {Name: "sub-01", ProviderID: "p_abc"}},
 	)
 	_, err := e.UpdateNode(context.Background(), nativeapi.NodeUpdateRequest{
-		NodeID: "n_mock",
+		NodeID: mockNodeID(t, mockLink),
 		Link:   nodeStringPtr(taken),
 	}, index, nil)
 	if apiErr := flowAPIError(t, err); apiErr.Status != 409 || apiErr.Code != "state_conflict" {
@@ -595,9 +604,9 @@ func TestConfigUpdateNodeNoOpWritesNothing(t *testing.T) {
 	before, _ := os.ReadFile(target.abs)
 	ops.calls = 0
 
-	index := nodeIndexWith(map[string]nodeRef{"n_mock": {Name: "mock-01", ProviderID: inlineProviderID}})
+	index := nodeIndexWith(map[string]nodeRef{mockNodeID(t, mockLink): {Name: "mock-01", ProviderID: inlineProviderID}})
 	outcome, err := e.UpdateNode(context.Background(), nativeapi.NodeUpdateRequest{
-		NodeID: "n_mock",
+		NodeID: mockNodeID(t, mockLink),
 		Name:   nodeStringPtr("mock-01"),
 		Link:   nodeStringPtr(mockLink),
 	}, index, nil)
@@ -626,10 +635,10 @@ func TestConfigUpdateNodeReplaysAfterTheNodeIDChanges(t *testing.T) {
 	if _, err := e.CreateNode(context.Background(), nativeapi.NodeCreateRequest{Name: "mock-01", Link: mockLink}, emptyNodeIndex, nil); err != nil {
 		t.Fatal(err)
 	}
-	index := nodeIndexWith(map[string]nodeRef{"n_old": {Name: "mock-01", ProviderID: inlineProviderID}})
+	index := nodeIndexWith(map[string]nodeRef{mockNodeID(t, mockLink): {Name: "mock-01", ProviderID: inlineProviderID}})
 	newLink := "socks5://user:pass@192.0.2.11:1080"
 	first, err := e.UpdateNode(context.Background(), nativeapi.NodeUpdateRequest{
-		NodeID:         "n_old",
+		NodeID:         mockNodeID(t, mockLink),
 		Link:           nodeStringPtr(newLink),
 		IdempotencyKey: "patch-key",
 	}, index, func(nodeID string) (any, error) { return nodeID, nil })
@@ -643,9 +652,9 @@ func TestConfigUpdateNodeReplaysAfterTheNodeIDChanges(t *testing.T) {
 
 	// The write changed the link, so the old id no longer names the node: the
 	// generation now publishes a different id for the same inline entry.
-	replayedIndex := nodeIndexWith(map[string]nodeRef{"n_new": {Name: "mock-01", ProviderID: inlineProviderID}})
+	replayedIndex := nodeIndexWith(map[string]nodeRef{mockNodeID(t, newLink): {Name: "mock-01", ProviderID: inlineProviderID}})
 	second, err := e.UpdateNode(context.Background(), nativeapi.NodeUpdateRequest{
-		NodeID:         "n_old",
+		NodeID:         mockNodeID(t, mockLink),
 		Link:           nodeStringPtr(newLink),
 		IdempotencyKey: "patch-key",
 	}, replayedIndex, func(nodeID string) (any, error) { return nodeID, nil })
@@ -665,7 +674,7 @@ func TestConfigUpdateNodeRequiresWritesEnabled(t *testing.T) {
 	e := newFlowEditor(t, main, false, &fakeConfigOperations{})
 
 	_, err := e.UpdateNode(context.Background(), nativeapi.NodeUpdateRequest{
-		NodeID: "n_mock",
+		NodeID: mockNodeID(t, mockLink),
 		Name:   nodeStringPtr("mock-02"),
 	}, emptyNodeIndex, nil)
 	if apiErr := flowAPIError(t, err); apiErr.Status != 404 || apiErr.Code != "capability_not_supported" {
@@ -865,5 +874,35 @@ func TestValidateNodeLinkRejectsOutOfRangePort(t *testing.T) {
 	}
 	if _, err := validateNodeLink(context.Background(), logrus.New(), "socks5://u:p@127.0.0.1:65535"); err != nil {
 		t.Fatalf("validateNodeLink rejected port 65535: %v", err)
+	}
+}
+
+func TestConfigNodeWriteRejectsStaleIdentity(t *testing.T) {
+	for _, method := range []string{"update", "delete"} {
+		t.Run(method, func(t *testing.T) {
+			main, _ := newManagedTree(t)
+			ops := &fakeConfigOperations{}
+			e := newFlowEditor(t, main, true, ops)
+			target := flowSource(t, e, "config.d/node.dae")
+			oldID := mockNodeID(t, mockLink)
+			index := nodeIndexWith(map[string]nodeRef{oldID: {Name: "mock-01", ProviderID: inlineProviderID}})
+			const replacement = "node {\n  mock-01: 'socks5://192.0.2.99:1080'\n}\n"
+			if err := os.WriteFile(target.abs, []byte(replacement), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			if method == "update" {
+				_, err = e.UpdateNode(t.Context(), nativeapi.NodeUpdateRequest{NodeID: oldID, Name: nodeStringPtr("renamed")}, index, nil)
+			} else {
+				_, err = e.DeleteNode(t.Context(), nativeapi.NodeDeleteRequest{NodeID: oldID}, index, nil)
+			}
+			if apiErr := flowAPIError(t, err); apiErr.Status != 409 || apiErr.Code != "state_conflict" {
+				t.Fatalf("got %d %s, want 409 state_conflict", apiErr.Status, apiErr.Code)
+			}
+			got, err := os.ReadFile(target.abs)
+			if err != nil || string(got) != replacement || ops.calls != 0 {
+				t.Fatalf("refused write changed state: file=%q, read error=%v, queued=%d", got, err, ops.calls)
+			}
+		})
 	}
 }

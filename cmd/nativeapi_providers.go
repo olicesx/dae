@@ -111,11 +111,15 @@ func providerNameOf(key, tag string) string {
 // counts come from the running generation's dialers, so a provider with no
 // usable node reports status stale without inventing an update time.
 func (p *nativeAPIProvider) providers(active *nativeActiveGeneration) ([]nativeapi.Provider, error) {
-	nodes, err := active.nodes("")
+	nodes, err := active.nodeInventory("")
 	if err != nil {
 		return nil, err
 	}
 
+	return active.projectProviders(nodes), nil
+}
+
+func (active *nativeActiveGeneration) projectProviders(nodes []nodeInventoryEntry) []nativeapi.Provider {
 	type definition struct {
 		kind string
 		url  string
@@ -145,11 +149,8 @@ func (p *nativeAPIProvider) providers(active *nativeActiveGeneration) ([]nativea
 		keyByProviderID[providerIDOf(key)] = key
 	}
 	counts := make(map[string]int, len(definitions))
-	for _, node := range nodes {
-		providerID := inlineProviderID
-		if node.ProviderID != nil {
-			providerID = *node.ProviderID
-		}
+	for _, entry := range nodes {
+		providerID := providerIDOf(entry.dialer.Property().ProviderTag)
 		key, ok := keyByProviderID[providerID]
 		if !ok {
 			// A node whose provider is no longer in the accepted configuration
@@ -202,7 +203,7 @@ func (p *nativeAPIProvider) providers(active *nativeActiveGeneration) ([]nativea
 		}
 		return providers[i].ID < providers[j].ID
 	})
-	return providers, nil
+	return providers
 }
 
 // ListProviders serves one page of provider metadata.

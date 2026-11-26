@@ -44,3 +44,25 @@ func TestDialerSortKeyDistinguishesDuplicateLinks(t *testing.T) {
 	// they are the same node with the same metadata.
 	require.Equal(t, dialerSortKey(first), dialerSortKey(newDialer("sub_a")))
 }
+
+func TestEgressDialersKeepJoinedKeyOrder(t *testing.T) {
+	option := &dialer.GlobalOption{Log: logrus.New(), CheckInterval: 15 * time.Second}
+	newDialer := func(property *dialer.Property) *dialer.Dialer {
+		d := dialer.NewDialerContext(t.Context(), noopAdmissionDialer{}, option,
+			dialer.InstanceOption{DisableCheck: true}, property)
+		t.Cleanup(func() { _ = d.Close() })
+		return d
+	}
+	withoutProperty := &dialer.Dialer{}
+	prefix := newDialer(&dialer.Property{Property: D.Property{Name: "a", Link: "z"}})
+	embeddedNUL := newDialer(&dialer.Property{Property: D.Property{Name: "a\x00b", Link: "z"}})
+	subscription := newDialer(&dialer.Property{Property: D.Property{Name: "a", Link: "z"}, SubscriptionTag: "tag"})
+	otherProvider := newDialer(&dialer.Property{Property: D.Property{Name: "a", Link: "z"}, SubscriptionTag: "tag", ProviderTag: "other"})
+	runtime := newEgressRuntime(option.Log, nil)
+	runtime.configureResources(nil, []*dialer.Dialer{prefix, subscription, withoutProperty, otherProvider, embeddedNUL}, nil)
+	// The embedded NUL puts "b" next to the other keys' link bytes.
+	want := []*dialer.Dialer{withoutProperty, embeddedNUL, prefix, subscription, otherProvider}
+	for range 16 {
+		require.Equal(t, want, runtime.dialers())
+	}
+}

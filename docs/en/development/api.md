@@ -78,8 +78,9 @@ is `404 resource_not_found` and a subscription or file node is
 name or link answers `422 unsupported_value` and a taken name `409 state_conflict`.
 A relink whose link another inline entry or already loaded node uses is
 `409 state_conflict` too, because the API identifies a node by its link and two
-entries with one link collapse into a single node. A generation that is ahead of
-the file (the line is gone) answers `409 state_conflict`; a keyless entry
+entries with one link collapse into a single node. If the file has a different
+node ID under the same name, `PATCH` and `DELETE` return `409 state_conflict`.
+A missing line also returns `409 state_conflict` for `PATCH`. A keyless entry
 (`node { 'ss://…' }`) has no name to address and cannot be edited through the API
 — edit the file instead. A patch that repeats the node's current values writes
 nothing, starts no reload and answers `200 {"updated": 0}`. This endpoint is a
@@ -570,7 +571,9 @@ operations are never evicted.
 The switch completes when the operation reports `succeeded`. The old control
 plane can still be retiring and closing connections in the background. During
 retirement, `reload`, `suspend` and `resume` return `409 state_conflict`. The
-client can retry after a few seconds.
+client can retry after a few seconds. Once shutdown starts, new mutating API
+requests receive `503 temporarily_unavailable` with `Retry-After: 1` while the
+HTTP listener is draining.
 
 With `ui` configured, `/ui/` serves the frontend and every other non-`/api` path
 redirects there, so only `/api` and `/api/v1/...` take part in authentication.

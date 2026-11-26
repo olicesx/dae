@@ -12,6 +12,10 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/daeuniverse/dae/component/outbound/dialer"
+	"github.com/daeuniverse/dae/config"
+	"github.com/stretchr/testify/require"
 )
 
 func TestGeoFileDigestTracksFileContent(t *testing.T) {
@@ -53,4 +57,22 @@ func TestGeoFileDigestTracksFileContent(t *testing.T) {
 	if second == first {
 		t.Fatal("digest did not change after the file content changed")
 	}
+}
+
+func TestProvidersCountMergedNodeUnderRepresentative(t *testing.T) {
+	first, duplicate := healthTestDialer(t), healthTestDialer(t)
+	first.Property().Link, first.Property().ProviderTag = "ss://shared", "alpha"
+	duplicate.Property().Link, duplicate.Property().ProviderTag = "ss://shared", "beta"
+	t.Cleanup(func() { _ = first.Close(); _ = duplicate.Close() })
+	active := nativeActiveGeneration{conf: &config.Config{
+		Subscription: []config.KeyableString{"beta:https://example.com/b", "alpha:https://example.com/a"},
+	}}
+	providers := active.projectProviders(collectNodes([]*dialer.Dialer{first, duplicate}, nil, ""))
+	require.Len(t, providers, 2)
+	require.Equal(t, providerIDOf("alpha"), providers[0].ID)
+	require.Equal(t, uint64(1), providers[0].NodeCount)
+	require.Equal(t, "ok", providers[0].Status)
+	require.Equal(t, providerIDOf("beta"), providers[1].ID)
+	require.Zero(t, providers[1].NodeCount)
+	require.Equal(t, "stale", providers[1].Status)
 }

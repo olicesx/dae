@@ -256,47 +256,48 @@ func (s *runtimeStats) snapshot(activeConnections, udpSessions, windowSec, maxPo
 
 	s.rollLocked(now)
 
-	startTime := now.Add(-time.Duration(windowSec) * time.Second)
-
-	first := 0
-	if !history {
-		startTime = now.Add(-runtimeRateWindow)
-		first = sort.Search(s.historyLen, func(i int) bool {
-			return s.history[(s.historyStart+i)%len(s.history)].Timestamp.After(startTime)
-		})
+	// Only buckets ending within the rate window can contribute to the
+	// headline rate. The chart below selects completed samples separately.
+	rateStart := now.Add(-runtimeRateWindow)
+	firstRecent := sort.Search(s.historyLen, func(i int) bool {
+		return s.historyBucket(i).Timestamp.After(rateStart)
+	})
+	var recentStorage [int(runtimeRateWindow/runtimeBucketDuration) + 2]runtimeBucket
+	recent := recentStorage[:0]
+	for i := firstRecent; i < s.historyLen; i++ {
+		recent = append(recent, s.historyBucket(i))
 	}
-	buckets := make([]runtimeBucket, 0, s.historyLen-first+1)
-	for i := first; i < s.historyLen; i++ {
-		bucket := s.history[(s.historyStart+i)%len(s.history)]
-		if !bucket.Timestamp.Before(startTime) {
-			buckets = append(buckets, bucket)
-		}
-	}
-
-	// Include the in-flight bucket when it has actually spanned time. A
-	// zero-length bucket would otherwise be counted as a full interval in the
-	// rate denominator and in the sample series, dragging both down (or
-	// fabricating a zero sample) whenever a snapshot lands exactly on a
-	// boundary.
-	// History carries only completed intervals: the in-flight bucket's rate is
-	// an instantaneous reading whose span shrinks to nothing near a boundary,
-	// which would show up as a spike at the end of every chart.
-	completedBuckets := len(buckets)
-
-	currentBucketStart := s.currentBucketStartLocked()
-	if currentDuration := now.Sub(currentBucketStart); currentDuration > 0 {
-		buckets = append(buckets, runtimeBucket{
+	if duration := now.Sub(s.currentBucketStartLocked()); duration > 0 {
+		recent = append(recent, runtimeBucket{
 			Timestamp:     now,
 			UploadBytes:   s.currentUploadBytes.Load(),
 			DownloadBytes: s.currentDownloadBytes.Load(),
-			Duration:      currentDuration,
+			Duration:      duration,
 		})
 	}
+	uploadRate, downloadRate := ratesFromBuckets(recent, now, runtimeRateWindow)
 
-	uploadRate, downloadRate := ratesFromBuckets(buckets, now, runtimeRateWindow)
 	var samples []RuntimeTrafficSample
 	if history {
-		samples = thinRuntimeSamples(samplesFromBuckets(buckets[:completedBuckets]), maxPoints)
+		start := now.Add(-time.Duration(windowSec) * time.Second)
+		first := sort.Search(s.historyLen, func(i int) bool {
+			return !s.historyBucket(i).Timestamp.Before(start)
+		})
+		count := s.historyLen - first
+		stride := historySampleStride(count, maxPoints)
+		samples = make([]RuntimeTrafficSample, 0, (count+stride-1)/stride)
+		if count > 0 {
+			// Anchor decimation at the newest completed bucket, preserving
+			// the original rates and timestamps of the retained samples.
+			for i := first + (count-1)%stride; i < s.historyLen; i += stride {
+				bucket := s.historyBucket(i)
+				samples = append(samples, RuntimeTrafficSample{
+					Timestamp:    bucket.Timestamp,
+					UploadRate:   rateFromBytes(bucket.UploadBytes, bucket.Duration),
+					DownloadRate: rateFromBytes(bucket.DownloadBytes, bucket.Duration),
+				})
+			}
+		}
 	}
 
 	return RuntimeStatsSnapshot{
@@ -434,24 +435,16 @@ func (c *ControlPlane) snapshotRuntimeStats(windowSec, maxPoints int, history bo
 	return c.runtimeStatsStore().snapshot(activeConnections, udpSessions, windowSec, maxPoints, time.Now(), history)
 }
 
-// thinRuntimeSamples selects every Nth stored sample backwards from the newest
-// so at most maxPoints are returned. The contract asks for decimation with the
-// original timestamps and rates preserved: aggregating a bucket (for example
-// with its maximum) would fabricate spikes the recorder never measured.
-func thinRuntimeSamples(samples []RuntimeTrafficSample, maxPoints int) []RuntimeTrafficSample {
-	if maxPoints <= 0 || len(samples) <= maxPoints {
-		return samples
+// historySampleStride selects at most maxPoints from a newest-anchored series.
+func historySampleStride(count, maxPoints int) int {
+	if maxPoints <= 0 || count <= maxPoints {
+		return 1
 	}
-	stride := (len(samples) + maxPoints - 1) / maxPoints
+	return (count-1)/maxPoints + 1
+}
 
-	result := make([]RuntimeTrafficSample, 0, maxPoints)
-	for i := len(samples) - 1; i >= 0; i -= stride {
-		result = append(result, samples[i])
-	}
-	for left, right := 0, len(result)-1; left < right; left, right = left+1, right-1 {
-		result[left], result[right] = result[right], result[left]
-	}
-	return result
+func (s *runtimeStats) historyBucket(index int) runtimeBucket {
+	return s.history[(s.historyStart+index)%len(s.history)]
 }
 
 func bucketStart(now time.Time) time.Time {
@@ -463,18 +456,6 @@ func rateFromBytes(bytes uint64, duration time.Duration) uint64 {
 		return 0
 	}
 	return uint64(float64(bytes) * float64(time.Second) / float64(duration))
-}
-
-func samplesFromBuckets(buckets []runtimeBucket) []RuntimeTrafficSample {
-	samples := make([]RuntimeTrafficSample, 0, len(buckets))
-	for _, bucket := range buckets {
-		samples = append(samples, RuntimeTrafficSample{
-			Timestamp:    bucket.Timestamp,
-			UploadRate:   rateFromBytes(bucket.UploadBytes, bucket.Duration),
-			DownloadRate: rateFromBytes(bucket.DownloadBytes, bucket.Duration),
-		})
-	}
-	return samples
 }
 
 func ratesFromBuckets(buckets []runtimeBucket, now time.Time, window time.Duration) (uploadRate uint64, downloadRate uint64) {

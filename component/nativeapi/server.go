@@ -323,11 +323,17 @@ type StreamCloser interface {
 	CloseStreams()
 }
 
+// StopAcceptingWrites rejects new mutating API requests while reads can still
+// observe the server as it drains.
+func (s *Server) StopAcceptingWrites() {
+	s.stopping.Store(true)
+}
+
 func (s *Server) Shutdown(ctx context.Context) error {
 	if s == nil || s.httpServer == nil {
 		return nil
 	}
-	s.stopping.Store(true)
+	s.StopAcceptingWrites()
 	if closer, ok := s.logs.(StreamCloser); ok {
 		closer.CloseStreams()
 	}

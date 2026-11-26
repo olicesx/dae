@@ -667,6 +667,9 @@ func (e *configEditor) UpdateNode(ctx context.Context, req nativeapi.NodeUpdateR
 			Message: "the managed node source has no editable \"name: link\" entry for this node; reload or edit the file directly",
 		}
 	}
+	if err := e.checkNodeIdentity(ctx, currentLink, req.NodeID); err != nil {
+		return nativeapi.NodeUpdateOutcome{}, err
+	}
 	name, link := ref.Name, currentLink
 	if req.Name != nil {
 		name = *req.Name
@@ -781,17 +784,34 @@ func (e *configEditor) DeleteNode(ctx context.Context, req nativeapi.NodeDeleteR
 			Status: 404, Code: "capability_not_supported", Message: "Only inline nodes can be deleted; refresh or delete the provider instead",
 		}
 	}
-	updated, removed := removeNodeEntry(string(target.raw), ref.Name)
-	if !removed {
+	currentLink, found := nodeLinkOf(string(target.raw), ref.Name)
+	if !found {
 		// The index came from the running generation, which may still hold a
 		// node the file no longer defines (an edit that has not reloaded yet).
 		return nativeapi.NodeDeleteOutcome{}, nil
 	}
+	if err := e.checkNodeIdentity(ctx, currentLink, req.NodeID); err != nil {
+		return nativeapi.NodeDeleteOutcome{}, err
+	}
+	updated, _ := removeNodeEntry(string(target.raw), ref.Name)
 	accepted, err := e.commitSourceUpdate(ctx, target, []byte(updated), nativeapi.OperationKindNodeDelete, req.IdempotencyKey, fingerprint, resolve)
 	if err != nil {
 		return nativeapi.NodeDeleteOutcome{}, err
 	}
 	return nativeapi.NodeDeleteOutcome{Accepted: accepted, Deleted: 1}, nil
+}
+
+// checkNodeIdentity compares the on-disk link with the running node ID before
+// the editor changes a named entry. The name can be reused before a reload.
+func (e *configEditor) checkNodeIdentity(ctx context.Context, link, nodeID string) error {
+	currentID, err := validateNodeLink(ctx, e.log, link)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err != nil || currentID != nodeID {
+		return nativeapi.NewAPIError(409, "state_conflict", "the managed node changed on disk; reload to reconcile")
+	}
+	return nil
 }
 
 func (e *configEditor) lookupNode(index nodeIndexFunc, nodeID string) (nodeRef, bool, error) {

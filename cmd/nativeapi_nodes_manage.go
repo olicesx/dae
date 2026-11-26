@@ -94,25 +94,22 @@ func (p *nativeAPIProvider) nodeByName(name, providerID string) (*nativeapi.Node
 	if err != nil {
 		return nil, err
 	}
-	nodes, err := active.nodes("")
+	nodes, err := active.nodeInventory("")
 	if err != nil {
 		return nil, err
 	}
-	if node := findNodeByNameAndProvider(nodes, name, providerID); node != nil {
-		return node, nil
+	if entry := findNodeByNameAndProvider(nodes, name, providerID); entry != nil {
+		node := entry.node()
+		return &node, nil
 	}
 	return nil, nativeapi.NewAPIError(404, "resource_not_found", "node not found")
 }
 
-func findNodeByNameAndProvider(nodes []nativeapi.Node, name, providerID string) *nativeapi.Node {
+func findNodeByNameAndProvider(nodes []nodeInventoryEntry, name, providerID string) *nodeInventoryEntry {
 	for i := range nodes {
-		nodeProviderID := inlineProviderID
-		if nodes[i].ProviderID != nil {
-			nodeProviderID = *nodes[i].ProviderID
-		}
-		if nodes[i].Name == name && nodeProviderID == providerID {
-			node := nodes[i]
-			return &node
+		property := nodes[i].dialer.Property()
+		if property.Name == name && providerIDOf(property.ProviderTag) == providerID {
+			return &nodes[i]
 		}
 	}
 	return nil
@@ -125,17 +122,14 @@ func (p *nativeAPIProvider) nodeIndex() (map[string]nodeRef, error) {
 	if err != nil {
 		return nil, err
 	}
-	nodes, err := active.nodes("")
+	nodes, err := active.nodeInventory("")
 	if err != nil {
 		return nil, err
 	}
 	index := make(map[string]nodeRef, len(nodes))
-	for _, node := range nodes {
-		providerID := inlineProviderID
-		if node.ProviderID != nil {
-			providerID = *node.ProviderID
-		}
-		index[node.ID] = nodeRef{Name: node.Name, ProviderID: providerID}
+	for _, entry := range nodes {
+		property := entry.dialer.Property()
+		index[entry.id] = nodeRef{Name: property.Name, ProviderID: providerIDOf(property.ProviderTag)}
 	}
 	return index, nil
 }

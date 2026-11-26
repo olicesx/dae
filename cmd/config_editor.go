@@ -427,6 +427,9 @@ func mergeCandidateSections(base []*config_parser.Section, extra []*config_parse
 // parsed candidate. The API must not be laxer than `dae validate`, otherwise a
 // replacement is stored and the reload that follows it fails.
 func (e *configEditor) fullValidate(conf *config.Config) error {
+	if _, err := parseFallbackResolver(conf.Global.FallbackResolver); err != nil {
+		return err
+	}
 	if err := conf.Api.Validate(); err != nil {
 		return err
 	}

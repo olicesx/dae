@@ -130,17 +130,37 @@ func TestMemoryHistoryEmptyWindowUsesRecorderInterval(t *testing.T) {
 	}
 }
 
-func TestThinMemorySamplesKeepsNewest(t *testing.T) {
-	samples := make([]MemorySample, 6)
-	for i := range samples {
-		samples[i].SampledAt = time.Unix(int64(i), 0)
+func TestMemoryHistorySelectsWrappedSamplesInWindow(t *testing.T) {
+	stats, now := fullMemoryHistory()
+	// Include the exact cutoff and exclude the newest future sample.
+	history := stats.snapshotHistory(6, 3, now.Add(-time.Second))
+	want := []time.Duration{-7 * time.Second, -4 * time.Second, -time.Second}
+	if got := len(history.Samples); got != len(want) {
+		t.Fatalf("samples = %d, want %d", got, len(want))
 	}
-	thinned := thinMemorySamples(samples, 3)
-	if len(thinned) != 3 {
-		t.Fatalf("thinned = %d, want 3", len(thinned))
+	for i, sample := range history.Samples {
+		if !sample.SampledAt.Equal(now.Add(want[i])) || sample.RSSBytes == nil || *sample.RSSBytes != uint64(-want[i]/time.Second) {
+			t.Fatalf("sample %d = %+v, want original sample at %s", i, sample, now.Add(want[i]))
+		}
 	}
-	if !thinned[len(thinned)-1].SampledAt.Equal(samples[len(samples)-1].SampledAt) {
-		t.Fatalf("newest sample was dropped: %v", thinned)
+}
+
+func fullMemoryHistory() (*memoryStats, time.Time) {
+	stats := newMemoryStats()
+	now := time.Unix(1_700_000_000, 0)
+	for i := maxMemoryHistorySamples() + 7; i >= 0; i-- {
+		at := now.Add(-time.Duration(i) * time.Second)
+		value := uint64(i)
+		stats.pushLocked(MemorySample{SampledAt: at, RSSBytes: &value}, at)
+	}
+	return stats, now
+}
+
+func BenchmarkMemoryHistorySnapshot(b *testing.B) {
+	stats, now := fullMemoryHistory()
+	b.ReportAllocs()
+	for b.Loop() {
+		stats.snapshotHistory(1800, 180, now)
 	}
 }
 

@@ -6,9 +6,13 @@
 package cmd
 
 import (
+	"net/netip"
+	"slices"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/daeuniverse/dae/component/nativeapi"
 	"github.com/daeuniverse/dae/control"
 )
 
@@ -173,11 +177,10 @@ func TestSortConnectionFlowsByCounters(t *testing.T) {
 		{ID: "d", HasBytes: true, UploadBytes: 3, DownloadBytes: 5},
 	}
 	order := func(field, direction string) []string {
-		sorted := append([]control.SessionFlowSnapshot(nil), flows...)
-		sortConnectionFlows(sorted, field, direction, nil)
+		sorted := rankConnections(flows, field, direction, nil)
 		ids := make([]string, 0, len(sorted))
-		for _, flow := range sorted {
-			ids = append(ids, flow.ID)
+		for _, rank := range sorted {
+			ids = append(ids, flows[rank.index].ID)
 		}
 		return ids
 	}
@@ -210,38 +213,100 @@ func TestSortConnectionFlowsByWindowBytes(t *testing.T) {
 	}
 	windows := map[string]flowWindowBytes{"a": {upload: 5, download: 100}, "b": {upload: 50, download: 10}}
 
-	sorted := append([]control.SessionFlowSnapshot(nil), flows...)
-	sortConnectionFlows(sorted, "window_download", "desc", windows)
-	if sorted[0].ID != "a" || sorted[1].ID != "b" || sorted[2].ID != "no-window" {
-		t.Fatalf("window_download order = %v", []string{sorted[0].ID, sorted[1].ID, sorted[2].ID})
+	sorted := rankConnections(flows, "window_download", "desc", windows)
+	if flows[sorted[0].index].ID != "a" || flows[sorted[1].index].ID != "b" || flows[sorted[2].index].ID != "no-window" {
+		t.Fatalf("window_download order = %v", []string{flows[sorted[0].index].ID, flows[sorted[1].index].ID, flows[sorted[2].index].ID})
 	}
 
-	sorted = append([]control.SessionFlowSnapshot(nil), flows...)
-	sortConnectionFlows(sorted, "window_upload", "asc", windows)
-	if sorted[0].ID != "a" || sorted[1].ID != "b" || sorted[2].ID != "no-window" {
-		t.Fatalf("window_upload order = %v", []string{sorted[0].ID, sorted[1].ID, sorted[2].ID})
+	sorted = rankConnections(flows, "window_upload", "asc", windows)
+	if flows[sorted[0].index].ID != "a" || flows[sorted[1].index].ID != "b" || flows[sorted[2].index].ID != "no-window" {
+		t.Fatalf("window_upload order = %v", []string{flows[sorted[0].index].ID, flows[sorted[1].index].ID, flows[sorted[2].index].ID})
 	}
 
-	sorted = append([]control.SessionFlowSnapshot(nil), flows...)
-	sortConnectionFlows(sorted, "window_total", "desc", windows)
-	if sorted[0].ID != "a" || sorted[1].ID != "b" || sorted[2].ID != "no-window" {
-		t.Fatalf("window_total order = %v", []string{sorted[0].ID, sorted[1].ID, sorted[2].ID})
+	sorted = rankConnections(flows, "window_total", "desc", windows)
+	if flows[sorted[0].index].ID != "a" || flows[sorted[1].index].ID != "b" || flows[sorted[2].index].ID != "no-window" {
+		t.Fatalf("window_total order = %v", []string{flows[sorted[0].index].ID, flows[sorted[1].index].ID, flows[sorted[2].index].ID})
 	}
 }
 
-func TestSelectConnectionFlowsKeepsTheSortedHead(t *testing.T) {
+func TestListConnectionSnapshotsOrdersBeforeTruncation(t *testing.T) {
+	fixture := newWindowFixture(time.Unix(1_700_000_000, 0))
+	provider := &nativeAPIProvider{connectionBytes: true}
+	provider.flowsOnce.Do(func() { provider.flowWindow = fixture.tracker })
+	src := netip.MustParseAddrPort("192.0.2.1:1234")
+	started := fixture.now.Add(-time.Second)
 	flows := []control.SessionFlowSnapshot{
-		{ID: "tcp-1", Network: "tcp", HasBytes: true, DownloadBytes: 30},
+		{ID: "ignored", Src: netip.MustParseAddrPort("192.0.2.2:1234"), Network: "tcp", HasBytes: true, StartedAt: started, DownloadBytes: 100},
+		{ID: "tcp-1", Src: src, Network: "tcp", HasBytes: true, StartedAt: started, DownloadBytes: 10},
+		{ID: "udp-1", Src: src, Network: "udp"},
+		{ID: "tcp-2", Src: src, Network: "tcp", HasBytes: true, StartedAt: started, DownloadBytes: 20},
+		{ID: "tcp-3", Src: src, Network: "tcp", HasBytes: true, StartedAt: started, DownloadBytes: 20},
+	}
+	filter := nativeapi.ConnectionFilter{Src: src.Addr().String(), Limit: 2, Sort: "window_download", WindowSeconds: 10}
+	list := provider.listConnectionSnapshots(flows, filter, "test-instance")
+	if list.TotalTCP != 3 || list.TotalUDP != 1 || !list.Truncated || list.InstanceID != "test-instance" {
+		t.Fatalf("unexpected list metadata: %+v", list)
+	}
+	if len(list.TCP) != 2 || list.TCP[0].ID != "c_tcp-2" || list.TCP[1].ID != "c_tcp-3" {
+		t.Fatalf("tcp flows = %+v, want the first two ranked matches in stable order", list.TCP)
+	}
+	if len(list.UDP) != 1 || list.UDP[0].ID != "c_udp-1" {
+		t.Fatalf("udp flows = %+v, want the UDP match", list.UDP)
+	}
+	if list.Window == nil || list.Window.Seconds != 10 || list.TCP[0].DownloadWindowBytes == nil || *list.TCP[0].DownloadWindowBytes != "20" {
+		t.Fatalf("window metadata or counters missing: %+v", list)
+	}
+	if fixture.tracker.rings["tcp-1"] == nil || fixture.tracker.rings["ignored"] != nil {
+		t.Fatalf("window measurements must include truncated matches and skip filtered flows: %v", fixture.tracker.rings)
+	}
+}
+
+func TestListConnectionSnapshotsEmptyWindowRegistersDemand(t *testing.T) {
+	fixture := newWindowFixture(time.Unix(1_700_000_000, 0))
+	provider := &nativeAPIProvider{connectionBytes: true}
+	provider.flowsOnce.Do(func() { provider.flowWindow = fixture.tracker })
+	list := provider.listConnectionSnapshots([]control.SessionFlowSnapshot{{Network: "tcp"}}, nativeapi.ConnectionFilter{Type: "udp", WindowSeconds: 10}, "instance")
+	if list.TCP == nil || list.UDP == nil || len(list.TCP) != 0 || len(list.UDP) != 0 || list.TotalTCP != 0 || list.TotalUDP != 0 || list.Truncated {
+		t.Fatalf("expected empty arrays and totals: %+v", list)
+	}
+	if fixture.tracker.demand[10] != fixture.now {
+		t.Fatalf("empty listing did not register demand: %v", fixture.tracker.demand)
+	}
+}
+
+func BenchmarkListConnectionSnapshots(b *testing.B) {
+	provider := &nativeAPIProvider{}
+	small := []control.SessionFlowSnapshot{
+		{ID: "tcp-1", Network: "tcp", HasBytes: true, DownloadBytes: 10},
 		{ID: "udp-1", Network: "udp"},
 		{ID: "tcp-2", Network: "tcp", HasBytes: true, DownloadBytes: 20},
-		{ID: "tcp-3", Network: "tcp", HasBytes: true, DownloadBytes: 10},
 	}
-	tcpFlows, udpFlows, truncated := selectConnectionFlows(flows, 2)
-	if len(tcpFlows) != 2 || tcpFlows[0].ID != "tcp-1" || tcpFlows[1].ID != "tcp-2" {
-		t.Fatalf("tcp flows = %+v, want the first two matches", tcpFlows)
+	large := make([]control.SessionFlowSnapshot, 4096)
+	for i := range large {
+		large[i] = control.SessionFlowSnapshot{
+			ID:            strconv.Itoa(i),
+			Network:       small[i%len(small)].Network,
+			HasBytes:      i%3 != 1,
+			DownloadBytes: uint64(i * 997 % len(large)),
+		}
 	}
-	if len(udpFlows) != 1 || udpFlows[0].ID != "udp-1" || !truncated {
-		t.Fatalf("udp flows = %+v truncated = %v", udpFlows, truncated)
+	for _, tc := range []struct {
+		name   string
+		flows  []control.SessionFlowSnapshot
+		filter nativeapi.ConnectionFilter
+	}{
+		{name: "empty", filter: nativeapi.ConnectionFilter{Sort: "download"}},
+		{name: "single", flows: small[:1], filter: nativeapi.ConnectionFilter{Sort: "download"}},
+		{name: "mixed_sorted", flows: small, filter: nativeapi.ConnectionFilter{Sort: "download", Limit: 1}},
+		{name: "large_sorted", flows: large, filter: nativeapi.ConnectionFilter{Sort: "download", Limit: 100}},
+		{name: "filtered_out", flows: small, filter: nativeapi.ConnectionFilter{Type: "other"}},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				provider.listConnectionSnapshots(slices.Clone(tc.flows), tc.filter, "instance")
+			}
+		})
 	}
 }
 

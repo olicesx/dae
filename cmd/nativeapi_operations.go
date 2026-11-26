@@ -24,6 +24,11 @@ type nativeAPIOperations struct {
 	events     *nativeAPIProvider
 	probes     *probeGate
 
+	// admissionMu serializes stopping with reload admission, including requests
+	// already inside a handler when the HTTP write gate closes.
+	admissionMu sync.Mutex
+	stopping    bool
+
 	// probeTargetsMu guards probeTargetSlots, the process-wide per-node permit
 	// that makes capabilities.probes.limits.max_concurrent_per_target true
 	// across jobs. A single job already runs up to four rows at once, so
@@ -85,6 +90,12 @@ func (o *nativeAPIOperations) ReplayOperation(kind, scope, idempotencyKey string
 	return o.store.Replay(kind, scope, idempotencyKey)
 }
 
+func (o *nativeAPIOperations) stopAcceptingReloads() {
+	o.admissionMu.Lock()
+	defer o.admissionMu.Unlock()
+	o.stopping = true
+}
+
 // StartOperation queues a reload for the contract's operation resources, which
 // report the reload's generation ids rather than a written resource.
 func (o *nativeAPIOperations) StartOperation(ctx context.Context, kind, scope, idempotencyKey string) (nativeapi.OperationAccepted, error) {
@@ -103,6 +114,16 @@ func (o *nativeAPIOperations) StartOperationWithResult(ctx context.Context, kind
 	if o == nil || o.manager == nil {
 		return nativeapi.OperationAccepted{}, nativeapi.NewAPIError(503, "temporarily_unavailable",
 			"the reload manager is unavailable")
+	}
+	o.admissionMu.Lock()
+	defer o.admissionMu.Unlock()
+	if o.stopping {
+		return nativeapi.OperationAccepted{}, &nativeapi.APIError{
+			Status: 503, Code: "temporarily_unavailable", Message: "server is shutting down", RetryAfterSeconds: 1,
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nativeapi.OperationAccepted{}, err
 	}
 	accepted, replayed, err := o.store.Accept(kind, scope, idempotencyKey)
 	if err != nil {

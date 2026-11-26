@@ -611,6 +611,20 @@ func TestAccessSummary(t *testing.T) {
 	}
 }
 
+func TestServerStopsAcceptingWritesBeforeListenerShutdown(t *testing.T) {
+	server := newTestServer(t, Config{AllowAnonymousLoopback: true}, fakeRuntimeProvider{runtime: testRuntime()})
+	server.StopAcceptingWrites()
+
+	write := doRequest(server, http.MethodPost, "/api/v1/operations/reload", "127.0.0.1:1234", nil)
+	if write.Code != http.StatusServiceUnavailable || write.Header().Get("Retry-After") != "1" {
+		t.Fatalf("reload during shutdown = %d, %s", write.Code, write.Body.String())
+	}
+	read := doRequest(server, http.MethodGet, "/api/v1/version", "127.0.0.1:1234", nil)
+	if read.Code != http.StatusOK {
+		t.Fatalf("read during shutdown = %d, %s", read.Code, read.Body.String())
+	}
+}
+
 func TestServerStartStopLogging(t *testing.T) {
 	logger, hook := test.NewNullLogger()
 	server, err := NewServer(Config{Listen: "127.0.0.1:19699", AllowAnonymousLoopback: true}, fakeRuntimeProvider{runtime: testRuntime()}, logger)

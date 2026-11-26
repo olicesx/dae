@@ -15,6 +15,7 @@ import (
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/nativeapi"
+	"github.com/daeuniverse/dae/component/outbound"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 )
 
@@ -379,14 +380,18 @@ func (p *nativeAPIProvider) ListNodes(ctx context.Context, groupID string, limit
 	if err != nil {
 		return nativeapi.NodeList{}, err
 	}
-	nodes, err := active.nodes(groupID)
+	nodes, err := active.nodeInventory(groupID)
 	if err != nil {
 		return nativeapi.NodeList{}, err
 	}
+	return nodePage(nodes, active.generation.id, limit, cursor)
+}
+
+func nodePage(nodes []nodeInventoryEntry, generation string, limit int, cursor string) (nativeapi.NodeList, error) {
 	offset := 0
 	if cursor != "" {
 		decoded, ok := decodeNodeCursor(cursor)
-		if !ok || decoded.generation != active.generation.id || decoded.offset > len(nodes) {
+		if !ok || decoded.generation != generation || decoded.offset > len(nodes) {
 			return nativeapi.NodeList{}, nativeapi.NewAPIError(410, "snapshot_expired", "cursor does not belong to the current node snapshot")
 		}
 		offset = decoded.offset
@@ -395,12 +400,16 @@ func (p *nativeAPIProvider) ListNodes(ctx context.Context, groupID string, limit
 	if end > len(nodes) {
 		end = len(nodes)
 	}
+	projected := make([]nativeapi.Node, 0, end-offset)
+	for _, entry := range nodes[offset:end] {
+		projected = append(projected, entry.node())
+	}
 	page := nativeapi.NodeList{
 		ObservedAt: time.Now().UTC().Format(time.RFC3339),
-		Nodes:      nodes[offset:end],
+		Nodes:      projected,
 	}
 	if end < len(nodes) {
-		next := encodeNodeCursor(nodeCursor{generation: active.generation.id, offset: end})
+		next := encodeNodeCursor(nodeCursor{generation: generation, offset: end})
 		page.NextCursor = &next
 	}
 	return page, nil
@@ -414,41 +423,61 @@ func (p *nativeAPIProvider) GetNode(ctx context.Context, nodeID string) (*native
 	if err != nil {
 		return nil, err
 	}
-	nodes, err := active.nodes("")
+	nodes, err := active.nodeInventory("")
 	if err != nil {
 		return nil, err
 	}
-	for i := range nodes {
-		if nodes[i].ID == nodeID {
-			node := nodes[i]
+	for _, entry := range nodes {
+		if entry.id == nodeID {
+			node := entry.node()
 			return &node, nil
 		}
 	}
 	return nil, nativeapi.NewAPIError(404, "resource_not_found", "node not found")
 }
 
-// nodes projects the managed dialers, optionally limited to one group.
-func (a *nativeActiveGeneration) nodes(groupID string) ([]nativeapi.Node, error) {
-	groups := a.userGroups()
+// nodeInventoryEntry retains the first dialer for metadata and the remaining
+// dialers in inventory order for health merging.
+type nodeInventoryEntry struct {
+	id         string
+	dialer     *dialer.Dialer
+	groupIDs   []string
+	duplicates []*dialer.Dialer
+}
+
+func (entry nodeInventoryEntry) node() nativeapi.Node {
+	property := entry.dialer.Property()
+	health := dialerHealthObservations(entry.dialer)
+	for _, d := range entry.duplicates {
+		health = mergeHealthObservations(health, dialerHealthObservations(d))
+	}
+	return nativeapi.Node{
+		ID:              entry.id,
+		Name:            property.Name,
+		Protocol:        optionalString(property.Protocol),
+		SubscriptionTag: optionalString(property.SubscriptionTag),
+		ProviderID:      stringPointer(providerIDOf(property.ProviderTag)),
+		GroupIDs:        entry.groupIDs,
+		Health:          health,
+	}
+}
+
+func (a *nativeActiveGeneration) nodeInventory(groupID string) ([]nodeInventoryEntry, error) {
 	if groupID != "" {
 		if _, ok := a.findGroup(groupID); !ok {
 			return nil, nativeapi.NewAPIError(404, "resource_not_found", "group not found")
 		}
 	}
-	groupIDs := make(map[*dialer.Dialer][]string, len(a.groups))
-	for _, item := range groups {
-		id := groupIDOf(item.group.Name)
-		if groupID != "" && id != groupID {
-			continue
-		}
-		for _, d := range item.group.Dialers {
-			groupIDs[d] = append(groupIDs[d], id)
-		}
-	}
+	return collectNodes(a.generation.controlPlane.EgressDialers(), a.groups, groupID), nil
+}
 
-	// The builtin direct/block dialers are engine pseudo-nodes, not user nodes.
+// collectNodes merges dialers in their inventory order, optionally limiting
+// membership and health contributors to one group.
+func collectNodes(all []*dialer.Dialer, groups []*outbound.DialerGroup, groupID string) []nodeInventoryEntry {
+	groupIDs := make(map[*dialer.Dialer][]string, len(groups))
+	// The builtin direct/block dialers are engine pseudo-nodes.
 	builtin := make(map[*dialer.Dialer]struct{}, 2)
-	for _, group := range a.groups {
+	for _, group := range groups {
 		if group == nil {
 			continue
 		}
@@ -457,11 +486,18 @@ func (a *nativeActiveGeneration) nodes(groupID string) ([]nativeapi.Node, error)
 			for _, d := range group.Dialers {
 				builtin[d] = struct{}{}
 			}
+		default:
+			id := groupIDOf(group.Name)
+			if groupID != "" && id != groupID {
+				continue
+			}
+			for _, d := range group.Dialers {
+				groupIDs[d] = append(groupIDs[d], id)
+			}
 		}
 	}
 
-	all := a.generation.controlPlane.EgressDialers()
-	nodes := make([]nativeapi.Node, 0, len(all))
+	nodes := make([]nodeInventoryEntry, 0, len(all))
 	indexByID := make(map[string]int, len(all))
 	for _, d := range all {
 		if _, isBuiltin := builtin[d]; isBuiltin {
@@ -476,32 +512,16 @@ func (a *nativeActiveGeneration) nodes(groupID string) ([]nativeapi.Node, error)
 			continue
 		}
 		id := nodeIDOf(property)
-		health := dialerHealthObservations(d)
-		if existing, ok := indexByID[id]; ok {
-			// The node ID is derived from the share link, so two
-			// subscriptions carrying the same link are one node. Merge their
-			// memberships and health instead of returning duplicate IDs.
-			node := &nodes[existing]
-			node.GroupIDs = mergeSortedStrings(node.GroupIDs, ids)
-			node.Health = mergeHealthObservations(node.Health, health)
+		if i, ok := indexByID[id]; ok {
+			entry := &nodes[i]
+			entry.groupIDs = mergeSortedStrings(entry.groupIDs, ids)
+			entry.duplicates = append(entry.duplicates, d)
 			continue
 		}
 		indexByID[id] = len(nodes)
-		node := nativeapi.Node{
-			ID:              id,
-			Name:            property.Name,
-			Protocol:        optionalString(property.Protocol),
-			SubscriptionTag: optionalString(property.SubscriptionTag),
-			ProviderID:      stringPointer(providerIDOf(property.ProviderTag)),
-			GroupIDs:        mergeSortedStrings(nil, ids),
-			Health:          health,
-		}
-		if node.Health == nil {
-			node.Health = []nativeapi.HealthObservation{}
-		}
-		nodes = append(nodes, node)
+		nodes = append(nodes, nodeInventoryEntry{id: id, dialer: d, groupIDs: mergeSortedStrings(nil, ids)})
 	}
-	return nodes, nil
+	return nodes
 }
 
 func mergeSortedStrings(existing []string, additional []string) []string {

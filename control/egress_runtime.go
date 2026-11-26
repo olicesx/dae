@@ -8,7 +8,8 @@ package control
 import (
 	stderrors "errors"
 	"reflect"
-	"sort"
+	"slices"
+	"strings"
 	"sync"
 
 	"github.com/daeuniverse/dae/component/outbound"
@@ -104,19 +105,29 @@ func (r *egressRuntime) dialers() []*dialer.Dialer {
 	if r == nil {
 		return nil
 	}
+	type keyedDialer struct {
+		dialer *dialer.Dialer
+		key    string
+	}
 	r.mu.Lock()
-	result := make([]*dialer.Dialer, 0, len(r.dialerRefs))
+	entries := make([]keyedDialer, 0, len(r.dialerRefs))
 	for d := range r.dialerRefs {
 		if d != nil {
-			result = append(result, d)
+			entries = append(entries, keyedDialer{dialer: d})
 		}
 	}
 	r.mu.Unlock()
-	// Stable keeps tied keys (for example two subscriptions carrying the same
-	// link) in one order, so a paginated walk cannot serve the same entry twice.
-	sort.SliceStable(result, func(i, j int) bool {
-		return dialerSortKey(result[i]) < dialerSortKey(result[j])
+	// Keep the exact byte order of the joined key, including embedded NULs.
+	for i := range entries {
+		entries[i].key = dialerSortKey(entries[i].dialer)
+	}
+	slices.SortStableFunc(entries, func(a, b keyedDialer) int {
+		return strings.Compare(a.key, b.key)
 	})
+	result := make([]*dialer.Dialer, len(entries))
+	for i, entry := range entries {
+		result[i] = entry.dialer
+	}
 	return result
 }
 

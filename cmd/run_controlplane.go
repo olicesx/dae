@@ -9,7 +9,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -277,6 +276,10 @@ func mergeSubscriptionResults(log *logrus.Logger, tagToNodeList map[string][]str
 }
 
 func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf *control.InheritedBpf, freshDatapath *control.FreshDatapathState, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {
+	fallbackResolver, err := parseFallbackResolver(conf.Global.FallbackResolver)
+	if err != nil {
+		return nil, err
+	}
 	// Deep copy to prevent modification.
 	conf = deepcopy.Copy(conf).(*config.Config)
 	if conf.Global.SoMarkFromDae == 0 {
@@ -312,7 +315,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf *contr
 
 	/// Build generation-scoped direct dialers.
 	directDialers := direct.NewDirectDialers(conf.Global.FallbackResolver)
-	systemDNSResolver := netutils.NewSystemDNSResolver(netip.MustParseAddrPort(conf.Global.FallbackResolver))
+	systemDNSResolver := netutils.NewSystemDNSResolver(fallbackResolver)
 	locationFinder := assets.NewLocationFinder(externGeoDataDirs)
 	// The startup router resolves subscription hosts before the runtime
 	// generations exist. It stays bootstrap-only on purpose: the

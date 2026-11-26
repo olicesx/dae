@@ -18,7 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func healthTestDialer(t *testing.T) *dialer.Dialer {
+func healthTestDialer(t testing.TB) *dialer.Dialer {
 	t.Helper()
 	option := &dialer.GlobalOption{Log: logrus.New(), CheckInterval: 15 * time.Second}
 	d := newNamedDialer(option, &dialer.Property{Property: D.Property{Name: "hk-01"}})
@@ -300,4 +300,66 @@ func TestBuildRankingUsesEngineSortingValue(t *testing.T) {
 
 	// A sample with no engine rank produces no ranking at all.
 	require.Nil(t, buildRanking(consts.DialerSelectionPolicy_MinLastLatency, healthSample{lastMs: &metric}))
+}
+
+func TestNodePageMergesDialersBeforePagination(t *testing.T) {
+	first, newer, tied := healthTestDialer(t), healthTestDialer(t), healthTestDialer(t)
+	for _, d := range []*dialer.Dialer{first, newer, tied} {
+		d.Property().Link = "ss://shared"
+		t.Cleanup(func() { _ = d.Close() })
+	}
+	first.Property().Name, first.Property().ProviderTag = "a", "alpha"
+	newer.Property().Name, newer.Property().ProviderTag = "b", "beta"
+	tied.Property().Name = "c"
+	setLatency := func(d *dialer.Dialer, shift, latency time.Duration) {
+		snapshot := d.HealthSnapshot()
+		probe := &snapshot.Collections[dialer.IdxTcp4].LastProbe
+		probe.CheckedAt = probe.CheckedAt.Add(shift)
+		probe.Latency = latency
+		d.RestoreHealthSnapshot(snapshot)
+	}
+	setLatency(newer, 2*time.Second, 30*time.Millisecond)
+	setLatency(tied, 2500*time.Millisecond, 1*time.Millisecond)
+
+	option := &dialer.GlobalOption{Log: logrus.New()}
+	other := newNamedDialer(option, &dialer.Property{Property: D.Property{Name: "d", Link: "ss://other"}})
+	builtin := newNamedDialer(option, &dialer.Property{Property: D.Property{Name: "direct"}})
+	t.Cleanup(func() { _ = other.Close(); _ = builtin.Close() })
+	groups := []*outbound.DialerGroup{
+		{Name: "alpha", Dialers: []*dialer.Dialer{first}},
+		{Name: "beta", Dialers: []*dialer.Dialer{newer, tied}},
+		{Name: consts.OutboundDirect.String(), Dialers: []*dialer.Dialer{builtin}},
+	}
+	all := []*dialer.Dialer{first, newer, tied, other, builtin}
+	entries := collectNodes(all, groups, "")
+	require.Len(t, entries, 2)
+	page, err := nodePage(entries, "gen-1", 1, "")
+	require.NoError(t, err)
+	require.Len(t, page.Nodes, 1)
+	require.NotNil(t, page.NextCursor)
+	node := page.Nodes[0]
+	require.Equal(t, nodeIDOf(first.Property()), node.ID)
+	require.Equal(t, "a", node.Name)
+	require.Equal(t, providerIDOf("alpha"), *node.ProviderID)
+	require.Equal(t, mergeSortedStrings(nil, []string{groupIDOf("alpha"), groupIDOf("beta")}), node.GroupIDs)
+	require.Equal(t, dialerHealthObservations(newer), node.Health)
+
+	next, err := nodePage(entries, "gen-1", 1, *page.NextCursor)
+	require.NoError(t, err)
+	require.Len(t, next.Nodes, 1)
+	require.Equal(t, nodeIDOf(other.Property()), next.Nodes[0].ID)
+	require.Equal(t, []nativeapi.HealthObservation{}, next.Nodes[0].Health)
+	require.Equal(t, []string{}, next.Nodes[0].GroupIDs)
+	require.Nil(t, next.NextCursor)
+	_, err = nodePage(entries, "gen-2", 1, *page.NextCursor)
+	var apiErr *nativeapi.APIError
+	require.ErrorAs(t, err, &apiErr)
+	require.Equal(t, "snapshot_expired", apiErr.Code)
+
+	filtered, err := nodePage(collectNodes(all, groups, groupIDOf("alpha")), "gen-1", 1, "")
+	require.NoError(t, err)
+	require.Len(t, filtered.Nodes, 1)
+	require.Equal(t, []string{groupIDOf("alpha")}, filtered.Nodes[0].GroupIDs)
+	require.Equal(t, dialerHealthObservations(first), filtered.Nodes[0].Health)
+	require.Nil(t, filtered.NextCursor)
 }

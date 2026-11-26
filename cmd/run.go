@@ -479,6 +479,7 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 	w.runStateChanges = runStateChanges
 
 	var apiServer *nativeapi.Server
+	var apiOperations *nativeAPIOperations
 	if conf.Api.Enabled {
 		logHub := newFrameHub(rtStatus.snapshot().InstanceID, "logs", nativeapi.LogMaxBufferedRecords, nativeapi.LogRetentionSeconds*time.Second, nativeapi.LogMaxClients)
 		eventHub := newFrameHub(rtStatus.snapshot().InstanceID, "events", nativeapi.EventMaxBufferedEvents, nativeapi.EventRetentionSeconds*time.Second, nativeapi.EventMaxClients)
@@ -541,6 +542,7 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 			return fmt.Errorf("start native api listener %q: %w", conf.Api.Listen, err)
 		}
 		apiServer = server
+		apiOperations = operations
 		log.Infof("Native API listening on %s", conf.Api.Listen)
 		for _, warning := range conf.Api.Warnings() {
 			log.Warnln("Native API:", warning)
@@ -948,11 +950,17 @@ loop:
 		}
 	}
 
+	// Reject new writes and close reload admission before tearing down the
+	// datapath. A request already in the editor can still reach the queue.
+	if apiServer != nil {
+		apiServer.StopAcceptingWrites()
+		apiOperations.stopAcceptingReloads()
+	}
+	if rtStatus.getState() != string(runtimeStateFailed) {
+		rtStatus.setState(runtimeStateDraining)
+	}
 	defer func() {
 		_ = sdnotify.Stopping()
-		if rtStatus.getState() != string(runtimeStateFailed) {
-			rtStatus.setState(runtimeStateDraining)
-		}
 		if w.pprofServer != nil {
 			w.log.Infoln("Shutting down pprof server")
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

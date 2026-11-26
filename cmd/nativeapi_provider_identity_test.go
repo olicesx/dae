@@ -10,22 +10,26 @@ import (
 	"testing"
 
 	"github.com/daeuniverse/dae/common/subscription"
-	"github.com/daeuniverse/dae/component/nativeapi"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
+	D "github.com/daeuniverse/outbound/dialer"
 	"github.com/sirupsen/logrus"
 )
 
 func TestFindNodeByNameAndProvider(t *testing.T) {
-	subProvider := "p_sub"
-	nodes := []nativeapi.Node{
-		{ID: "sub-id", Name: "edge", ProviderID: &subProvider},
-		{ID: "inline-id", Name: "edge"},
+	option := &dialer.GlobalOption{Log: logrus.New()}
+	sub := newNamedDialer(option, &dialer.Property{Property: D.Property{Name: "edge"}, ProviderTag: "sub"})
+	inline := newNamedDialer(option, &dialer.Property{Property: D.Property{Name: "edge"}})
+	t.Cleanup(func() { _ = sub.Close(); _ = inline.Close() })
+	subProvider := providerIDOf("sub")
+	nodes := []nodeInventoryEntry{
+		{id: "sub-id", dialer: sub},
+		{id: "inline-id", dialer: inline},
 	}
 	node := findNodeByNameAndProvider(nodes, "edge", inlineProviderID)
-	if node == nil || node.ID != "inline-id" {
+	if node == nil || node.id != "inline-id" {
 		t.Fatalf("inline node = %+v, want the inline duplicate", node)
 	}
-	if node = findNodeByNameAndProvider(nodes, "edge", subProvider); node == nil || node.ID != "sub-id" {
+	if node = findNodeByNameAndProvider(nodes, "edge", subProvider); node == nil || node.id != "sub-id" {
 		t.Fatalf("subscription node = %+v, want the subscription duplicate", node)
 	}
 }

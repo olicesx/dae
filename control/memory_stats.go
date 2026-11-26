@@ -6,8 +6,10 @@
 package control
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -126,20 +128,27 @@ func readProcessRSS(path string) (uint64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		value, ok := strings.CutPrefix(line, "VmRSS:")
+	for line := range bytes.SplitSeq(data, []byte("\n")) {
+		value, ok := bytes.CutPrefix(line, []byte("VmRSS:"))
 		if !ok {
 			continue
 		}
-		fields := strings.Fields(value)
-		if len(fields) < 2 || fields[1] != "kB" {
-			return 0, false
+		var count []byte
+		for field := range bytes.FieldsSeq(value) {
+			if count == nil {
+				count = field
+				continue
+			}
+			if string(field) != "kB" {
+				return 0, false
+			}
+			kb, err := strconv.ParseUint(string(count), 10, 64)
+			if err != nil {
+				return 0, false
+			}
+			return kb * 1024, true
 		}
-		kb, err := strconv.ParseUint(fields[0], 10, 64)
-		if err != nil {
-			return 0, false
-		}
-		return kb * 1024, true
+		return 0, false
 	}
 	return 0, false
 }
@@ -178,11 +187,11 @@ func readUintFile(path string) (uint64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	value := strings.TrimSpace(string(data))
-	if value == "" || value == "max" {
+	value := bytes.TrimSpace(data)
+	if len(value) == 0 || string(value) == "max" {
 		return 0, false
 	}
-	parsed, err := strconv.ParseUint(value, 10, 64)
+	parsed, err := strconv.ParseUint(string(value), 10, 64)
 	if err != nil {
 		return 0, false
 	}
@@ -198,14 +207,14 @@ func readMemoryMax(path string) (value uint64, unlimited bool, ok bool) {
 	if err != nil {
 		return 0, false, false
 	}
-	trimmed := strings.TrimSpace(string(data))
-	if trimmed == "max" {
+	trimmed := bytes.TrimSpace(data)
+	if string(trimmed) == "max" {
 		return 0, true, true
 	}
-	if trimmed == "" {
+	if len(trimmed) == 0 {
 		return 0, false, false
 	}
-	parsed, err := strconv.ParseUint(trimmed, 10, 64)
+	parsed, err := strconv.ParseUint(string(trimmed), 10, 64)
 	if err != nil {
 		return 0, false, false
 	}
@@ -217,33 +226,44 @@ func readCgroupEvents(path string) *CgroupMemoryEvents {
 	if err != nil {
 		return nil
 	}
-	values := make(map[string]uint64, 3)
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
+	var counters struct {
+		CgroupMemoryEvents
+		high, oom, oomKill uint64
+	}
+	for line := range bytes.SplitSeq(data, []byte("\n")) {
+		var fields [2][]byte
+		n := 0
+		for field := range bytes.FieldsSeq(line) {
+			n++
+			if n > len(fields) {
+				break
+			}
+			fields[n-1] = field
+		}
+		if n != len(fields) {
 			continue
 		}
-		switch fields[0] {
-		case "high", "oom", "oom_kill":
-			if value, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
-				values[fields[0]] = value
-			}
+		var target **uint64
+		var storage *uint64
+		switch string(fields[0]) {
+		case "high":
+			target, storage = &counters.High, &counters.high
+		case "oom":
+			target, storage = &counters.OOM, &counters.oom
+		case "oom_kill":
+			target, storage = &counters.OOMKill, &counters.oomKill
+		default:
+			continue
+		}
+		if value, err := strconv.ParseUint(string(fields[1]), 10, 64); err == nil {
+			*storage = value
+			*target = storage
 		}
 	}
-	if len(values) == 0 {
+	if counters.High == nil && counters.OOM == nil && counters.OOMKill == nil {
 		return nil
 	}
-	events := &CgroupMemoryEvents{}
-	if value, ok := values["high"]; ok {
-		events.High = &value
-	}
-	if value, ok := values["oom"]; ok {
-		events.OOM = &value
-	}
-	if value, ok := values["oom_kill"]; ok {
-		events.OOMKill = &value
-	}
-	return events
+	return &counters.CgroupMemoryEvents
 }
 
 // cgroupDirectory resolves the cgroup v2 directory of this process from
@@ -254,9 +274,9 @@ func cgroupDirectory(procSelf string) (string, bool) {
 		return "", false
 	}
 	member := ""
-	for _, line := range strings.Split(string(membership), "\n") {
-		if rest, ok := strings.CutPrefix(line, "0::"); ok {
-			member = strings.TrimSpace(rest)
+	for line := range bytes.SplitSeq(membership, []byte("\n")) {
+		if rest, ok := bytes.CutPrefix(line, []byte("0::")); ok {
+			member = string(bytes.TrimSpace(rest))
 			break
 		}
 	}
@@ -272,23 +292,36 @@ func cgroupDirectory(procSelf string) (string, bool) {
 		path  string
 	}
 	var best candidate
-	for _, line := range strings.Split(string(mountinfo), "\n") {
-		left, right, ok := strings.Cut(line, " - ")
+	for line := range bytes.SplitSeq(mountinfo, []byte("\n")) {
+		left, right, ok := bytes.Cut(line, []byte(" - "))
 		if !ok {
 			continue
 		}
-		if fields := strings.Fields(right); len(fields) == 0 || fields[0] != "cgroup2" {
+		var cgroup2 bool
+		for fsType := range bytes.FieldsSeq(right) {
+			cgroup2 = string(fsType) == "cgroup2"
+			break
+		}
+		if !cgroup2 {
 			continue
 		}
-		fields := strings.Fields(left)
-		if len(fields) < 5 {
+		var fields [5][]byte
+		n := 0
+		for field := range bytes.FieldsSeq(left) {
+			fields[n] = field
+			n++
+			if n == len(fields) {
+				break
+			}
+		}
+		if n < len(fields) {
 			continue
 		}
-		root, ok := unescapeMountPath(fields[3])
+		root, ok := unescapeMountPath(string(fields[3]))
 		if !ok {
 			continue
 		}
-		mount, ok := unescapeMountPath(fields[4])
+		mount, ok := unescapeMountPath(string(fields[4]))
 		if !ok {
 			continue
 		}
@@ -313,19 +346,20 @@ func relativeCgroupPath(member, root string) (string, bool) {
 	if member == root {
 		return "", true
 	}
-	prefix := strings.TrimSuffix(root, "/") + "/"
-	if !strings.HasPrefix(member, prefix) {
+	prefix := strings.TrimSuffix(root, "/")
+	if !strings.HasPrefix(member, prefix) || len(member) == len(prefix) || member[len(prefix)] != '/' {
 		return "", false
 	}
-	return member[len(prefix)-1:], true
+	return member[len(prefix):], true
 }
+
+var mountPathUnescaper = strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
 
 func unescapeMountPath(value string) (string, bool) {
 	if !strings.HasPrefix(value, "/") {
 		return "", false
 	}
-	replacer := strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
-	return replacer.Replace(value), true
+	return mountPathUnescaper.Replace(value), true
 }
 
 // cgroupScope reports service only when dae is alone in a leaf cgroup, so the
@@ -335,12 +369,17 @@ func cgroupScope(directory string) string {
 	if err != nil {
 		return "unknown"
 	}
-	lines := strings.Fields(string(procs))
-	if len(lines) == 0 {
-		return "unknown"
+	var pidBuffer [20]byte
+	pid := strconv.AppendInt(pidBuffer[:0], int64(os.Getpid()), 10)
+	found := false
+	for field := range bytes.FieldsSeq(procs) {
+		if found || !bytes.Equal(field, pid) {
+			return "shared"
+		}
+		found = true
 	}
-	if len(lines) != 1 || lines[0] != strconv.Itoa(os.Getpid()) {
-		return "shared"
+	if !found {
+		return "unknown"
 	}
 	entries, err := os.ReadDir(directory)
 	if err != nil {
@@ -401,7 +440,7 @@ type bpfFdInfoKey struct {
 
 func parseBpfFdInfo(info string) (key bpfFdInfoKey, memlock uint64, ok bool) {
 	memlockSeen := false
-	for _, line := range strings.Split(info, "\n") {
+	for line := range strings.SplitSeq(info, "\n") {
 		switch {
 		case strings.HasPrefix(line, "map_type:"):
 			key.kind = "map"
@@ -568,15 +607,23 @@ func (s *memoryStats) snapshotHistory(windowSeconds, maxPoints int, now time.Tim
 	defer s.mu.Unlock()
 
 	start := now.Add(-time.Duration(windowSeconds) * time.Second)
-	samples := make([]MemorySample, 0, s.historyLength)
-	for i := 0; i < s.historyLength; i++ {
-		sample := s.samples[(s.historyStart+i)%len(s.samples)]
-		if sample.SampledAt.Before(start) || sample.SampledAt.After(now) {
-			continue
-		}
-		samples = append(samples, sample)
+	sampleAt := func(i int) MemorySample {
+		return s.samples[(s.historyStart+i)%len(s.samples)]
 	}
-	samples = thinMemorySamples(samples, maxPoints)
+	first := sort.Search(s.historyLength, func(i int) bool {
+		return !sampleAt(i).SampledAt.Before(start)
+	})
+	end := first + sort.Search(s.historyLength-first, func(i int) bool {
+		return sampleAt(first + i).SampledAt.After(now)
+	})
+	count := end - first
+	stride := historySampleStride(count, maxPoints)
+	samples := make([]MemorySample, 0, (count+stride-1)/stride)
+	if count > 0 {
+		for i := first + (count-1)%stride; i < end; i += stride {
+			samples = append(samples, sampleAt(i))
+		}
+	}
 
 	every := memorySampleInterval.Seconds()
 	if len(samples) >= 2 {
@@ -593,21 +640,6 @@ func (s *memoryStats) snapshotHistory(windowSeconds, maxPoints int, now time.Tim
 		Samples:             samples,
 		Metrics:             metrics,
 	}
-}
-
-func thinMemorySamples(samples []MemorySample, maxPoints int) []MemorySample {
-	if maxPoints <= 0 || len(samples) <= maxPoints {
-		return samples
-	}
-	stride := (len(samples) + maxPoints - 1) / maxPoints
-	result := make([]MemorySample, 0, maxPoints)
-	for i := len(samples) - 1; i >= 0; i -= stride {
-		result = append(result, samples[i])
-	}
-	for left, right := 0, len(result)-1; left < right; left, right = left+1, right-1 {
-		result[left], result[right] = result[right], result[left]
-	}
-	return result
 }
 
 // memorySnapshot projects the latest reading for the API.

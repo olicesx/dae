@@ -199,11 +199,11 @@ func TestPatchNodeEditsTheManagedFileOverHTTP(t *testing.T) {
 	}
 	server.SetNodeProvider(&editorNodes{
 		e:     e,
-		index: nodeIndexWith(map[string]nodeRef{"n_mock": {Name: "mock-01", ProviderID: inlineProviderID}}),
+		index: nodeIndexWith(map[string]nodeRef{mockNodeID(t, mockLink): {Name: "mock-01", ProviderID: inlineProviderID}}),
 	})
 
 	relinked := "socks5://user:pass@192.0.2.11:1080"
-	req := httptest.NewRequest(http.MethodPatch, "/api/v1/nodes/n_mock",
+	req := httptest.NewRequest(http.MethodPatch, "/api/v1/nodes/"+mockNodeID(t, mockLink),
 		strings.NewReader(`{"name":"mock-02","link":"`+relinked+`"}`))
 	req.Host = "127.0.0.1:9527"
 	req.RemoteAddr = "127.0.0.1:50000"

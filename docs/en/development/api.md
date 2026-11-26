@@ -3,7 +3,7 @@
 Listener configuration, authentication, TLS, Host/Origin checks and
 self-hosting the UI are covered in
 [configuration notes](../configuration/api.md). This page documents the
-endpoints and the resource contract dae implements.
+endpoints and the resource contract kdae implements.
 
 ## Endpoints
 
@@ -17,7 +17,7 @@ Current implementation:
 - `GET /api/v1/runtime/outbounds` — per-outbound counters, retained across reloads
 - `GET /api/v1/runtime/memory` — process, cgroup v2 and eBPF memory
 - `GET /api/v1/runtime/memory/history?window_seconds=&max_points=`
-- `GET /api/v1/runtime/direct-stats` — opt-in direct-traffic counters
+- `GET /api/v1/x-kdae/runtime/direct-stats` — opt-in direct-traffic counters
 - `GET /api/v1/datapath` — eBPF attachments, routing generation and map occupancy
 - `GET /api/v1/groups`
 - `GET /api/v1/groups/{group_id}`
@@ -47,6 +47,12 @@ Current implementation:
 - `GET /api/v1/events` and `GET /api/v1/logs` — server-sent event streams
 - `POST /api/v1/probes` — start a node or group probe; the operation is polled
   through `GET /api/v1/operations/{operation_id}`
+
+The shared endpoints follow the `api-standardize` contract. What kdae adds is
+kept where the contract puts engine extensions, under a member named after the
+engine: discovery `links` and capabilities `resources` carry an `x-kdae`
+member, so does a group's `config`, and the extension route sits under
+`/api/v1/x-kdae/`. The direct-stats observer is the only one so far.
 
 `POST /api/v1/providers` (inline provider creation),
 `DELETE /api/v1/providers/{provider_id}` and `POST /api/v1/geodata/update`
@@ -125,9 +131,10 @@ Deliberate deviations from the contract:
 
 - `api.dae` is hidden. It is omitted from `sources[]`, and its ID answers
   `404 resource_not_found`, the same as an unknown ID. Capabilities report it in
-  `x-dae.hidden_sources`.
-- `config.dae` is read-only (`entry_source`). A replacement may not change the
-  `api` section.
+  `x-kdae.hidden_sources`.
+- `config.dae` is read-only by role. None of the contract's four causes
+  applies, so it reports no `read_only_reason`. A replacement may not change
+  the `api` section.
 - `GET` reads the files on disk, not an accepted snapshot. Its `revision` is
   the same function of the configuration that `runtime.generation.config_revision`
   uses, so the two compare: they match while disk is what the engine loaded and
@@ -172,7 +179,7 @@ dials with — except `random`, which re-rolls for every connection and answers
 `null`.
 
 `config` always carries the seven contract keys, `null` when the group sets no
-value of its own, plus `x-dae` with dae's own `check_addresses`,
+value of its own, plus `x-kdae` with kdae's own `check_addresses`,
 `tcp_check_http_method` and `udp_check_dns`.
 
 `runtime.health` lists one entry per member and network key — TCP, DNS-UDP and
@@ -426,7 +433,7 @@ datapath and never reaches a counter, so the row could only ever report zeros.
 
 ### Direct traffic
 
-`GET /api/v1/runtime/direct-stats` reports `enabled`, `attached`,
+`GET /api/v1/x-kdae/runtime/direct-stats` reports `enabled`, `attached`,
 `counter_since`, `up_bytes`, `up_packets`, `down_bytes`, `down_packets` and
 `last_error`. Counter values are decimal strings. `enabled` is the effective
 `api.direct_stats` switch (configuration plus the kernel/TC capability gate);

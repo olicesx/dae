@@ -76,7 +76,7 @@ var fixedRouteTemplates = map[string]string{
 	"/api/v1/runtime/outbounds":       "/api/v1/runtime/outbounds",
 	"/api/v1/runtime/memory":          "/api/v1/runtime/memory",
 	"/api/v1/runtime/memory/history":  "/api/v1/runtime/memory/history",
-	"/api/v1/runtime/direct-stats":    "/api/v1/runtime/direct-stats",
+	DirectStatsPath:                   DirectStatsPath,
 	"/api/v1/datapath":                "/api/v1/datapath",
 	"/api/v1/rules":                   "/api/v1/rules",
 	"/api/v1/routing/trace":           "/api/v1/routing/trace",

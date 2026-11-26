@@ -234,9 +234,15 @@ func TestRuntimeCapabilitiesAdvertiseNewResources(t *testing.T) {
 	if datapath["available"] != true {
 		t.Fatalf("datapath = %#v", datapath)
 	}
-	direct := resources["runtime_direct_stats"].(map[string]any)
+	// The observer is an engine-only resource and is keyed under the engine
+	// member, as the contract requires of anything not shared.
+	extension, _ := resources[EngineExtension].(map[string]any)
+	direct, _ := extension["direct_stats"].(map[string]any)
 	if direct["available"] != true {
-		t.Fatalf("runtime_direct_stats = %#v", direct)
+		t.Fatalf("%s.direct_stats = %#v", EngineExtension, direct)
+	}
+	if _, ok := resources["runtime_direct_stats"]; ok {
+		t.Fatalf("direct stats is keyed beside the shared resources: %#v", resources)
 	}
 }
 
@@ -245,7 +251,7 @@ func TestRuntimeDirectStats(t *testing.T) {
 	withRuntimeProviders(server)
 	remote := "127.0.0.1:1234"
 
-	response := doRequest(server, http.MethodGet, "/api/v1/runtime/direct-stats", remote, nil)
+	response := doRequest(server, http.MethodGet, DirectStatsPath, remote, nil)
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", response.Code)
 	}
@@ -265,8 +271,13 @@ func TestRuntimeDirectStatsUnsupportedWithoutProvider(t *testing.T) {
 	server := newTestServer(t, Config{AllowAnonymousLoopback: true}, fakeRuntimeProvider{runtime: testRuntime()})
 	remote := "127.0.0.1:1234"
 
-	response := doRequest(server, http.MethodGet, "/api/v1/runtime/direct-stats", remote, nil)
+	response := doRequest(server, http.MethodGet, DirectStatsPath, remote, nil)
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", response.Code)
+	}
+	// The route never lived beside the shared ones.
+	response = doRequest(server, http.MethodGet, "/api/v1/runtime/direct-stats", remote, nil)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d for the unnamespaced route, want 404", response.Code)
 	}
 }

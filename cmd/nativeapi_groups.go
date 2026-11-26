@@ -294,7 +294,7 @@ func groupConfigOf(item userGroup) nativeapi.GroupConfig {
 	if extension.UDPCheckDNS == nil {
 		extension.UDPCheckDNS = []string{}
 	}
-	config.XDae = extension
+	config.Extension = extension
 	return config
 }
 

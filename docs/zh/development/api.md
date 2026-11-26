@@ -23,7 +23,7 @@ listener 的配置、认证、TLS、Host/Origin 校验与自托管前端见
 - `GET /api/v1/runtime/outbounds` — 按出站统计，reload 后继续累计
 - `GET /api/v1/runtime/memory` — 进程、cgroup v2 与 eBPF 内存
 - `GET /api/v1/runtime/memory/history?window_seconds=&max_points=`
-- `GET /api/v1/runtime/direct-stats` — 需开启的直连流量计数
+- `GET /api/v1/x-kdae/runtime/direct-stats` — 需开启的直连流量计数
 - `GET /api/v1/datapath` — eBPF 挂载点、routing generation 与 map 占用
 - `GET /api/v1/nodes?group_id=&limit=&cursor=`
 - `GET /api/v1/nodes/{node_id}`
@@ -45,6 +45,10 @@ listener 的配置、认证、TLS、Host/Origin 校验与自托管前端见
 - `GET /api/v1/events`、`GET /api/v1/logs` — SSE 事件流
 - `POST /api/v1/probes` — 启动节点/组探测，通过
   `GET /api/v1/operations/{operation_id}` 轮询结果
+
+共享端点遵循 `api-standardize` 契约。kdae 自己增加的内容放在契约给引擎扩展预留的位置，
+即以引擎名命名的成员：发现文档的 `links`、能力声明的 `resources` 以及组的 `config` 都带有
+`x-kdae` 成员，扩展路由位于 `/api/v1/x-kdae/` 之下。目前只有直连流量计数这一个扩展。
 
 `POST /api/v1/providers`（创建 inline provider）、
 `DELETE /api/v1/providers/{provider_id}`、`POST /api/v1/geodata/update`
@@ -98,8 +102,9 @@ provider 可以刷新，inline/file provider 返回 `404 capability_not_supporte
 与契约的有意偏离：
 
 - `api.dae` 被隐藏：不出现在 `sources[]` 中，其 ID 返回 `404 resource_not_found`，与未知 ID 一致。
-  能力信息通过 `x-dae.hidden_sources` 体现。
-- `config.dae` 只读（`entry_source`）。替换时不得修改 `api` 段。
+  能力信息通过 `x-kdae.hidden_sources` 体现。
+- `config.dae` 按角色只读：契约列出的四种原因都不适用，因此不报
+  `read_only_reason`。替换时不得修改 `api` 段。
 - `GET` 读取磁盘文件，而非已接受的快照。其 `revision` 与
   `runtime.generation.config_revision` 使用同一个函数，因此两者可比：磁盘内容就是引擎已加载
   的内容时二者相等，写入尚未 reload 时二者不同。
@@ -132,7 +137,7 @@ pin 在该 transport 上优先于自动策略，且与 `selector` 一样忽略�
 成员，`source: "runtime"`——自动组总会报告它实际拨号的成员——只有 `random` 例外，
 它每条连接都重新随机，因此为 `null`。
 
-`config` 始终返回契约要求的 7 个 key，组未设置时为 `null`；另有 `x-dae` 携带 dae 自己的
+`config` 始终返回契约要求的 7 个 key，组未设置时为 `null`；另有 `x-kdae` 携带 kdae 自己的
 `check_addresses`、`tcp_check_http_method`、`udp_check_dns`。
 
 `runtime.health` 按成员与网络 key（TCP、DNS-UDP、data-UDP，各自再分 IP 版本）列出观测，
@@ -323,7 +328,7 @@ builtin `block` 行不再暴露：被封锁的流量在数据面被直接丢弃�
 
 ### 直连流量
 
-`GET /api/v1/runtime/direct-stats` 返回 `enabled`、`attached`、`counter_since`、
+`GET /api/v1/x-kdae/runtime/direct-stats` 返回 `enabled`、`attached`、`counter_since`、
 `up_bytes`、`up_packets`、`down_bytes`、`down_packets` 与 `last_error`，计数器为十进制
 字符串。`enabled` 是生效开关（配置 + 内核/TC 能力门控）；`attached` 表示是否至少有一个
 观测钩子真正挂上数据面；`last_error` 保留最近一次加载/挂载或部分读取失败，因此

@@ -279,17 +279,17 @@ func TestCapabilitiesAdvertiseConfigLayout(t *testing.T) {
 	if config["max_bytes"] != float64(caps.MaxBytes) || config["max_sources"] != float64(caps.MaxSources) {
 		t.Fatalf("limits = %v / %v", config["max_bytes"], config["max_sources"])
 	}
-	xdae, _ := config["x-dae"].(map[string]any)
-	if xdae == nil {
-		t.Fatalf("x-dae block missing: %v", config)
+	extension, _ := config[EngineExtension].(map[string]any)
+	if extension == nil {
+		t.Fatalf("%s block missing: %v", EngineExtension, config)
 	}
-	layout, _ := xdae["layout"].(map[string]any)
+	layout, _ := extension["layout"].(map[string]any)
 	if layout["kind"] != "managed" {
 		t.Fatalf("layout = %v", layout)
 	}
-	hidden, _ := xdae["hidden_sources"].([]any)
+	hidden, _ := extension["hidden_sources"].([]any)
 	if len(hidden) != 1 || hidden[0] != "api.dae" {
-		t.Fatalf("hidden_sources = %v", xdae["hidden_sources"])
+		t.Fatalf("hidden_sources = %v", extension["hidden_sources"])
 	}
 	validate, _ := resources["config_validate"].(map[string]any)
 	if validate["available"] != true {

@@ -20,6 +20,15 @@ const (
 	// runs every other name on the generic dae contract), so the fork is
 	// reported under its own name instead of borrowing upstream's.
 	EngineName = "kdae"
+	// EngineExtension is the x-<engine> member the contract reserves for an
+	// engine's own links, resources and routes. The contract keys it on the
+	// name GET /api reports, so it is derived from EngineName rather than
+	// spelled again.
+	EngineExtension = "x-" + EngineName
+	// DirectStatsPath is the direct-traffic observer, a kdae extension. Its
+	// route lives under the engine namespace, where the contract puts
+	// everything a shared client is not expected to understand.
+	DirectStatsPath = BasePath + "/" + EngineExtension + "/runtime/direct-stats"
 )
 
 // RuntimeProvider supplies a coherent runtime snapshot for GET /api/v1/runtime.
@@ -184,7 +193,7 @@ type GroupMember struct {
 }
 
 // GroupConfigExtension carries dae-only group options. The contract keeps them
-// out of the patchable document under config["x-dae"].
+// out of the patchable document under config[EngineExtension].
 type GroupConfigExtension struct {
 	CheckAddresses     []string `json:"check_addresses"`
 	TCPCheckHTTPMethod string   `json:"tcp_check_http_method"`
@@ -192,14 +201,17 @@ type GroupConfigExtension struct {
 }
 
 type GroupConfig struct {
-	DefaultMemberID      *string               `json:"default_member_id"`
-	FinalOutbound        *string               `json:"final_outbound"`
-	CheckURL             *string               `json:"check_url"`
-	CheckInterval        *int                  `json:"check_interval"`
-	Tolerance            *int                  `json:"tolerance"`
-	IdleTimeout          *int                  `json:"idle_timeout"`
-	InterruptConnections *bool                 `json:"interrupt_connections"`
-	XDae                 *GroupConfigExtension `json:"x-dae,omitempty"`
+	DefaultMemberID      *string `json:"default_member_id"`
+	FinalOutbound        *string `json:"final_outbound"`
+	CheckURL             *string `json:"check_url"`
+	CheckInterval        *int    `json:"check_interval"`
+	Tolerance            *int    `json:"tolerance"`
+	IdleTimeout          *int    `json:"idle_timeout"`
+	InterruptConnections *bool   `json:"interrupt_connections"`
+	// Extension carries the engine's own options under its x-<engine> member.
+	// A struct tag cannot name a constant, so the tag repeats EngineExtension;
+	// TestGroupConfigExtensionTagFollowsEngineName keeps the two aligned.
+	Extension *GroupConfigExtension `json:"x-kdae,omitempty"`
 }
 
 type GroupConfigDocument struct {
@@ -647,8 +659,11 @@ type EbpfRoutingSummary struct {
 
 type EbpfDetail struct {
 	EbpfSummary
+	// Attachments and Maps are the detail a summary leaves out. Both are optional
+	// in the contract, but a present maps member must be an object: the tag has
+	// to omit a nil value rather than write null.
 	Attachments []EbpfAttachment `json:"attachments,omitempty"`
-	Maps        *EbpfMaps        `json:"maps"`
+	Maps        *EbpfMaps        `json:"maps,omitempty"`
 }
 
 type EbpfAttachment struct {

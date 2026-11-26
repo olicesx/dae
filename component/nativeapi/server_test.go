@@ -154,9 +154,16 @@ func TestDiscoveryPublicAndFull(t *testing.T) {
 		t.Fatalf("status = %v", fullBody["status"])
 	}
 	fullLinks := fullBody["links"].(map[string]any)
-	for _, key := range []string{"version", "capabilities", "runtime", "config", "operations", "routing_trace"} {
+	for _, key := range []string{"version", "capabilities", "runtime", "config", "operations", EngineExtension} {
 		if _, ok := fullLinks[key]; !ok {
 			t.Fatalf("full links missing %q: %#v", key, fullLinks)
+		}
+	}
+	// The contract closes the links object around the shared links: an engine
+	// route travels under the engine member, never beside them.
+	for _, key := range []string{"routing_trace", "runtime_direct_stats"} {
+		if _, ok := fullLinks[key]; ok {
+			t.Fatalf("links carry the engine route %q beside the shared links: %#v", key, fullLinks)
 		}
 	}
 }

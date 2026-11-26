@@ -187,6 +187,19 @@ func (e *configEditor) sourceWritable(s configSourceFile) bool {
 	return s.kind == "include" && filepath.Dir(s.abs) == filepath.Join(e.baseDir, "config.d") && filepath.Ext(s.abs) == ".dae"
 }
 
+// contractReadOnlyReason keeps a read-only cause the contract enumerates. The
+// member is defined as present only while one of its listed causes applies,
+// and the other causes have no listed value: the entry source is read-only by
+// role, and an unmanaged layout is reported through the config capability.
+// Writing still stays refused for them; only the reported cause is dropped.
+func contractReadOnlyReason(reason string) string {
+	switch reason {
+	case "writes_disabled", "store_blocked", "listener_secret_source", "listener_secret_in_content":
+		return reason
+	}
+	return ""
+}
+
 func permissionDenied(message, reason string) error {
 	return &nativeapi.APIError{
 		Status:  403,
@@ -296,7 +309,7 @@ func (e *configEditor) sourceView(s configSourceFile, readOnlyReason string) (na
 			LineCount:     strings.Count(content, "\n") + 1,
 		},
 		Writable:       readOnlyReason == "",
-		ReadOnlyReason: readOnlyReason,
+		ReadOnlyReason: contractReadOnlyReason(readOnlyReason),
 		LoadedAt:       s.modTime,
 	}
 	return view, masked

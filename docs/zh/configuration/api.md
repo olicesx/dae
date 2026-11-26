@@ -80,14 +80,14 @@ include {
 `subscription.dae`，以此类推。不拆分、或只拆一部分的配置，无法通过 API 编辑。
 
 不满足时，写请求返回 `403 permission_denied`，原因放在 `details.reason`，也会出现在
-`GET /api/v1/capabilities` 的 `resources.config.x-dae.layout.reason` 中（`writes_disabled`
+`GET /api/v1/capabilities` 的 `resources.config.x-kdae.layout.reason` 中（`writes_disabled`
 或 `layout_unmanaged`），同处的 `layout.kind` 则为 `managed` 或 `unmanaged`。
 
 补充约束：
 
 - `api.dae` 对 API 完全隐藏：不出现在源列表里，其 ID 一律返回 `404`。因此**改监听地址、
   端口或 secret 只能人工改文件并重启**。
-- `config.dae` 本身只读（`entry_source`），替换时不得改动 `api` 块。
+- `config.dae` 本身按角色只读，不报 `read_only_reason`；替换时不得改动 `api` 块。
 - 写入前会跑与 `dae validate -c` 相同的完整校验；不通过的候选返回 `422` 并附行号，磁盘
   不会变动。
 
@@ -128,7 +128,7 @@ api {
 }
 ```
 
-之后 `GET /api/v1/runtime/direct-stats` 会返回累计的 `up_bytes`、`up_packets`、
+之后 `GET /api/v1/x-kdae/runtime/direct-stats` 会返回累计的 `up_bytes`、`up_packets`、
 `down_bytes` 与 `down_packets`，以及 `enabled`、`attached`、`counter_since`、
 `last_error`。`enabled` 是生效开关，`attached` 表示钩子是否真正挂上；`up_packets` /
 `down_packets` 是 **skb 计数**，GSO/GRO 下会低于线缆包数。数字是链路字节而不是 payload

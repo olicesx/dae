@@ -86,7 +86,7 @@ subscriptions `subscription.dae`, and so on. A configuration that is not split
 this way cannot be edited through the API.
 
 When a condition fails, writes answer `403 permission_denied` with the reason in
-`details.reason`, also visible as `resources.config.x-dae.layout.reason` in
+`details.reason`, also visible as `resources.config.x-kdae.layout.reason` in
 `GET /api/v1/capabilities` (`writes_disabled` or `layout_unmanaged`), while
 `layout.kind` stays `managed` or `unmanaged`.
 
@@ -95,8 +95,8 @@ Further constraints:
 - `api.dae` is hidden from the API: it is absent from the source list and its ID
   answers `404`. Changing the listen address, the port or the secret therefore
   stays a manual edit plus a restart.
-- `config.dae` itself is read-only (`entry_source`) and a replacement may not
-  change the `api` block.
+- `config.dae` itself is read-only by role and reports no `read_only_reason`;
+  a replacement may not change the `api` block.
 - A replacement is validated with the same chain as `dae validate -c`; a rejected
   candidate answers `422` with line numbers and nothing is written.
 
@@ -142,7 +142,7 @@ api {
 }
 ```
 
-`GET /api/v1/runtime/direct-stats` then reports cumulative `up_bytes`,
+`GET /api/v1/x-kdae/runtime/direct-stats` then reports cumulative `up_bytes`,
 `up_packets`, `down_bytes` and `down_packets`, plus `enabled`, `attached`,
 `counter_since` and `last_error`. `enabled` is the effective switch; `attached`
 says whether a hook actually reached the datapath. `up_packets` and

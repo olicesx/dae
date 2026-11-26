@@ -475,7 +475,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleRuntimeMemory(w, r)
 	case "/api/v1/runtime/memory/history":
 		s.handleMemoryHistory(w, r)
-	case "/api/v1/runtime/direct-stats":
+	case DirectStatsPath:
 		s.handleRuntimeDirectStats(w, r)
 	case "/api/v1/datapath":
 		s.handleDatapath(w, r)

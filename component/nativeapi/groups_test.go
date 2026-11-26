@@ -88,7 +88,7 @@ func testGroup() Group {
 		Members: []GroupMember{
 			{ID: "n_0123456789ab", Name: "hk-01", Kind: "node"},
 		},
-		Config: GroupConfig{XDae: &GroupConfigExtension{CheckAddresses: []string{}}},
+		Config: GroupConfig{Extension: &GroupConfigExtension{CheckAddresses: []string{}}},
 		Runtime: GroupRuntime{
 			Selection: GroupSelectionPair{},
 			Health:    []GroupHealthObservation{},

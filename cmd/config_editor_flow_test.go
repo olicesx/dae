@@ -178,8 +178,10 @@ func TestConfigGetConfigHidesAPIDaeAndMarksEntryReadOnly(t *testing.T) {
 		if s.Path == "api.dae" {
 			t.Fatal("api.dae must not be listed")
 		}
-		if s.Path == "config.dae" && (s.Writable || s.ReadOnlyReason != "entry_source") {
-			t.Fatalf("config.dae must be read-only with reason entry_source: %+v", s)
+		// The entry is read-only by role. The contract reports a cause only for
+		// the four it lists, and none of them applies here.
+		if s.Path == "config.dae" && (s.Writable || s.ReadOnlyReason != "") {
+			t.Fatalf("config.dae must be read-only without a reported cause: %+v", s)
 		}
 		if strings.HasPrefix(s.Path, "config.d/") && (!s.Writable || s.ReadOnlyReason != "") {
 			t.Fatalf("module must be writable: %+v", s)
@@ -567,8 +569,11 @@ func TestConfigGetConfigMasksListenerSecret(t *testing.T) {
 		if strings.Contains(s.Content, "hunter2") {
 			t.Fatalf("secret leaked in %s: %q", s.Path, s.Content)
 		}
-		if s.Writable || s.ReadOnlyReason != "layout_unmanaged" {
-			t.Fatalf("an unmanaged tree must be read-only with layout_unmanaged: %+v", s)
+		// The contract lists four causes for read_only_reason and an unmanaged
+		// tree is none of them: the source stays read-only, and the cause is
+		// reported by the config capability's layout instead.
+		if s.Writable || s.ReadOnlyReason != "" {
+			t.Fatalf("an unmanaged tree must be read-only without a source-level cause: %+v", s)
 		}
 	}
 }

@@ -92,6 +92,44 @@ jobs:
         name: dae
         path: dae
 
+    - name: Fetch the tools the VM installs offline
+      # The dae container used to fetch curl, dig, nc, ip, iptables and ping
+      # with apt at test time. That download leaves the VM through the docker
+      # network inside it, and on 2026-11-26 it was the one setup download
+      # that stalled: four 6.6 legs spent minutes in apt on archive.ubuntu.com
+      # and were cancelled at the test job's 10-minute limit, three of them
+      # before dae was even started (runs 45788733452, 45794077659), while the
+      # runner's own apt update finished in seconds. The VM's other downloads
+      # (its own apt, docker pull, the v2ray release) stayed fast throughout.
+      #
+      # ubuntu:22.04 is the image the test runs, so a throwaway one resolves
+      # exactly what its apt would install, recommends included. It downloads
+      # the set here over the runner's own network; the test jobs hand the
+      # directory to the VM through the workspace mount and install it with
+      # dpkg, so the timed job makes no setup download of its own.
+      run: |
+        set -euo pipefail
+        mkdir -p vm-tools/debs
+        # A failed index only earns a warning and a 0 from apt-get update, so
+        # the update inside the container runs with APT::Update::Error-Mode=any:
+        # the set must never be resolved from a partial index.
+        docker run --rm -v "$PWD/vm-tools/debs:/debs" ubuntu:22.04 sh -c '
+          set -e
+          apt-get update -o APT::Update::Error-Mode=any
+          apt-get install -y --download-only -o Dir::Cache::archives=/debs \
+            curl dnsutils netcat iproute2 iptables iputils-ping'
+        # apt runs as root inside the container; hand the files back so the
+        # runner user can clean the workspace up.
+        sudo chown -R "$(id -u):$(id -g)" vm-tools
+        ls vm-tools/debs/*.deb > /dev/null
+
+    - name: Store VM tools
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      with:
+        name: vm-tools
+        path: vm-tools
+        if-no-files-found: error
+
   test:
     runs-on: ubuntu-22.04
     name: Test
@@ -111,6 +149,12 @@ jobs:
         with:
           name: dae
           path: dae
+
+      - name: Retrieve VM tools
+        uses: actions/download-artifact@c850b930e6ba138125429b7e5c93fc707a7f8427 # v4.1.4
+        with:
+          name: vm-tools
+          path: vm-tools
 
       # NOTE: do NOT pre-install the LVH host dependencies (qemu, libvirt,
       # virtinst, ...) before the Provision step. find-lvh-cli inside
@@ -225,8 +269,18 @@ jobs:
             set -ex
             cd /host
 
-            docker exec dae apt update
-            docker exec dae apt install -y curl dnsutils netcat
+            # curl, dig and nc were installed here with apt at test time. They
+            # come from the directory the build job fetched ("Fetch the tools
+            # the VM installs offline"), along with the LAN tools, so nothing
+            # in this timed job waits on the VM's own network.
+            docker exec -e DEBIAN_FRONTEND=noninteractive dae sh -c '
+              set -e
+              dpkg -i /host/vm-tools/debs/*.deb
+              # dpkg exiting 0 is no proof the set was complete: say here which
+              # tool is missing, not at the check that first needs it.
+              for t in curl dig nc ip iptables-legacy ping sysctl; do
+                command -v "$t" > /dev/null || { echo "missing $t after the offline install" >&2; exit 1; }
+              done'
 
             vmess_link=$(base64 -w0 vmess.json)
             cat > ./conf.dae <<!
@@ -370,7 +424,8 @@ jobs:
             cd /host
 
             docker restart -t0 dae
-            docker exec dae apt install -y iproute2 iptables iputils-ping
+            # ip, iptables and ping arrived with the other tools in
+            # "Setup dae server".
 
             cat >lan.bash <<!
             set -ex

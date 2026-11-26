@@ -80,7 +80,7 @@ func (p *nativeAPIProvider) SnapshotRuntime(ctx context.Context, detail string) 
 
 	status := p.status.snapshot()
 	now := time.Now()
-	stats := active.controlPlane.SnapshotRuntimeStats(3600, 180)
+	stats := active.controlPlane.SnapshotRuntimeTotals()
 
 	// Report the same counter boundary as runtime/outbounds: the traffic totals
 	// are inherited across reloads from the process-level accumulator, so the

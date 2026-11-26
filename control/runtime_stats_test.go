@@ -28,7 +28,7 @@ func TestRuntimeStatsRateMatchesTrafficAtPollingCadence(t *testing.T) {
 			const bytesPerSecond = 1_000_000
 			const step = 10 * time.Millisecond
 
-			store.snapshot(0, 0, 3600, 180, start)
+			store.snapshot(0, 0, 3600, 180, start, true)
 
 			var nextPoll time.Duration
 			checked := 0
@@ -42,7 +42,12 @@ func TestRuntimeStatsRateMatchesTrafficAtPollingCadence(t *testing.T) {
 					continue
 				}
 				nextPoll = elapsed + pollInterval
-				snapshot := store.snapshot(0, 0, 3600, 180, now)
+				snapshot := store.snapshot(0, 0, 3600, 180, now, true)
+				totals := store.snapshot(0, 0, 0, 0, now, false)
+				if totals.Samples != nil || totals.UploadRate != snapshot.UploadRate || totals.DownloadRate != snapshot.DownloadRate ||
+					totals.UploadTotal != snapshot.UploadTotal || totals.DownloadTotal != snapshot.DownloadTotal {
+					t.Fatalf("totals snapshot differs at %v: %+v", elapsed, totals)
+				}
 				if elapsed < time.Second {
 					continue
 				}

@@ -6,6 +6,7 @@
 package control
 
 import (
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -235,7 +236,7 @@ func (s *runtimeStats) advanceBucket(now time.Time) {
 	s.rollLocked(now)
 }
 
-func (s *runtimeStats) snapshot(activeConnections int, udpSessions int, windowSec int, maxPoints int, now time.Time) RuntimeStatsSnapshot {
+func (s *runtimeStats) snapshot(activeConnections, udpSessions, windowSec, maxPoints int, now time.Time, history bool) RuntimeStatsSnapshot {
 	if s == nil {
 		return RuntimeStatsSnapshot{
 			UpdatedAt:         now,
@@ -257,8 +258,15 @@ func (s *runtimeStats) snapshot(activeConnections int, udpSessions int, windowSe
 
 	startTime := now.Add(-time.Duration(windowSec) * time.Second)
 
-	buckets := make([]runtimeBucket, 0, s.historyLen+1)
-	for i := 0; i < s.historyLen; i++ {
+	first := 0
+	if !history {
+		startTime = now.Add(-runtimeRateWindow)
+		first = sort.Search(s.historyLen, func(i int) bool {
+			return s.history[(s.historyStart+i)%len(s.history)].Timestamp.After(startTime)
+		})
+	}
+	buckets := make([]runtimeBucket, 0, s.historyLen-first+1)
+	for i := first; i < s.historyLen; i++ {
 		bucket := s.history[(s.historyStart+i)%len(s.history)]
 		if !bucket.Timestamp.Before(startTime) {
 			buckets = append(buckets, bucket)
@@ -286,6 +294,10 @@ func (s *runtimeStats) snapshot(activeConnections int, udpSessions int, windowSe
 	}
 
 	uploadRate, downloadRate := ratesFromBuckets(buckets, now, runtimeRateWindow)
+	var samples []RuntimeTrafficSample
+	if history {
+		samples = thinRuntimeSamples(samplesFromBuckets(buckets[:completedBuckets]), maxPoints)
+	}
 
 	return RuntimeStatsSnapshot{
 		UpdatedAt:         now,
@@ -295,7 +307,7 @@ func (s *runtimeStats) snapshot(activeConnections int, udpSessions int, windowSe
 		DownloadTotal:     s.downloadTotal.Load(),
 		ActiveConnections: activeConnections,
 		UDPSessions:       udpSessions,
-		Samples:           thinRuntimeSamples(samplesFromBuckets(buckets[:completedBuckets]), maxPoints),
+		Samples:           samples,
 	}
 }
 
@@ -404,13 +416,22 @@ func (c *ControlPlane) recordDownloadTraffic(n int64) {
 }
 
 func (c *ControlPlane) SnapshotRuntimeStats(windowSec int, maxPoints int) RuntimeStatsSnapshot {
+	return c.snapshotRuntimeStats(windowSec, maxPoints, true)
+}
+
+// SnapshotRuntimeTotals returns current rates and totals without building traffic history.
+func (c *ControlPlane) SnapshotRuntimeTotals() RuntimeStatsSnapshot {
+	return c.snapshotRuntimeStats(0, 0, false)
+}
+
+func (c *ControlPlane) snapshotRuntimeStats(windowSec, maxPoints int, history bool) RuntimeStatsSnapshot {
 	activeConnections := 0
 	udpSessions := 0
 	if c != nil {
 		activeConnections = c.ActiveTCPConnections()
 		udpSessions = DefaultUdpEndpointPool.Len()
 	}
-	return c.runtimeStatsStore().snapshot(activeConnections, udpSessions, windowSec, maxPoints, time.Now())
+	return c.runtimeStatsStore().snapshot(activeConnections, udpSessions, windowSec, maxPoints, time.Now(), history)
 }
 
 // thinRuntimeSamples selects every Nth stored sample backwards from the newest

@@ -1005,7 +1005,9 @@ func NewControlPlaneWithContextOptions(
 	SetAnyfromSoMark(global.SoMarkFromDae)
 	plane.deferFuncs = append(plane.deferFuncs, plane.closePublishedListenerFiles)
 	plane.startRealDomainNegJanitor()
-	plane.startMemorySampler()
+	if flowStatsActive() {
+		plane.startMemorySampler()
+	}
 
 	var upstreamHostResolver func(ctx context.Context, host string, network string) (*netutils.Ip46, error, error)
 	if len(bootstrapResolvers) > 0 {

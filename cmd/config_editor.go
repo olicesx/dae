@@ -546,6 +546,7 @@ func (e *configEditor) ValidateConfig(ctx context.Context, req nativeapi.ConfigV
 	if err != nil {
 		return nativeapi.ConfigValidationResult{}, err
 	}
+	mainID := requestMainSourceID(req.Sources, all)
 
 	diags := []nativeapi.ConfigDiagnostic{}
 	failed := false
@@ -566,22 +567,22 @@ func (e *configEditor) ValidateConfig(ctx context.Context, req nativeapi.ConfigV
 		for abs, raw := range overrides {
 			if _, err := config_parser.Parse(string(raw)); err != nil {
 				failed = true
-				diags = append(diags, e.diagnosticsFor(err, map[string]string{abs: absToID[abs]}, "", "config_invalid")...)
+				diags = append(diags, e.diagnosticsFor(err, map[string]string{abs: absToID[abs]}, absToID[abs], "config_invalid")...)
 			}
 		}
 	} else if !failed {
 		conf, buildErr := e.buildCandidate(overrides, anonymousSections)
 		if buildErr != nil {
 			failed = true
-			diags = append(diags, e.diagnosticsFor(buildErr, absToID, "", "config_invalid")...)
+			diags = append(diags, e.diagnosticsFor(buildErr, absToID, mainID, "config_invalid")...)
 		} else if fullErr := e.fullValidate(conf); fullErr != nil {
 			failed = true
-			diags = append(diags, e.diagnosticsFor(fullErr, absToID, "", "validation_failed")...)
+			diags = append(diags, e.diagnosticsFor(fullErr, absToID, mainID, "validation_failed")...)
 		}
 	}
 	if failed && len(diags) == 0 {
 		// Every error pointed only at the hidden source and was dropped; keep the failure visible.
-		diags = append(diags, invalidDiagnostic())
+		diags = append(diags, invalidDiagnostic(mainID))
 	}
 	return nativeapi.ConfigValidationResult{
 		Valid:        !failed,
@@ -591,8 +592,30 @@ func (e *configEditor) ValidateConfig(ctx context.Context, req nativeapi.ConfigV
 	}, nil
 }
 
-func invalidDiagnostic() nativeapi.ConfigDiagnostic {
-	return nativeapi.ConfigDiagnostic{Level: "error", Code: "config_invalid", Message: "configuration is invalid"}
+// invalidDiagnostic keeps a failure visible when every error behind it pointed
+// only at the hidden source. It still names a source, because the contract
+// requires every diagnostic to carry an ID of at least one character.
+func invalidDiagnostic(sourceID string) nativeapi.ConfigDiagnostic {
+	return nativeapi.ConfigDiagnostic{Level: "error", SourceID: sourceID, Code: "config_invalid", Message: "configuration is invalid"}
+}
+
+// requestMainSourceID names the source an error belongs to when the error names
+// no file of its own. The contract calls the first submitted source the main
+// one and defaults its ID to source-1, so that is the anchor; with nothing
+// submitted, the candidate is the accepted tree and its entry file is.
+func requestMainSourceID(reqs []nativeapi.ConfigValidationSource, all []configSourceFile) string {
+	if len(reqs) > 0 {
+		if reqs[0].ID != "" {
+			return reqs[0].ID
+		}
+		return "source-1"
+	}
+	for _, s := range all {
+		if s.kind == "main" {
+			return s.id
+		}
+	}
+	return "source-1"
 }
 
 // parseErrorLinePattern matches the "line L:C" prefixes the parser emits.
@@ -827,9 +850,10 @@ func (e *configEditor) guardApiUnchanged(candidate *config.Config) error {
 }
 
 func (e *configEditor) unprocessable(err error, target configSourceFile) error {
-	diags := e.diagnosticsFor(err, map[string]string{target.abs: target.id}, "", "config_invalid")
+	// A parse error carries a line but no path, so the target is the fallback.
+	diags := e.diagnosticsFor(err, map[string]string{target.abs: target.id}, target.id, "config_invalid")
 	if len(diags) == 0 {
-		diags = []nativeapi.ConfigDiagnostic{invalidDiagnostic()}
+		diags = []nativeapi.ConfigDiagnostic{invalidDiagnostic(target.id)}
 	}
 	return &nativeapi.APIError{
 		Status:  422,

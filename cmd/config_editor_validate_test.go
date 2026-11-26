@@ -41,6 +41,56 @@ func TestConfigValidateAcceptsContentOnlySource(t *testing.T) {
 	}
 }
 
+// Every diagnostic names a source: the contract requires an ID of at least one
+// character. An error that names no file belongs to the candidate as a whole,
+// which the contract anchors on its first source.
+func TestConfigValidateUnattributedErrorNamesTheMainSource(t *testing.T) {
+	main, _ := newManagedTree(t)
+	e := newFlowEditor(t, main, true, &fakeConfigOperations{})
+
+	// Parses, but is no routing rule: the failure surfaces while the candidate
+	// is built, and nothing in the error names a file.
+	bad := "routing {\n  rules {\n  this is not a rule\n  }\n}\n"
+	for _, tc := range []struct{ id, want string }{{"", "source-1"}, {"candidate", "candidate"}} {
+		result, err := e.ValidateConfig(context.Background(), nativeapi.ConfigValidationRequest{
+			Mode:    "full",
+			Sources: []nativeapi.ConfigValidationSource{{ID: tc.id, Content: &bad}},
+		})
+		if err != nil {
+			t.Fatalf("id %q: %v", tc.id, err)
+		}
+		if result.Valid || len(result.Diagnostics) == 0 {
+			t.Fatalf("id %q: expected diagnostics, got %+v", tc.id, result)
+		}
+		if got := result.Diagnostics[0].SourceID; got != tc.want {
+			t.Fatalf("id %q: diagnostic source id = %q, want %q", tc.id, got, tc.want)
+		}
+	}
+}
+
+// An overridden file is known to the request by the ID it was submitted under,
+// and its syntax errors are reported under that ID.
+func TestConfigValidateOverrideSyntaxErrorNamesTheOverriddenSource(t *testing.T) {
+	main, _ := newManagedTree(t)
+	e := newFlowEditor(t, main, true, &fakeConfigOperations{})
+	target := flowSource(t, e, flowGlobalRel)
+
+	bad := "global {\n"
+	result, err := e.ValidateConfig(context.Background(), nativeapi.ConfigValidationRequest{
+		Mode:    "syntax",
+		Sources: []nativeapi.ConfigValidationSource{{ID: target.id, Content: &bad}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Valid || len(result.Diagnostics) == 0 {
+		t.Fatalf("expected diagnostics, got %+v", result)
+	}
+	if got := result.Diagnostics[0].SourceID; got != target.id {
+		t.Fatalf("diagnostic source id = %q, want the overridden source %q", got, target.id)
+	}
+}
+
 // The node editor validates its rewritten node block under a label of its own
 // before writing the source. That label is request-local, so an id the tree does
 // not know must be a candidate rather than a 404.

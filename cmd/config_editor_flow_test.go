@@ -252,6 +252,11 @@ func TestConfigReplaceSyntaxErrorReturnsLocatedDiagnostics(t *testing.T) {
 	if len(diags) == 0 || diags[0].Line == nil {
 		t.Fatalf("expected a diagnostic with a line: %+v", diags)
 	}
+	// A parse error carries a line but no path. The diagnostic still has to
+	// name the source it came from: the contract requires a non-empty ID.
+	if diags[0].SourceID != target.id {
+		t.Fatalf("diagnostic source id = %q, want the replaced source %q", diags[0].SourceID, target.id)
+	}
 	if got, _ := os.ReadFile(target.abs); string(got) != string(target.raw) {
 		t.Fatal("rejected write must not change the file")
 	}

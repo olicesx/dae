@@ -122,6 +122,26 @@ func (c *DnsController) recordDnsLog(question dnsmessage.Question, req *udpReque
 	store.dnsLogStart = (store.dnsLogStart + 1) % len(store.dnsLogRing)
 }
 
+// SetDNSLogCapacity changes the retention limit, preserving the newest records
+// and the sequence space of the shared store across controller handoffs.
+func (c *DnsController) SetDNSLogCapacity(capacity int) {
+	if c == nil || c.dnsControllerStore == nil || capacity < 1 {
+		return
+	}
+	store := c.dnsControllerStore
+	store.dnsLogMu.Lock()
+	defer store.dnsLogMu.Unlock()
+	if capacity == len(store.dnsLogRing) || (store.dnsLogRing == nil && capacity == DnsLogCapacity) {
+		return
+	}
+	ring := make([]dnsLogRecord, capacity)
+	kept := min(store.dnsLogLen, capacity)
+	for i := range kept {
+		ring[i] = store.dnsLogRing[(store.dnsLogStart+store.dnsLogLen-kept+i)%len(store.dnsLogRing)]
+	}
+	store.dnsLogRing, store.dnsLogStart, store.dnsLogLen = ring, 0, kept
+}
+
 // DnsLogEpoch identifies the store behind the DNS log.
 func (c *DnsController) DnsLogEpoch() uint64 {
 	if c == nil || c.dnsControllerStore == nil {

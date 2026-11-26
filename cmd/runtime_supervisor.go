@@ -37,6 +37,8 @@ type runtimeGeneration struct {
 	configRevision string
 	activatedAt    time.Time
 
+	traceDNS *control.TraceDNS
+
 	cleanupOnce sync.Once
 	cleanupErr  error
 }
@@ -53,6 +55,9 @@ func newRuntimeGeneration(controlPlane *control.ControlPlane, listener *control.
 	}
 	if conf != nil {
 		g.configRevision = conf.Revision()
+		if controlPlane != nil && controlPlane.RoutingTraceAvailable() {
+			g.traceDNS, _ = controlPlane.NewTraceDNS(&conf.Dns)
+		}
 	}
 	return g
 }
@@ -74,6 +79,11 @@ func (g *runtimeGeneration) cleanup() error {
 		}
 		if g.cancel != nil {
 			g.cancel()
+		}
+		// The trace resolver's private dialers borrow the plane's settings
+		// and outbound groups; release them before the plane goes.
+		if g.traceDNS != nil {
+			g.traceDNS.Close()
 		}
 		if g.controlPlane != nil {
 			if err := g.controlPlane.Close(); err != nil {
@@ -103,6 +113,9 @@ type runtimeSupervisor struct {
 	prepared *runtimeGeneration
 	retiring *runtimeGeneration
 	closed   bool
+
+	// onActivate applies process settings before publishing the active slot.
+	onActivate func(*runtimeGeneration)
 }
 
 func newRuntimeSupervisor(active *runtimeGeneration) *runtimeSupervisor {
@@ -130,6 +143,9 @@ func (s *runtimeSupervisor) replaceActive(active *runtimeGeneration) error {
 		return errRuntimeSupervisorRetiring
 	}
 
+	if s.onActivate != nil {
+		s.onActivate(active)
+	}
 	s.active = active
 	if active.controlPlane != nil {
 		active.controlPlane.PublishActiveDebugState()
@@ -169,6 +185,10 @@ func (s *runtimeSupervisor) installPrepared(candidate *runtimeGeneration) error 
 // warmup and validation. It returns the previously active generation so the
 // caller can drain it before marking retirement complete.
 func (s *runtimeSupervisor) publishPrepared(candidate *runtimeGeneration) (*runtimeGeneration, error) {
+	return s.publishPreparedWithCommit(candidate, nil)
+}
+
+func (s *runtimeSupervisor) publishPreparedWithCommit(candidate *runtimeGeneration, commit func() error) (*runtimeGeneration, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -185,7 +205,15 @@ func (s *runtimeSupervisor) publishPrepared(candidate *runtimeGeneration) (*runt
 		return nil, errRuntimeSupervisorRetiring
 	}
 
+	if commit != nil {
+		if err := commit(); err != nil {
+			return nil, err
+		}
+	}
 	retiring := s.active
+	if s.onActivate != nil {
+		s.onActivate(candidate)
+	}
 	s.active = candidate
 	s.prepared = nil
 	s.retiring = retiring

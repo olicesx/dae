@@ -6,8 +6,11 @@
 package nativeapi
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -51,12 +54,11 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		s.handleValidateConfig(w, r)
 
 	case path == configSourcesPath:
-		// Create (POST) is not implemented; the list route is not in the contract.
-		if r.Method == http.MethodPost {
-			writeError(w, requestID, http.StatusNotFound, codeCapabilityNotSupported, "configuration source creation is not supported by this engine")
+		if r.Method != http.MethodPost {
+			writeMethodNotAllowed(w, requestID, "POST")
 			return
 		}
-		writeError(w, requestID, http.StatusMethodNotAllowed, codeMethodNotAllowed, "method is not allowed")
+		s.handleCreateConfigSource(w, r)
 
 	case strings.HasPrefix(path, configSourcePrefix):
 		sourceID := strings.TrimPrefix(path, configSourcePrefix)
@@ -76,6 +78,57 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, requestID, http.StatusNotFound, codeResourceNotFound, "resource not found")
 	}
+}
+
+func (s *Server) handleCreateConfigSource(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDFromContext(r.Context())
+	caps := s.config.ConfigCapabilities()
+	creator, ok := s.config.(ConfigSourceCreator)
+	if !ok || !caps.Create {
+		writeError(w, requestID, http.StatusNotFound, codeCapabilityNotSupported, "configuration source creation is unavailable")
+		return
+	}
+	if !caps.Writable {
+		writeError(w, requestID, http.StatusForbidden, codePermissionDenied, "configuration writes are disabled")
+		return
+	}
+	if !isJSONContentType(r.Header.Get("Content-Type")) {
+		writeError(w, requestID, http.StatusUnsupportedMediaType, codeUnsupportedMediaType, "Content-Type must be application/json")
+		return
+	}
+	var raw json.RawMessage
+	if err := decodeLimitedJSON(r, s.cfg.MaxJSONBodyBytes, &raw); err != nil {
+		if err == errLimitedJSONBodyTooLarge {
+			writeError(w, requestID, http.StatusRequestEntityTooLarge, codeRequestTooLarge, "request body is too large")
+			return
+		}
+		writeError(w, requestID, http.StatusBadRequest, codeInvalidRequest, "invalid JSON body")
+		return
+	}
+	var body struct {
+		Path    string  `json:"path"`
+		Content *string `json:"content"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if !utf8.Valid(raw) || decoder.Decode(&body) != nil || body.Content == nil || !ValidConfigSourceCreatePath(body.Path) {
+		writeError(w, requestID, http.StatusBadRequest, codeInvalidRequest, "a relative .dae path and source content are required")
+		return
+	}
+	if len(*body.Content) > caps.MaxBytes {
+		writeError(w, requestID, http.StatusRequestEntityTooLarge, codeRequestTooLarge, "content is too large")
+		return
+	}
+	accepted, err := creator.CreateConfigSource(r.Context(), CreateConfigSourceRequest{
+		Path: body.Path, Content: *body.Content, IdempotencyKey: r.Header.Get("Idempotency-Key"),
+	})
+	if err != nil {
+		s.writeProviderFailure(w, requestID, err)
+		return
+	}
+	w.Header().Set("Location", accepted.Href)
+	w.Header().Set("Retry-After", operationPollRetryAfter)
+	writeJSON(w, http.StatusAccepted, accepted)
 }
 
 func (s *Server) handleGetConfigSource(w http.ResponseWriter, r *http.Request, sourceID string) {

@@ -6,8 +6,11 @@
 package nativeapi
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -88,17 +91,126 @@ func TestRoutingTraceRejectsInvalidInput(t *testing.T) {
 			body: `{"input":{"network":"tcp","domain":"example.com","dst_port":443,"dscp":64}}`,
 		},
 		{
-			name: "live DNS resolution unsupported",
-			body: `{"input":{"network":"tcp","domain":"example.com","dst_port":443},"resolve":"live"}`,
+			name: "domain exceeds DNS query limit",
+			body: `{"input":{"network":"tcp","domain":"` + strings.Repeat("a", 254) + `","dst_port":443}}`,
+		},
+		{
+			name: "unknown input field",
+			body: `{"input":{"network":"tcp","domain":"example.com","dst_port":443,"flow_id":"other"}}`,
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			response := traceRequest(newRoutingTraceTestServer(t), test.body)
-			if response.Code != http.StatusBadRequest && response.Code != http.StatusUnprocessableEntity {
-				t.Fatalf("status = %d, want 400 or 422: %s", response.Code, response.Body.String())
+			if response.Code != http.StatusBadRequest || errorCode(t, response) != codeInvalidRequest {
+				t.Fatalf("status = %d, want 400 invalid_request: %s", response.Code, response.Body.String())
 			}
 		})
+	}
+}
+
+type liveTraceRules struct {
+	fakeRules
+	trace func(RoutingTraceRequest) (RoutingTraceResponse, error)
+}
+
+func (liveTraceRules) RoutingTraceLiveAvailable() bool { return true }
+
+func (p liveTraceRules) TraceRouting(_ context.Context, request RoutingTraceRequest) (RoutingTraceResponse, error) {
+	return p.trace(request)
+}
+
+func TestRoutingTraceDispatchesLiveDNSResults(t *testing.T) {
+	server := newRoutingTraceTestServer(t)
+	server.SetRulesProvider(liveTraceRules{trace: func(request RoutingTraceRequest) (RoutingTraceResponse, error) {
+		if request.Resolve != "live" || request.Input.Domain == nil || *request.Input.Domain != "example.com" || request.Input.DstIP != nil {
+			t.Fatalf("unexpected provider request: %#v", request)
+		}
+		return RoutingTraceResponse{
+			Mode: "simulation", InstanceID: "i", GenerationID: "1", ObservedAt: "2026-01-01T00:00:00Z",
+			Evaluations: []RoutingEvaluation{},
+			DNS: []SimulationDNSData{{
+				LookupID: "lookup-1", Purpose: "dial_target", Name: "example.com", QType: "A",
+				Source: "upstream", Status: "nxdomain", RouteEvaluationIDs: []string{}, Addresses: []string{},
+			}},
+		}, nil
+	}})
+	response := traceRequest(server, `{"input":{"network":"tcp","domain":"example.com","dst_port":443},"resolve":"live"}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("trace status = %d: %s", response.Code, response.Body.String())
+	}
+	body := decodeJSON(t, response)
+	dns := body["dns"].([]any)
+	if len(body["evaluations"].([]any)) != 0 || len(dns) != 1 {
+		t.Fatalf("unexpected trace response: %#v", body)
+	}
+	lookup := dns[0].(map[string]any)
+	if lookup["purpose"] != "dial_target" || lookup["attempt_id"] != nil || lookup["status"] != "nxdomain" {
+		t.Fatalf("unexpected DNS result: %#v", lookup)
+	}
+	if _, present := body["flow_id"]; present {
+		t.Fatalf("trace contains a flow ID: %#v", body)
+	}
+}
+
+func TestRoutingTraceResolveModeValidation(t *testing.T) {
+	const input = `{"network":"tcp","domain":"example.com","dst_port":443}`
+	const ipInput = `{"network":"tcp","dst_ip":"192.0.2.1","dst_port":443}`
+	const bothInput = `{"network":"tcp","domain":"example.com","dst_ip":"192.0.2.1","dst_port":443}`
+	const neitherInput = `{"network":"tcp","dst_port":443}`
+	tests := []struct {
+		name, input, resolve string
+		live                 bool
+		status               int
+		code                 string
+	}{
+		{"unavailable", input, `"live"`, false, http.StatusUnprocessableEntity, codeUnsupportedValue},
+		{"unknown", input, `"other"`, true, http.StatusUnprocessableEntity, codeUnsupportedValue},
+		{"null", input, `null`, true, http.StatusBadRequest, codeInvalidRequest},
+		{"wrong type", input, `5`, true, http.StatusBadRequest, codeInvalidRequest},
+		{"missing domain", ipInput, `"live"`, true, http.StatusUnprocessableEntity, codeUnsupportedValue},
+		{"explicit destination", bothInput, `"live"`, true, http.StatusUnprocessableEntity, codeUnsupportedValue},
+		{"missing destination", neitherInput, `"none"`, true, http.StatusBadRequest, codeInvalidRequest},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := newRoutingTraceTestServer(t)
+			if test.live {
+				server.SetRulesProvider(liveTraceRules{trace: func(RoutingTraceRequest) (RoutingTraceResponse, error) {
+					t.Fatal("invalid request reached provider")
+					return RoutingTraceResponse{}, nil
+				}})
+			}
+			response := traceRequest(server, `{"input":`+test.input+`,"resolve":`+test.resolve+`}`)
+			if response.Code != test.status || errorCode(t, response) != test.code {
+				t.Fatalf("trace status = %d, want %d/%s: %s", response.Code, test.status, test.code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestRoutingTraceResolveModes(t *testing.T) {
+	if got := routingTraceResolveModes(fakeRules{}); !slices.Equal(got, []string{"none"}) {
+		t.Fatalf("default modes = %v", got)
+	}
+	if got := routingTraceResolveModes(liveTraceRules{}); !slices.Equal(got, []string{"none", "live"}) {
+		t.Fatalf("isolated provider modes = %v", got)
+	}
+}
+
+func TestRoutingTraceUnavailableIncludesRetryAfter(t *testing.T) {
+	for _, err := range []error{
+		errors.New("runtime unavailable"),
+		NewAPIError(http.StatusServiceUnavailable, "snapshot_unavailable", "routing snapshot unavailable"),
+	} {
+		server := newRoutingTraceTestServer(t)
+		server.SetRulesProvider(liveTraceRules{trace: func(RoutingTraceRequest) (RoutingTraceResponse, error) {
+			return RoutingTraceResponse{}, err
+		}})
+		response := traceRequest(server, validRoutingTraceBody)
+		if response.Code != http.StatusServiceUnavailable || response.Header().Get("Retry-After") != "1" {
+			t.Fatalf("trace status = %d, Retry-After = %q: %s", response.Code, response.Header().Get("Retry-After"), response.Body.String())
+		}
 	}
 }
 
@@ -109,7 +221,7 @@ func TestRoutingTraceRejectsOversizedAndTrailingJSON(t *testing.T) {
 	}, fakeRuntimeProvider{runtime: testRuntime()})
 	server.SetRulesProvider(fakeRules{})
 	oversized := traceRequest(server, validRoutingTraceBody)
-	if oversized.Code != http.StatusRequestEntityTooLarge {
+	if oversized.Code != http.StatusRequestEntityTooLarge || errorCode(t, oversized) != codeRequestTooLarge {
 		t.Fatalf("oversized body status = %d, want 413", oversized.Code)
 	}
 

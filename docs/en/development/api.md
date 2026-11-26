@@ -13,6 +13,7 @@ Current implementation:
 - `GET /api/v1/version`
 - `GET /api/v1/capabilities`
 - `GET /api/v1/runtime`
+- `GET /api/v1/runtime/settings`, `PATCH /api/v1/runtime/settings`
 - `GET /api/v1/runtime/traffic/history?window_seconds=&max_points=`
 - `GET /api/v1/runtime/outbounds` — per-outbound counters, retained across reloads
 - `GET /api/v1/runtime/memory` — process, cgroup v2 and eBPF memory
@@ -35,9 +36,13 @@ Current implementation:
 - `POST /api/v1/operations/resume`
 - `GET /api/v1/operations/{operation_id}`
 - `GET /api/v1/rules` — configured routing rules of the running generation
-- `POST /api/v1/routing/trace` — simulate routing against the running generation; `resolve: "none"` only
-- `GET /api/v1/providers` and `GET /api/v1/providers/{provider_id}`
-- `GET /api/v1/geodata` — geoip/geosite asset fingerprints
+- `POST /api/v1/routing/trace` — simulate routing against the running generation, with
+  optional live DNS resolution (`resolve: "none"` or `"live"`)
+- `GET /api/v1/providers`, `POST /api/v1/providers`,
+  `GET /api/v1/providers/{provider_id}`, `DELETE /api/v1/providers/{provider_id}`
+  and `POST /api/v1/providers/{provider_id}/refresh`
+- `GET /api/v1/geodata` — geoip/geosite asset fingerprints and update status
+- `POST /api/v1/geodata/update` — download and activate both geodata assets
 - `GET /api/v1/dns/cache`, `DELETE /api/v1/dns/cache?name=`,
   `DELETE /api/v1/dns/cache/{entry_id}`, `POST /api/v1/dns/cache/flush`
 - `GET /api/v1/dns/log`, `GET /api/v1/dns/rules`, `POST /api/v1/dns/query`
@@ -52,13 +57,36 @@ The shared endpoints follow the `api-standardize` contract. What kdae adds is
 kept where the contract puts engine extensions, under a member named after the
 engine: discovery `links` and capabilities `resources` carry an `x-kdae`
 member, so does a group's `config`, and the extension route sits under
-`/api/v1/x-kdae/`. The direct-stats observer is the only one so far.
+`/api/v1/x-kdae/`. That namespace exposes the direct-stats observer.
 
-`POST /api/v1/providers` (inline provider creation),
-`DELETE /api/v1/providers/{provider_id}` and `POST /api/v1/geodata/update`
-answer `404 capability_not_supported`, matching `providers.can_manage` and
-`geodata.can_update` being `false`: dae does not create or delete subscriptions
-through the API.
+`POST /api/v1/providers` and `DELETE /api/v1/providers/{provider_id}` create and
+delete subscription providers. Like node management they are gated on the
+configuration write switch: `providers.can_manage` is true only with
+`api.config_write`, the managed layout and the operations adapter; without it
+both answer `404 capability_not_supported`. The body is
+`{"name": string, "kind": "subscription", "url": string}`. The URL must be
+`http` or `https`; the name is 1-64 characters of letters, digits, `_`, `.` or
+`-`, the charset the configuration accepts for a tag, and a name that the file
+or the running generation already uses answers `409 state_conflict`.
+`update_interval`, `user_agent` and `cache` are accepted only as `null`,
+because the configuration has no such option: the capability lists no
+`create_options`, and a value answers `422 unsupported_value`. The provider is
+written to the `subscription` section of its module as `name: 'url'` and
+committed through a reload: `202` with a `provider_create` operation whose
+result is the provider. The next generation fetches the URL. A fetch that fails
+leaves the provider in place with `status: "error"`, no nodes and `last_error`;
+the operation still succeeds, because the configuration change is what was
+asked for. `DELETE` removes the entry and answers `202` with a
+`provider_delete` operation whose result is `{"deleted": 1}`; an unknown ID is
+`200 {"deleted": 0}` and an inline or file provider
+`404 capability_not_supported`. A reload that the daemon rejects (a
+configuration whose subscriptions all fail to resolve would leave no node)
+reports `reload_rejected` on the operation, and the previous generation keeps
+running.
+
+`url_redacted` is the URL as written to the configuration, with only a listener
+secret masked. It lets an operator recognise a subscription, and a client must
+treat it like a credential.
 
 `POST /api/v1/nodes` and `DELETE /api/v1/nodes/{node_id}` are implemented,
 gated on the configuration write switch: `nodes.can_manage` is true only with
@@ -93,18 +121,46 @@ the API runs. Only a `subscription` provider can be refreshed — an inline or f
 provider answers `404 capability_not_supported` — and it queues a
 `provider_refresh` operation.
 
-`/api/v1/runtime/settings` and `/api/v1/auth*` answer
-`404 capability_not_supported`. Routing trace availability follows the running
-generation; when `routing_trace.available` is false, its endpoint answers the
-same error. Trace is disabled when the generation exceeds 4096 rule steps. It simulates
-routing only: it does not connect or perform DNS
-queries, and currently supports `resolve: "none"` only; `resolve: "live"` answers
-`422 unsupported_value`. Limits are 30 requests per principal per minute and
+`/api/v1/auth*` answers `404 capability_not_supported`.
+Routing trace availability follows the running generation. When the capability
+is unavailable, the endpoint returns `404 capability_not_supported`. The default
+resolution mode is `none`. `live` is advertised for every generation that has a
+trace, whatever its DNS policy and traffic rules: geosite or external assets in
+DNS rules, encrypted or hostname upstreams, packet metadata rules, and upstreams
+that routing sends through a proxy outbound.
+
+A live lookup is made the way the runtime would make it for the traced client.
+The trace uses the active generation's compiled DNS rules, with independent
+upstream resolution and match caches. Rules loaded from assets follow the
+active generation until reload. The A and AAAA queries run concurrently and
+are reported in that order. If the generation retires during resolution,
+the trace is cancelled and returns `503 temporarily_unavailable`. Each upstream
+query follows the source address, source port,
+`pname` and `dscp` of the trace input, with the upstream server as the
+destination. A direct path uses a private direct dialer. A proxy outbound
+selects its node the way the runtime would, and the query travels a private copy
+of that node, rebuilt from its link and closed with the lookup. The trace reads
+outbound selection and health for node choice. Its queries leave the runtime
+DNS cache, DNS log, forwarders, dialer health, selection and counters untouched.
+
+A path that depends on an input the trace does not have is refused, naming the
+input in the DNS step's `error`, instead of guessed. `pname` is the exception:
+only traffic this host generates has one, so a trace that names no source
+address, or a source on another host, is made for a forwarded client and its
+pname rules are decided; a source on this host needs its `pname` for a
+determinate path. An `asis` answer, an upstream that is dae's own listener and
+a routing that blocks the upstream are reported in the same field. A failed
+exchange reports `TIMEOUT` or `ERROR` with its reason; a reason names inputs,
+outbounds and policy, never a node or its credentials. Live tracing returns one
+routing evaluation per unique address, up to 16 addresses and
+4096 aggregate rule steps, with a 12-second deadline. Unsupported resolve modes
+return `422 unsupported_value`. Limits are 30 requests per principal per minute and
 120 globally per minute; excess requests answer `429 rate_limited` with
 `Retry-After`.
 
 Configuration supports source-level editing plus restricted group-config
 editing: `GET /api/v1/config`, `GET /api/v1/config/sources/{source_id}`,
+`POST /api/v1/config/sources`,
 `PUT /api/v1/config/sources/{source_id}` (requires `If-Match`) and
 `POST /api/v1/config/validate`. A `sources[].id` is the contract's request-local
 diagnostic label: it defaults to `source-N`, overrides the visible source with
@@ -120,6 +176,15 @@ path answers `405`. Writes are available only when `api.config_write = true` and
 the config directory follows the managed layout (`config.dae` includes
 `config.d/*.dae` and `api.dae`); otherwise they answer `403 permission_denied`
 with `details.reason`, and nothing is written.
+
+Config PUT and managed node and provider writes restore the previous source
+bytes and permissions after a definite reload rejection, provided the written
+file is still in place and unchanged. The failed operation reports
+`reload_rejected` with `details.committed: false` and `details.written: false`
+when restoration succeeds. `details.written: true` means the write was not
+rolled back, for example because an external edit took precedence. If shutdown
+interrupts confirmation of activation, the file is left in place and
+`details.committed` is `null`.
 
 Group config patches use `application/json-patch+json` and require the strong
 `If-Match` revision from the config `ETag`. Only `/config/check_interval`
@@ -143,6 +208,37 @@ Deliberate deviations from the contract:
 
 Rules and DNS rules are edited by replacing their owning source (`routing.dae`,
 `dns.dae`). The API does not offer row-level edits.
+
+### Runtime settings
+
+GET reports the effective values. PATCH takes an `application/json` merge such as
+`{"log":{"level":"debug"}}` and applies it immediately. This endpoint is available
+when the native API is enabled, including with `api.config_write: false`.
+
+| Field | Default | Accepted values |
+| --- | --- | --- |
+| `log.level` | `global.log_level` | `trace`, `debug`, `info`, `warn`, `error` |
+| `log.buffered_records` | 1024 | 64–1024 |
+| `dns_log.max_records` | 1024 | 64–1024 |
+| `flows.max_flows` | 2048 | 64–2048 |
+| `flows.retention_seconds` | 900 seconds | 1–900 seconds |
+
+Shrinking a buffer keeps its newest entries. Cursors whose entries are evicted
+expire as usual. PATCH validates the whole body before applying any setting.
+An invalid request returns `400 invalid_request` and a recognized but unavailable
+field or log level returns `422 unsupported_value`.
+
+kdae stores overrides in `runtime-settings.json` alongside the entry configuration.
+Overrides survive reload and daemon restart. The capability declares this under
+`resources.runtime_settings.x-kdae`. PATCH does not edit the `.dae`
+files or trigger a reload. If the JSON file cannot be read or validated at startup,
+dae logs a warning and starts with the configured values. If a PATCH needs to
+write the file and the write fails, it returns `503 temporarily_unavailable` with
+`Retry-After` and keeps the previous settings.
+
+To clear an individual override, PATCH that field to its configured value or
+built-in default. GET reports `source: "runtime"` while any override is stored and
+`source: "config"` once all overrides are cleared.
 
 ### Groups and selection
 
@@ -249,24 +345,42 @@ resource never paginates: `max_rules` is the routing dictionary capacity
 section and untagged subscriptions form the editable `inline` provider
 (`p_inline`); every other tag becomes `p_` plus a hash of the tag, so a
 provider ID (and its nodes' `provider_id`) survives a reload as long as the tag
-does. `node_count` comes from the running generation, and a provider whose
-subscription produced no dialer reports `status: "stale"` instead of an
-invented update time. Pagination reuses the generation-bound node cursor.
+does. `node_count` comes from the running generation, and `status` follows the
+last fetch: `ok` with nodes, `stale` when a failed fetch left the previous nodes
+in place, `error` when there are none, in which case `updated_at` stays `null`
+instead of an invented time. Pagination reuses the generation-bound node cursor.
 
 `can_refresh` follows the operations adapter alone, so it is true for every
-subscription, while `can_manage` stays `false` because providers are never
-created or deleted over the API. `POST /api/v1/providers/{provider_id}/refresh`
-therefore queues a `provider_refresh` operation for a subscription and answers
+subscription. `can_manage` additionally needs the configuration write switch;
+when it is false, creating and deleting a provider answers
+`404 capability_not_supported`. `POST /api/v1/providers/{provider_id}/refresh`
+queues a `provider_refresh` operation for a subscription and answers
 `404 capability_not_supported` for any other provider kind. A refresh refetches
 the subscription; when the fetch fails, the last good nodes are kept so the
 running generation is not cut, and the provider reports the failure instead of a
-success: `status` is `"stale"`, `last_error` carries the reason, and `updated_at`
-is the time of the last attempt.
+success: `status` is `"stale"`, `last_error` carries the reason, and
+`updated_at` is the time of the last attempt. A provider whose subscription has
+never produced a node reports `status: "error"` instead of an invented update
+time.
 
-`GET /api/v1/geodata` reports the geoip and geosite files dae loaded with size,
-mtime and SHA-256. The digest is cached until the file changes, so polling is
-cheap. `can_update` is `false`: assets come from the installation, and
-`POST /api/v1/geodata/update` answers `404 capability_not_supported`.
+`GET /api/v1/geodata` reports the loaded geoip and geosite fingerprints. With a
+token-configured listener, it also reports update status and required codes.
+PATCH the `geodata` section of `/api/v1/runtime/settings` to configure ordered
+URLs, the download route, checksum verification, and a 1–168 hour interval.
+Automatic updates default to off. Settings survive restarts and
+`{"geodata":null}` resets them.
+
+`POST /api/v1/geodata/update` takes an empty body and returns `202` with a
+`geodata_update` operation. Both assets must download and validate before dae
+activates them in one reload. dae keeps the previous assets if the update fails.
+
+Each URL gets one deadline, and the next URL is tried only after a failure.
+Redirects are not followed. With route `routing`, the request follows the
+routing rules like user traffic: a proxy outbound receives the hostname under
+`dial_mode: domain`, while a direct outbound connects only to the vetted public
+address. The operation error carries only the failure category,
+`download_failed` or `validation_failed`. The reason and elapsed time of every
+attempt go to the log at warning level, without URL credentials.
 
 ### DNS cache, log, rules and query
 

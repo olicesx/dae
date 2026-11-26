@@ -7,6 +7,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 
 	"github.com/daeuniverse/dae/component/nativeapi"
 )
@@ -134,10 +135,90 @@ func (p *nativeAPIProvider) nodeIndex() (map[string]nodeRef, error) {
 	return index, nil
 }
 
-// ProviderCapabilities advertises on-demand refresh. Refetching a subscription
-// takes a reload, which is what RefreshProvider queues.
+// ProviderCapabilities advertises on-demand refresh and provider management.
+// Refetching a subscription takes a reload, which is what RefreshProvider
+// queues; a provider is written into the managed configuration and reloads the
+// same way, so management follows the configuration's write gate. A created
+// provider is fetched while the change activates, so it is not created
+// unfetched, and dae's subscription syntax carries none of the optional
+// create fields.
 func (p *nativeAPIProvider) ProviderCapabilities() nativeapi.ProviderCapabilities {
-	return nativeapi.ProviderCapabilities{CanRefresh: p.operations != nil}
+	caps := nativeapi.ProviderCapabilities{CanRefresh: p.operations != nil}
+	if p.config != nil && p.operations != nil {
+		caps.CanManage = p.config.ConfigCapabilities().Writable
+	}
+	return caps
+}
+
+// CreateProvider writes one subscription provider into the managed
+// configuration. The operation's result is the Provider the reload publishes,
+// looked up by the ID a tag derives rather than predicted from the URL.
+func (p *nativeAPIProvider) CreateProvider(ctx context.Context, req nativeapi.ProviderCreateRequest) (nativeapi.ProviderCreateOutcome, error) {
+	if !p.ProviderCapabilities().CanManage {
+		return nativeapi.ProviderCreateOutcome{}, errProviderManagementUnavailable
+	}
+	providerID := providerIDOf(req.Name)
+	resolve := func() (any, error) {
+		provider, err := p.GetProvider(context.Background(), providerID)
+		if err != nil {
+			return nil, err
+		}
+		return *provider, nil
+	}
+	accepted, err := p.config.CreateProvider(ctx, req, p.providerNames, resolve)
+	if err != nil {
+		return nativeapi.ProviderCreateOutcome{}, err
+	}
+	return nativeapi.ProviderCreateOutcome{Accepted: accepted}, nil
+}
+
+// DeleteProvider removes one subscription or file provider. An id that names
+// nothing is an idempotent no-op; the operation's result is the deletion count.
+func (p *nativeAPIProvider) DeleteProvider(ctx context.Context, req nativeapi.ProviderDeleteRequest) (nativeapi.ProviderDeleteOutcome, error) {
+	if !p.ProviderCapabilities().CanManage {
+		return nativeapi.ProviderDeleteOutcome{}, errProviderManagementUnavailable
+	}
+	locate := func() (nativeapi.Provider, bool, error) {
+		provider, err := p.GetProvider(context.Background(), req.ProviderID)
+		if err != nil {
+			var apiErr *nativeapi.APIError
+			if errors.As(err, &apiErr) && apiErr.Status == 404 {
+				return nativeapi.Provider{}, false, nil
+			}
+			return nativeapi.Provider{}, false, err
+		}
+		return *provider, true, nil
+	}
+	resolve := func() (any, error) {
+		return nativeapi.ProviderDeleteResult{Deleted: 1}, nil
+	}
+	return p.config.DeleteProvider(ctx, req, locate, resolve)
+}
+
+// providerNames returns the names the running generation's providers hold,
+// so a create cannot take a name that is in use.
+func (p *nativeAPIProvider) providerNames() (map[string]bool, error) {
+	active, err := p.activeGeneration()
+	if err != nil {
+		return nil, err
+	}
+	providers, err := p.providers(active)
+	if err != nil {
+		return nil, err
+	}
+	names := make(map[string]bool, len(providers))
+	for _, provider := range providers {
+		if provider.Kind != "inline" {
+			names[provider.Name] = true
+		}
+	}
+	return names, nil
+}
+
+var errProviderManagementUnavailable = &nativeapi.APIError{
+	Status:  404,
+	Code:    "capability_not_supported",
+	Message: "provider management is not supported by this engine",
 }
 
 // RefreshProvider queues a reload for one subscription. A reload refetches every

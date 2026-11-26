@@ -109,6 +109,22 @@ func (h *frameHub) publish(event string, data any) {
 	}
 }
 
+// resize retains the newest replay frames and leaves live subscribers attached.
+func (h *frameHub) resize(capacity int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if capacity == h.capacity {
+		return
+	}
+	h.pruneLocked(time.Now())
+	frames := make([]storedFrame, capacity)
+	kept := min(h.length, capacity)
+	for i := range kept {
+		frames[i] = h.frames[(h.start+h.length-kept+i)%len(h.frames)]
+	}
+	h.frames, h.start, h.length, h.capacity = frames, 0, kept, capacity
+}
+
 func (h *frameHub) pruneLocked(now time.Time) {
 	cutoff := now.Add(-h.retention)
 	for h.length > 0 {

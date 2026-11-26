@@ -126,6 +126,7 @@ type ControlPlane struct {
 	mptcp                  bool
 	udpRouteScopeSensitive bool
 	controlPlaneUDPRuntime
+	traceDnsOption *dialer.GlobalOption
 	// sniLearning projects sniffed TLS SNI knowledge into the kernel routing
 	// fallback map. Nil-safe: disabled configurations keep a nil subsystem.
 	sniLearning *sniLearning
@@ -198,6 +199,7 @@ type InheritedBpf = bpfObjects
 type ControlPlaneBuildOptions struct {
 	DelayDatapathCommit   bool
 	DelayDNSListenerStart bool
+	DNSLogCapacity        int
 	DNSRoutingUnchanged   bool
 	IsReload              bool
 	DirectDialer          netproxy.Dialer
@@ -626,6 +628,14 @@ func NewControlPlaneWithContextOptions(
 	locationFinder := assets.NewLocationFinder(externGeoDataDirs)
 	option := dialer.NewGlobalOption(global, log)
 	option.SetRuntimeDependencies(directDialer, fullconeDirectDialer, systemDNSResolver)
+	// A routing trace builds its own DNS policy and dialers from a copy of the
+	// settings, so a live lookup shares no transport cache, health or
+	// selection state with the runtime's.
+	traceDnsOption := dialer.NewGlobalOption(global, quietTraceLogger())
+	deferFuncs = append(deferFuncs, func() error {
+		dialer.CleanupTransportCacheNamespace(traceDnsOption.TransportCacheNamespace)
+		return nil
+	})
 
 	// A proxy transport may have to resolve a peer-supplied domain-typed address
 	// on its datagram read path. Point that lookup at this generation's DNS view
@@ -995,6 +1005,7 @@ func NewControlPlaneWithContextOptions(
 		soMarkFromDae:                 global.SoMarkFromDae,
 		mptcp:                         global.Mptcp,
 		udpRouteScopeSensitive:        builder.UsesPacketMetadataRouting(),
+		traceDnsOption:                traceDnsOption,
 		controlPlaneUDPRuntime: controlPlaneUDPRuntime{
 			failedQuicDcidCache:  newFailedQuicDcidCache(failedQuicDcidCacheMaxEntries),
 			udpDirectDispatchSem: make(chan struct{}, udpDirectDispatchConcurrency),
@@ -1041,6 +1052,7 @@ func NewControlPlaneWithContextOptions(
 	if err != nil {
 		return nil, err
 	}
+	plane.dnsController.SetDNSLogCapacity(buildOpts.DNSLogCapacity)
 	plane.deferFuncs = append(plane.deferFuncs, plane.closeOwnedDNSController)
 
 	// Create and start DNS listener if configured

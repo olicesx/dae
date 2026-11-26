@@ -96,7 +96,7 @@ func (s *Server) handleCreateNode(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := decodeLimitedJSON(r, s.cfg.MaxJSONBodyBytes, &body); err != nil {
 		if err == errLimitedJSONBodyTooLarge {
-			writeError(w, requestID, http.StatusRequestEntityTooLarge, codeInvalidRequest, "request body is too large")
+			writeError(w, requestID, http.StatusRequestEntityTooLarge, codeRequestTooLarge, "The request exceeds a size limit.")
 			return
 		}
 		writeError(w, requestID, http.StatusBadRequest, codeInvalidRequest, "invalid JSON body: "+err.Error())
@@ -145,7 +145,7 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := decodeLimitedJSON(r, s.cfg.MaxJSONBodyBytes, &body); err != nil {
 		if err == errLimitedJSONBodyTooLarge {
-			writeError(w, requestID, http.StatusRequestEntityTooLarge, codeInvalidRequest, "request body is too large")
+			writeError(w, requestID, http.StatusRequestEntityTooLarge, codeRequestTooLarge, "The request exceeds a size limit.")
 			return
 		}
 		writeError(w, requestID, http.StatusBadRequest, codeInvalidRequest, "invalid JSON body: "+err.Error())

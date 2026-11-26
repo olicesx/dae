@@ -32,6 +32,8 @@ type reloadWorker struct {
 	externGeoDataDirs []string
 	processSessions   *control.SessionManager
 	runtimeSupervisor *runtimeSupervisor
+	runtimeSettings   *runtimeSettingsStore
+	geoData           *geoDataService
 	reloadManager     *reloadManager
 	runStateChanges   chan<- struct{}
 
@@ -99,7 +101,12 @@ func (w *reloadWorker) run() {
 		abortConnections := os.Remove(AbortFile) == nil
 		w.log.Infoln("[Reload] Load new config")
 		var newConf *config.Config
-		if req.isSuspend {
+		geoReload := w.geoData.IsGeoDataReload(w.reloadManager.currentRuntimeReloadID())
+		switch {
+		case geoReload:
+			activeConfig := *w.conf
+			newConf = &activeConfig
+		case req.isSuspend:
 			newConf, err = emptyConfig()
 			if err != nil {
 				w.log.WithFields(logrus.Fields{
@@ -115,7 +122,7 @@ func (w *reloadWorker) run() {
 			// Suspend must not look like an API configuration change. The
 			// listener is process-owned and keeps its startup configuration.
 			newConf.Api = w.conf.Api
-		} else {
+		default:
 			var includes []string
 			// The read lock pairs with the API write path: a candidate that is
 			// still being admitted must not be read here, because the write rolls
@@ -127,6 +134,11 @@ func (w *reloadWorker) run() {
 				w.log.WithFields(logrus.Fields{
 					"err": err,
 				}).Errorln("[Reload] Failed to reload")
+				w.reloadManager.failReloadAttempt(err)
+				continue
+			}
+			if err = preprocessWanInterfaceAuto(newConf); err != nil {
+				w.log.WithError(err).Errorln("[Reload] Failed to resolve WAN interfaces")
 				w.reloadManager.failReloadAttempt(err)
 				continue
 			}
@@ -155,10 +167,16 @@ func (w *reloadWorker) run() {
 		// *logrus.Logger. Keeping one logger instance also propagates the new
 		// level to every component that already captured the pointer, which a
 		// fresh logger silently left on the old one.
-		oldLogOutput := w.log.Out
-		logger.SetLogger(w.log, newConf.Global.LogLevel, disableTimestamp, nil)
-		logger.SetLogger(logrus.StandardLogger(), newConf.Global.LogLevel, disableTimestamp, nil)
-		logrus.SetOutput(oldLogOutput)
+		if w.runtimeSettings != nil {
+			// The activation hook applies the new level together with any
+			// override. Preparing a candidate must not reset a live PATCH.
+			w.runtimeSettings.configureReloadLoggers()
+		} else {
+			oldLogOutput := w.log.Out
+			logger.SetLogger(w.log, newConf.Global.LogLevel, disableTimestamp, nil)
+			logger.SetLogger(logrus.StandardLogger(), newConf.Global.LogLevel, disableTimestamp, nil)
+			logrus.SetOutput(oldLogOutput)
+		}
 		if !req.isSuspend {
 			if deferred := preserveReloadInterfaceBindings(w.conf, newConf); len(deferred) > 0 {
 				w.log.WithField("bindings", strings.Join(deferred, ",")).Warnln("[Reload] Deferring interface removal or role change until cold start to preserve established flows")
@@ -170,6 +188,15 @@ func (w *reloadWorker) run() {
 		freshDatapathReload := portChanged || datapathChanged
 		stagedHotHandoff := shouldUseStagedHotHandoff(freshDatapathReload, w.listener != nil)
 		freshDatapathHandoff := freshDatapathReload && w.listener != nil
+		operationID := w.reloadManager.currentRuntimeReloadID()
+		geoDirs, geoErr := w.geoData.ReloadAssetDirs(operationID, w.externGeoDataDirs)
+		if geoErr == nil && !stagedHotHandoff && !freshDatapathHandoff && w.geoData.IsGeoDataReload(operationID) {
+			geoErr = fmt.Errorf("geodata activation requires a staged reload")
+		}
+		if geoErr != nil {
+			w.reloadManager.failReloadAttempt(geoErr)
+			continue
+		}
 		if !w.reloadManager.beginReloadTransition() {
 			reloadErr := errRuntimeSupervisorClosed
 			w.reloadManager.setReloadError(reloadErr)
@@ -226,20 +253,23 @@ func (w *reloadWorker) run() {
 			w.log.Warnln("[Reload] Kernel datapath input changed (interface/somark/map-size); will perform a fresh datapath handoff")
 		}
 
-		dnsConfigUnchanged := dnsConfigEqual(w.conf, newConf)
+		dnsConfigUnchanged := !geoReload && dnsConfigEqual(w.conf, newConf)
 		ipVersionPreferenceUnchanged := w.conf.Dns.IpVersionPrefer == newConf.Dns.IpVersionPrefer
 		streamStagedDnsCache := shouldStreamStagedDnsCache(
 			stagedHotHandoff,
 			dnsConfigUnchanged,
 			ipVersionPreferenceUnchanged,
 		)
-		dnsCache, rollbackDNSCache := cloneReloadDNSCaches(w.conf, newConf, stagedHotHandoff, w.c.CloneDnsCache)
+		var dnsCache, rollbackDNSCache map[string]*control.DnsCache
+		if !geoReload {
+			dnsCache, rollbackDNSCache = cloneReloadDNSCaches(w.conf, newConf, stagedHotHandoff, w.c.CloneDnsCache)
+		}
 		var stagedListener *control.Listener
 
 		if stagedHotHandoff {
 			w.log.Infoln("[Reload] Prepare staged same-port handoff")
 			ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
-			newC, prepareErr := newPreparedControlPlane(ctx, w.log, obj, nil, dnsCache, newConf, w.externGeoDataDirs, dnsConfigUnchanged, true)
+			newC, prepareErr := newPreparedControlPlane(ctx, w.log, obj, nil, dnsCache, newConf, geoDirs, dnsConfigUnchanged, true, w.runtimeSettings.dnsLogCapacity())
 			prepareErr = attachPreparedSessionManager(newC, w.processSessions, prepareErr)
 			if prepareErr != nil {
 				reloadErr := wrapReloadTimeoutError("prepare staged reload", prepareErr, reloadPrepareTimeout)
@@ -318,7 +348,7 @@ func (w *reloadWorker) run() {
 			freshState, prepareErr := w.c.SnapshotFreshDatapathState()
 			var newC *control.ControlPlane
 			if prepareErr == nil {
-				newC, prepareErr = newPreparedControlPlane(ctx, w.log, nil, freshState, dnsCache, newConf, w.externGeoDataDirs, false, true)
+				newC, prepareErr = newPreparedControlPlane(ctx, w.log, nil, freshState, dnsCache, newConf, geoDirs, false, true, w.runtimeSettings.dnsLogCapacity())
 			}
 			prepareErr = attachPreparedSessionManager(newC, w.processSessions, prepareErr)
 			if prepareErr != nil {
@@ -377,7 +407,7 @@ func (w *reloadWorker) run() {
 
 		w.log.Infoln("[Reload] Load new control plane")
 		ctx, cancel := context.WithTimeout(context.Background(), reloadPrepareTimeout)
-		newC, err := newControlPlane(ctx, w.log, obj, dnsCache, newConf, w.externGeoDataDirs, dnsConfigUnchanged, true)
+		newC, err := newControlPlane(ctx, w.log, obj, dnsCache, newConf, geoDirs, dnsConfigUnchanged, true, w.runtimeSettings.dnsLogCapacity())
 		err = attachPreparedSessionManager(newC, w.processSessions, err)
 
 		var newCancel context.CancelFunc
@@ -394,7 +424,7 @@ func (w *reloadWorker) run() {
 				obj = nil
 			}
 			ctx, cancel = context.WithTimeout(context.Background(), reloadPrepareTimeout)
-			newC, err = newControlPlane(ctx, w.log, obj, rollbackDNSCache, w.conf, w.externGeoDataDirs, false, true)
+			newC, err = newControlPlane(ctx, w.log, obj, rollbackDNSCache, w.conf, w.geoData.AssetDirs(w.externGeoDataDirs), false, true, w.runtimeSettings.dnsLogCapacity())
 			err = attachPreparedSessionManager(newC, w.processSessions, err)
 			err = wrapReloadTimeoutError("rollback control plane", err, reloadPrepareTimeout)
 			if err != nil {

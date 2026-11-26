@@ -7,7 +7,10 @@ package nativeapi
 
 import (
 	"context"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // CodeStaleRevision is returned with 412 when If-Match does not match the
@@ -18,6 +21,7 @@ const CodeStaleRevision = "stale_revision"
 type ConfigCapabilities struct {
 	// Writable reports whether control callers may replace editable sources.
 	Writable   bool
+	Create     bool
 	MaxBytes   int
 	MaxSources int
 	// Layout is "managed" or "unmanaged"; LayoutReason explains why writes are
@@ -96,6 +100,32 @@ type ReplaceConfigSourceRequest struct {
 	IfMatch        string
 	IdempotencyKey string
 	Content        string
+}
+
+// CreateConfigSourceRequest carries a complete new source and its optional replay key.
+type CreateConfigSourceRequest struct {
+	Path           string
+	Content        string
+	IdempotencyKey string
+}
+
+// ValidConfigSourceCreatePath checks the portable wire syntax, independent of the store.
+func ValidConfigSourceCreatePath(path string) bool {
+	if len(path) < 5 || len(path) > 1024 || !utf8.ValidString(path) ||
+		!strings.HasSuffix(path, ".dae") || strings.ContainsFunc(path, unicode.IsControl) {
+		return false
+	}
+	for segment := range strings.SplitSeq(path, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// ConfigSourceCreator is the optional config source creation capability.
+type ConfigSourceCreator interface {
+	CreateConfigSource(ctx context.Context, req CreateConfigSourceRequest) (OperationAccepted, error)
 }
 
 // ConfigProvider serves the accepted configuration. Errors are returned as

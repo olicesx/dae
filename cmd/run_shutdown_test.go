@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -750,6 +751,26 @@ func TestBuildRunShutdownHandoffCarriesCurrentGenerationCancel(t *testing.T) {
 	}
 }
 
+func TestRuntimeSupervisorGeodataCommitFailureKeepsActiveGeneration(t *testing.T) {
+	oldGeneration := newTestRuntimeGeneration()
+	candidate := newTestRuntimeGeneration()
+	supervisor := newRuntimeSupervisor(oldGeneration)
+	if err := supervisor.installPrepared(candidate); err != nil {
+		t.Fatal(err)
+	}
+	commitFailure := errors.New("cannot persist asset selection")
+	activated := false
+	supervisor.onActivate = func(*runtimeGeneration) { activated = true }
+	retiring, err := supervisor.publishPreparedWithCommit(candidate, func() error { return commitFailure })
+	if !errors.Is(err, commitFailure) || retiring != nil || activated || supervisor.activeSnapshot() != oldGeneration {
+		t.Fatalf("failed commit published candidate: retiring=%v err=%v activated=%v", retiring, err, activated)
+	}
+	supervisor.rollbackPrepared(candidate)
+	if err := supervisor.installPrepared(newTestRuntimeGeneration()); err != nil {
+		t.Fatalf("cannot install a candidate after failed asset commit: %v", err)
+	}
+}
+
 func TestReloadManagerShutdownSupervisorIncludesUnclaimedRetirement(t *testing.T) {
 	manager := newReloadManager(make(chan reloadRequest, 1), make(chan struct{}, 1), make(chan os.Signal, 1))
 	oldGeneration := newTestRuntimeGeneration()
@@ -980,6 +1001,63 @@ func TestPreserveReloadInterfaceBindingsOnlyAddsDuringHotReload(t *testing.T) {
 	if got, want := fmt.Sprint(newConf.Global.WanInterface), "[wan1 wan0]"; got != want {
 		t.Fatalf("effective WAN interfaces = %s, want %s", got, want)
 	}
+}
+
+// A single-homed host binds the same link as LAN and WAN. The link's roles
+// are unchanged by any reload that keeps it configured, so nothing is deferred
+// and the next generation keeps both roles.
+func TestPreserveReloadInterfaceBindingsKeepsUnchangedDualRoleLink(t *testing.T) {
+	oldConf := &config.Config{Global: config.Global{
+		LanInterface: []string{"eth0"},
+		WanInterface: []string{"eth0"},
+	}}
+	for name, lan := range map[string][]string{"same": {"eth0"}, "reordered": {"eth0", "eth1"}} {
+		t.Run(name, func(t *testing.T) {
+			newConf := &config.Config{Global: config.Global{
+				LanInterface: slices.Clone(lan),
+				WanInterface: []string{"eth0"},
+			}}
+			if deferred := preserveReloadInterfaceBindings(oldConf, newConf); len(deferred) != 0 {
+				t.Fatalf("deferred bindings = %v, want none", deferred)
+			}
+			if !slices.Equal(newConf.Global.LanInterface, lan) || !slices.Equal(newConf.Global.WanInterface, []string{"eth0"}) {
+				t.Fatalf("interfaces were rewritten: lan=%v wan=%v", newConf.Global.LanInterface, newConf.Global.WanInterface)
+			}
+		})
+	}
+}
+
+func TestPreserveReloadInterfaceBindingsDefersRealRoleChanges(t *testing.T) {
+	tests := []struct {
+		name     string
+		lan, wan []string
+		wantLAN  []string
+		wantWAN  []string
+		deferred []string
+	}{
+		{name: "dual role drops wan", lan: []string{"eth0"}, wantLAN: []string{"eth0"}, wantWAN: []string{"eth0"}, deferred: []string{"lan:eth0"}},
+		{name: "dual role drops lan", lan: []string{}, wan: []string{"eth0"}, wantLAN: []string{"eth0"}, wantWAN: []string{"eth0"}, deferred: []string{"lan:eth0"}},
+		{name: "dual role replaced by lan-only link", lan: []string{"eth1"}, wan: []string{"eth1"}, wantLAN: []string{"eth1", "eth0"}, wantWAN: []string{"eth1", "eth0"}, deferred: []string{"lan:eth0"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			newConf := &config.Config{Global: config.Global{LanInterface: slices.Clone(tt.lan), WanInterface: slices.Clone(tt.wan)}}
+			deferred := preserveReloadInterfaceBindings(oldDualRoleConfig(), newConf)
+			if fmt.Sprint(deferred) != fmt.Sprint(tt.deferred) {
+				t.Fatalf("deferred bindings = %v, want %v", deferred, tt.deferred)
+			}
+			if fmt.Sprint(newConf.Global.LanInterface) != fmt.Sprint(tt.wantLAN) || fmt.Sprint(newConf.Global.WanInterface) != fmt.Sprint(tt.wantWAN) {
+				t.Fatalf("interfaces = lan %v wan %v, want lan %v wan %v", newConf.Global.LanInterface, newConf.Global.WanInterface, tt.wantLAN, tt.wantWAN)
+			}
+		})
+	}
+}
+
+func oldDualRoleConfig() *config.Config {
+	return &config.Config{Global: config.Global{
+		LanInterface: []string{"eth0"},
+		WanInterface: []string{"eth0"},
+	}}
 }
 
 // TestBpfDatapathChangedRoutesPolicyChangesViaStagedHandoff verifies that

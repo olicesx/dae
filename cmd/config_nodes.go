@@ -6,11 +6,9 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"net"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -175,20 +173,9 @@ func insertNodeEntry(text, name, link string) (string, error) {
 	return trimmed + "\n\nnode {\n" + entry("  ") + "}\n", nil
 }
 
-// nodeBlockIndent returns the indentation the entries inside a node block use,
-// defaulting to two spaces when the block has no entry to copy from.
+// nodeBlockIndent returns the indentation the entries inside a node block use.
 func nodeBlockIndent(text string, from int) string {
-	for _, line := range strings.Split(text[from:], "\n") {
-		trimmed := strings.TrimLeft(line, " \t")
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "}") {
-			if strings.HasPrefix(trimmed, "}") {
-				break
-			}
-			continue
-		}
-		return line[:len(line)-len(trimmed)]
-	}
-	return "  "
+	return blockIndent(text, from)
 }
 
 // removeNodeEntry removes the line that defines name inside the node block.
@@ -444,8 +431,7 @@ func inlineNodeLinks(text string) map[string]string {
 }
 
 // commitSourceUpdate validates content as the next configuration, backs up the
-// current bytes and queues kind. A failed start restores the previous bytes,
-// because no operation will ever read the rejected edit.
+// current bytes and queues kind with rollback on rejection.
 func (e *configEditor) commitSourceUpdate(ctx context.Context, target configSourceFile, content []byte, kind, idempotencyKey, fingerprint string, resolve func() (any, error)) (nativeapi.OperationAccepted, error) {
 	scope := sourceUpdateScope(target.abs, fingerprint)
 	if accepted, replayed, err := e.replaySourceUpdate(kind, scope, idempotencyKey); err != nil || replayed {
@@ -465,57 +451,6 @@ func (e *configEditor) commitSourceUpdate(ctx context.Context, target configSour
 		return nativeapi.OperationAccepted{}, err
 	}
 	return e.commitValidatedSource(ctx, target, content, kind, scope, idempotencyKey, resolve)
-}
-
-// commitValidatedSource writes an already validated candidate, queues its
-// operation and restores the previous bytes if the operation cannot start. The
-// config PUT and node write paths share it so their guard/backup/rollback
-// sequence cannot drift apart.
-func (e *configEditor) commitValidatedSource(
-	ctx context.Context,
-	target configSourceFile,
-	content []byte,
-	kind, scope, idempotencyKey string,
-	resolve func() (any, error),
-) (nativeapi.OperationAccepted, error) {
-	// e.mu serialises API writers, not whatever else edits the tree. The
-	// contract asks for If-Match to be judged again when the replacement is
-	// committed, so read the file once more at that moment: a change that landed
-	// while this request was being validated must neither be overwritten nor be
-	// archived as the backup of what the write replaced.
-	onDisk, err := os.ReadFile(target.abs)
-	if err != nil {
-		return nativeapi.OperationAccepted{}, fmt.Errorf("re-read config source: %w", err)
-	}
-	if !bytes.Equal(onDisk, target.raw) {
-		return nativeapi.OperationAccepted{}, &nativeapi.APIError{
-			Status: 412, Code: nativeapi.CodeStaleRevision,
-			Message: "config source changed since it was read",
-		}
-	}
-	mode := os.FileMode(0o600)
-	if fi, statErr := os.Stat(target.abs); statErr == nil {
-		mode = fi.Mode().Perm()
-	}
-	// Hold the read lock across write, queue and rollback: the reload worker
-	// must not read this candidate while it is still owned by an admission that
-	// may reject it.
-	unlockRead := e.lockConfigRead()
-	defer unlockRead()
-	if err := writeFileAtomic(target.abs+".bak", target.raw, 0o600); err != nil {
-		return nativeapi.OperationAccepted{}, fmt.Errorf("write config backup: %w", err)
-	}
-	if err := writeFileAtomic(target.abs, content, mode); err != nil {
-		return nativeapi.OperationAccepted{}, fmt.Errorf("write config source: %w", err)
-	}
-	accepted, err := e.operations.StartOperationWithResult(ctx, kind, scope, idempotencyKey, resolve)
-	if err != nil {
-		if restoreErr := writeFileAtomic(target.abs, target.raw, mode); restoreErr != nil {
-			e.log.WithError(restoreErr).Error("failed to restore config source after rejected operation")
-		}
-		return nativeapi.OperationAccepted{}, err
-	}
-	return accepted, nil
 }
 
 // CreateNode writes one inline node into the managed node source. resolve turns

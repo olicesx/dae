@@ -134,7 +134,9 @@ func (active *nativeActiveGeneration) projectProviders(nodes []nodeInventoryEntr
 			tag, link := common.GetTagFromLinkLikePlaintext(string(raw))
 			key := subscription.ProviderKey(tag, string(raw))
 			if _, exists := definitions[key]; !exists {
-				definitions[key] = definition{kind: "subscription", url: link, tag: tag}
+				// A file link is read from disk and has no URL to report;
+				// everything else is a fetched subscription.
+				definitions[key] = definition{kind: providerKindOf(link), url: link, tag: tag}
 			}
 		}
 		if len(active.conf.Node) > 0 {
@@ -177,7 +179,8 @@ func (active *nativeActiveGeneration) projectProviders(nodes []nodeInventoryEntr
 		}
 		// A refresh that fell back to the cached nodes, or failed outright, is
 		// not a success: the contract has last_error and updated_at so a client
-		// can tell the two apart.
+		// can tell the two apart. A failure that left no usable node is an
+		// error; one that kept the cached nodes is merely stale.
 		if health, ok := subscriptionHealth(key); ok {
 			if !health.updatedAt.IsZero() {
 				updatedAt := health.updatedAt.UTC().Format(time.RFC3339)
@@ -185,14 +188,20 @@ func (active *nativeActiveGeneration) projectProviders(nodes []nodeInventoryEntr
 			}
 			if health.err != "" {
 				provider.Status = "stale"
+				if provider.NodeCount == 0 {
+					provider.Status = "error"
+				}
 				provider.LastError = &nativeapi.SafeError{Code: "fetch_failed", Message: health.err}
 			}
 		}
-		if definition.url != "" {
-			// The field is what a client may display: the userinfo and query of
-			// a subscription URL carry its token, so they must not survive here
-			// even though the API is authenticated.
-			url := common.RedactURL(definition.url)
+		if definition.url != "" && definition.kind == "subscription" {
+			// The contract returns the configured URL as written, so a client
+			// can show or re-create the provider; only the listener secret is
+			// masked, the way the configuration sources are.
+			url := definition.url
+			if active.conf != nil {
+				url = *maskGeoDisplaySecret(&url, active.conf.Api.Secret)
+			}
 			provider.URLRedacted = &url
 		}
 		providers = append(providers, provider)

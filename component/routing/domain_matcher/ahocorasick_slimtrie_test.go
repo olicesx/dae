@@ -136,6 +136,21 @@ func TestAddSetRejectsOutOfBoundsBitIndex(t *testing.T) {
 	}
 }
 
+func TestIndependentDomainCacheDoesNotWarmRuntimeCache(t *testing.T) {
+	matcher := NewAhocorasickSlimtrie(logrus.StandardLogger(), 32)
+	matcher.AddSet(0, []string{"example.com"}, consts.RoutingDomainKey_Full)
+	if err := matcher.Build(); err != nil {
+		t.Fatal(err)
+	}
+	isolated := matcher.WithIndependentCache()
+	if bitmap := isolated.MatchDomainBitmap("EXAMPLE.COM."); bitmap[0] != 1 {
+		t.Fatalf("isolated bitmap = %v, want rule 0", bitmap)
+	}
+	if len(matcher.matchCache) != 0 {
+		t.Fatal("isolated match populated runtime cache")
+	}
+}
+
 func TestMatchDomainBitmapHitReturnsSharedAlias(t *testing.T) {
 	actrie := NewAhocorasickSlimtrie(logrus.StandardLogger(), 32)
 	actrie.AddSet(0, []string{"example.com"}, consts.RoutingDomainKey_Full)

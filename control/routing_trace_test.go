@@ -19,12 +19,18 @@ import (
 
 func newRoutingTraceMatcher(t *testing.T, rules ...*config_parser.RoutingRule) (*RoutingMatcher, []RoutingRuleSnapshot) {
 	t.Helper()
-	program, err := routing.NewNormalizedProgram(rules, config.FunctionOrString("direct"))
+	return newRoutingTraceMatcherWithFallback(t, "direct", rules...)
+}
+
+func newRoutingTraceMatcherWithFallback(t *testing.T, fallback config.FunctionOrString, rules ...*config_parser.RoutingRule) (*RoutingMatcher, []RoutingRuleSnapshot) {
+	t.Helper()
+	program, err := routing.NewNormalizedProgram(rules, fallback)
 	if err != nil {
 		t.Fatalf("create normalized program: %v", err)
 	}
 	builder, err := NewRoutingMatcherBuilderFromProgram(logrus.New(), program, map[string]uint8{
 		"direct": uint8(consts.OutboundDirect),
+		"block":  uint8(consts.OutboundBlock),
 		"proxy":  uint8(consts.OutboundUserDefinedMin),
 	}, nil)
 	if err != nil {

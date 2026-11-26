@@ -6,23 +6,29 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 
 	"github.com/daeuniverse/dae/component/dns"
 	"github.com/daeuniverse/dae/component/nativeapi"
@@ -57,6 +63,8 @@ type operationQueue interface {
 	// an operation that completed in the meantime, and the operation would then
 	// report the reload's generation ids instead of the written resource.
 	StartOperationWithResult(ctx context.Context, kind, scope, idempotencyKey string, resolve func() (any, error)) (nativeapi.OperationAccepted, error)
+	// StartConfigUpdate also registers completion for a source already written to disk.
+	StartConfigUpdate(ctx context.Context, kind, scope, idempotencyKey string, resolve func() (any, error), complete configWriteCompletion) (nativeapi.OperationAccepted, error)
 	// ReplayOperation reports a keyed request that already has an accepted
 	// operation, before the write path performs any filesystem side effect.
 	ReplayOperation(kind, scope, idempotencyKey string) (nativeapi.OperationAccepted, bool, error)
@@ -75,6 +83,7 @@ type configEditor struct {
 	reload     *reloadManager
 	busy       func() bool
 	generation func() string
+	supervisor *runtimeSupervisor
 }
 
 // configSourceFile is one loaded source with its raw bytes.
@@ -104,6 +113,7 @@ func newConfigEditor(cfgFile string, api config.Api, operations operationQueue,
 		enabled:    api.ConfigWrite && operations != nil,
 		operations: operations,
 		reload:     reload,
+		supervisor: supervisor,
 	}
 	e.busy = func() bool {
 		return reload != nil && (reload.reloadActive.Load() || reload.reloadPending.Load())
@@ -128,7 +138,9 @@ func (e *configEditor) ConfigCapabilities() nativeapi.ConfigCapabilities {
 	if err == nil {
 		managed, reason = detectManagedLayout(e.mainPath, sourcePaths(all))
 	}
+	_, canCreate := e.operations.(configCreateQueue)
 	caps := nativeapi.ConfigCapabilities{
+		Create:        managed && canCreate,
 		Writable:      e.enabled && managed,
 		MaxBytes:      configMaxBytes,
 		MaxSources:    configMaxSources,
@@ -298,6 +310,10 @@ func (e *configEditor) scrub(text string) string {
 
 func (e *configEditor) sourceView(s configSourceFile, readOnlyReason string) (nativeapi.ConfigSource, bool) {
 	content, masked := maskSource(string(s.raw))
+	lines := strings.Count(content, "\n")
+	if content != "" && !strings.HasSuffix(content, "\n") {
+		lines++
+	}
 	view := nativeapi.ConfigSource{
 		ConfigSourceContent: nativeapi.ConfigSourceContent{
 			ID:            s.id,
@@ -306,7 +322,7 @@ func (e *configEditor) sourceView(s configSourceFile, readOnlyReason string) (na
 			ContentSHA256: rawSHA256(s.raw),
 			Bytes:         len(s.raw),
 			Content:       content,
-			LineCount:     strings.Count(content, "\n") + 1,
+			LineCount:     lines,
 		},
 		Writable:       readOnlyReason == "",
 		ReadOnlyReason: contractReadOnlyReason(readOnlyReason),
@@ -664,6 +680,396 @@ func (e *configEditor) diagnosticsFor(err error, absToID map[string]string, fall
 	return diags
 }
 
+// CreateConfigSource validates and stores a supplemental source before queueing reload.
+func (e *configEditor) CreateConfigSource(ctx context.Context, req nativeapi.CreateConfigSourceRequest) (nativeapi.OperationAccepted, error) {
+	var rejected nativeapi.OperationAccepted
+	if err := ctx.Err(); err != nil {
+		return rejected, err
+	}
+	queue, supported := e.operations.(configCreateQueue)
+	if !supported {
+		return rejected, nativeapi.NewAPIError(404, "capability_not_supported", "configuration source creation is unavailable")
+	}
+	if !e.enabled {
+		return rejected, permissionDenied("config writes are not available", "writes_disabled")
+	}
+	if !nativeapi.ValidConfigSourceCreatePath(req.Path) || filepath.Base(req.Path) == hiddenConfigSourceName {
+		return rejected, nativeapi.NewAPIError(400, "invalid_request", "invalid configuration source path")
+	}
+	if len(req.Content) > configMaxBytes {
+		return rejected, nativeapi.NewAPIError(413, "request_too_large", "config source is too large")
+	}
+	if !utf8.ValidString(req.Content) {
+		return rejected, nativeapi.NewAPIError(400, "invalid_request", "source content must be UTF-8")
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	abs := filepath.Join(e.baseDir, req.Path)
+	target := configSourceFile{id: sourceIDFor(req.Path), abs: abs}
+	scope := sourceUpdateScope(abs, rawSHA256([]byte("config_create\x00"+req.Content)))
+	if accepted, replayed, err := e.replaySourceUpdate(nativeapi.OperationKindReload, scope, req.IdempotencyKey); err != nil || replayed {
+		return accepted, err
+	}
+	if err := e.checkConfigCreateParent(abs); err != nil {
+		return rejected, err
+	}
+	if _, err := os.Lstat(abs); err == nil {
+		return rejected, configSourceExists()
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return rejected, configCreateUnavailable()
+	}
+	if filepath.Dir(req.Path) != "config.d" {
+		return rejected, configCreateDiagnostic(sourceIDFor("config.dae"), "source-not-included", "No managed include pattern loads this path.")
+	}
+
+	// Pin the destination directory. A concurrent rename or symlink swap
+	// cannot redirect creation or cleanup through the caller's path.
+	dir, err := e.openConfigCreateDir()
+	if err != nil {
+		return rejected, err
+	}
+	keepDir := false
+	defer func() {
+		if !keepDir {
+			_ = dir.Close()
+		}
+	}()
+	all, err := e.loadSources()
+	if err != nil {
+		return rejected, configCreateUnavailable()
+	}
+	if ok, reason := e.layoutOK(all); !ok {
+		return rejected, permissionDenied("config writes are not available", reason)
+	}
+	if len(e.visibleSources(all)) >= configMaxSources {
+		return rejected, nativeapi.NewAPIError(413, "request_too_large", "too many config sources")
+	}
+	if e.apiAtStart.Secret != "" && strings.Contains(req.Content, e.apiAtStart.Secret) {
+		return rejected, permissionDenied("source must not contain the listener secret", "listener_secret_in_content")
+	}
+	sections, err := config_parser.Parse(req.Content)
+	if err != nil {
+		return rejected, e.unprocessable(err, target)
+	}
+	for _, section := range sections {
+		switch section.Name {
+		case "api":
+			return rejected, permissionDenied("the api section may only be declared in the listener source", "listener_secret_in_content")
+		case "include":
+			return rejected, configCreateDiagnostic(target.id, "config_invalid", "A managed source must not contain an include block.")
+		}
+		if slices.Contains(managedConfigModules, section.Name+".dae") {
+			return rejected, configCreateDiagnostic(target.id, "config_invalid", "This section belongs to a required managed source.")
+		}
+	}
+	// Keep the existing detector's conservative include check for candidate
+	// text too, so a successful create cannot disable managed editing.
+	if includeKeywordPattern.MatchString(req.Content) {
+		return rejected, configCreateDiagnostic(target.id, "config_invalid", "A managed source must not contain an include block.")
+	}
+	content := []byte(req.Content)
+	merged, entries, origins, err := config.NewMergerWithNewSource(e.mainPath, abs, content).MergeWithSourcesAndOrigins()
+	if err != nil {
+		return rejected, e.unprocessable(err, target)
+	}
+	if !slices.Contains(entries, abs) {
+		return rejected, configCreateDiagnostic(sourceIDFor("config.dae"), "source-not-included", "No include pattern loads this path.")
+	}
+	for _, occurrences := range origins {
+		for _, origin := range occurrences[1:] {
+			if origin.File != occurrences[0].File {
+				return rejected, configCreateDiagnostic(target.id, "config_invalid", "A section is declared by more than one file.")
+			}
+		}
+	}
+	candidate, err := config.New(merged)
+	if err != nil {
+		return rejected, e.unprocessable(err, target)
+	}
+	if err := e.guardApiUnchanged(candidate); err != nil {
+		return rejected, err
+	}
+	if err := e.fullValidate(candidate); err != nil {
+		return rejected, e.unprocessable(err, target)
+	}
+	accepted, err := e.commitConfigCreate(ctx, queue, dir, all, target, candidate, content, scope, req.IdempotencyKey)
+	keepDir = err == nil
+	return accepted, err
+}
+
+func configSourceExists() *nativeapi.APIError {
+	return nativeapi.NewAPIError(409, "state_conflict", "a config source already exists at this path")
+}
+
+func configCreateUnavailable() *nativeapi.APIError {
+	return nativeapi.NewAPIError(503, "temporarily_unavailable", "the config store cannot create a source right now")
+}
+
+func configCreateDiagnostic(sourceID, code, message string) error {
+	return &nativeapi.APIError{
+		Status: 422, Code: "unsupported_value", Message: "configuration validation failed",
+		Details: map[string]any{"diagnostics": []nativeapi.ConfigDiagnostic{{
+			Level: "error", SourceID: sourceID, Code: code, Message: message,
+		}}},
+	}
+}
+
+// Inspect existing ancestors so even an unmatched path cannot traverse a
+// symlink outside the configuration root. Missing parents are never created.
+func (e *configEditor) checkConfigCreateParent(path string) error {
+	root, err := filepath.EvalSymlinks(e.baseDir)
+	if err != nil {
+		return configCreateUnavailable()
+	}
+	parent := filepath.Dir(path)
+	for parent != e.baseDir {
+		resolved, err := filepath.EvalSymlinks(parent)
+		if errors.Is(err, os.ErrNotExist) {
+			parent = filepath.Dir(parent)
+			continue
+		}
+		rel, relErr := filepath.Rel(root, resolved)
+		if err != nil || relErr != nil || !filepath.IsLocal(rel) {
+			return nativeapi.NewAPIError(400, "invalid_request", "config source parent must stay inside the config root")
+		}
+		return nil
+	}
+	return nil
+}
+
+func (e *configEditor) openConfigCreateDir() (*os.File, error) {
+	root, err := os.Open(e.baseDir)
+	if err != nil {
+		return nil, configCreateUnavailable()
+	}
+	defer func() { _ = root.Close() }()
+	fd, err := unix.Openat(int(root.Fd()), "config.d", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ENOTDIR) || errors.Is(err, unix.ELOOP) {
+		return nil, nativeapi.NewAPIError(400, "invalid_request", "config.d must be a real directory")
+	}
+	if err != nil {
+		return nil, configCreateUnavailable()
+	}
+	return os.NewFile(uintptr(fd), "config.d"), nil
+}
+
+func (e *configEditor) commitConfigCreate(ctx context.Context, queue configCreateQueue, dir *os.File,
+	all []configSourceFile, target configSourceFile, candidate *config.Config, content []byte, scope, key string,
+) (nativeapi.OperationAccepted, error) {
+	var rejected nativeapi.OperationAccepted
+	unlock := e.lockConfigRead()
+	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return rejected, err
+	}
+	if e.busy() {
+		return rejected, &nativeapi.APIError{
+			Status: 409, Code: "state_conflict", Message: "a reload is already in progress",
+			Details: map[string]any{"reason": "reload_in_progress"},
+		}
+	}
+	if e.reload != nil && e.reload.status != nil && e.reload.status.getState() != string(runtimeStateRunning) {
+		return rejected, nativeapi.NewAPIError(409, "state_conflict", "config source creation requires a running generation")
+	}
+	if e.supervisor != nil {
+		active := e.supervisor.activeSnapshot()
+		if active == nil || active.conf == nil {
+			return rejected, nativeapi.NewAPIError(409, "state_conflict", "config source creation requires an active generation")
+		}
+		probe := *candidate
+		if err := preprocessWanInterfaceAuto(&probe); err != nil {
+			return rejected, configCreateDiagnostic(target.id, "interface-resolution-failed", "Could not resolve the automatic WAN interfaces.")
+		}
+		if len(preserveReloadInterfaceBindings(active.conf, &probe)) != 0 {
+			return rejected, configCreateDiagnostic(target.id, "restart-required", "Interface removal or role changes require a restart.")
+		}
+	}
+	if !e.isCurrentConfigCreateDir(dir) {
+		return rejected, configCreateUnavailable()
+	}
+	name := filepath.Base(target.abs)
+	var info unix.Stat_t
+	if err := unix.Fstatat(int(dir.Fd()), name, &info, unix.AT_SYMLINK_NOFOLLOW); err == nil {
+		return rejected, configSourceExists()
+	} else if !errors.Is(err, unix.ENOENT) {
+		return rejected, configCreateUnavailable()
+	}
+	current, err := e.loadSources()
+	if err != nil || !slices.EqualFunc(all, current, func(a, b configSourceFile) bool {
+		return a.abs == b.abs && bytes.Equal(a.raw, b.raw)
+	}) {
+		return rejected, nativeapi.NewAPIError(409, "state_conflict", "the source set changed during validation")
+	}
+	var mode os.FileMode
+	for _, source := range current {
+		stat, err := os.Lstat(source.abs)
+		if err != nil || !stat.Mode().IsRegular() {
+			return rejected, configCreateUnavailable()
+		}
+		if source.abs == e.mainPath {
+			mode = stat.Mode().Perm()
+		}
+	}
+	identity, err := installConfigSource(dir, name, content, mode)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return rejected, configSourceExists()
+		}
+		e.log.WithError(err).Warn("cannot store new config source")
+		return rejected, configCreateUnavailable()
+	}
+	// Keep the directory and created inode alive until completion so a
+	// replacement cannot reuse the created file's identity.
+	complete := func(committed *bool) *nativeapi.SafeError {
+		defer func() { _ = identity.Close() }()
+		defer func() { _ = dir.Close() }()
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		unlock := e.lockConfigRead()
+		defer unlock()
+		if committed == nil {
+			return configWriteFailure(true, nil, "reload was interrupted before its activation could be confirmed")
+		}
+		if *committed {
+			return nil
+		}
+		if !e.isCurrentConfigCreateDir(dir) || !removeCreatedConfigSource(dir, name, identity, content) {
+			return configWriteFailure(true, committed, "reload was rejected and cleanup conflicted with the config store")
+		}
+		return configWriteFailure(false, committed, "reload was rejected and the new source was removed")
+	}
+	var accepted nativeapi.OperationAccepted
+	if e.isCurrentConfigCreateDir(dir) {
+		accepted, err = queue.StartConfigCreate(ctx, scope, key, complete)
+	} else {
+		err = configCreateUnavailable()
+	}
+	if err != nil {
+		defer func() { _ = identity.Close() }()
+		if !removeCreatedConfigSource(dir, name, identity, content) {
+			no := false
+			failure := configWriteFailure(true, &no, "reload admission failed and cleanup conflicted with the config store")
+			return rejected, &nativeapi.APIError{Status: 503, Code: "temporarily_unavailable", Message: failure.Message, Details: failure.Details}
+		}
+		return rejected, err
+	}
+	return accepted, nil
+}
+
+func (e *configEditor) isCurrentConfigCreateDir(dir *os.File) bool {
+	pinned, err := dir.Stat()
+	if err != nil {
+		return false
+	}
+	current, err := os.Lstat(filepath.Join(e.baseDir, "config.d"))
+	return err == nil && os.SameFile(pinned, current)
+}
+
+func installConfigSource(dir *os.File, name string, content []byte, mode os.FileMode) (*os.File, error) {
+	file, err := stageConfigSource(dir, content, mode)
+	if err != nil {
+		return nil, err
+	}
+	fd := int(dir.Fd())
+	if err := unix.Renameat2(fd, file.Name(), fd, name, unix.RENAME_NOREPLACE); err != nil {
+		_ = file.Close()
+		_ = unix.Unlinkat(fd, file.Name(), 0)
+		return nil, err
+	}
+	return file, nil
+}
+
+func stageConfigSource(dir *os.File, content []byte, mode os.FileMode) (*os.File, error) {
+	fd := int(dir.Fd())
+	tmp := ".dae-config-" + rand.Text() + ".tmp"
+	created, err := unix.Openat(fd, tmp, unix.O_CREAT|unix.O_EXCL|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(created), tmp)
+	if _, err = file.Write(content); err == nil {
+		err = file.Chmod(mode)
+	}
+	if err == nil {
+		err = file.Sync()
+	}
+	if err != nil {
+		_ = file.Close()
+		_ = unix.Unlinkat(fd, tmp, 0)
+		return nil, err
+	}
+	return file, nil
+}
+
+func removeCreatedConfigSource(dir *os.File, name string, identity *os.File, content []byte) bool {
+	fd := int(dir.Fd())
+	matched, absent := matchesConfigSource(fd, name, identity, nil, content, false)
+	if !matched {
+		return absent
+	}
+	// Move the directory entry before deleting it so a replacement published
+	// between the check and rename can be detected and restored. If another
+	// writer has since taken the original name, preserve both entries.
+	quarantine := ".dae-config-" + rand.Text() + ".tmp"
+	if err := unix.Renameat2(fd, name, fd, quarantine, unix.RENAME_NOREPLACE); err != nil {
+		return errors.Is(err, unix.ENOENT)
+	}
+	if matched, _ := matchesConfigSource(fd, quarantine, identity, nil, content, false); matched {
+		if err := unix.Unlinkat(fd, quarantine, 0); err == nil {
+			return true
+		}
+	}
+	_ = unix.Renameat2(fd, quarantine, fd, name, unix.RENAME_NOREPLACE)
+	return false
+}
+
+func matchesConfigSource(fd int, name string, identity *os.File, expected os.FileInfo, content []byte, followSymlink bool) (matched, absent bool) {
+	created, err := identity.Stat()
+	if err != nil {
+		return false, false
+	}
+	openFlags := unix.O_RDONLY | unix.O_NONBLOCK | unix.O_CLOEXEC
+	statFlags := 0
+	if !followSymlink {
+		openFlags |= unix.O_NOFOLLOW
+		statFlags = unix.AT_SYMLINK_NOFOLLOW
+	}
+	currentFD, err := unix.Openat(fd, name, openFlags, 0)
+	if err != nil {
+		return false, errors.Is(err, unix.ENOENT)
+	}
+	current := os.NewFile(uintptr(currentFD), name)
+	defer func() { _ = current.Close() }()
+	var before unix.Stat_t
+	if err := unix.Fstat(currentFD, &before); err != nil {
+		return false, false
+	}
+	stat, err := current.Stat()
+	if err != nil || !stat.Mode().IsRegular() || !os.SameFile(created, stat) || stat.Size() != int64(len(content)) {
+		return false, false
+	}
+	if expected != nil && (stat.Mode() != expected.Mode() || !stat.ModTime().Equal(expected.ModTime())) {
+		return false, false
+	}
+	raw, err := io.ReadAll(io.LimitReader(current, int64(len(content))+1))
+	if err != nil || !bytes.Equal(raw, content) {
+		return false, false
+	}
+	var latest unix.Stat_t
+	if err := unix.Fstatat(fd, name, &latest, statFlags); err != nil {
+		return false, errors.Is(err, unix.ENOENT)
+	}
+	return latest.Ino == before.Ino && latest.Dev == before.Dev && latest.Ctim == before.Ctim, false
+}
+
+func configWriteFailure(written bool, committed *bool, message string) *nativeapi.SafeError {
+	return &nativeapi.SafeError{
+		Code: "reload_rejected", Message: message,
+		Details: map[string]any{"written": written, "committed": committed},
+	}
+}
+
 func fingerprintReplace(req nativeapi.ReplaceConfigSourceRequest) string {
 	return rawSHA256([]byte(req.SourceID + "\x00" + req.IfMatch + "\x00" + req.Content))
 }
@@ -786,17 +1192,17 @@ func (e *configEditor) guardConfigWrite(target configSourceFile, content []byte)
 	if !e.isApiSource(target.abs) && declaresApiSection(string(content)) {
 		return permissionDenied("the api section may only be declared in the listener source", "listener_secret_in_content")
 	}
+	if !slices.Contains(managedConfigModules, filepath.Base(target.abs)) && takesManagedSection(target.raw, content) {
+		return configCreateDiagnostic(target.id, "config_invalid", "This section belongs to a required managed source.")
+	}
 	if reason := e.candidateLayoutReason(target.abs, content); reason != "" {
 		return &nativeapi.APIError{
 			Status: 422, Code: "unsupported_value",
 			Message: "the write would make the managed configuration layout unmanaged: " + reason,
 		}
 	}
-	if e.busy() {
-		return &nativeapi.APIError{
-			Status: 409, Code: "state_conflict", Message: "a reload is already in progress",
-			Details: map[string]any{"reason": "reload_in_progress"},
-		}
+	if err := e.guardReloadIdle(); err != nil {
+		return err
 	}
 	// W_OK check: an unwritable file would fail after the backup was taken.
 	if syscall.Access(target.abs, 2) != nil {
@@ -806,6 +1212,36 @@ func (e *configEditor) guardConfigWrite(target configSourceFile, content []byte)
 		}
 	}
 	return nil
+}
+
+func (e *configEditor) guardReloadIdle() error {
+	if e.busy() {
+		return &nativeapi.APIError{
+			Status:  409,
+			Code:    "state_conflict",
+			Message: "a reload is already in progress",
+			Details: map[string]any{"reason": "reload_in_progress"},
+		}
+	}
+	return nil
+}
+
+// A supplemental file cannot claim a required module's section, even when
+// that module is empty. Preserve the ability to edit any existing owner.
+func takesManagedSection(previous, content []byte) bool {
+	sections, err := config_parser.Parse(string(content))
+	if err != nil {
+		return false
+	}
+	prior, _ := config_parser.Parse(string(previous))
+	for _, section := range sections {
+		if slices.Contains(managedConfigModules, section.Name+".dae") && !slices.ContainsFunc(prior, func(old *config_parser.Section) bool {
+			return old.Name == section.Name
+		}) {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *configEditor) isApiSource(abs string) bool {

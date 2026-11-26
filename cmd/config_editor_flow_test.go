@@ -88,6 +88,15 @@ func (f *fakeConfigOperations) StartOperationWithResult(ctx context.Context, kin
 	return accepted, nil
 }
 
+func (f *fakeConfigOperations) StartConfigUpdate(ctx context.Context, kind, scope, idempotencyKey string, resolve func() (any, error), complete configWriteCompletion) (nativeapi.OperationAccepted, error) {
+	accepted, err := f.StartOperationWithResult(ctx, kind, scope, idempotencyKey, resolve)
+	if err == nil {
+		committed := true
+		complete(&committed)
+	}
+	return accepted, err
+}
+
 // newFlowEditor mirrors production startup: the api block is read from api.dae
 // and passed as the start-up snapshot, so the candidate api must match it.
 func newFlowEditor(t *testing.T, main string, enabled bool, ops operationQueue) *configEditor {
@@ -263,7 +272,7 @@ func TestConfigRejectsMalformedFallbackResolver(t *testing.T) {
 
 	conf := &config.Config{}
 	conf.Global.FallbackResolver = invalidAddr
-	_, err = newControlPlaneWithMode(t.Context(), nil, nil, nil, nil, conf, nil, false, false, false)
+	_, err = newControlPlaneWithMode(t.Context(), nil, nil, nil, nil, conf, nil, false, false, false, 0)
 	if err == nil || !strings.Contains(err.Error(), "fallback_resolver") {
 		t.Fatalf("control plane returned %v, want fallback_resolver error", err)
 	}

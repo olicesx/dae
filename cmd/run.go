@@ -366,6 +366,19 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 	defer func() {
 		err = errors.Join(err, processSessions.Close())
 	}()
+	var settings *runtimeSettingsStore
+	var geoData *geoDataService
+	if conf.Api.Enabled {
+		settingsPath, pathErr := filepath.Abs(filepath.Join(filepath.Dir(cfgFile), "runtime-settings.json"))
+		if pathErr != nil {
+			return fmt.Errorf("resolve runtime settings path: %w", pathErr)
+		}
+		if conf.Api.Secret != "" {
+			geoData = newGeoDataService(filepath.Join(filepath.Dir(settingsPath), "geodata.d"), log)
+			defer geoData.Close()
+		}
+		settings = newRuntimeSettingsStore(settingsPath, log, processSessions, conf.Global.LogLevel, geoData)
+	}
 
 	var currCancel context.CancelFunc
 
@@ -377,7 +390,7 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 	currCancel = cancel
 	configureTransparentHugePages(log, conf.Global.DisableTHP)
 	configureGcMemoryLimit(log)
-	c, err := newControlPlane(ctx, log, nil, nil, conf, externGeoDataDirs, false, false)
+	c, err := newControlPlane(ctx, log, nil, nil, conf, geoData.AssetDirs(externGeoDataDirs), false, false, settings.dnsLogCapacity())
 	if err != nil {
 		cancel()
 		return err
@@ -389,6 +402,12 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 	}
 	initialGeneration := newRuntimeGeneration(c, nil, currCancel, conf)
 	runtimeSupervisor := newRuntimeSupervisor(initialGeneration)
+	if settings != nil {
+		runtimeSupervisor.onActivate = func(generation *runtimeGeneration) {
+			settings.activate(generation)
+			geoData.Activate(generation, externGeoDataDirs)
+		}
+	}
 
 	// Serve tproxy TCP/UDP server util signals.
 	listener, listenErr := listenControlPlaneInDaeNetns(c, conf.Global.TproxyPort)
@@ -411,6 +430,8 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 		externGeoDataDirs: externGeoDataDirs,
 		processSessions:   processSessions,
 		runtimeSupervisor: runtimeSupervisor,
+		runtimeSettings:   settings,
+		geoData:           geoData,
 		log:               log,
 		conf:              conf,
 		c:                 c,
@@ -483,6 +504,7 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 	if conf.Api.Enabled {
 		logHub := newFrameHub(rtStatus.snapshot().InstanceID, "logs", nativeapi.LogMaxBufferedRecords, nativeapi.LogRetentionSeconds*time.Second, nativeapi.LogMaxClients)
 		eventHub := newFrameHub(rtStatus.snapshot().InstanceID, "events", nativeapi.EventMaxBufferedEvents, nativeapi.EventRetentionSeconds*time.Second, nativeapi.EventMaxClients)
+		settings.attachLogHub(logHub)
 		log.AddHook(&logHubHook{hub: logHub})
 		provider := &nativeAPIProvider{
 			supervisor:      runtimeSupervisor,
@@ -498,6 +520,9 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 		}
 		operations := newNativeAPIOperations(reloadManager, runtimeSupervisor)
 		operations.events = provider
+		if geoData != nil {
+			geoData.AttachOperations(operations)
+		}
 		server, err := nativeapi.NewServer(nativeAPIConfig(conf), provider, log)
 		if err != nil {
 			_ = listener.Close()
@@ -514,11 +539,16 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 		server.SetDatapathProvider(provider)
 		server.SetRulesProvider(provider)
 		server.SetProviderProvider(provider)
-		server.SetGeoDataProvider(provider)
+		if geoData != nil {
+			server.SetGeoDataProvider(geoData)
+		} else {
+			server.SetGeoDataProvider(provider)
+		}
 		server.SetDnsProvider(provider)
 		server.SetConnectionProvider(provider)
 		server.SetFlowProvider(provider)
 		server.SetLogProvider(provider)
+		server.SetRuntimeSettingsProvider(settings)
 		server.SetEventProvider(provider)
 		server.SetOperationProvider(operations)
 		server.SetProbeProvider(operations)
@@ -832,7 +862,9 @@ loop:
 					}
 					var retiringGeneration *runtimeGeneration
 					if publishErr == nil {
-						retiringGeneration, publishErr = runtimeSupervisor.publishPrepared(handoff.preparedGeneration)
+						retiringGeneration, publishErr = runtimeSupervisor.publishPreparedWithCommit(handoff.preparedGeneration, func() error {
+							return geoData.CommitReload(reloadManager.currentRuntimeReloadID())
+						})
 					}
 					if publishErr == nil && handoff.provisionalOwner {
 						handoff.newControlPlane.UnregisterProvisionalRoutingEpochExecutionOwner()
@@ -955,6 +987,7 @@ loop:
 	if apiServer != nil {
 		apiServer.StopAcceptingWrites()
 		apiOperations.stopAcceptingReloads()
+		apiOperations.finishInterruptedConfigCreates()
 	}
 	if rtStatus.getState() != string(runtimeStateFailed) {
 		rtStatus.setState(runtimeStateDraining)

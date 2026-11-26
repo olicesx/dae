@@ -332,7 +332,6 @@ func TestKnownUnimplementedResourcesReportCapability(t *testing.T) {
 		"/api/v1/runtime/memory",
 		"/api/v1/runtime/memory/history",
 		"/api/v1/runtime/outbounds",
-		"/api/v1/runtime/settings",
 		"/api/v1/datapath",
 		"/api/v1/routing/trace",
 		"/api/v1/auth",

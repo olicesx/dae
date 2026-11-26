@@ -99,6 +99,53 @@ type Limits struct {
 	MaxJSONBodyBytes      int `json:"max_json_body_bytes"`
 }
 
+// RuntimeSettings is the effective snapshot of the five adjustable settings.
+type RuntimeSettings struct {
+	ObservedAt string                `json:"observed_at"`
+	Source     string                `json:"source"`
+	Log        RuntimeLogSettings    `json:"log"`
+	DNSLog     RuntimeDNSLogSettings `json:"dns_log"`
+	Flows      RuntimeFlowSettings   `json:"flows"`
+	GeoData    *GeoDataSettings      `json:"geodata,omitempty"`
+}
+
+type RuntimeLogSettings struct {
+	Level           string `json:"level"`
+	BufferedRecords int    `json:"buffered_records"`
+}
+
+type RuntimeDNSLogSettings struct {
+	MaxRecords int `json:"max_records"`
+}
+
+type RuntimeFlowSettings struct {
+	MaxFlows         int `json:"max_flows"`
+	RetentionSeconds int `json:"retention_seconds"`
+}
+
+// RuntimeSettingsPatch contains only values the caller wants to change.
+// An absent section has all nil fields and is omitted when marshaled.
+type RuntimeSettingsPatch struct {
+	Log     RuntimeLogSettingsPatch    `json:"log,omitzero"`
+	DNSLog  RuntimeDNSLogSettingsPatch `json:"dns_log,omitzero"`
+	Flows   RuntimeFlowSettingsPatch   `json:"flows,omitzero"`
+	GeoData *GeoDataSettingsPatch      `json:"geodata,omitempty"`
+}
+
+type RuntimeLogSettingsPatch struct {
+	Level           *string `json:"level,omitempty"`
+	BufferedRecords *int    `json:"buffered_records,omitempty"`
+}
+
+type RuntimeDNSLogSettingsPatch struct {
+	MaxRecords *int `json:"max_records,omitempty"`
+}
+
+type RuntimeFlowSettingsPatch struct {
+	MaxFlows         *int `json:"max_flows,omitempty"`
+	RetentionSeconds *int `json:"retention_seconds,omitempty"`
+}
+
 type Runtime struct {
 	ObservedAt string          `json:"observed_at"`
 	InstanceID string          `json:"instance_id"`
@@ -400,6 +447,12 @@ type NodeDeleteResult struct {
 	Deleted int `json:"deleted"`
 }
 
+// ProviderDeleteResult is the body of a completed provider_delete operation:
+// how many providers the write removed.
+type ProviderDeleteResult struct {
+	Deleted int `json:"deleted"`
+}
+
 type RuntimeStateResult struct {
 	RuntimeState *string `json:"runtime_state"`
 }
@@ -439,6 +492,7 @@ type GeoDataDownload struct {
 type GeoData struct {
 	ObservedAt string     `json:"observed_at"`
 	Assets     []GeoAsset `json:"assets"`
+	*GeoDataUpdateStatus
 }
 
 type GeoAsset struct {
@@ -447,6 +501,7 @@ type GeoAsset struct {
 	SizeBytes      string  `json:"size_bytes"`
 	ModifiedAt     *string `json:"modified_at"`
 	SourceRedacted *string `json:"source_redacted"`
+	*GeoAssetDownload
 }
 
 // RuleList is the complete routing dictionary of one generation.

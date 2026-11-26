@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/daeuniverse/dae/common"
@@ -36,7 +37,9 @@ type Merger struct {
 	merged map[string]bool
 	// overrides maps absolute cleaned paths to replacement bytes. An override
 	// only replaces the bytes read for a file that already exists on disk.
-	overrides map[string][]byte
+	overrides        map[string][]byte
+	newSourcePath    string
+	newSourceContent []byte
 	// origins records, per section name, every file-level occurrence parsed
 	// during Merge. It is used by the managed-layout gate.
 	origins map[string][]SectionOrigin
@@ -74,6 +77,16 @@ func NewMergerWithOverrides(entry string, overrides map[string][]byte) *Merger {
 	return m
 }
 
+// NewMergerWithNewSource validates a prospective source at its final path. The
+// caller owns filesystem admission and must ensure that path does not exist.
+// The source can enter the candidate only through an actual include pattern.
+func NewMergerWithNewSource(entry, path string, content []byte) *Merger {
+	m := NewMerger(entry)
+	m.newSourcePath = absCleanPath(path)
+	m.newSourceContent = content
+	return m
+}
+
 func absCleanPath(p string) string {
 	abs, err := filepath.Abs(p)
 	if err != nil {
@@ -97,11 +110,17 @@ func (m *Merger) Merge() (sections []*config_parser.Section, entries []string, e
 // MergeWithOrigins behaves like Merge and additionally returns, per section
 // name, the files and line ranges the section was parsed from.
 func (m *Merger) MergeWithOrigins() (sections []*config_parser.Section, origins map[string][]SectionOrigin, err error) {
-	sections, _, err = m.Merge()
+	sections, _, origins, err = m.MergeWithSourcesAndOrigins()
+	return
+}
+
+// MergeWithSourcesAndOrigins returns the reached paths along with the section origins.
+func (m *Merger) MergeWithSourcesAndOrigins() ([]*config_parser.Section, []string, map[string][]SectionOrigin, error) {
+	sections, entries, err := m.Merge()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return sections, m.origins, nil
+	return sections, entries, m.origins, nil
 }
 
 func (m *Merger) readEntry(entry string) (err error) {
@@ -116,6 +135,9 @@ func (m *Merger) readEntry(entry string) (err error) {
 	// Check file path security.
 	if err = common.EnsureFileInSubDir(entry, m.entryDir); err != nil {
 		return fmt.Errorf("failed in checking path of config file %v: %w", entry, err)
+	}
+	if m.newSourcePath != "" && absCleanPath(entry) == m.newSourcePath {
+		return m.parseEntry(entry, m.newSourceContent)
 	}
 	f, err := os.Open(entry)
 	if err != nil {
@@ -140,6 +162,10 @@ func (m *Merger) readEntry(entry string) (err error) {
 			return err
 		}
 	}
+	return m.parseEntry(entry, b)
+}
+
+func (m *Merger) parseEntry(entry string, b []byte) error {
 	entrySections, err := config_parser.Parse(string(b))
 	if err != nil {
 		return fmt.Errorf("failed to parse config file %v:\n%w", entry, err)
@@ -155,16 +181,39 @@ func (m *Merger) readEntry(entry string) (err error) {
 	return nil
 }
 
-func unsqueezeEntries(patternEntries []string) (unsqueezed []string, err error) {
+func (m *Merger) unsqueezeEntries(patternEntries []string) (unsqueezed []string, err error) {
 	unsqueezed = make([]string, 0, len(patternEntries))
 	for _, pattern := range patternEntries {
 		files, err := filepath.Glob(pattern)
 		if err != nil {
 			return nil, err
 		}
+		if m.newSourcePath != "" {
+			matches, err := filepath.Match(absCleanPath(pattern), m.newSourcePath)
+			if err != nil {
+				return nil, err
+			}
+			if matches {
+				path := m.newSourcePath
+				if !filepath.IsAbs(pattern) {
+					path, err = filepath.Rel(absCleanPath("."), path)
+					if err != nil {
+						return nil, err
+					}
+				}
+				if !slices.Contains(files, path) {
+					files = append(files, path)
+					slices.Sort(files)
+				}
+			}
+		}
 		for _, file := range files {
 			// We only support .dae
 			if !strings.HasSuffix(file, ".dae") {
+				continue
+			}
+			if m.newSourcePath != "" && absCleanPath(file) == m.newSourcePath {
+				unsqueezed = append(unsqueezed, file)
 				continue
 			}
 			fi, err := os.Stat(file)
@@ -217,7 +266,7 @@ func (m *Merger) dfsMerge(entry string, fatherEntry string) (err error) {
 		}
 	}
 	// DFS and merge children recursively.
-	childEntries, err := unsqueezeEntries(patterEntries)
+	childEntries, err := m.unsqueezeEntries(patterEntries)
 	if err != nil {
 		return err
 	}

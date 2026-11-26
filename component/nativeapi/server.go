@@ -48,24 +48,25 @@ type Server struct {
 	provider RuntimeProvider
 	log      *logrus.Logger
 
-	groups      GroupProvider
-	operations  OperationProvider
-	config      ConfigProvider
-	traffic     TrafficHistoryProvider
-	nodes       NodeProvider
-	outbounds   OutboundProvider
-	memory      MemoryProvider
-	directStats DirectStatsProvider
-	datapath    DatapathProvider
-	rules       RulesProvider
-	providers   ProviderProvider
-	geodata     GeoDataProvider
-	dns         DnsProvider
-	connections ConnectionProvider
-	flows       FlowProvider
-	logs        LogProvider
-	events      EventProvider
-	probes      ProbeProvider
+	groups          GroupProvider
+	operations      OperationProvider
+	config          ConfigProvider
+	traffic         TrafficHistoryProvider
+	nodes           NodeProvider
+	outbounds       OutboundProvider
+	runtimeSettings RuntimeSettingsProvider
+	memory          MemoryProvider
+	directStats     DirectStatsProvider
+	datapath        DatapathProvider
+	rules           RulesProvider
+	providers       ProviderProvider
+	geodata         GeoDataProvider
+	dns             DnsProvider
+	connections     ConnectionProvider
+	flows           FlowProvider
+	logs            LogProvider
+	events          EventProvider
+	probes          ProbeProvider
 
 	httpServer *http.Server
 	listener   net.Listener
@@ -195,6 +196,14 @@ func (s *Server) SetOutboundProvider(provider OutboundProvider) {
 		return
 	}
 	s.outbounds = provider
+}
+
+// SetRuntimeSettingsProvider registers settings support before serving requests.
+func (s *Server) SetRuntimeSettingsProvider(provider RuntimeSettingsProvider) {
+	if s == nil {
+		return
+	}
+	s.runtimeSettings = provider
 }
 
 func (s *Server) SetMemoryProvider(provider MemoryProvider) {
@@ -482,6 +491,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.handleRuntime(w, r)
+	case runtimeSettingsPath:
+		s.handleRuntimeSettings(w, r)
 	case "/api/v1/runtime/traffic/history":
 		s.handleTrafficHistory(w, r)
 	case "/api/v1/runtime/outbounds":
@@ -502,6 +513,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleProviders(w, r)
 	case "/api/v1/geodata":
 		s.handleGeoData(w, r)
+	case geoDataUpdatePath:
+		s.handleGeoDataUpdate(w, r)
 	case "/api/v1/dns/cache":
 		s.handleDnsCache(w, r)
 	case "/api/v1/dns/cache/flush":
@@ -569,8 +582,6 @@ func writeMethodNotAllowed(w http.ResponseWriter, requestID, allow string) {
 var unavailablePrefixes = []string{
 	// Known contract resources with no implementation plan: answer
 	// capability_not_supported instead of the generic resource_not_found.
-	"/api/v1/geodata/update",
-	"/api/v1/runtime/settings",
 	"/api/v1/auth",
 }
 

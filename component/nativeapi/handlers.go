@@ -107,6 +107,9 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		"runtime": map[string]any{
 			"available": true,
 		},
+		"runtime_settings": map[string]any{
+			"available": false,
+		},
 		"config": map[string]any{
 			"available": false,
 		},
@@ -114,12 +117,27 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 			"available": false,
 		},
 	}
+	geoSettings := s.geoDataSettingsCapabilities()
+	if s.runtimeSettings != nil {
+		fields := []string{"log.level", "log.buffered_records", "dns_log.max_records", "flows.max_flows", "flows.retention_seconds"}
+		if geoSettings != nil {
+			fields = append(fields, "geodata")
+		}
+		resources["runtime_settings"] = map[string]any{
+			"available": true,
+			"fields":    fields,
+			EngineExtension: map[string]any{
+				"persist":  "file",
+				"survives": []string{"activation", "restart"},
+			},
+		}
+	}
 	if s.config != nil {
 		caps := s.config.ConfigCapabilities()
 		resources["config"] = map[string]any{
 			"available":   true,
 			"writable":    caps.Writable,
-			"create":      false,
+			"create":      caps.Create,
 			"max_bytes":   caps.MaxBytes,
 			"max_sources": caps.MaxSources,
 			EngineExtension: map[string]any{
@@ -197,12 +215,19 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.providers != nil {
 		caps := s.providers.ProviderCapabilities()
-		resources["providers"] = map[string]any{
+		providers := map[string]any{
 			"available":     true,
 			"can_refresh":   caps.CanRefresh,
-			"can_manage":    false,
+			"can_manage":    caps.CanManage,
 			"max_page_size": NodeListMaxLimit,
 		}
+		if caps.CreateUnfetched {
+			providers["create_unfetched"] = true
+		}
+		if len(caps.CreateOptions) > 0 {
+			providers["create_options"] = caps.CreateOptions
+		}
+		resources["providers"] = providers
 	} else {
 		resources["providers"] = map[string]any{"available": false}
 	}
@@ -217,6 +242,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		}
 		resources["dns_log"] = map[string]any{
 			"available":     true,
+			"min_records":   DnsLogMinRecords,
 			"max_records":   DnsLogMaxRecords,
 			"max_page_size": DnsLogMaxPageSize,
 		}
@@ -244,11 +270,20 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		resources["dns_query"] = map[string]any{"available": false}
 	}
 	if s.geodata != nil {
-		resources["geodata"] = map[string]any{
-			"available":  true,
-			"can_update": false,
-			"assets":     []string{"geoip", "geosite"},
+		update, _ := s.geodata.(GeoDataUpdateProvider)
+		canUpdate := update != nil && s.operations != nil && update.GeoDataUpdateAvailable()
+		resource := map[string]any{"available": true, "can_update": canUpdate, "assets": []string{"geoip", "geosite"}}
+		if canUpdate {
+			resource["checksum"] = nil
 		}
+		if geoSettings != nil {
+			resource["configurable_sources"] = true
+			resource["max_urls"] = geoSettings.MaxURLs
+			resource["interval_hours"] = map[string]int{"min": geoSettings.MinIntervalHours, "max": geoSettings.MaxIntervalHours, "default": geoSettings.DefaultHours}
+			resource["checksum"] = geoSettings.Checksum
+			resource["lifecycle"] = map[string]any{"file_values": "start", "overrides_persist": true}
+		}
+		resources["geodata"] = resource
 	} else {
 		resources["geodata"] = map[string]any{"available": false}
 	}
@@ -268,9 +303,10 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 			"available":            true,
 			"recording":            "on",
 			"scopes":               []string{"userspace_tcp", "userspace_udp"},
-			"max_flows":            2048,
+			"min_flows":            FlowMinFlows,
+			"max_flows":            FlowMaxFlows,
 			"max_steps_per_flow":   1,
-			"retention_seconds":    900,
+			"retention_seconds":    FlowMaxRetentionSeconds,
 			"snapshot_ttl_seconds": 30,
 			"max_page_size":        NodeListMaxLimit,
 		}
@@ -283,6 +319,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 			"levels":               s.logs.LogLevels(),
 			"filters":              s.logs.LogFilters(),
 			"retention_seconds":    LogRetentionSeconds,
+			"min_buffered_records": LogMinBufferedRecords,
 			"max_buffered_records": LogMaxBufferedRecords,
 		}
 	} else {
@@ -334,8 +371,8 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		}
 		resources["routing_trace"] = map[string]any{
 			"available":                         traceAvailable,
-			"resolve_modes":                     []string{"none"},
-			"max_addresses":                     16,
+			"resolve_modes":                     routingTraceResolveModes(s.rules),
+			"max_addresses":                     RoutingTraceMaxAddresses,
 			"max_rule_steps":                    MaxRoutingTraceRuleSteps,
 			"timeout_ms":                        RoutingTraceTimeoutMs,
 			"per_principal_requests_per_minute": routingTraceRequestsPerPrincipalPerMinute,

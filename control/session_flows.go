@@ -288,6 +288,30 @@ func (m *SessionManager) appendFlowHistory(flow SessionFlowSnapshot, endedAt tim
 	m.flowHistoryStart = (m.flowHistoryStart + 1) % len(m.flowHistory)
 }
 
+// SetFlowHistoryLimits updates closed-flow retention without resetting revisions.
+func (m *SessionManager) SetFlowHistoryLimits(capacity int, retention time.Duration) {
+	if capacity < 1 || retention <= 0 {
+		return
+	}
+	m.flowHistoryMu.Lock()
+	defer m.flowHistoryMu.Unlock()
+	now := time.Now()
+	m.pruneFlowHistoryLocked(now)
+	if retention != m.flowHistoryRetention {
+		m.flowHistoryRetention = retention
+		m.pruneFlowHistoryLocked(now)
+	}
+	if capacity == len(m.flowHistory) || (m.flowHistory == nil && capacity == FlowHistoryCapacity) {
+		return
+	}
+	ring := make([]SessionFlowHistoryEntry, capacity)
+	kept := min(m.flowHistoryLen, capacity)
+	for i := range kept {
+		ring[i] = m.flowHistory[(m.flowHistoryStart+m.flowHistoryLen-kept+i)%len(m.flowHistory)]
+	}
+	m.flowHistory, m.flowHistoryStart, m.flowHistoryLen = ring, 0, kept
+}
+
 // FlowHistorySnapshots returns finished flows, oldest first, with revisions.
 func (m *SessionManager) FlowHistorySnapshots() ([]SessionFlowHistoryEntry, uint64) {
 	if m == nil {
@@ -305,12 +329,17 @@ func (m *SessionManager) FlowHistorySnapshots() ([]SessionFlowHistoryEntry, uint
 }
 
 func (m *SessionManager) pruneFlowHistoryLocked(now time.Time) {
-	cutoff := now.Add(-FlowHistoryRetention)
+	retention := m.flowHistoryRetention
+	if retention == 0 {
+		retention = FlowHistoryRetention
+	}
+	cutoff := now.Add(-retention)
 	for m.flowHistoryLen > 0 {
 		oldest := m.flowHistory[m.flowHistoryStart]
 		if !oldest.EndedAt.Before(cutoff) {
 			break
 		}
+		m.flowHistory[m.flowHistoryStart] = SessionFlowHistoryEntry{}
 		m.flowHistoryStart = (m.flowHistoryStart + 1) % len(m.flowHistory)
 		m.flowHistoryLen--
 	}

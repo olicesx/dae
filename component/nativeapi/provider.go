@@ -30,7 +30,9 @@ const (
 	MaxRuleDictionarySize    = 1 << 20
 	MaxGroupPatchOperations  = 16
 	MaxRoutingTraceRuleSteps = 4096
-	RoutingTraceTimeoutMs    = 5000
+	// A live trace resolves A and AAAA, and each may travel a proxy and be
+	// re-asked by the response policy, so it needs more than a simulation.
+	RoutingTraceTimeoutMs = 12000
 
 	MaxMemoryHistoryWindowSeconds = 3600
 	MaxMemoryHistoryPoints        = 180
@@ -109,6 +111,14 @@ type RulesProvider interface {
 	TraceRouting(ctx context.Context, request RoutingTraceRequest) (RoutingTraceResponse, error)
 }
 
+// RuntimeSettingsProvider reads and updates the five runtime-adjustable settings.
+// PatchRuntimeSettings must persist and apply the entire patch atomically, or
+// leave the previous settings in effect on error.
+type RuntimeSettingsProvider interface {
+	RuntimeSettings(ctx context.Context) (RuntimeSettings, error)
+	PatchRuntimeSettings(ctx context.Context, patch RuntimeSettingsPatch) (RuntimeSettings, error)
+}
+
 // OutboundProvider serves the per-outbound counter projection.
 type OutboundProvider interface {
 	RuntimeOutbounds(ctx context.Context) (RuntimeOutbounds, error)
@@ -133,6 +143,7 @@ type DatapathProvider interface {
 }
 
 const (
+	DnsLogMinRecords    = 64
 	DnsLogMaxRecords    = 1024
 	DnsLogMaxPageSize   = 1000
 	DnsRulesMaxCapacity = 65536
@@ -218,6 +229,13 @@ type ProbeProvider interface {
 	StartProbe(ctx context.Context, request ProbeRequest, idempotencyKey string) (OperationAccepted, error)
 }
 
+const (
+	FlowMinFlows            = 64
+	FlowMaxFlows            = 2048
+	FlowMinRetentionSeconds = 1
+	FlowMaxRetentionSeconds = 900
+)
+
 // FlowProvider serves the bounded flow history.
 type FlowProvider interface {
 	ListFlows(ctx context.Context, filter FlowFilter) (FlowList, error)
@@ -226,6 +244,7 @@ type FlowProvider interface {
 
 const (
 	LogRetentionSeconds   = 300
+	LogMinBufferedRecords = 64
 	LogMaxBufferedRecords = 1024
 	// LogMaxClients bounds concurrent /logs streams. Without it a client that
 	// reconnects in a loop pins one goroutine and one buffer slot per stream.

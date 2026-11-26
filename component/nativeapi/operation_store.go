@@ -38,6 +38,8 @@ const (
 	OperationKindNodeUpdate      = "node_update"
 	OperationKindNodeDelete      = "node_delete"
 	OperationKindProviderRefresh = "provider_refresh"
+	OperationKindProviderCreate  = "provider_create"
+	OperationKindProviderDelete  = "provider_delete"
 	OperationKindGroupUpdate     = "group_update"
 )
 

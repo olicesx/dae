@@ -134,6 +134,31 @@ func New(dns *config.Dns, opt *NewOption) (s *Dns, err error) {
 	return s, nil
 }
 
+// WithIndependentState reuses compiled DNS policy for a simulation. Its
+// upstream resolvers and domain caches start empty, and it has no runtime
+// upstream-ready callback.
+func (s *Dns) WithIndependentState(log *logrus.Logger) *Dns {
+	reqMatcher, respMatcher := *s.reqMatcher, *s.respMatcher
+	reqMatcher.domainMatcher = reqMatcher.domainMatcher.WithIndependentCache()
+	respMatcher.domainMatcher = respMatcher.domainMatcher.WithIndependentCache()
+	copy := &Dns{
+		log: log, reqMatcher: &reqMatcher, respMatcher: &respMatcher,
+		upstreamTags: s.upstreamTags,
+		upstream:     make([]*UpstreamResolver, len(s.upstream)),
+	}
+	copy.upstream2Index.Store((*Upstream)(nil), int(consts.DnsRequestOutboundIndex_AsIs))
+	for i, source := range s.upstream {
+		copy.upstream[i] = &UpstreamResolver{
+			Raw: source.Raw, Network: source.Network, ResolveIp46: source.ResolveIp46,
+			FinishInitCallback: func(_ *url.URL, upstream *Upstream) error {
+				copy.upstream2Index.Store(upstream, i)
+				return nil
+			},
+		}
+	}
+	return copy
+}
+
 func (s *Dns) CheckUpstreamsFormat() error {
 	for _, upstream := range s.upstream {
 		_, hostname, _, _, err := ParseRawUpstream(upstream.Raw)

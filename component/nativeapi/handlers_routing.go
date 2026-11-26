@@ -7,14 +7,20 @@ package nativeapi
 
 import (
 	"crypto/sha256"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
+	// RoutingTraceMaxAddresses bounds the distinct addresses in a live trace.
+	RoutingTraceMaxAddresses = 16
+
 	routingTraceRequestsPerPrincipalPerMinute = 30
 	routingTraceGlobalRequestsPerMinute       = 120
 )
@@ -51,6 +57,15 @@ func (l *routingTraceRateLimiter) allow(principal string, now time.Time) (bool, 
 	return true, 0
 }
 
+// routingTraceResolveModes keeps admission and capability discovery on the same
+// opt-in. Providers enable live only when DNS can run in an isolated context.
+func routingTraceResolveModes(provider RulesProvider) []string {
+	if provider, ok := provider.(interface{ RoutingTraceLiveAvailable() bool }); ok && provider.RoutingTraceLiveAvailable() {
+		return []string{"none", "live"}
+	}
+	return []string{"none"}
+}
+
 func (s *Server) handleRoutingTrace(w http.ResponseWriter, r *http.Request) {
 	requestID := requestIDFromContext(r.Context())
 	if s.rules == nil {
@@ -76,21 +91,26 @@ func (s *Server) handleRoutingTrace(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	var request RoutingTraceRequest
-	if err := decodeLimitedJSON(r, s.cfg.MaxJSONBodyBytes, &request); err != nil {
-		if err == errLimitedJSONBodyTooLarge {
-			writeError(w, requestID, http.StatusRequestEntityTooLarge, codeInvalidRequest, "request body is too large")
+	var body struct {
+		Input   RoutingTraceInput `json:"input"`
+		Resolve json.RawMessage   `json:"resolve"`
+	}
+	if err := decodeLimitedJSON(r, s.cfg.MaxJSONBodyBytes, &body); err != nil {
+		if errors.Is(err, errLimitedJSONBodyTooLarge) {
+			writeError(w, requestID, http.StatusRequestEntityTooLarge, codeRequestTooLarge, "request body is too large")
 			return
 		}
 		writeError(w, requestID, http.StatusBadRequest, codeInvalidRequest, "invalid JSON body: "+err.Error())
 		return
 	}
-	if request.Resolve == "" {
-		request.Resolve = "none"
-	}
-	if request.Resolve != "none" && request.Resolve != "live" {
-		writeError(w, requestID, http.StatusBadRequest, codeInvalidRequest, "resolve must be none or live")
-		return
+	request := RoutingTraceRequest{Input: body.Input, Resolve: "none"}
+	if body.Resolve != nil {
+		var resolve *string
+		if err := json.Unmarshal(body.Resolve, &resolve); err != nil || resolve == nil {
+			writeError(w, requestID, http.StatusBadRequest, codeInvalidRequest, "resolve must be a string")
+			return
+		}
+		request.Resolve = *resolve
 	}
 	if request.Input.Network != groupNetworkTCP && request.Input.Network != groupNetworkUDP {
 		writeError(w, requestID, http.StatusBadRequest, codeInvalidRequest, "network must be tcp or udp")
@@ -108,20 +128,8 @@ func (s *Server) handleRoutingTrace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, requestID, http.StatusBadRequest, codeInvalidRequest, "dscp must be between 0 and 63")
 		return
 	}
-	if request.Input.Domain != nil && (strings.TrimSpace(*request.Input.Domain) == "" || *request.Input.Domain != strings.TrimSpace(*request.Input.Domain)) {
-		writeError(w, requestID, http.StatusBadRequest, codeInvalidRequest, "domain must be a non-empty hostname")
-		return
-	}
-	if request.Input.Domain == nil && request.Input.DstIP == nil {
-		writeError(w, requestID, http.StatusBadRequest, codeInvalidRequest, "domain or dst_ip is required")
-		return
-	}
-	if request.Resolve == "live" {
-		if request.Input.Domain == nil || request.Input.DstIP != nil {
-			writeError(w, requestID, http.StatusBadRequest, codeInvalidRequest, "resolve=live requires domain and dst_ip must be null")
-			return
-		}
-		writeError(w, requestID, http.StatusUnprocessableEntity, codeUnsupportedValue, "live DNS resolution is not supported by this engine")
+	if request.Input.Domain != nil && (*request.Input.Domain == "" || len(*request.Input.Domain) > 253 || *request.Input.Domain != strings.TrimSpace(*request.Input.Domain)) {
+		writeError(w, requestID, http.StatusBadRequest, codeInvalidRequest, "domain must be 1..253 characters without surrounding whitespace")
 		return
 	}
 	if _, err := parseOptionalTraceIP(request.Input.DstIP); err != nil {
@@ -133,8 +141,25 @@ func (s *Server) handleRoutingTrace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !slices.Contains(routingTraceResolveModes(s.rules), request.Resolve) {
+		writeError(w, requestID, http.StatusUnprocessableEntity, codeUnsupportedValue, "resolve mode is not supported by this engine")
+		return
+	}
+	if request.Resolve == "live" && (request.Input.Domain == nil || request.Input.DstIP != nil) {
+		writeError(w, requestID, http.StatusUnprocessableEntity, codeUnsupportedValue, "resolve=live requires domain and dst_ip must be null")
+		return
+	}
+	if request.Input.Domain == nil && request.Input.DstIP == nil {
+		writeError(w, requestID, http.StatusBadRequest, codeInvalidRequest, "domain or dst_ip is required")
+		return
+	}
+
 	response, err := s.rules.TraceRouting(r.Context(), request)
 	if err != nil {
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr == nil || (apiErr.Status == http.StatusServiceUnavailable && apiErr.RetryAfterSeconds <= 0) {
+			w.Header().Set("Retry-After", "1")
+		}
 		s.writeProviderFailure(w, requestID, err)
 		return
 	}

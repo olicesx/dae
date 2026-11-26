@@ -176,11 +176,10 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		if r.Method == http.MethodPost {
-			// Provider creation is a configuration write; this engine is read-only.
-			writeError(w, requestID, http.StatusNotFound, codeCapabilityNotSupported, "resource is not supported by this engine")
+			s.handleCreateProvider(w, r)
 			return
 		}
-		writeMethodNotAllowed(w, requestID, "GET, HEAD")
+		writeMethodNotAllowed(w, requestID, "GET, HEAD, POST")
 		return
 	}
 	limit, ok := parseBoundedPositiveInt(r.URL.Query().Get("limit"), NodeListDefaultLimit)
@@ -215,13 +214,16 @@ func (s *Server) handleProvider(w http.ResponseWriter, r *http.Request) {
 		writeError(w, requestID, http.StatusNotFound, codeResourceNotFound, "resource not found")
 		return
 	}
-	if r.Method == http.MethodDelete || r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
-		// Provider creation, deletion and refresh are configuration writes.
-		writeError(w, requestID, http.StatusNotFound, codeCapabilityNotSupported, "resource is not supported by this engine")
+	if r.Method == http.MethodDelete {
+		s.handleDeleteProvider(w, r, rest)
+		return
+	}
+	if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
+		writeMethodNotAllowed(w, requestID, "GET, HEAD, DELETE")
 		return
 	}
 	if !isReadMethod(r.Method) {
-		writeMethodNotAllowed(w, requestID, "GET, HEAD")
+		writeMethodNotAllowed(w, requestID, "GET, HEAD, DELETE")
 		return
 	}
 	provider, err := s.providers.GetProvider(r.Context(), rest)

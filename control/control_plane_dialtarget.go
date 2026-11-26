@@ -86,6 +86,21 @@ func (c *ControlPlane) resolveDomainDialMode(outbound consts.OutboundIndex, dst 
 	return false, false
 }
 
+// DialTargetForResolvedDomain is ChooseDialTarget for a host the caller has
+// resolved itself, such as an update URL. That host is known to be real, so
+// the dial-mode policy applies without a cache lookup, an asynchronous probe
+// or a re-route, and nothing is warmed for later connections.
+func (c *ControlPlane) DialTargetForResolvedDomain(outbound consts.OutboundIndex, dst netip.AddrPort, domain string) string {
+	if outbound.IsReserved() || domain == "" || isIPLikeDomain(domain) {
+		return dst.String()
+	}
+	switch c.dialMode {
+	case consts.DialMode_Domain, consts.DialMode_DomainCao, consts.DialMode_DomainPlus:
+		return net.JoinHostPort(domain, strconv.Itoa(int(dst.Port())))
+	}
+	return dst.String()
+}
+
 func (c *ControlPlane) ChooseDialTarget(outbound consts.OutboundIndex, dst netip.AddrPort, domain string) (dialTarget string, shouldReroute bool, dialIp bool) {
 	dialMode := consts.DialMode_Ip
 

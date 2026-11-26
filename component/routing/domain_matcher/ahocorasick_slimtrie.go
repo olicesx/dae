@@ -210,6 +210,16 @@ func (n *AhocorasickSlimtrie) SkippedDomainCount() uint64 {
 // DNS traffic has high temporal locality).
 const matchCacheCap = 512
 
+// WithIndependentCache shares the compiled tables of a built matcher and
+// gives its caller an empty, independent match cache.
+func (n *AhocorasickSlimtrie) WithIndependentCache() *AhocorasickSlimtrie {
+	return &AhocorasickSlimtrie{
+		validAcIndexes: n.validAcIndexes, validTrieIndexes: n.validTrieIndexes,
+		validRegexpIndexes: n.validRegexpIndexes,
+		ac:                 n.ac, trie: n.trie, regexp: n.regexp,
+	}
+}
+
 // MatchDomainBitmap returns the routing bitmap for domain. The returned
 // slice is immutable and may alias the memo; callers must not write it
 // in place (an in-place OR would poison every later DnsCache lookup).

@@ -162,7 +162,7 @@ func (m *reloadManager) finishRuntimeReload(success bool) {
 			m.status.setState(runtimeStateRunning)
 		}
 		m.status.recordLastReload(operationID, "succeeded", nil)
-		m.notifyReloadObserver(operationID, false, true, nil)
+		m.notifyReloadObserver(operationID, false, true, m.reloadError())
 		return
 	}
 	if previous, ok := m.previousRuntimeState.Load().(string); ok && previous != "" {
@@ -615,8 +615,8 @@ func preserveReloadInterfaceBindings(oldConf, newConf *config.Config) []string {
 	if oldConf == nil || newConf == nil {
 		return nil
 	}
-	lan := append([]string(nil), newConf.Global.LanInterface...)
-	wan := append([]string(nil), newConf.Global.WanInterface...)
+	lan := slices.Clone(newConf.Global.LanInterface)
+	wan := slices.Clone(newConf.Global.WanInterface)
 	remove := func(values []string, target string) []string {
 		result := values[:0]
 		for _, value := range values {
@@ -628,30 +628,44 @@ func preserveReloadInterfaceBindings(oldConf, newConf *config.Config) []string {
 	}
 
 	var deferred []string
-	oldLAN := make(map[string]struct{}, len(oldConf.Global.LanInterface))
+	seen := make(map[string]struct{}, len(oldConf.Global.LanInterface)+len(oldConf.Global.WanInterface))
+	// An interface of the running generation keeps exactly the roles it holds
+	// in the datapath. A link that is both LAN and WAN in both configurations
+	// has no role change; only a real difference is deferred to a cold start.
+	reconcile := func(iface string, wasLAN, wasWAN bool) {
+		if _, done := seen[iface]; done {
+			return
+		}
+		seen[iface] = struct{}{}
+		isLAN, isWAN := slices.Contains(lan, iface), slices.Contains(wan, iface)
+		if isLAN == wasLAN && isWAN == wasWAN {
+			return
+		}
+		if wasLAN != isLAN {
+			if wasLAN {
+				lan = append(lan, iface)
+			} else {
+				lan = remove(lan, iface)
+			}
+		}
+		if wasWAN != isWAN {
+			if wasWAN {
+				wan = append(wan, iface)
+			} else {
+				wan = remove(wan, iface)
+			}
+		}
+		label := "wan:"
+		if wasLAN {
+			label = "lan:"
+		}
+		deferred = append(deferred, label+iface)
+	}
 	for _, iface := range oldConf.Global.LanInterface {
-		oldLAN[iface] = struct{}{}
-		changed := !slices.Contains(lan, iface) || slices.Contains(wan, iface)
-		wan = remove(wan, iface)
-		if !slices.Contains(lan, iface) {
-			lan = append(lan, iface)
-		}
-		if changed {
-			deferred = append(deferred, "lan:"+iface)
-		}
+		reconcile(iface, true, slices.Contains(oldConf.Global.WanInterface, iface))
 	}
 	for _, iface := range oldConf.Global.WanInterface {
-		if _, isLAN := oldLAN[iface]; isLAN {
-			continue
-		}
-		changed := !slices.Contains(wan, iface) || slices.Contains(lan, iface)
-		lan = remove(lan, iface)
-		if !slices.Contains(wan, iface) {
-			wan = append(wan, iface)
-		}
-		if changed {
-			deferred = append(deferred, "wan:"+iface)
-		}
+		reconcile(iface, false, true)
 	}
 	newConf.Global.LanInterface = lan
 	newConf.Global.WanInterface = wan

@@ -23,6 +23,7 @@ type nativeAPIOperations struct {
 	supervisor *runtimeSupervisor
 	events     *nativeAPIProvider
 	probes     *probeGate
+	geodata    *geoDataService
 
 	// admissionMu serializes stopping with reload admission, including requests
 	// already inside a handler when the HTTP write gate closes.
@@ -41,8 +42,9 @@ type nativeAPIOperations struct {
 	// Node, a node_delete for the deletion count and a provider_refresh for the
 	// Provider; only the caller knows which resource it touched, and the value
 	// can only be read once the reload has published it.
-	resultMu        sync.Mutex
-	resultResolvers map[string]func() (any, error)
+	resultMu               sync.Mutex
+	resultResolvers        map[string]func() (any, error)
+	configWriteCompletions map[string]configWriteCompletion
 }
 
 // SetResultResolver registers the body a completed operation reports.
@@ -108,6 +110,10 @@ func (o *nativeAPIOperations) StartOperation(ctx context.Context, kind, scope, i
 // result, and publishing the replay key before admission let a concurrent
 // caller receive a 202 for work that was then rejected.
 func (o *nativeAPIOperations) StartOperationWithResult(ctx context.Context, kind, scope, idempotencyKey string, resolve func() (any, error)) (nativeapi.OperationAccepted, error) {
+	return o.startReloadOperation(ctx, kind, scope, idempotencyKey, resolve, nil)
+}
+
+func (o *nativeAPIOperations) startReloadOperation(ctx context.Context, kind, scope, idempotencyKey string, resolve func() (any, error), complete configWriteCompletion) (nativeapi.OperationAccepted, error) {
 	if err := ctx.Err(); err != nil {
 		return nativeapi.OperationAccepted{}, err
 	}
@@ -135,6 +141,7 @@ func (o *nativeAPIOperations) StartOperationWithResult(ctx context.Context, kind
 		return accepted, nil
 	}
 	o.SetResultResolver(accepted.OperationID, resolve)
+	o.setConfigWriteCompletion(accepted.OperationID, complete)
 	request := reloadRequest{
 		isSuspend:       kind == nativeapi.OperationKindSuspend,
 		requestedAt:     time.Now(),
@@ -145,6 +152,7 @@ func (o *nativeAPIOperations) StartOperationWithResult(ctx context.Context, kind
 		// The transition never started, so the key stays usable for the retry
 		// the client is expected to make.
 		o.takeResultResolver(accepted.OperationID)
+		o.takeConfigWriteCompletion(accepted.OperationID)
 		o.store.ReleaseReplayKey(idempotencyKey)
 		o.store.Fail(accepted.OperationID, &nativeapi.SafeError{
 			Code:    "state_conflict",
@@ -179,12 +187,40 @@ func (o *nativeAPIOperations) FollowReload(operationID string, started bool, suc
 	if o == nil {
 		return
 	}
+	if o.geodata != nil && o.geodata.IsGeoDataReload(operationID) {
+		if !started {
+			o.geodata.finishReload(operationID, success)
+			if success {
+				o.publishGenerationEvents()
+			} else {
+				o.events.publishRuntimeUpdated()
+			}
+		}
+		return
+	}
 	if started {
 		if o.store != nil && operationID != "" {
 			o.store.Start(operationID)
 			o.events.publishOperationUpdated(operationID, "running")
 		}
 		return
+	}
+	if complete := o.takeConfigWriteCompletion(operationID); complete != nil {
+		// The legacy reload path can restore the old configuration and still
+		// bring its listener back successfully. The stored reload error then
+		// records the failed activation.
+		committed := success && reloadErr == nil
+		if failure := complete(&committed); failure != nil {
+			o.takeResultResolver(operationID)
+			o.store.Fail(operationID, failure)
+			o.events.publishOperationUpdated(operationID, "failed")
+			if success {
+				o.publishGenerationEvents()
+			} else {
+				o.events.publishRuntimeUpdated()
+			}
+			return
+		}
 	}
 	// A signal-triggered reload owns no operation but still changes the
 	// generation, so it must publish the same invalidation events. Only the

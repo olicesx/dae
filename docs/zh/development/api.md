@@ -11,6 +11,7 @@ listener 的配置、认证、TLS、Host/Origin 校验与自托管前端见
 - `GET /api/v1/version`
 - `GET /api/v1/capabilities`
 - `GET /api/v1/runtime`
+- `GET /api/v1/runtime/settings`、`PATCH /api/v1/runtime/settings`
 - `GET /api/v1/runtime/traffic/history?window_seconds=&max_points=`
 - `GET /api/v1/groups`
 - `GET /api/v1/groups/{group_id}`
@@ -33,9 +34,13 @@ listener 的配置、认证、TLS、Host/Origin 校验与自托管前端见
 - `POST /api/v1/operations/resume`
 - `GET /api/v1/operations/{operation_id}`
 - `GET /api/v1/rules` — 当前 generation 的配置态路由规则
-- `POST /api/v1/routing/trace` — 按当前 generation 模拟路由；仅支持 `resolve: "none"`
-- `GET /api/v1/providers`、`GET /api/v1/providers/{provider_id}`
-- `GET /api/v1/geodata` — geoip/geosite 资源指纹
+- `POST /api/v1/routing/trace` — 按当前 generation 模拟路由，可选实时解析域名
+  （`resolve: "none"` 或 `"live"`）
+- `GET /api/v1/providers`、`POST /api/v1/providers`、
+  `GET /api/v1/providers/{provider_id}`、`DELETE /api/v1/providers/{provider_id}`、
+  `POST /api/v1/providers/{provider_id}/refresh`
+- `GET /api/v1/geodata` — geoip/geosite 资源指纹与更新状态
+- `POST /api/v1/geodata/update` — 下载并激活两份地理数据
 - `GET /api/v1/dns/cache`、`DELETE /api/v1/dns/cache?name=`、
   `DELETE /api/v1/dns/cache/{entry_id}`、`POST /api/v1/dns/cache/flush`
 - `GET /api/v1/dns/log`、`GET /api/v1/dns/rules`、`POST /api/v1/dns/query`
@@ -48,12 +53,25 @@ listener 的配置、认证、TLS、Host/Origin 校验与自托管前端见
 
 共享端点遵循 `api-standardize` 契约。kdae 自己增加的内容放在契约给引擎扩展预留的位置，
 即以引擎名命名的成员：发现文档的 `links`、能力声明的 `resources` 以及组的 `config` 都带有
-`x-kdae` 成员，扩展路由位于 `/api/v1/x-kdae/` 之下。目前只有直连流量计数这一个扩展。
+`x-kdae` 成员。直连流量计数的扩展路由位于 `/api/v1/x-kdae/` 之下。
 
-`POST /api/v1/providers`（创建 inline provider）、
-`DELETE /api/v1/providers/{provider_id}`、`POST /api/v1/geodata/update`
-返回 `404 capability_not_supported`，与 `providers.can_manage`、
-`geodata.can_update` 恒为 `false` 一致：dae 不通过 API 创建或删除订阅。
+`POST /api/v1/providers` 与 `DELETE /api/v1/providers/{provider_id}` 创建、删除订阅 provider。
+与节点管理一样受配置写入闸门约束：只有 `api.config_write`、受管目录布局与 operations 适配器
+同时具备时 `providers.can_manage` 才为 true，否则两者都返回 `404 capability_not_supported`。
+请求体为 `{"name": string, "kind": "subscription", "url": string}`。URL 必须是 `http` 或 `https`；
+名称为 1–64 个字母、数字、`_`、`.`、`-`（配置的 tag 字符集），文件或运行中 generation 已占用的名称
+返回 `409 state_conflict`。`update_interval`、`user_agent`、`cache` 只接受 `null`：配置里没有这些选项，
+能力声明也不带 `create_options`，传值返回 `422 unsupported_value`。provider 以 `name: 'url'` 写入
+其模块的 `subscription` 段，并通过一次 reload 提交：返回 `202` 与 `provider_create` 操作，
+操作结果即该 provider。下一个 generation 负责拉取 URL；拉取失败时 provider 保留，
+`status` 为 `"error"`、没有节点并带 `last_error`，操作本身仍算成功，因为请求的是配置变更。
+`DELETE` 移除条目并返回 `202` 与 `provider_delete` 操作，结果为 `{"deleted": 1}`；
+未知 ID 为 `200 {"deleted": 0}`，inline/file provider 为 `404 capability_not_supported`。
+若 reload 被守护进程拒绝（例如全部订阅都解析失败、结果将没有任何节点），操作报
+`reload_rejected`，上一个 generation 继续运行。
+
+`url_redacted` 是写入配置时的原样 URL，只遮盖监听器密钥。它用于让运维认出是哪个订阅，
+客户端必须把它当作凭据对待。
 
 `POST /api/v1/nodes` 与 `DELETE /api/v1/nodes/{node_id}` 已实现，受配置写入闸门约束：
 `nodes.can_manage` 随 `api.config_write` 与受管目录布局一起为真。
@@ -78,15 +96,31 @@ reload，返回 `200 {"updated": 0}`。该端点是 dae 在契约之外的扩展
 provider 可以刷新，inline/file provider 返回 `404 capability_not_supported`；刷新排队一个
 `provider_refresh` 操作。
 
-`/api/v1/runtime/settings` 与 `/api/v1/auth*` 返回 `404 capability_not_supported`。
-路由模拟的能力随当前 generation 提供；超过 4096 个规则步骤时不会构建模拟器。
-`routing_trace.available` 为 `false` 时，
-`POST /api/v1/routing/trace` 返回同一错误。它只模拟、不执行连接或 DNS 查询，且当前仅支持
-`resolve: "none"`；`resolve: "live"` 返回 `422 unsupported_value`。每主体每分钟最多 30 次，
-全局每分钟最多 120 次，超限返回 `429 rate_limited` 和 `Retry-After`。
+`/api/v1/auth*` 返回 `404 capability_not_supported`。
+路由模拟能力由当前 generation 决定。超过 4096 个规则步骤时不会构建模拟器，
+此时调用 `POST /api/v1/routing/trace` 返回 `404 capability_not_supported`。
+默认解析模式是 `none`。只要 generation 有模拟能力就公布 `live`，不再限制 DNS 策略与流量规则：
+DNS 规则里的 geosite 或外部资源、加密或主机名上游、依赖包元数据的规则，以及被路由送往代理出口的上游都可以。
+
+实时追踪复用当前 generation 已编译的 DNS 规则，并独立维护上游解析状态与匹配缓存。地理数据规则
+随 generation 激活。A 和 AAAA 并行查询，结果按 A、AAAA 的顺序返回。若查询期间 generation
+退役，追踪取消并返回 `503 temporarily_unavailable`。每次上游查询都像客户端的查询一样被路由：
+依据追踪输入的源地址、源端口、`pname` 与 `dscp`，目的地址为上游服务器。直连路径使用私有的直连 dialer；
+代理出口按运行时的方式选节点，查询经由该节点的私有副本发出——副本由节点链接重建，随查询结束关闭。
+选节点时读取出站的选择状态和健康信息。追踪查询不会写入运行时 DNS 缓存、日志、转发器、节点健康状态、
+组选择或出站计数器。
+
+路径依赖于追踪没有的输入时会拒绝解析，并在 DNS 步骤的 `error` 里点名该输入，而不是猜测。
+`pname` 是例外：只有本主机产生的流量才有进程名，因此没有给源地址、或源地址在别的主机上的追踪，
+按转发客户端处理并判定其 pname 规则；源地址在本主机时需要给出 `pname` 才能得到确定的路径。
+`asis` 应答、上游是 dae 自己的监听器、路由拦截了上游，也在同一字段报告。失败的交换报 `TIMEOUT`
+或 `ERROR` 并附原因；原因只点名输入、出站与策略，绝不包含节点或其凭据。实时解析每个不同地址产生一次
+路由评估，最多 16 个地址、合计 4096 个规则步骤，时限为 12 秒。不支持的解析模式返回
+`422 unsupported_value`。每主体每分钟最多 30 次，全局每分钟最多 120 次，超限返回
+`429 rate_limited` 和 `Retry-After`。
 
 配置支持源级编辑及受限的组配置编辑：`GET /api/v1/config`、
-`GET /api/v1/config/sources/{source_id}`、
+`GET /api/v1/config/sources/{source_id}`、`POST /api/v1/config/sources`、
 `PUT /api/v1/config/sources/{source_id}`（需 `If-Match`）与 `POST /api/v1/config/validate`。
 `POST /api/v1/config/validate` 的 `sources[].id` 按契约是请求内诊断标识：缺省用 `source-N`；
 命中现有可见源 ID 时作为该源的候选覆盖（dae 扩展），未命中时作为独立候选校验（不落盘），
@@ -96,6 +130,12 @@ provider 可以刷新，inline/file provider 返回 `404 capability_not_supporte
 `sources[]`，对集合路径的非 `POST` 请求返回 `405`。写入仅当 `api.config_write = true`
 且配置目录符合受管布局（`config.dae` 引入 `config.d/*.dae` 与 `api.dae`）时可用；
 否则返回 `403 permission_denied` 并附 `details.reason`，且不写盘。
+
+配置 PUT 以及受管节点和 provider 的写入在 reload 明确被拒绝后，如果写入的源文件仍在原位且未被修改，
+会恢复原有内容与权限。恢复成功时，失败操作报 `reload_rejected`，并附 `details.committed: false`
+和 `details.written: false`。`details.written: true` 表示未回滚此次写入，例如源文件已被外部修改。
+如果关闭进程时无法确认新配置是否已生效，则保留现有文件，`details.committed` 为 `null`。
+
 组配置补丁使用 `application/json-patch+json`，需要从组配置 `ETag` 传入强 `If-Match`；
 目前仅允许修改 `/config/check_interval`（秒）和 `/config/tolerance`（毫秒）。
 成功修改会排队 reload，返回 `202` 与 `group_update` operation；`groups.config_patch` 和组的
@@ -111,6 +151,33 @@ provider 可以刷新，inline/file provider 返回 `404 capability_not_supporte
   的内容时二者相等，写入尚未 reload 时二者不同。
 
 规则与 DNS 规则通过替换其所属源文件（`routing.dae`、`dns.dae`）来编辑，API 不提供行级编辑。
+
+### 运行时设置
+
+GET 返回当前生效值。PATCH 接收 `application/json` 合并请求，例如
+`{"log":{"level":"debug"}}`，成功后立即生效。只要启用了原生 API，这个端点就可用，
+`api.config_write: false` 时也可以使用。
+
+| 字段 | 默认值 | 可设范围 |
+| --- | --- | --- |
+| `log.level` | `global.log_level` | `trace`、`debug`、`info`、`warn`、`error` |
+| `log.buffered_records` | 1024 | 64–1024 |
+| `dns_log.max_records` | 1024 | 64–1024 |
+| `flows.max_flows` | 2048 | 64–2048 |
+| `flows.retention_seconds` | 900 秒 | 1–900 秒 |
+
+缩小容量时保留最新记录，指向已淘汰记录的游标按原规则过期。PATCH 会先校验整个请求。
+非法请求返回 `400 invalid_request`，规范定义但未开放的字段或日志级别返回
+`422 unsupported_value`。
+
+kdae 将覆盖值写入入口配置同目录的 `runtime-settings.json`。覆盖值跨 reload 和进程重启保留，
+能力文档通过 `resources.runtime_settings.x-kdae` 声明该行为。
+PATCH 不会修改 `.dae` 文件或触发 reload。启动时若 JSON 文件无法读取或校验，dae 会记录警告并按
+配置值启动。PATCH 需要写盘但写入失败时，返回 `503 temporarily_unavailable` 和 `Retry-After`，
+继续使用原有设置。
+
+要清除某个字段的覆盖，用 PATCH 把它设回配置值或内置默认值。只要还有覆盖，GET 就返回
+`source: "runtime"`，全部清除后返回 `source: "config"`。
 
 ### 组与运行时选择
 
@@ -192,17 +259,27 @@ key 最优成员的 `delta_to_best_ms`。`rank` 是瞬时排名，而组的选�
 `GET /api/v1/providers` 按订阅 tag 归并节点。`node` 段与无 tag 的订阅合并为可编辑的
 `inline` provider（`p_inline`），其他 tag 为 `p_` 加 tag 哈希，因此只要 tag 不变，
 provider ID（以及节点的 `provider_id`）跨 reload 稳定。`node_count` 取自当前
-generation；订阅没有产出任何 dialer 时 `status` 为 `"stale"`，而不是编造更新时间。
+generation；`status` 跟随最近一次拉取：有节点为 `ok`，拉取失败但保留了之前的节点为 `stale`，
+一个节点都没有为 `error`，此时 `updated_at` 为 `null` 而不是编造的时间。
 分页复用节点那套绑定 generation 的 cursor。`can_refresh` 只看 operations 适配器，
-因此订阅恒为 true；`can_manage` 恒为 false（不通过 API 创建或删除 provider）。
-`POST /api/v1/providers/{provider_id}/refresh` 因此对订阅排队一个 `provider_refresh`
-操作，对其他 kind 返回 `404 capability_not_supported`。刷新会重新拉取订阅；拉取失败时
-保留上一次成功的节点，避免切断正在运行的 generation，同时不把失败报成成功：`status`
+因此订阅恒为 true；`can_manage` 还需要配置写入闸门，为 false 时创建与删除 provider 返回
+`404 capability_not_supported`。`POST /api/v1/providers/{provider_id}/refresh` 对订阅排队一个
+`provider_refresh` 操作，对其他 kind 返回 `404 capability_not_supported`。刷新会重新拉取订阅；
+拉取失败时保留上一次成功的节点，避免切断正在运行的 generation，同时不把失败报成成功：`status`
 为 `"stale"`，`last_error` 给出原因，`updated_at` 是最后一次尝试的时间。
 
-`GET /api/v1/geodata` 报告 dae 实际加载的 geoip/geosite 文件大小、mtime 与 SHA-256。
-摘要会缓存到文件变化为止，因此轮询开销很小。`can_update` 为 `false`：资源来自安装包，
-`POST /api/v1/geodata/update` 返回 `404 capability_not_supported`。
+`GET /api/v1/geodata` 报告已加载的 geoip/geosite 资源指纹。配置令牌的监听器还会
+报告更新状态和规则所需的代码。通过 PATCH `/api/v1/runtime/settings` 的 `geodata`
+字段设置按优先级排列的下载 URL、下载路径、校验开关和 1–168 小时的更新间隔。
+自动更新默认关闭。设置跨进程重启保留，`{"geodata":null}` 可恢复默认设置。
+
+`POST /api/v1/geodata/update` 使用空请求体，返回 `202` 和 `geodata_update` 操作。
+dae 下载并校验两份资产后，通过一次 reload 激活。更新失败时继续使用之前的资产。
+
+每个 URL 有一个总时限，只有失败后才尝试下一个 URL；不跟随重定向。路线为 `routing` 时，
+请求与用户流量一样经过路由规则：代理出口在 `dial_mode: domain` 下收到的是主机名，
+直连出口只会连接已校验的公网地址。操作错误只包含失败类别（`download_failed` 或
+`validation_failed`）；每次尝试的原因与耗时以 warning 级别写入日志，不包含 URL 中的凭据。
 
 ### DNS 缓存、日志、规则与查询
 

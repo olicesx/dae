@@ -7,6 +7,7 @@ package nativeapi
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -316,5 +317,93 @@ func TestReplaceConfigSourcePreconditionPrecedesMediaType(t *testing.T) {
 	}
 	if len(provider.replaceReqs) != 0 {
 		t.Fatal("a request without If-Match must not reach the provider")
+	}
+}
+
+type fakeConfigCreator struct {
+	fakeConfigProvider
+	requests []CreateConfigSourceRequest
+	err      error
+}
+
+func (p *fakeConfigCreator) CreateConfigSource(_ context.Context, req CreateConfigSourceRequest) (OperationAccepted, error) {
+	p.requests = append(p.requests, req)
+	return OperationAccepted{OperationID: "op-create", Kind: OperationKindReload, Status: "queued", Href: "/api/v1/operations/op-create"}, p.err
+}
+
+func TestConfigCreateAcceptsDoonaRequest(t *testing.T) {
+	provider := &fakeConfigCreator{fakeConfigProvider: fakeConfigProvider{caps: writableCaps()}}
+	provider.caps.Create = true
+	server := newConfigServer(t, provider)
+	response := doConfigRequest(server, http.MethodPost, configSourcesPath, `{"path":"config.d/extra.dae","content":""}`, map[string]string{"Idempotency-Key": "doona-key"})
+	var accepted OperationAccepted
+	if response.Code != http.StatusAccepted || json.Unmarshal(response.Body.Bytes(), &accepted) != nil ||
+		accepted.Kind != OperationKindReload || accepted.Href != response.Header().Get("Location") ||
+		response.Header().Get("Retry-After") != operationPollRetryAfter {
+		t.Fatalf("create response = %d, %v, %s", response.Code, response.Header(), response.Body)
+	}
+	if len(provider.requests) != 1 || provider.requests[0] != (CreateConfigSourceRequest{Path: "config.d/extra.dae", IdempotencyKey: "doona-key"}) {
+		t.Fatalf("provider requests = %#v", provider.requests)
+	}
+}
+
+func TestConfigCreateRequestErrors(t *testing.T) {
+	const valid = `{"path":"config.d/x.dae","content":""}`
+	for _, tc := range []struct {
+		name, body, mediaType, code string
+		status                      int
+		unavailable, readonly       bool
+	}{
+		{name: "unavailable", body: valid, code: codeCapabilityNotSupported, status: 404, unavailable: true},
+		{name: "read-only", body: valid, code: codePermissionDenied, status: 403, readonly: true},
+		{name: "content type", body: valid, mediaType: "text/plain", code: codeUnsupportedMediaType, status: 415},
+		{name: "unknown field", body: `{"path":"x.dae","content":"","extra":true}`, code: codeInvalidRequest, status: 400},
+		{name: "missing content", body: `{"path":"x.dae"}`, code: codeInvalidRequest, status: 400},
+		{name: "null content", body: `{"path":"x.dae","content":null}`, code: codeInvalidRequest, status: 400},
+		{name: "absolute path", body: `{"path":"/x.dae","content":""}`, code: codeInvalidRequest, status: 400},
+		{name: "traversal", body: `{"path":"config.d/../x.dae","content":""}`, code: codeInvalidRequest, status: 400},
+		{name: "empty path segment", body: `{"path":"config.d//x.dae","content":""}`, code: codeInvalidRequest, status: 400},
+		{name: "control character", body: `{"path":"config.d/x\u0085.dae","content":""}`, code: codeInvalidRequest, status: 400},
+		{name: "invalid UTF-8", body: "{\"path\":\"x.dae\",\"content\":\"\xff\"}", code: codeInvalidRequest, status: 400},
+		{name: "content byte limit", body: `{"path":"x.dae","content":"你好你好你好"}`, code: codeRequestTooLarge, status: 413},
+		{name: "body byte limit", body: valid + strings.Repeat(" ", 128), code: codeRequestTooLarge, status: 413},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			caps := writableCaps()
+			caps.Create = !tc.unavailable
+			caps.Writable = !tc.readonly
+			provider := &fakeConfigCreator{fakeConfigProvider: fakeConfigProvider{caps: caps}}
+			server := newConfigServer(t, provider)
+			server.cfg.MaxJSONBodyBytes = 128
+			headers := map[string]string{}
+			if tc.mediaType != "" {
+				headers["Content-Type"] = tc.mediaType
+			}
+			response := doConfigRequest(server, http.MethodPost, configSourcesPath, tc.body, headers)
+			if response.Code != tc.status || errorCode(t, response) != tc.code || len(provider.requests) != 0 {
+				t.Fatalf("create response = %d %s, requests = %#v", response.Code, response.Body, provider.requests)
+			}
+		})
+	}
+}
+
+func TestConfigCreatePreservesProviderDiagnostics(t *testing.T) {
+	caps := writableCaps()
+	caps.Create = true
+	provider := &fakeConfigCreator{
+		fakeConfigProvider: fakeConfigProvider{caps: caps},
+		err: &APIError{Status: 422, Code: codeUnsupportedValue, Message: "not included", Details: map[string]any{
+			"diagnostics": []ConfigDiagnostic{{Level: "error", SourceID: "src_main", Code: "source-not-included", Message: "No include pattern loads this path."}},
+		}},
+	}
+	response := doConfigRequest(newConfigServer(t, provider), http.MethodPost, configSourcesPath, `{"path":"x.dae","content":""}`, nil)
+	var body struct {
+		Error struct {
+			Details struct{ Diagnostics []ConfigDiagnostic }
+		}
+	}
+	if response.Code != 422 || errorCode(t, response) != codeUnsupportedValue || json.Unmarshal(response.Body.Bytes(), &body) != nil ||
+		len(body.Error.Details.Diagnostics) != 1 || body.Error.Details.Diagnostics[0].SourceID != "src_main" {
+		t.Fatalf("response = %d %s", response.Code, response.Body)
 	}
 }

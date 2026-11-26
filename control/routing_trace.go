@@ -16,6 +16,15 @@ import (
 
 const MaxRoutingTraceRuleSteps = 4096
 
+// RoutingTraceBounds returns the generation ID and an upper bound on the
+// steps emitted by a single evaluation, including rules skipped after a match.
+func (c *ControlPlane) RoutingTraceBounds() (string, int) {
+	if !c.RoutingTraceAvailable() {
+		return "", 0
+	}
+	return c.routingGeneration, len(c.routingRules) + len(c.routingTraceMatcher.predicateGroups) + 1
+}
+
 type RoutingTraceInput struct {
 	Network consts.L4ProtoType
 	Domain  *string
@@ -55,25 +64,10 @@ type traceConditionResult struct {
 	missing []string
 }
 
-func (m *RoutingMatcher) TraceRouting(
-	ctx context.Context,
-	input RoutingTraceInput,
-	rules []RoutingRuleSnapshot,
-	fallback string,
-) (RoutingTraceEvaluation, error) {
-	if m == nil {
-		return RoutingTraceEvaluation{}, fmt.Errorf("routing trace matcher is unavailable")
-	}
-	if err := ctx.Err(); err != nil {
-		return RoutingTraceEvaluation{}, err
-	}
-	if len(m.ruleSpans) != len(rules) {
-		return RoutingTraceEvaluation{}, fmt.Errorf(
-			"routing trace rule mapping is inconsistent: matcher has %d rules, snapshot has %d",
-			len(m.ruleSpans), len(rules),
-		)
-	}
-
+// traceFacts normalizes a trace input the way the datapath hands a packet to
+// the matcher. The source MAC is not a trace input, so it stays zero, and a
+// rule that needs it is reported as missing input.
+func (m *RoutingMatcher) traceFacts(input RoutingTraceInput) *routingMatcherFacts {
 	var sourceAddr, destAddr [16]uint8
 	var sourcePort uint16
 	var ipVersion consts.IpVersionType
@@ -108,6 +102,30 @@ func (m *RoutingMatcher) TraceRouting(
 		ipVersion, input.Network, domain, pname, dscp, [16]uint8{},
 	)
 
+	return &facts
+}
+
+func (m *RoutingMatcher) TraceRouting(
+	ctx context.Context,
+	input RoutingTraceInput,
+	rules []RoutingRuleSnapshot,
+	fallback string,
+) (RoutingTraceEvaluation, error) {
+	if m == nil {
+		return RoutingTraceEvaluation{}, fmt.Errorf("routing trace matcher is unavailable")
+	}
+	if err := ctx.Err(); err != nil {
+		return RoutingTraceEvaluation{}, err
+	}
+	if len(m.ruleSpans) != len(rules) {
+		return RoutingTraceEvaluation{}, fmt.Errorf(
+			"routing trace rule mapping is inconsistent: matcher has %d rules, snapshot has %d",
+			len(m.ruleSpans), len(rules),
+		)
+	}
+
+	facts := m.traceFacts(input)
+
 	evaluation := RoutingTraceEvaluation{
 		Decision:      "indeterminate",
 		MissingInputs: []string{},
@@ -137,7 +155,7 @@ func (m *RoutingMatcher) TraceRouting(
 			span := m.ruleSpans[index]
 			var traceErr error
 			outcome.Result, outcome.MissingInputs, outcome.Conditions, traceErr =
-				m.evaluateTraceRule(ctx, ruleID, span, &facts, input)
+				m.evaluateTraceRule(ctx, ruleID, span, facts, input)
 			if traceErr != nil {
 				return RoutingTraceEvaluation{}, traceErr
 			}
@@ -192,7 +210,10 @@ func (m *RoutingMatcher) evaluateTraceRule(
 	facts *routingMatcherFacts,
 	input RoutingTraceInput,
 ) (string, []string, []RoutingTraceCondition, error) {
-	conditions := make([]RoutingTraceCondition, 0, span.conditionTo-span.conditionFrom)
+	var conditions []RoutingTraceCondition
+	if ruleID != "" {
+		conditions = make([]RoutingTraceCondition, 0, span.conditionTo-span.conditionFrom)
+	}
 	unknown := map[string]struct{}{}
 	hasNotMatched := false
 	nameCount := map[string]int{}
@@ -201,20 +222,25 @@ func (m *RoutingMatcher) evaluateTraceRule(
 		if err != nil {
 			return "", nil, nil, err
 		}
-		nameCount[group.name]++
-		id := ruleID + "/" + group.name
-		if nameCount[group.name] > 1 {
-			id = fmt.Sprintf("%s/%s#%d", ruleID, group.name, nameCount[group.name])
+		if ruleID != "" {
+			nameCount[group.name]++
+			id := ruleID + "/" + group.name
+			if nameCount[group.name] > 1 {
+				id = fmt.Sprintf("%s/%s#%d", ruleID, group.name, nameCount[group.name])
+			}
+			expression := group.expression
+			conditions = append(conditions, RoutingTraceCondition{
+				ID:            id,
+				Expression:    &expression,
+				Result:        condition.result,
+				MissingInputs: condition.missing,
+			})
 		}
-		expression := group.expression
-		conditions = append(conditions, RoutingTraceCondition{
-			ID:            id,
-			Expression:    &expression,
-			Result:        condition.result,
-			MissingInputs: condition.missing,
-		})
 		switch condition.result {
 		case "not_matched":
+			if ruleID == "" {
+				return "not_matched", nil, nil, nil
+			}
 			hasNotMatched = true
 		case "indeterminate":
 			for _, missing := range condition.missing {
@@ -313,6 +339,74 @@ func sortedSet(values map[string]struct{}) []string {
 	}
 	sort.Strings(result)
 	return result
+}
+
+// TraceEgressResult is the routing verdict for one connection the daemon
+// itself opens on a client's behalf.
+type TraceEgressResult struct {
+	Outbound consts.OutboundIndex
+	Mark     uint32
+	Must     bool
+	// MissingInputs lists the inputs indeterminate rules need. The verdict is
+	// the one a client with none of them would get; it is reliable only when
+	// the list is empty.
+	MissingInputs []string
+}
+
+// TraceEgress routes a daemon-originated connection the way Route does for a
+// client with the trace input's address and packet metadata. The runtime
+// routes a DNS upstream query by the requesting client's source address and
+// metadata, with the upstream server as the destination, so a live lookup
+// needs the same verdict. Only the trace matcher's private caches are read.
+func (m *RoutingMatcher) TraceEgress(
+	ctx context.Context,
+	input RoutingTraceInput,
+	rules []RoutingRuleSnapshot,
+) (TraceEgressResult, error) {
+	if m == nil {
+		return TraceEgressResult{}, fmt.Errorf("routing trace matcher is unavailable")
+	}
+	if err := ctx.Err(); err != nil {
+		return TraceEgressResult{}, err
+	}
+	if len(m.ruleSpans) != len(rules) {
+		return TraceEgressResult{}, fmt.Errorf(
+			"routing trace rule mapping is inconsistent: matcher has %d rules, snapshot has %d",
+			len(m.ruleSpans), len(rules),
+		)
+	}
+	facts := m.traceFacts(input)
+	fallback := m.compiledMatches[len(m.compiledMatches)-1]
+	result := TraceEgressResult{Outbound: fallback.outbound, Mark: fallback.mark, Must: fallback.must}
+	uncertain := map[string]struct{}{}
+	must := false
+	for _, span := range m.ruleSpans {
+		if err := ctx.Err(); err != nil {
+			return TraceEgressResult{}, err
+		}
+		outcome, missing, _, err := m.evaluateTraceRule(ctx, "", span, facts, input)
+		if err != nil {
+			return TraceEgressResult{}, err
+		}
+		for _, name := range missing {
+			uncertain[name] = struct{}{}
+		}
+		if outcome != "matched" {
+			continue
+		}
+		match := m.compiledMatches[span.end-1]
+		if match.outbound == consts.OutboundMustRules {
+			must = true
+			continue
+		}
+		result.Outbound, result.Mark, result.Must = match.outbound, match.mark, match.must
+		break
+	}
+	result.Must = result.Must || must
+	if len(uncertain) > 0 {
+		result.MissingInputs = sortedSet(uncertain)
+	}
+	return result, nil
 }
 
 func (c *ControlPlane) TraceRouting(ctx context.Context, input RoutingTraceInput) (RoutingTraceEvaluation, error) {

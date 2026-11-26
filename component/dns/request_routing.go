@@ -154,7 +154,7 @@ func (b *RequestMatcherBuilder) Build() (matcher *RequestMatcher, err error) {
 }
 
 type RequestMatcher struct {
-	domainMatcher routing.DomainMatcher // All domain matchSets use one DomainMatcher.
+	domainMatcher *domain_matcher.AhocorasickSlimtrie // All domain matchSets use one DomainMatcher.
 
 	matches []requestMatchSet
 }

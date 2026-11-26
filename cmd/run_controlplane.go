@@ -53,12 +53,12 @@ func listenControlPlaneInDaeNetns(c *control.ControlPlane, port uint16) (*contro
 	return listener, nil
 }
 
-func newControlPlane(ctx context.Context, log *logrus.Logger, bpf *control.InheritedBpf, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {
-	return newControlPlaneWithMode(ctx, log, bpf, nil, dnsCache, conf, externGeoDataDirs, false, dnsRoutingUnchanged, isReloadBuild)
+func newControlPlane(ctx context.Context, log *logrus.Logger, bpf *control.InheritedBpf, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, dnsRoutingUnchanged bool, isReloadBuild bool, dnsLogCapacity int) (c *control.ControlPlane, err error) {
+	return newControlPlaneWithMode(ctx, log, bpf, nil, dnsCache, conf, externGeoDataDirs, false, dnsRoutingUnchanged, isReloadBuild, dnsLogCapacity)
 }
 
-func newPreparedControlPlane(ctx context.Context, log *logrus.Logger, bpf *control.InheritedBpf, freshDatapath *control.FreshDatapathState, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {
-	return newControlPlaneWithMode(ctx, log, bpf, freshDatapath, dnsCache, conf, externGeoDataDirs, true, dnsRoutingUnchanged, isReloadBuild)
+func newPreparedControlPlane(ctx context.Context, log *logrus.Logger, bpf *control.InheritedBpf, freshDatapath *control.FreshDatapathState, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, dnsRoutingUnchanged bool, isReloadBuild bool, dnsLogCapacity int) (c *control.ControlPlane, err error) {
+	return newControlPlaneWithMode(ctx, log, bpf, freshDatapath, dnsCache, conf, externGeoDataDirs, true, dnsRoutingUnchanged, isReloadBuild, dnsLogCapacity)
 }
 
 // buildControlPlaneRuntime is the final construction boundary after config
@@ -86,6 +86,7 @@ func buildControlPlaneRuntime(
 	dnsRoutingUnchanged bool,
 	isReloadBuild bool,
 	routingTrace bool,
+	dnsLogCapacity int,
 ) (*control.ControlPlane, error) {
 	return control.NewControlPlaneWithContextOptions(
 		ctx,
@@ -100,6 +101,7 @@ func buildControlPlaneRuntime(
 		control.ControlPlaneBuildOptions{
 			DelayDatapathCommit:   prepareOnly,
 			DelayDNSListenerStart: prepareOnly,
+			DNSLogCapacity:        dnsLogCapacity,
 			DNSRoutingUnchanged:   dnsRoutingUnchanged,
 			IsReload:              isReloadBuild || bpf != nil,
 			DirectDialer:          directDialer,
@@ -275,7 +277,7 @@ func mergeSubscriptionResults(log *logrus.Logger, tagToNodeList map[string][]str
 	return fetched, resolvingFailed
 }
 
-func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf *control.InheritedBpf, freshDatapath *control.FreshDatapathState, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, dnsRoutingUnchanged bool, isReloadBuild bool) (c *control.ControlPlane, err error) {
+func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf *control.InheritedBpf, freshDatapath *control.FreshDatapathState, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string, prepareOnly bool, dnsRoutingUnchanged bool, isReloadBuild bool, dnsLogCapacity int) (c *control.ControlPlane, err error) {
 	fallbackResolver, err := parseFallbackResolver(conf.Global.FallbackResolver)
 	if err != nil {
 		return nil, err
@@ -539,6 +541,7 @@ func newControlPlaneWithMode(ctx context.Context, log *logrus.Logger, bpf *contr
 		dnsRoutingUnchanged,
 		isReloadBuild,
 		conf.Api.Enabled,
+		dnsLogCapacity,
 	)
 	if err != nil {
 		return nil, err

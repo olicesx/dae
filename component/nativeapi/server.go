@@ -69,6 +69,7 @@ type Server struct {
 
 	httpServer *http.Server
 	listener   net.Listener
+	stopping   atomic.Bool
 
 	listenHost         string
 	listenPort         int
@@ -300,6 +301,7 @@ func (s *Server) Start() error {
 	s.httpServer = &http.Server{
 		Handler:           s,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    s.cfg.MaxHeaderBytes,
 	}
@@ -325,6 +327,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s == nil || s.httpServer == nil {
 		return nil
 	}
+	s.stopping.Store(true)
 	if closer, ok := s.logs.(StreamCloser); ok {
 		closer.CloseStreams()
 	}
@@ -432,6 +435,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx = context.WithValue(ctx, fullDiscoveryKey, fullDiscovery)
 	r = r.WithContext(ctx)
+
+	if s.stopping.Load() && !isReadMethod(r.Method) {
+		w.Header().Set("Retry-After", "1")
+		writeError(w, requestID, http.StatusServiceUnavailable, codeTemporarilyUnavailable, "server is shutting down")
+		return
+	}
 
 	if isUnavailablePath(r.URL.Path) {
 		writeError(w, requestID, http.StatusNotFound, codeCapabilityNotSupported, "resource is not supported by this engine")

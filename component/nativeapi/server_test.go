@@ -623,6 +623,21 @@ func TestServerStartStopLogging(t *testing.T) {
 	if err := server.Shutdown(context.Background()); err != nil {
 		t.Fatalf("shutdown: %v", err)
 	}
+	request := func(method, path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, "http://"+server.Addr().String()+path, nil)
+		req.RemoteAddr = "127.0.0.1:1234"
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		return rec
+	}
+	write := request(http.MethodPost, "/api/v1/operations/reload")
+	if write.Code != http.StatusServiceUnavailable || write.Header().Get("Retry-After") == "" {
+		t.Fatalf("reload during shutdown: %d, %s", write.Code, write.Body.String())
+	}
+	read := request(http.MethodGet, "/api/v1/version")
+	if read.Code != http.StatusOK {
+		t.Fatalf("read during shutdown: %d, %s", read.Code, read.Body.String())
+	}
 	stopped := false
 	for _, entry := range hook.AllEntries() {
 		if entry.Level == logrus.InfoLevel && entry.Message == "Native API listener stopped" {

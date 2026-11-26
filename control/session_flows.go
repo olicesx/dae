@@ -22,9 +22,10 @@ const FlowHistoryRetention = 15 * time.Minute
 
 // flowStatsEnabled is the process-wide switch for the per-flow bookkeeping that
 // only the API reads: the closed-flow history snapshot and the per-flow byte
-// counters. Taking that snapshot on every close and incrementing the counters
-// on every relay record are costs main never paid, so api.enabled=false must
-// turn both off. The zero value is off, matching a build without the API; the
+// counters, and to the per-outbound byte counters behind runtime/outbounds.
+// Taking that snapshot on every close and incrementing those counters on every
+// relay record are costs main never paid, so api.enabled=false must turn them
+// all off. The zero value is off, matching a build without the API; the
 // control plane sets it from api.enabled before each build, like
 // ConfigureDnsLog and ConfigureDirectStats.
 var flowStatsEnabled atomic.Bool

@@ -131,12 +131,18 @@ func (c *ControlPlane) SnapshotOutboundCounters() OutboundCountersSnapshot {
 // recordUploadTrafficFor accounts upload bytes both in the process-lifetime
 // runtime history and against the selected outbound. The counter pointer is
 // resolved once per flow, so the byte path never re-enters the registry.
+//
+// The per-outbound half feeds runtime/outbounds, which only the API reads, so
+// it follows the API switch like the per-flow bookkeeping does: with the API
+// off the byte path is the one history record it was before the API.
 func (c *ControlPlane) recordUploadTrafficFor(counters *ob.Counters, n int64) {
 	if n <= 0 {
 		return
 	}
 	c.recordUploadTraffic(n)
-	counters.AddUpload(uint64(n))
+	if flowStatsActive() {
+		counters.AddUpload(uint64(n))
+	}
 }
 
 // recordDownloadTrafficFor is recordUploadTrafficFor for the reply direction.
@@ -145,7 +151,9 @@ func (c *ControlPlane) recordDownloadTrafficFor(counters *ob.Counters, n int64) 
 		return
 	}
 	c.recordDownloadTraffic(n)
-	counters.AddDownload(uint64(n))
+	if flowStatsActive() {
+		counters.AddDownload(uint64(n))
+	}
 }
 
 // trafficRecordersFor binds the relay record callbacks to one outbound. The

@@ -65,6 +65,8 @@ func TestCounterRegistryRetainsByNameAcrossGenerations(t *testing.T) {
 }
 
 func TestTrafficRecordersForAttributeToOutbound(t *testing.T) {
+	ConfigureFlowStats(true)
+	t.Cleanup(func() { ConfigureFlowStats(false) })
 	plane := &ControlPlane{runtimeStats: newRuntimeStats()}
 	counters := &ob.Counters{}
 	download, upload := plane.trafficRecordersFor(counters)
@@ -90,6 +92,40 @@ func TestTrafficRecordersForAttributeToOutbound(t *testing.T) {
 	upload(-1)
 	if got := counters.UploadBytes(); got != 10 {
 		t.Fatalf("upload after no-op = %d, want 10", got)
+	}
+}
+
+// TestOutboundByteCountersFollowTheApiSwitch pins what the byte path pays with
+// the API off. The per-outbound half feeds runtime/outbounds, which nothing
+// reads then, so it is skipped and only the history main always kept remains.
+func TestOutboundByteCountersFollowTheApiSwitch(t *testing.T) {
+	ConfigureFlowStats(false)
+	t.Cleanup(func() { ConfigureFlowStats(false) })
+	plane := &ControlPlane{runtimeStats: newRuntimeStats()}
+	counters := &ob.Counters{}
+	download, upload := plane.trafficRecordersFor(counters)
+
+	upload(10)
+	download(20)
+
+	if got := counters.UploadBytes(); got != 0 {
+		t.Fatalf("upload counted with the API off = %d, want 0", got)
+	}
+	if got := counters.DownloadBytes(); got != 0 {
+		t.Fatalf("download counted with the API off = %d, want 0", got)
+	}
+	if got := plane.runtimeStats.uploadTotal.Load(); got != 10 {
+		t.Fatalf("history upload with the API off = %d, want 10", got)
+	}
+
+	ConfigureFlowStats(true)
+	upload(1)
+	download(2)
+	if got := counters.UploadBytes(); got != 1 {
+		t.Fatalf("upload with the API on = %d, want 1", got)
+	}
+	if got := counters.DownloadBytes(); got != 2 {
+		t.Fatalf("download with the API on = %d, want 2", got)
 	}
 }
 

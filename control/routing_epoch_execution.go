@@ -105,9 +105,20 @@ func (g *routingEpochIngressGate) release() {
 	g.waitMu.Unlock()
 }
 
+// closeAndWait seals the gate and waits until every holder has left. The wait
+// has no bound, so it belongs to paths that cancel the holders first; retirement
+// uses closeAndWaitUntil.
 func (g *routingEpochIngressGate) closeAndWait() {
+	g.closeAndWaitUntil(time.Time{})
+}
+
+// closeAndWaitUntil seals the gate and waits for its holders to leave, but no
+// later than deadline; a zero deadline waits for as long as it takes. It reports
+// whether every holder had left. A holder that leaves afterwards still closes
+// the drained channel, so a caller that moved on leaves nothing behind.
+func (g *routingEpochIngressGate) closeAndWaitUntil(deadline time.Time) bool {
 	if g == nil {
-		return
+		return true
 	}
 	for {
 		state := g.state.Load()
@@ -119,19 +130,30 @@ func (g *routingEpochIngressGate) closeAndWait() {
 		}
 	}
 	if g.state.Load() == routingEpochIngressClosed {
-		return
+		return true
 	}
 	g.waitMu.Lock()
 	if g.state.Load() == routingEpochIngressClosed {
 		g.waitMu.Unlock()
-		return
+		return true
 	}
 	if g.drained == nil {
 		g.drained = make(chan struct{})
 	}
 	drained := g.drained
 	g.waitMu.Unlock()
-	<-drained
+	if deadline.IsZero() {
+		<-drained
+		return true
+	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case <-drained:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 // LinkRoutingEpochPeer links two generations that share one BPF object during
@@ -507,14 +529,23 @@ func (c *ControlPlane) StopRoutingEpochExecution() {
 }
 
 // StopRoutingEpochExecutionWithTimeout seals admission and waits for drain
-// tickets. A positive timeout bounds the IdleCh wait so a stuck ticket cannot
-// pin retirement forever; timeout still proceeds to cancel the generation.
+// tickets. A positive timeout bounds both waits with one deadline, so neither a
+// stuck ingress holder nor a stuck ticket can pin retirement forever; a timeout
+// still proceeds to cancel the generation. The holders are what the
+// cancellation unblocks, so waiting for them without a bound would wait for
+// the very step that comes after it.
 func (c *ControlPlane) StopRoutingEpochExecutionWithTimeout(timeout time.Duration) {
 	if c == nil {
 		return
 	}
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
 	c.closeRoutingEpochExecution()
-	c.udpIngressAdmission.closeAndWait()
+	if !c.udpIngressAdmission.closeAndWaitUntil(deadline) && c.log != nil {
+		c.log.Warnln("routing epoch admission wait timed out; continuing retirement")
+	}
 	if c.drainTracker == nil {
 		return
 	}
@@ -523,7 +554,7 @@ func (c *ControlPlane) StopRoutingEpochExecutionWithTimeout(timeout time.Duratio
 		<-idle
 		return
 	}
-	timer := time.NewTimer(timeout)
+	timer := time.NewTimer(time.Until(deadline))
 	select {
 	case <-idle:
 		if !timer.Stop() {

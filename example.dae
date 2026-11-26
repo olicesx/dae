@@ -497,6 +497,6 @@ api {
     # Figures are link bytes and a lower bound: the first packet of every flow and flows that
     # predate a restart are not counted, and non-TCP/UDP traffic is skipped. Every packet on
     # those interfaces then pays for a map lookup or two, so keep it off unless
-    # GET /api/v1/runtime/direct-stats is needed.
+    # GET /api/v1/x-kdae/runtime/direct-stats is needed.
     #direct_stats: false
 }

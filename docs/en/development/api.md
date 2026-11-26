@@ -567,6 +567,11 @@ same request and answers `409 idempotency_conflict` when the key is reused for a
 different operation. Records live in memory for 3600 seconds; unfinished
 operations are never evicted.
 
+The switch completes when the operation reports `succeeded`. The old control
+plane can still be retiring and closing connections in the background. During
+retirement, `reload`, `suspend` and `resume` return `409 state_conflict`. The
+client can retry after a few seconds.
+
 With `ui` configured, `/ui/` serves the frontend and every other non-`/api` path
 redirects there, so only `/api` and `/api/v1/...` take part in authentication.
 

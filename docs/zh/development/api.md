@@ -428,6 +428,10 @@ cgroup 部分取决于系统。cgroup v2 只有在父级委派控制器之后
 `202` body，同一 key 用于不同操作时返回 `409 idempotency_conflict`。记录在内存中保留
 3600 秒；未完成的操作不会被淘汰。
 
+操作报告 `succeeded` 时，切换已经完成。旧控制面仍可能在后台退役并关闭连接。
+退役期间，`reload`、`suspend` 和 `resume` 会返回 `409 state_conflict`。
+客户端可以等几秒后重试。
+
 配置了 `ui` 时，`/ui/` 提供前端，其余非 `/api` 路径都会重定向到那里，因此只有 `/api` 与
 `/api/v1/...` 参与认证。
 

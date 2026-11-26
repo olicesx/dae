@@ -11,11 +11,15 @@ import (
 )
 
 const (
-	APIName    = "daeuniverse/native"
-	APIMajor   = 1
-	APIStatus  = "draft"
-	BasePath   = "/api/v1"
-	EngineName = "dae"
+	APIName   = "daeuniverse/native"
+	APIMajor  = 1
+	APIStatus = "draft"
+	BasePath  = "/api/v1"
+	// EngineName is what GET /api reports as engine.name. Panels key their
+	// engine adapters on it (doona selects its honk adapter for "honk" and
+	// runs every other name on the generic dae contract), so the fork is
+	// reported under its own name instead of borrowing upstream's.
+	EngineName = "kdae"
 )
 
 // RuntimeProvider supplies a coherent runtime snapshot for GET /api/v1/runtime.

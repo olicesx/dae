@@ -375,6 +375,9 @@ func TestTraceDNSDialsThroughAPrivateCopyOfTheSelectedNode(t *testing.T) {
 	// The outbound group holds a node that leads to the relay; the query must
 	// reach the upstream through it without the runtime node being used.
 	plane, option := newTraceDNSTestPlane(t, "proxy")
+	// The loopback relay needs no routing mark. Setting SO_MARK requires
+	// capabilities that the unit and race jobs do not grant.
+	option.SoMarkFromDae = 0
 	runtime, err := dialer.NewFromLinkContext(context.Background(), option, dialer.InstanceOption{DisableCheck: true},
 		"socks5://"+relay.addr.String()+"#runtime-node", "")
 	require.NoError(t, err)

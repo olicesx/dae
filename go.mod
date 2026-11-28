@@ -14,7 +14,7 @@ require (
 	github.com/miekg/dns v1.1.72
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
 	github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac
-	github.com/olicesx/quic-go v0.0.0-20261128073414-d6911de607df
+	github.com/olicesx/quic-go v0.0.0-20261128085253-84aaa9da6f47
 	github.com/panjf2000/ants/v2 v2.11.5
 	github.com/safchain/ethtool v0.7.0
 	github.com/shirou/gopsutil/v4 v4.26.1
@@ -124,7 +124,7 @@ require (
 // The fork keeps PMTU probes out of congestion loss vectors, reports actual
 // timer losses, preserves DATAGRAM delivery at GSO batch boundaries, and
 // compacts queued short stream frames under sustained receive backlog.
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20261128073414-d6911de607df
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20261128085253-84aaa9da6f47
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
@@ -184,4 +184,4 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20261128
 
 // The outbound audit fixes Vision framing, SS2022 UDP relay addresses and
 // TCP deadlines, TLS buffering, and shared transport lifecycle handling.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261128073745-4a511f9b3488
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261128085440-eb45df1f4ead

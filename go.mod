@@ -183,5 +183,6 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20261128
 // validates exactly the QUIC revision dae consumes.
 
 // The outbound audit fixes Vision framing, SS2022 UDP relay addresses and
-// TCP deadlines, TLS buffering, and shared transport lifecycle handling.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261128085440-eb45df1f4ead
+// TCP deadlines, TLS buffering, and shared transport lifecycle handling,
+// and places TUIC UDP associations by per-connection count.
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261128121032-00e23746c7d4

@@ -14,7 +14,7 @@ require (
 	github.com/miekg/dns v1.1.72
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
 	github.com/okzk/sdnotify v0.0.0-20240725214427-1c1fdd37c5ac
-	github.com/olicesx/quic-go v0.0.0-20261022020930-ffb41ccbd9d2
+	github.com/olicesx/quic-go v0.0.0-20261128065640-7f07f8e1e727
 	github.com/panjf2000/ants/v2 v2.11.5
 	github.com/safchain/ethtool v0.7.0
 	github.com/shirou/gopsutil/v4 v4.26.1
@@ -121,7 +121,10 @@ require (
 // This pin also raises the fork's module floor to go1.26.10 (CVE-2026-111943:
 // crypto/x509 distrusts the eight compromised eMudhra intermediates), the
 // same floor the dae module now requires.
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20261022020930-ffb41ccbd9d2
+// The fork keeps PMTU probes out of congestion loss vectors, reports actual
+// timer losses, preserves DATAGRAM delivery at GSO batch boundaries, and
+// compacts queued short stream frames under sustained receive backlog.
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20261128065640-7f07f8e1e727
 
 //replace github.com/cilium/ebpf v0.20.0
 //replace github.com/daeuniverse/dae-config-dist/go/dae_config => /home/mzz/antlrProjects/dae-config/build/go/dae_config
@@ -176,9 +179,9 @@ replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20261022
 // connection with an auth error - and the reference client discards the same
 // Close error.
 // This pin carries the fork's go1.26.10 toolchain floor for CVE-2026-111943
-// and re-pins its quic-go replace to the same floor commit, so a standalone
-// fork build validates exactly the revisions dae consumes.
+// and pins quic-go to the same revision as dae, so a standalone fork build
+// validates exactly the QUIC revision dae consumes.
 
 // The outbound audit fixes Vision framing, SS2022 UDP relay addresses and
 // TCP deadlines, TLS buffering, and shared transport lifecycle handling.
-replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261128061422-3033ce858bbe
+replace github.com/daeuniverse/outbound => github.com/olicesx/outbound v0.0.0-sticky-ip.0.20261128070439-67bba177d3e2
